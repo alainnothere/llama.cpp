@@ -7,6 +7,12 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <thread>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -607,12 +613,20 @@ struct server_prompt {
 };
 
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
-        this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
-        this->limit_tokens = limit_tokens;
-    }
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens,
+                        std::string disk_path, int32_t queue_depth,
+                        uint32_t arch_hash, uint32_t vocab_hash);
+    ~server_prompt_cache();
+
+    server_prompt_cache(const server_prompt_cache &)             = delete;
+    server_prompt_cache & operator=(const server_prompt_cache &) = delete;
 
     std::list<server_prompt> states;
+
+    // pending_spill: entries already enqueued for disk write but not yet committed.
+    // shared_ptr so the writer worker keeps the data alive if load() consumes the pending entry first.
+    // counted by size() / n_tokens() — RAM ceiling = limit_size + (queue_depth × avg_entry_size)
+    std::list<std::shared_ptr<server_prompt>> pending_spill;
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;
@@ -620,8 +634,13 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
-    size_t size() const;
+    // disk tier config — empty disk_path disables the tier
+    std::string disk_path;
+    int32_t     queue_depth = 16;
+    uint32_t    arch_hash   = 0;
+    uint32_t    vocab_hash  = 0;
 
+    size_t size() const;
     size_t n_tokens() const;
 
     server_prompt * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
@@ -629,4 +648,32 @@ struct server_prompt_cache {
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot);
 
     void update();
+
+    // called once on the main thread post start_loop() during graceful shutdown.
+    // drains the writer queue then synchronously spills remaining states + pending entries.
+    void shutdown_and_spill();
+
+private:
+    struct spill_job {
+        std::string uuid;
+        std::string filepath;
+        std::shared_ptr<server_prompt> entry;
+    };
+
+    std::deque<spill_job>           queue;
+    mutable std::mutex              mtx;     // protects queue + pending_spill. mutable so const accessors can lock.
+    mutable std::condition_variable cv;
+    std::thread                     worker;
+    std::atomic<bool>               stop_flag{false};
+
+    // launched lazily once disk_path is non-empty
+    void start_writer_if_needed();
+    void writer_loop();
+
+    // file I/O — runs on the worker thread (async path) or on the calling thread (sync fall-through / shutdown)
+    bool write_entry_to_file(const std::string & filepath, const server_prompt & entry);
+
+    // disk scan and restore. consumes the matched file on success.
+    bool try_match_disk(server_prompt & prompt, const server_tokens & tokens_new,
+                        llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot);
 };

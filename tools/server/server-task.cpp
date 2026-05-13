@@ -10,7 +10,39 @@
 #include "speculative.h"
 #include "server-common.h"
 
+#include <filesystem>
+#include <fstream>
+#include <optional>
+#include <random>
+#include <system_error>
+
 using json = nlohmann::ordered_json;
+
+//
+// disk-cache helpers (file-local)
+//
+
+namespace {
+
+constexpr uint32_t DISK_CACHE_MAGIC   = 0x53504344; // 'SPCD' — Server Prompt Cache Disk
+// v2: appended per-entry checkpoints (n_tokens, pos_min, pos_max, data_tgt, data_dft) after the
+// main+drft blobs. Required for SWA / hybrid / recurrent models: PARTIAL_ONLY checkpoints are the
+// only way to reuse a prefix once the live KV window has slid past it. v1 files are auto-deleted
+// by header-mismatch handling in try_match_disk.
+constexpr uint32_t DISK_CACHE_VERSION = 2;
+
+std::string gen_disk_cache_uuid() {
+    static thread_local std::mt19937_64 rng{std::random_device{}()};
+    std::uniform_int_distribution<uint64_t> dist;
+    const uint64_t a = dist(rng);
+    const uint64_t b = dist(rng);
+    char buf[33];
+    std::snprintf(buf, sizeof(buf), "%016llx%016llx",
+                  (unsigned long long) a, (unsigned long long) b);
+    return std::string(buf);
+}
+
+} // anonymous namespace
 
 //
 // task_params
@@ -1968,6 +2000,13 @@ size_t server_prompt_cache::size() const {
     for (const auto & state : states) {
         res += state.size();
     }
+    // pending_spill is shared with the writer thread — lock briefly to walk it safely
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        for (const auto & ptr : pending_spill) {
+            res += ptr->size();
+        }
+    }
 
     return res;
 }
@@ -1977,6 +2016,12 @@ size_t server_prompt_cache::n_tokens() const {
 
     for (const auto & state : states) {
         res += state.n_tokens();
+    }
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        for (const auto & ptr : pending_spill) {
+            res += ptr->n_tokens();
+        }
     }
 
     return res;
@@ -2047,14 +2092,13 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     auto it_best = states.end();
 
-    // find the most similar cached prompt, that would also preserve the most context
+    // Phase 1: find best match in states
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int lcp_cur = it->tokens.get_common_prefix(tokens_new);
 
         const float f_keep_cur = float(lcp_cur) / it->tokens.size();
         const float sim_cur    = float(lcp_cur) / tokens_new.size();
 
-        // don't trash large prompts
         if (f_keep_cur < 0.25f) {
             continue;
         }
@@ -2065,6 +2109,69 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
             it_best = it;
         }
+    }
+
+    // Phase 2: scan pending_spill (locked). If a pending entry beats the states winner, consume it from pending.
+    std::shared_ptr<server_prompt> pending_winner;
+    {
+        std::unique_lock<std::mutex> lock(mtx);
+        auto best = pending_spill.end();
+        float pf_keep = f_keep_best;
+        float psim    = sim_best;
+        for (auto it = pending_spill.begin(); it != pending_spill.end(); ++it) {
+            const int lcp_cur = (*it)->tokens.get_common_prefix(tokens_new);
+            const float f_keep_cur = float(lcp_cur) / (*it)->tokens.size();
+            const float sim_cur    = float(lcp_cur) / tokens_new.size();
+            if (f_keep_cur < 0.25f) {
+                continue;
+            }
+            if (pf_keep < f_keep_cur && psim < sim_cur) {
+                pf_keep = f_keep_cur;
+                psim    = sim_cur;
+                best = it;
+            }
+        }
+        if (best != pending_spill.end()) {
+            pending_winner = *best;
+            pending_spill.erase(best);
+            f_keep_best = pf_keep;
+            sim_best    = psim;
+            it_best     = states.end(); // pending wins over states
+        }
+    }
+
+    if (pending_winner) {
+        SRV_WRN(" - found better prompt in pending_spill with f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
+
+        {
+            auto & data = pending_winner->data.main;
+            const size_t size = data.size();
+            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
+            if (n != size) {
+                SRV_WRN("failed to restore state with size %zu\n", size);
+                return false;
+            }
+            data.clear();
+            data.shrink_to_fit();
+        }
+
+        {
+            auto & data = pending_winner->data.drft;
+            if (!data.empty()) {
+                GGML_ASSERT(ctx_dft);
+                const size_t size = data.size();
+                const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
+                if (n != size) {
+                    SRV_WRN("failed to restore drft state with size %zu\n", size);
+                    return false;
+                }
+                data.clear();
+                data.shrink_to_fit();
+            }
+        }
+
+        prompt = std::move(*pending_winner);
+        return true;
     }
 
     if (it_best != states.end()) {
@@ -2107,22 +2214,74 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         prompt = std::move(*it_best);
 
         states.erase(it_best);
+        return true;
+    }
+
+    // Phase 3: disk fallback
+    if (!disk_path.empty()) {
+        if (try_match_disk(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot)) {
+            SRV_WRN("%s", " - restored from disk\n");
+            return true;
+        }
     }
 
     return true;
 }
 
 void server_prompt_cache::update() {
+    auto evict_oldest = [this]() {
+        // Either spill to disk (preserving the entry) or destroy it.
+        // mtmd entries cannot be spilled — they get destroyed either way.
+        if (states.empty()) return;
+
+        const bool has_mtmd = states.front().tokens.has_mtmd;
+        if (disk_path.empty() || has_mtmd) {
+            SRV_WRN(" - removing oldest entry (size = %.3f MiB)%s\n",
+                    states.front().size() / (1024.0 * 1024.0),
+                    (!disk_path.empty() && has_mtmd) ? " [mtmd: not spillable]" : "");
+            states.pop_front();
+            return;
+        }
+
+        // Spill: move oldest entry to pending_spill, enqueue for async write.
+        // On queue overflow, fall through to a synchronous write on this thread (lossless).
+        std::string uuid     = gen_disk_cache_uuid();
+        std::string filepath = disk_path + "/" + uuid + ".bin";
+
+        auto entry_ptr = std::make_shared<server_prompt>(std::move(states.front()));
+        states.pop_front();
+
+        std::unique_lock<std::mutex> lock(mtx);
+        pending_spill.push_back(entry_ptr);
+
+        if ((int32_t) queue.size() < queue_depth) {
+            queue.push_back({uuid, filepath, entry_ptr});
+            cv.notify_one();
+            SRV_WRN(" - spilling oldest entry to disk (async, queued %zu/%d, size = %.3f MiB)\n",
+                    queue.size(), queue_depth, entry_ptr->size() / (1024.0 * 1024.0));
+        } else {
+            // Queue full — write synchronously (the task thread pays the cost; never drop)
+            lock.unlock();
+            SRV_WRN(" - spilling oldest entry to disk (SYNC fall-through, size = %.3f MiB)\n",
+                    entry_ptr->size() / (1024.0 * 1024.0));
+            const bool ok = write_entry_to_file(filepath, *entry_ptr);
+            lock.lock();
+            for (auto it = pending_spill.begin(); it != pending_spill.end(); ++it) {
+                if (it->get() == entry_ptr.get()) {
+                    pending_spill.erase(it);
+                    break;
+                }
+            }
+            if (!ok) {
+                SRV_WRN("disk cache: synchronous spill failed for '%s' (entry dropped)\n", filepath.c_str());
+            }
+        }
+    };
+
     if (limit_size > 0) {
         // always keep at least one state, regardless of the limits
         while (states.size() > 1 && size() > limit_size) {
-            if (states.empty()) {
-                break;
-            }
-
-            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
-
-            states.pop_front();
+            evict_oldest();
         }
     }
 
@@ -2134,22 +2293,568 @@ void server_prompt_cache::update() {
 
     if (limit_tokens > 0) {
         while (states.size() > 1 && n_tokens() > limit_tokens_cur) {
-            if (states.empty()) {
-                break;
-            }
-
-            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
-
-            states.pop_front();
+            evict_oldest();
         }
     }
 
-    SRV_WRN(" - cache state: %zu prompts, %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est)\n",
-            states.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
+    SRV_WRN(" - cache state: %zu prompts (+%zu pending), %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est)\n",
+            states.size(), pending_spill.size(), size() / (1024.0 * 1024.0),
+            limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
 
     for (const auto & state : states) {
         SRV_WRN("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
                 (const void *)&state, state.n_tokens(), state.checkpoints.size(), state.size() / (1024.0 * 1024.0));
     }
+}
+
+//
+// server_prompt_cache — disk tier
+//
+
+server_prompt_cache::server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens_in,
+                                          std::string disk_path_in, int32_t queue_depth_in,
+                                          uint32_t arch_hash_in, uint32_t vocab_hash_in) {
+    this->limit_size   = 1024ull * 1024ull * (limit_size_mib < 0 ? 0 : limit_size_mib);
+    this->limit_tokens = limit_tokens_in;
+    this->disk_path    = std::move(disk_path_in);
+    this->queue_depth  = queue_depth_in > 0 ? queue_depth_in : 16;
+    this->arch_hash    = arch_hash_in;
+    this->vocab_hash   = vocab_hash_in;
+
+    if (!this->disk_path.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(this->disk_path, ec);
+        if (ec) {
+            SRV_WRN("disk cache: cannot create directory '%s': %s — disk tier disabled\n",
+                    this->disk_path.c_str(), ec.message().c_str());
+            this->disk_path.clear();
+        } else {
+            SRV_WRN("disk cache: enabled at '%s' (queue depth %d, arch=0x%08x, vocab=0x%08x)\n",
+                    this->disk_path.c_str(), this->queue_depth, this->arch_hash, this->vocab_hash);
+            start_writer_if_needed();
+        }
+    }
+}
+
+server_prompt_cache::~server_prompt_cache() {
+    // Destructor runs on the main thread when ctx_server is destroyed (post start_loop, post clean_up).
+    // shutdown_and_spill stops the writer, joins, then synchronously spills remaining states + pending entries.
+    // The signal handler never reaches this path (it only sets stop_flag indirectly via terminate()).
+    shutdown_and_spill();
+}
+
+void server_prompt_cache::start_writer_if_needed() {
+    if (worker.joinable() || disk_path.empty()) {
+        return;
+    }
+    worker = std::thread([this]() { this->writer_loop(); });
+}
+
+void server_prompt_cache::writer_loop() {
+    while (true) {
+        spill_job job;
+        {
+            std::unique_lock<std::mutex> lock(mtx);
+            cv.wait(lock, [this]() { return stop_flag.load() || !queue.empty(); });
+            if (stop_flag.load() && queue.empty()) {
+                return;
+            }
+            job = std::move(queue.front());
+            queue.pop_front();
+        }
+
+        // I/O outside the lock — writes can take seconds
+        const bool ok = write_entry_to_file(job.filepath, *job.entry);
+        if (!ok) {
+            SRV_WRN("disk cache: async write failed for '%s' (entry dropped)\n", job.filepath.c_str());
+        }
+
+        // On failure: drop the entry from pending_spill rather than re-queuing it for retry.
+        //
+        // Why drop instead of retry:
+        // - Real-world write failures here are dominated by persistent causes (ENOSPC, EACCES,
+        //   EIO from failing hardware, path unmounted). Retry hits the same wall.
+        // - "Move back to states for retry" turns persistent failure into livelock: the failed
+        //   entry returns to states, next update() picks it up, spills, fails, returns... the
+        //   loop never terminates, RAM stays maxed, CPU pegged, logs flooded. Re-queue does not
+        //   achieve losslessness for persistent failures — it just relocates the loss into
+        //   "loop forever, never make progress."
+        // - The lossless property this cache actually provides is around queue overflow
+        //   (synchronous fall-through, not drop). Write-failure handling is a separate axis.
+        // - Drop with a warning gives the operator a clear signal something's wrong while
+        //   keeping the cache functional at reduced effective capacity.
+        //
+        // If transient-failure recovery ever becomes important, the right shape is bounded
+        // retry with backoff (e.g., 3 attempts, 100/500/2000 ms), then drop — not unconditional
+        // re-queue.
+        {
+            std::unique_lock<std::mutex> lock(mtx);
+            for (auto it = pending_spill.begin(); it != pending_spill.end(); ++it) {
+                if (it->get() == job.entry.get()) {
+                    pending_spill.erase(it);
+                    break;
+                }
+            }
+            cv.notify_all();
+        }
+    }
+}
+
+bool server_prompt_cache::write_entry_to_file(const std::string & filepath, const server_prompt & entry) {
+    const std::string tmppath = filepath + ".tmp";
+
+    size_t ckpts_bytes = 0;
+    for (const auto & cp : entry.checkpoints) {
+        ckpts_bytes += cp.data_tgt.size() + cp.data_dft.size();
+    }
+    const size_t bytes_total = entry.data.main.size() + entry.data.drft.size() + ckpts_bytes;
+    const int    n_tok       = entry.n_tokens();
+    const int64_t t_start    = ggml_time_us();
+
+    SRV_WRN("disk cache: writing %d tokens, %.1f MiB (main+drft) + %zu checkpoint(s) (%.1f MiB) → %s\n",
+            n_tok,
+            (entry.data.main.size() + entry.data.drft.size()) / (1024.0 * 1024.0),
+            entry.checkpoints.size(),
+            ckpts_bytes / (1024.0 * 1024.0),
+            filepath.c_str());
+
+    {
+        std::ofstream f(tmppath, std::ios::binary | std::ios::trunc);
+        if (!f) {
+            return false;
+        }
+
+        auto put_u32 = [&f](uint32_t v) {
+            f.write(reinterpret_cast<const char *>(&v), sizeof(v));
+        };
+        auto put_u64 = [&f](uint64_t v) {
+            f.write(reinterpret_cast<const char *>(&v), sizeof(v));
+        };
+
+        put_u32(DISK_CACHE_MAGIC);
+        put_u32(DISK_CACHE_VERSION);
+        put_u32(arch_hash);
+        put_u32(vocab_hash);
+        put_u32(static_cast<uint32_t>(limit_tokens)); // n_ctx at spill time (stored for diagnostics)
+
+        const auto & toks = entry.tokens.get_tokens();
+        const uint32_t n_tok = static_cast<uint32_t>(toks.size());
+        put_u32(n_tok);
+        if (n_tok > 0) {
+            f.write(reinterpret_cast<const char *>(toks.data()),
+                    static_cast<std::streamsize>(n_tok * sizeof(llama_token)));
+        }
+
+        put_u64(static_cast<uint64_t>(entry.data.main.size()));
+        if (!entry.data.main.empty()) {
+            f.write(reinterpret_cast<const char *>(entry.data.main.data()),
+                    static_cast<std::streamsize>(entry.data.main.size()));
+        }
+
+        put_u64(static_cast<uint64_t>(entry.data.drft.size()));
+        if (!entry.data.drft.empty()) {
+            f.write(reinterpret_cast<const char *>(entry.data.drft.data()),
+                    static_cast<std::streamsize>(entry.data.drft.size()));
+        }
+
+        // checkpoints — PARTIAL_ONLY KV snapshots taken during prefill. Required for SWA / hybrid /
+        // recurrent models: the main blob captures the trailing window only, so without these the
+        // rewind path at server-context.cpp can't recover earlier positions across restart.
+        put_u32(static_cast<uint32_t>(entry.checkpoints.size()));
+        for (const auto & cp : entry.checkpoints) {
+            const int64_t  n_tokens_v = cp.n_tokens;
+            const int32_t  pos_min_v  = cp.pos_min;
+            const int32_t  pos_max_v  = cp.pos_max;
+            f.write(reinterpret_cast<const char *>(&n_tokens_v), sizeof(n_tokens_v));
+            f.write(reinterpret_cast<const char *>(&pos_min_v),  sizeof(pos_min_v));
+            f.write(reinterpret_cast<const char *>(&pos_max_v),  sizeof(pos_max_v));
+
+            put_u64(static_cast<uint64_t>(cp.data_tgt.size()));
+            if (!cp.data_tgt.empty()) {
+                f.write(reinterpret_cast<const char *>(cp.data_tgt.data()),
+                        static_cast<std::streamsize>(cp.data_tgt.size()));
+            }
+            put_u64(static_cast<uint64_t>(cp.data_dft.size()));
+            if (!cp.data_dft.empty()) {
+                f.write(reinterpret_cast<const char *>(cp.data_dft.data()),
+                        static_cast<std::streamsize>(cp.data_dft.size()));
+            }
+        }
+
+        if (!f) {
+            std::error_code ec;
+            std::filesystem::remove(tmppath, ec);
+            return false;
+        }
+    }
+
+    std::error_code ec;
+    std::filesystem::rename(tmppath, filepath, ec);
+    if (ec) {
+        std::filesystem::remove(tmppath, ec);
+        return false;
+    }
+
+    const double t_ms = (ggml_time_us() - t_start) / 1e3;
+    const double mb_s = t_ms > 0.0 ? (bytes_total / (1024.0 * 1024.0)) / (t_ms / 1e3) : 0.0;
+    SRV_WRN("disk cache: wrote %.1f MiB in %.1f s (%.1f MiB/s) → %s\n",
+            bytes_total / (1024.0 * 1024.0), t_ms / 1e3, mb_s, filepath.c_str());
+    return true;
+}
+
+bool server_prompt_cache::try_match_disk(server_prompt & prompt, const server_tokens & tokens_new,
+                                          llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+    SRV_WRN("REMOVE_ME try_match_disk: enter, disk_path='%s', tokens_new.size=%zu, id_slot=%d, ctx_dft=%p\n",
+            disk_path.c_str(), tokens_new.size(), id_slot, (void *) ctx_dft);
+    if (disk_path.empty()) {
+        SRV_WRN("%s", "REMOVE_ME try_match_disk: disk_path empty → return false\n");
+        return false;
+    }
+
+    std::error_code ec;
+    if (!std::filesystem::exists(disk_path, ec) || ec) {
+        SRV_WRN("REMOVE_ME try_match_disk: disk_path does not exist (ec=%s) → return false\n", ec.message().c_str());
+        return false;
+    }
+
+    struct disk_match {
+        std::filesystem::path path;
+        std::vector<llama_token> tokens;
+        uint64_t main_size = 0;
+        uint64_t drft_size = 0;
+        std::streampos main_offset {};
+        float f_keep = 0.0f;
+        float sim    = 0.0f;
+    };
+
+    std::optional<disk_match> best;
+    float f_keep_best = 0.25f; // threshold floor
+    float sim_best    = -1.0f;
+
+    const bool runtime_has_dft = (ctx_dft != nullptr);
+
+    int n_scanned = 0;
+    int n_rejected_header = 0;
+    int n_rejected_hash = 0;
+    int n_rejected_capacity = 0;
+    int n_rejected_asym = 0;
+    int n_rejected_score = 0;
+    for (const auto & entry : std::filesystem::directory_iterator(disk_path, ec)) {
+        if (ec) break;
+        if (entry.path().extension() != ".bin") continue;
+        ++n_scanned;
+
+        std::ifstream f(entry.path(), std::ios::binary);
+        if (!f) continue;
+
+        auto get_u32 = [&f]() -> std::optional<uint32_t> {
+            uint32_t v;
+            f.read(reinterpret_cast<char *>(&v), sizeof(v));
+            if (!f) return std::nullopt;
+            return v;
+        };
+        auto get_u64 = [&f]() -> std::optional<uint64_t> {
+            uint64_t v;
+            f.read(reinterpret_cast<char *>(&v), sizeof(v));
+            if (!f) return std::nullopt;
+            return v;
+        };
+
+        const auto magic   = get_u32();
+        const auto version = get_u32();
+        if (!magic || *magic != DISK_CACHE_MAGIC || !version || *version != DISK_CACHE_VERSION) {
+            ++n_rejected_header;
+            SRV_WRN("REMOVE_ME try_match_disk: '%s' bad header (magic=%s, version=%s) → delete\n",
+                    entry.path().filename().c_str(),
+                    magic ? std::to_string(*magic).c_str() : "?",
+                    version ? std::to_string(*version).c_str() : "?");
+            f.close();
+            std::filesystem::remove(entry.path(), ec);
+            continue;
+        }
+
+        const auto fa = get_u32();
+        const auto fv = get_u32();
+        const auto fn_ctx = get_u32();
+        const auto n_tok  = get_u32();
+        (void) fn_ctx;
+        if (!fa || !fv || !n_tok) { ++n_rejected_header; continue; }
+        if (*fa != arch_hash || *fv != vocab_hash) {
+            ++n_rejected_hash;
+            SRV_WRN("REMOVE_ME try_match_disk: '%s' arch/vocab mismatch (file arch=0x%08x vocab=0x%08x, runtime arch=0x%08x vocab=0x%08x) → skip\n",
+                    entry.path().filename().c_str(), *fa, *fv, arch_hash, vocab_hash);
+            continue;
+        }
+        if (limit_tokens > 0 && *n_tok > limit_tokens) {
+            ++n_rejected_capacity;
+            SRV_WRN("REMOVE_ME try_match_disk: '%s' too many tokens (%u > %zu) → skip\n",
+                    entry.path().filename().c_str(), *n_tok, limit_tokens);
+            continue;
+        }
+
+        std::vector<llama_token> toks(*n_tok);
+        if (*n_tok > 0) {
+            f.read(reinterpret_cast<char *>(toks.data()),
+                   static_cast<std::streamsize>(*n_tok * sizeof(llama_token)));
+            if (!f) continue;
+        }
+
+        const auto main_size = get_u64();
+        if (!main_size) continue;
+        const auto main_offset = f.tellg();
+        f.seekg(static_cast<std::streamoff>(*main_size), std::ios::cur);
+        const auto drft_size = get_u64();
+        if (!drft_size) continue;
+
+        // asymmetric file rule: runtime has draft but file has none → skip
+        if (runtime_has_dft && *drft_size == 0) {
+            ++n_rejected_asym;
+            SRV_WRN("REMOVE_ME try_match_disk: '%s' asymmetric (runtime has drft, file does not) → skip\n",
+                    entry.path().filename().c_str());
+            continue;
+        }
+
+        // score against tokens_new
+        const llama_tokens & new_toks = tokens_new.get_tokens();
+        int lcp = 0;
+        const int n_min = std::min((int) toks.size(), (int) new_toks.size());
+        while (lcp < n_min && toks[lcp] == new_toks[lcp]) {
+            lcp++;
+        }
+
+        const float f_keep_cur = float(lcp) / float(toks.size());
+        const float sim_cur    = tokens_new.size() > 0 ? float(lcp) / float(tokens_new.size()) : 0.0f;
+
+        SRV_WRN("REMOVE_ME try_match_disk: '%s' n_tok=%u main_size=%llu drft_size=%llu lcp=%d f_keep=%.3f sim=%.3f\n",
+                entry.path().filename().c_str(), *n_tok,
+                (unsigned long long) *main_size, (unsigned long long) *drft_size,
+                lcp, f_keep_cur, sim_cur);
+
+        if (f_keep_cur < 0.25f) { ++n_rejected_score; continue; }
+
+        if (f_keep_best < f_keep_cur && sim_best < sim_cur) {
+            f_keep_best = f_keep_cur;
+            sim_best    = sim_cur;
+            best = disk_match{
+                entry.path(),
+                std::move(toks),
+                *main_size,
+                *drft_size,
+                main_offset,
+                f_keep_cur,
+                sim_cur,
+            };
+        }
+    }
+
+    SRV_WRN("REMOVE_ME try_match_disk: scan summary — scanned=%d hdr_rej=%d hash_rej=%d cap_rej=%d asym_rej=%d score_rej=%d winner=%s\n",
+            n_scanned, n_rejected_header, n_rejected_hash, n_rejected_capacity, n_rejected_asym, n_rejected_score,
+            best ? best->path.filename().c_str() : "(none)");
+
+    if (!best) {
+        return false;
+    }
+    SRV_WRN("REMOVE_ME try_match_disk: winner '%s' n_tok=%zu main_size=%llu drft_size=%llu f_keep=%.3f sim=%.3f\n",
+            best->path.filename().c_str(), best->tokens.size(),
+            (unsigned long long) best->main_size, (unsigned long long) best->drft_size,
+            best->f_keep, best->sim);
+
+    // Re-open the chosen file and read the state blobs.
+    // Layout from best->main_offset onward: [main_bytes][drft_size: u64][drft_bytes]
+    //                                       [n_ckpts: u32][per-ckpt: n_tokens,i64; pos_min,i32; pos_max,i32;
+    //                                       data_tgt_size,u64; data_tgt; data_dft_size,u64; data_dft]
+    std::ifstream f(best->path, std::ios::binary);
+    if (!f) {
+        return false;
+    }
+    f.seekg(best->main_offset);
+
+    std::vector<uint8_t> main_bytes(static_cast<size_t>(best->main_size));
+    if (best->main_size > 0) {
+        f.read(reinterpret_cast<char *>(main_bytes.data()),
+               static_cast<std::streamsize>(best->main_size));
+        if (!f) return false;
+    }
+
+    // drft_size is always present (u64); skip past it (and any bytes) regardless of whether the
+    // file carries draft data. The asymmetric-file rule (file-no-drft × runtime-has-drft) was
+    // enforced during the scan phase above, so we can trust the file's drft_size here.
+    uint64_t drft_sz_read = 0;
+    f.read(reinterpret_cast<char *>(&drft_sz_read), sizeof(drft_sz_read));
+    if (!f) return false;
+
+    std::vector<uint8_t> drft_bytes;
+    if (drft_sz_read > 0) {
+        drft_bytes.resize(static_cast<size_t>(drft_sz_read));
+        f.read(reinterpret_cast<char *>(drft_bytes.data()),
+               static_cast<std::streamsize>(drft_sz_read));
+        if (!f) return false;
+    }
+
+    // checkpoints section
+    uint32_t n_ckpts = 0;
+    f.read(reinterpret_cast<char *>(&n_ckpts), sizeof(n_ckpts));
+    if (!f) return false;
+
+    std::list<common_prompt_checkpoint> restored_ckpts;
+    for (uint32_t i = 0; i < n_ckpts; i++) {
+        int64_t  n_tokens_v = 0;
+        int32_t  pos_min_v  = 0;
+        int32_t  pos_max_v  = 0;
+        uint64_t tgt_sz     = 0;
+        uint64_t dft_sz     = 0;
+
+        f.read(reinterpret_cast<char *>(&n_tokens_v), sizeof(n_tokens_v));
+        f.read(reinterpret_cast<char *>(&pos_min_v),  sizeof(pos_min_v));
+        f.read(reinterpret_cast<char *>(&pos_max_v),  sizeof(pos_max_v));
+        f.read(reinterpret_cast<char *>(&tgt_sz),     sizeof(tgt_sz));
+        if (!f) return false;
+
+        common_prompt_checkpoint cp;
+        cp.n_tokens = n_tokens_v;
+        cp.pos_min  = pos_min_v;
+        cp.pos_max  = pos_max_v;
+        if (tgt_sz > 0) {
+            cp.data_tgt.resize(static_cast<size_t>(tgt_sz));
+            f.read(reinterpret_cast<char *>(cp.data_tgt.data()),
+                   static_cast<std::streamsize>(tgt_sz));
+            if (!f) return false;
+        }
+
+        f.read(reinterpret_cast<char *>(&dft_sz), sizeof(dft_sz));
+        if (!f) return false;
+        if (dft_sz > 0) {
+            cp.data_dft.resize(static_cast<size_t>(dft_sz));
+            f.read(reinterpret_cast<char *>(cp.data_dft.data()),
+                   static_cast<std::streamsize>(dft_sz));
+            if (!f) return false;
+        }
+
+        SRV_WRN("REMOVE_ME try_match_disk: read checkpoint %u/%u n_tokens=%lld pos_min=%d pos_max=%d tgt_sz=%llu dft_sz=%llu\n",
+                i + 1, n_ckpts, (long long) n_tokens_v, pos_min_v, pos_max_v,
+                (unsigned long long) tgt_sz, (unsigned long long) dft_sz);
+
+        restored_ckpts.push_back(std::move(cp));
+    }
+    f.close();
+    SRV_WRN("REMOVE_ME try_match_disk: read %u checkpoints from file, file closed\n", n_ckpts);
+
+    // Restore into the slot's seq via the same primitive the RAM path uses
+    const size_t n_main = llama_state_seq_set_data_ext(ctx_tgt, main_bytes.data(),
+                                                        main_bytes.size(), id_slot, 0);
+    SRV_WRN("REMOVE_ME try_match_disk: set_data_ext(main) returned %zu/%zu, post pos_min=%d pos_max=%d\n",
+            n_main, main_bytes.size(),
+            (int) llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id_slot),
+            (int) llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), id_slot));
+    if (n_main != main_bytes.size()) {
+        SRV_WRN("disk cache: set_data_ext (main) returned %zu of %zu\n", n_main, main_bytes.size());
+        return false;
+    }
+
+    if (runtime_has_dft && best->drft_size > 0) {
+        const size_t n_drft = llama_state_seq_set_data_ext(ctx_dft, drft_bytes.data(),
+                                                            drft_bytes.size(), id_slot, 0);
+        SRV_WRN("REMOVE_ME try_match_disk: set_data_ext(drft) returned %zu/%zu, post pos_min=%d pos_max=%d\n",
+                n_drft, drft_bytes.size(),
+                (int) llama_memory_seq_pos_min(llama_get_memory(ctx_dft), id_slot),
+                (int) llama_memory_seq_pos_max(llama_get_memory(ctx_dft), id_slot));
+        if (n_drft != drft_bytes.size()) {
+            SRV_WRN("disk cache: set_data_ext (drft) returned %zu of %zu\n", n_drft, drft_bytes.size());
+            return false;
+        }
+    }
+
+    // populate prompt.tokens with the file's tokens
+    prompt.tokens.clear();
+    prompt.tokens.insert(best->tokens);
+    SRV_WRN("REMOVE_ME try_match_disk: post-restore prompt.tokens.size=%zu prompt.checkpoints.size_about_to_be=%zu\n",
+            prompt.tokens.size(), restored_ckpts.size());
+
+    // hand the checkpoints to the slot's prompt — the rewind logic at
+    // server-context.cpp:2620-2641 walks this list to recover earlier-position state
+    // for SWA / hybrid / recurrent models when the main blob's window is past pos_min_thold.
+    prompt.checkpoints = std::move(restored_ckpts);
+
+    // consumed — delete the file (cache is add-only; entries are used once)
+    std::filesystem::remove(best->path, ec);
+
+    return true;
+}
+
+void server_prompt_cache::shutdown_and_spill() {
+    // Idempotent: if there's nothing left to do, return silently (no logs).
+    if (!worker.joinable() && pending_spill.empty() && states.empty()) {
+        return;
+    }
+
+    if (disk_path.empty()) {
+        stop_flag.store(true);
+        cv.notify_all();
+        if (worker.joinable()) {
+            worker.join();
+        }
+        return;
+    }
+
+    // Snapshot counts so the user sees what's coming before any blocking I/O happens.
+    size_t queued_writes;
+    size_t pending_now;
+    size_t states_now;
+    size_t bytes_in_flight;
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        queued_writes = queue.size();
+        pending_now   = pending_spill.size();
+        states_now    = states.size();
+        bytes_in_flight = 0;
+        for (const auto & p : pending_spill) bytes_in_flight += p->size();
+    }
+    for (const auto & s : states) bytes_in_flight += s.size();
+
+    SRV_WRN("disk cache: shutdown — draining %zu queued, %zu pending in-flight, %zu states "
+            "(total %.1f MiB to persist)\n",
+            queued_writes, pending_now, states_now, bytes_in_flight / (1024.0 * 1024.0));
+
+    // Drain the async worker. This blocks until any in-flight write completes, then any further queued.
+    stop_flag.store(true);
+    cv.notify_all();
+    if (worker.joinable()) {
+        SRV_WRN("%s", "disk cache: waiting for async writer to finish (this may take seconds-to-minutes for large states)...\n");
+        worker.join();
+        SRV_WRN("%s", "disk cache: async writer drained\n");
+    }
+
+    // Now synchronously spill anything left in pending_spill (failed-async cases), then states.
+    int n_done  = 0;
+    int n_total = (int) states.size() + (int) pending_spill.size();
+    if (n_total > 0) {
+        SRV_WRN("disk cache: synchronously spilling %d remaining entries\n", n_total);
+    }
+
+    while (!pending_spill.empty()) {
+        auto entry = pending_spill.front();
+        pending_spill.pop_front();
+        ++n_done;
+        SRV_WRN("disk cache: shutdown spill %d/%d (from pending)\n", n_done, n_total);
+        const std::string uuid     = gen_disk_cache_uuid();
+        const std::string filepath = disk_path + "/" + uuid + ".bin";
+        write_entry_to_file(filepath, *entry);
+    }
+
+    while (!states.empty()) {
+        if (states.front().tokens.has_mtmd) {
+            states.pop_front();
+            ++n_done;
+            SRV_WRN("disk cache: shutdown spill %d/%d (mtmd entry — destroyed, not spillable)\n", n_done, n_total);
+            continue;
+        }
+        ++n_done;
+        SRV_WRN("disk cache: shutdown spill %d/%d (from states)\n", n_done, n_total);
+        const std::string uuid     = gen_disk_cache_uuid();
+        const std::string filepath = disk_path + "/" + uuid + ".bin";
+        write_entry_to_file(filepath, states.front());
+        states.pop_front();
+    }
+
+    SRV_WRN("%s", "disk cache: shutdown complete\n");
 }

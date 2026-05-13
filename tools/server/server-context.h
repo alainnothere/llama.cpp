@@ -67,6 +67,16 @@ struct server_context {
     // terminate main loop (will unblock start_loop)
     void terminate();
 
+    // flush every idle slot's live KV state into the prompt cache.
+    // Intended to be called once at shutdown after start_loop() returns, before backend teardown.
+    // Without this, a single-conversation slot's live state would never reach the disk cache.
+    // Safe to call when prompt_cache is null (no-op) or when no model is loaded.
+    void flush_slots_to_cache();
+
+    // Drive the prompt-cache's disk spill to completion synchronously, with progress logs.
+    // Call after flush_slots_to_cache(), before backend teardown. Safe to call multiple times.
+    void spill_cache_to_disk();
+
     // get the underlaying llama_context, can return nullptr if sleeping
     // not thread-safe, should only be used from the main thread
     llama_context * get_llama_context() const;

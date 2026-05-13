@@ -1323,6 +1323,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--cache-disk-path"}, "PATH",
+        "directory for disk-backed KV cache spill (default: empty = disabled). entries evicted from the RAM cache spill to this directory and are restored on demand. path must be exclusive per server instance",
+        [](common_params & params, const std::string & value) {
+            params.cache_disk_path = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_PATH").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-queue-depth"}, "N",
+        string_format("async writer queue depth for the disk cache (default: %d). queue overflow falls through to synchronous write on the task thread", params.cache_disk_queue_depth),
+        [](common_params & params, int value) {
+            params.cache_disk_queue_depth = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_QUEUE_DEPTH").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

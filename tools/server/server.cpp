@@ -265,6 +265,16 @@ int main(int argc, char ** argv) {
         // setup clean up function, to be called before exit
         clean_up = [&ctx_http, &ctx_server]() {
             SRV_INF("%s: cleaning up before exit...\n", __func__);
+            // 1. Flush live slot KV state into the prompt cache.
+            //    Required for the disk-cache to capture single-conversation state at shutdown
+            //    (the regular cache-idle-slots trigger only fires when a NEW task arrives).
+            //    Touches ctx_tgt, must run before llama_backend_free().
+            ctx_server.flush_slots_to_cache();
+            // 2. Synchronously drain the disk-cache writer and spill any remaining entries.
+            //    Logs progress inline so the user sees what the shutdown is waiting on.
+            //    Independent of ctx_tgt (operates only on already-serialized bytes), but we run
+            //    it here for clear log ordering — the destructor's call becomes a no-op.
+            ctx_server.spill_cache_to_disk();
             ctx_http.stop();
             ctx_server.terminate();
             llama_backend_free();

@@ -670,6 +670,40 @@ private:
         prompt_cache->update();
     }
 
+    // Flush every idle slot's live KV state into the prompt cache.
+    // Called at shutdown so the disk-cache spill (in prompt_cache's destructor) can persist them.
+    // Without this, a single-conversation slot's state stays in ctx_tgt and is lost at shutdown.
+    void flush_idle_slots_to_cache() {
+        if (!prompt_cache) {
+            return;
+        }
+
+        int    n_eligible    = 0;
+        size_t bytes_to_save = 0;
+        for (const auto & slot : slots) {
+            if (slot.is_processing()) continue;
+            if (slot.prompt.n_tokens() == 0) continue;
+            ++n_eligible;
+            // approximate — each slot's actual state size is known only via the live KV
+            bytes_to_save += (size_t) slot.prompt.n_tokens();
+        }
+        if (n_eligible == 0) {
+            SRV_INF("%s", "no idle slots to flush to prompt cache\n");
+            return;
+        }
+        SRV_INF("flushing %d idle slot(s) to prompt cache (~%d tokens of state, this may take a moment)\n",
+                n_eligible, (int) bytes_to_save);
+
+        int n_flushed = 0;
+        for (auto & slot : slots) {
+            if (slot.is_processing()) continue;
+            if (slot.prompt.n_tokens() == 0) continue;
+            slot_save_and_clear(slot);
+            ++n_flushed;
+        }
+        SRV_INF("flushed %d slot(s) to prompt cache for shutdown\n", n_flushed);
+    }
+
     void handle_sleeping_state(bool new_state) {
         GGML_ASSERT(sleeping != new_state);
         if (new_state) {
@@ -902,7 +936,43 @@ private:
             }
             SRV_WRN("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            // Compute model identity hashes (FNV-1a, 32-bit) for the disk-cache file integrity check.
+            // Only meaningful when --cache-disk-path is set, but cheap to always compute.
+            uint32_t arch_hash  = 0;
+            uint32_t vocab_hash = 0;
+            if (!params_base.cache_disk_path.empty() && model_tgt != nullptr) {
+                constexpr uint32_t FNV_OFFSET = 2166136261u;
+                constexpr uint32_t FNV_PRIME  = 16777619u;
+
+                uint32_t h = FNV_OFFSET;
+                char arch_buf[128];
+                const int arch_len = llama_model_meta_val_str(model_tgt, "general.architecture",
+                                                               arch_buf, sizeof(arch_buf));
+                for (int i = 0; i < arch_len; ++i) {
+                    h ^= static_cast<uint8_t>(arch_buf[i]);
+                    h *= FNV_PRIME;
+                }
+                arch_hash = h;
+
+                h = FNV_OFFSET;
+                if (vocab != nullptr) {
+                    const int32_t n_v = llama_vocab_n_tokens(vocab);
+                    for (int32_t t = 0; t < n_v; ++t) {
+                        const char * s = llama_vocab_get_text(vocab, t);
+                        if (s == nullptr) continue;
+                        for (const char * p = s; *p; ++p) {
+                            h ^= static_cast<uint8_t>(*p);
+                            h *= FNV_PRIME;
+                        }
+                    }
+                }
+                vocab_hash = h;
+            }
+
+            prompt_cache = std::make_unique<server_prompt_cache>(
+                params_base.cache_ram_mib, n_ctx,
+                params_base.cache_disk_path, params_base.cache_disk_queue_depth,
+                arch_hash, vocab_hash);
         } else {
             SRV_WRN("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -2412,6 +2482,10 @@ private:
                             if (slot.task->params.cache_prompt) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+                                SLT_WRN(slot, "REMOVE_ME prefix-match: n_past=%d slot.prompt.tokens.size=%zu input_tokens.size=%zu can_shift=%d checkpoints.size=%zu\n",
+                                        n_past, (size_t) slot.prompt.tokens.size(), (size_t) input_tokens.size(),
+                                        (int) llama_memory_can_shift(llama_get_memory(ctx_tgt)),
+                                        slot.prompt.checkpoints.size());
 
                                 // if there is an alora invoked, don't cache after the invocation start
                                 if (slot.alora_invocation_start > 0) {
@@ -2545,6 +2619,8 @@ private:
 
                                 if (pos_min >= pos_min_thold) {
                                     SLT_WRN(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d, n_swa = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min, n_swa);
+                                    SLT_WRN(slot, "REMOVE_ME rewind path entered: pos_min(%d) >= pos_min_thold(%d), checkpoints available=%zu, will search for one with pos_min < %d or == 0\n",
+                                            pos_min, pos_min_thold, slot.prompt.checkpoints.size(), pos_min_thold);
 
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
@@ -2574,8 +2650,12 @@ private:
                                     if (do_reset) {
                                         SLT_WRN(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
+                                        SLT_WRN(slot, "REMOVE_ME rewind FAILED: no usable checkpoint among %zu (need pos_min < %d or == 0). Forcing n_past=0.\n",
+                                                slot.prompt.checkpoints.size(), pos_min_thold);
                                         pos_next = 0;
                                         n_past = 0;
+                                    } else {
+                                        SLT_WRN(slot, "REMOVE_ME rewind OK: restored checkpoint, pos_next=%d, n_past=%d\n", pos_next, n_past);
                                     }
                                 }
                             }
@@ -2624,15 +2704,23 @@ private:
                     const llama_pos p0 = slot.prompt.tokens.pos_next();
 
                     SLT_INF(slot, "n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
+                    {
+                        const auto pmin_tgt = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+                        const auto pmax_tgt = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                        SLT_WRN(slot, "REMOVE_ME pre-seq_rm: p0=%d slot.prompt.n_tokens=%d ctx_tgt pos_min=%d pos_max=%d checkpoints.size=%zu\n",
+                                p0, slot.prompt.n_tokens(), pmin_tgt, pmax_tgt, slot.prompt.checkpoints.size());
+                    }
 
                     if (!llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, p0, -1)) {
                         SLT_WRN(slot, "failed to truncate tokens with position >= %d - clearing the memory\n", p0);
+                        SLT_WRN(slot, "%s", "REMOVE_ME seq_rm failed — model+cache combo refuses partial removal (e.g. quantized KV / unified cache). Disk-cache state cannot be used for this request; clearing and reprocessing.\n");
 
                         slot.prompt_clear(true);
 
                         // there is no common part left
                         slot.n_prompt_tokens_cache = 0;
                     } else {
+                       SLT_WRN(slot, "REMOVE_ME seq_rm OK at p0=%d — prefix preserved, will process tail\n", p0);
                        if (ctx_dft && !llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), slot.id, p0, -1)) {
                            GGML_ABORT("failed to truncate draft context\n");
                        }
@@ -3230,6 +3318,16 @@ void server_context::start_loop() {
 
 void server_context::terminate() {
     impl->queue_tasks.terminate();
+}
+
+void server_context::flush_slots_to_cache() {
+    if (!impl) return;
+    impl->flush_idle_slots_to_cache();
+}
+
+void server_context::spill_cache_to_disk() {
+    if (!impl || !impl->prompt_cache) return;
+    impl->prompt_cache->shutdown_and_spill();
 }
 
 llama_context * server_context::get_llama_context() const {
