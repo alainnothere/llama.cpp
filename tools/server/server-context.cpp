@@ -1892,6 +1892,10 @@ private:
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
+            if (prompt_cache) {
+                prompt_cache->spill_checkpoint(cur);
+            }
+
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
         }
 

@@ -31,6 +31,14 @@ constexpr uint32_t DISK_CACHE_MAGIC   = 0x53504344; // 'SPCD' — Server Prompt 
 // by header-mismatch handling in try_match_disk.
 constexpr uint32_t DISK_CACHE_VERSION = 2;
 
+// checkpoint spill files — written by spill_checkpoint() when create_checkpoint() evicts an old
+// checkpoint to make room for a new one. format: magic, version, arch_hash, vocab_hash,
+// pos_min (i32), pos_max (i32), n_tokens (i64), data_tgt_size (u64), data_tgt, data_dft_size (u64), data_dft.
+// files are named cp_{pos_min}_{uuid}.bin and live in the same disk_path as cache entry files.
+// try_match_disk skips them (wrong magic); merge_checkpoint_spills() reads them.
+constexpr uint32_t CHECKPOINT_SPILL_MAGIC   = 0x43504B44; // 'CPKD'
+constexpr uint32_t CHECKPOINT_SPILL_VERSION = 1;
+
 std::string gen_disk_cache_uuid() {
     static thread_local std::mt19937_64 rng{std::random_device{}()};
     std::uniform_int_distribution<uint64_t> dist;
@@ -2171,6 +2179,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
 
         prompt = std::move(*pending_winner);
+        if (!disk_path.empty()) {
+            merge_checkpoint_spills(prompt);
+        }
         return true;
     }
 
@@ -2214,6 +2225,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         prompt = std::move(*it_best);
 
         states.erase(it_best);
+        if (!disk_path.empty()) {
+            merge_checkpoint_spills(prompt);
+        }
         return true;
     }
 
@@ -2221,6 +2235,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     if (!disk_path.empty()) {
         if (try_match_disk(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot)) {
             SRV_WRN("%s", " - restored from disk\n");
+            merge_checkpoint_spills(prompt);
             return true;
         }
     }
@@ -2502,6 +2517,212 @@ bool server_prompt_cache::write_entry_to_file(const std::string & filepath, cons
     return true;
 }
 
+void server_prompt_cache::spill_checkpoint(const common_prompt_checkpoint & cp) {
+    if (disk_path.empty()) {
+        return;
+    }
+
+    const std::string uuid     = gen_disk_cache_uuid();
+    const std::string filename = "cp_" + std::to_string(cp.pos_min) + "_" + uuid + ".bin";
+    const std::filesystem::path filepath = std::filesystem::path(disk_path) / filename;
+    const std::filesystem::path tmppath  = std::filesystem::path(disk_path) / (filename + ".tmp");
+
+    {
+        std::ofstream f(tmppath, std::ios::binary | std::ios::trunc);
+        if (!f) {
+            SRV_WRN("checkpoint spill: failed to open '%s' for write\n", tmppath.string().c_str());
+            return;
+        }
+
+        auto put_u32 = [&f](uint32_t v) { f.write(reinterpret_cast<const char *>(&v), sizeof(v)); };
+        auto put_u64 = [&f](uint64_t v) { f.write(reinterpret_cast<const char *>(&v), sizeof(v)); };
+
+        put_u32(CHECKPOINT_SPILL_MAGIC);
+        put_u32(CHECKPOINT_SPILL_VERSION);
+        put_u32(arch_hash);
+        put_u32(vocab_hash);
+
+        const int32_t pos_min_v  = cp.pos_min;
+        const int32_t pos_max_v  = cp.pos_max;
+        const int64_t n_tokens_v = cp.n_tokens;
+        f.write(reinterpret_cast<const char *>(&pos_min_v),  sizeof(pos_min_v));
+        f.write(reinterpret_cast<const char *>(&pos_max_v),  sizeof(pos_max_v));
+        f.write(reinterpret_cast<const char *>(&n_tokens_v), sizeof(n_tokens_v));
+
+        put_u64(static_cast<uint64_t>(cp.data_tgt.size()));
+        if (!cp.data_tgt.empty()) {
+            f.write(reinterpret_cast<const char *>(cp.data_tgt.data()),
+                    static_cast<std::streamsize>(cp.data_tgt.size()));
+        }
+
+        put_u64(static_cast<uint64_t>(cp.data_dft.size()));
+        if (!cp.data_dft.empty()) {
+            f.write(reinterpret_cast<const char *>(cp.data_dft.data()),
+                    static_cast<std::streamsize>(cp.data_dft.size()));
+        }
+
+        if (!f) {
+            std::error_code ec;
+            std::filesystem::remove(tmppath, ec);
+            SRV_WRN("checkpoint spill: write error for '%s'\n", tmppath.string().c_str());
+            return;
+        }
+    }
+
+    std::error_code ec;
+    std::filesystem::rename(tmppath, filepath, ec);
+    if (ec) {
+        std::filesystem::remove(tmppath, ec);
+        SRV_WRN("checkpoint spill: rename failed '%s': %s\n", tmppath.string().c_str(), ec.message().c_str());
+        return;
+    }
+
+    SRV_WRN("REMOVE_ME checkpoint spill: pos_min=%d pos_max=%d n_tokens=%lld tgt=%.1f MiB dft=%.1f MiB → %s\n",
+            cp.pos_min, cp.pos_max, (long long) cp.n_tokens,
+            cp.data_tgt.size() / (1024.0 * 1024.0),
+            cp.data_dft.size() / (1024.0 * 1024.0),
+            filename.c_str());
+}
+
+void server_prompt_cache::merge_checkpoint_spills(server_prompt & prompt) {
+    if (disk_path.empty()) {
+        return;
+    }
+
+    std::error_code ec;
+    if (!std::filesystem::exists(disk_path, ec) || ec) {
+        return;
+    }
+
+    int n_scanned    = 0;
+    int n_loaded     = 0;
+    int n_skip_magic = 0;
+    int n_skip_hash  = 0;
+    int n_skip_dup   = 0;
+
+    std::list<common_prompt_checkpoint> new_ckpts;
+
+    for (const auto & entry : std::filesystem::directory_iterator(disk_path, ec)) {
+        if (ec) break;
+        const std::string fname = entry.path().filename().string();
+        if (fname.size() < 4 || fname.compare(0, 3, "cp_") != 0) {
+            continue;
+        }
+        if (entry.path().extension() != ".bin") {
+            continue;
+        }
+        ++n_scanned;
+
+        std::ifstream f(entry.path(), std::ios::binary);
+        if (!f) {
+            continue;
+        }
+
+        uint32_t magic = 0, version = 0, fa = 0, fv = 0;
+        f.read(reinterpret_cast<char *>(&magic),   sizeof(magic));
+        f.read(reinterpret_cast<char *>(&version), sizeof(version));
+
+        if (magic != CHECKPOINT_SPILL_MAGIC || version != CHECKPOINT_SPILL_VERSION) {
+            ++n_skip_magic;
+            continue;
+        }
+
+        f.read(reinterpret_cast<char *>(&fa), sizeof(fa));
+        f.read(reinterpret_cast<char *>(&fv), sizeof(fv));
+
+        if (fa != arch_hash || fv != vocab_hash) {
+            ++n_skip_hash;
+            continue;
+        }
+
+        int32_t pos_min_v  = 0;
+        int32_t pos_max_v  = 0;
+        int64_t n_tokens_v = 0;
+        f.read(reinterpret_cast<char *>(&pos_min_v),  sizeof(pos_min_v));
+        f.read(reinterpret_cast<char *>(&pos_max_v),  sizeof(pos_max_v));
+        f.read(reinterpret_cast<char *>(&n_tokens_v), sizeof(n_tokens_v));
+        if (!f) {
+            continue;
+        }
+
+        // skip if this pos_min is already in the checkpoint list
+        bool dup = false;
+        for (const auto & cp : prompt.checkpoints) {
+            if (cp.pos_min == pos_min_v) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) {
+            ++n_skip_dup;
+            SRV_WRN("REMOVE_ME merge_checkpoint_spills: skip dup pos_min=%d from '%s'\n", pos_min_v, fname.c_str());
+            continue;
+        }
+
+        uint64_t tgt_sz = 0;
+        f.read(reinterpret_cast<char *>(&tgt_sz), sizeof(tgt_sz));
+        if (!f) {
+            continue;
+        }
+
+        common_prompt_checkpoint cp;
+        cp.pos_min  = pos_min_v;
+        cp.pos_max  = pos_max_v;
+        cp.n_tokens = n_tokens_v;
+
+        if (tgt_sz > 0) {
+            cp.data_tgt.resize(static_cast<size_t>(tgt_sz));
+            f.read(reinterpret_cast<char *>(cp.data_tgt.data()),
+                   static_cast<std::streamsize>(tgt_sz));
+            if (!f) {
+                continue;
+            }
+        }
+
+        uint64_t dft_sz = 0;
+        f.read(reinterpret_cast<char *>(&dft_sz), sizeof(dft_sz));
+        if (!f) {
+            continue;
+        }
+        if (dft_sz > 0) {
+            cp.data_dft.resize(static_cast<size_t>(dft_sz));
+            f.read(reinterpret_cast<char *>(cp.data_dft.data()),
+                   static_cast<std::streamsize>(dft_sz));
+            if (!f) {
+                continue;
+            }
+        }
+
+        SRV_WRN("REMOVE_ME merge_checkpoint_spills: loaded pos_min=%d pos_max=%d n_tokens=%lld"
+                " tgt=%.1f MiB dft=%.1f MiB from '%s'\n",
+                pos_min_v, pos_max_v, (long long) n_tokens_v,
+                tgt_sz / (1024.0 * 1024.0), dft_sz / (1024.0 * 1024.0),
+                fname.c_str());
+
+        new_ckpts.push_back(std::move(cp));
+        ++n_loaded;
+    }
+
+    SRV_WRN("REMOVE_ME merge_checkpoint_spills: scanned=%d loaded=%d skip_magic=%d skip_hash=%d skip_dup=%d existing=%zu\n",
+            n_scanned, n_loaded, n_skip_magic, n_skip_hash, n_skip_dup, prompt.checkpoints.size());
+
+    if (new_ckpts.empty()) {
+        return;
+    }
+
+    // insert into prompt.checkpoints keeping sorted order by pos_min
+    for (auto & cp : new_ckpts) {
+        auto it = prompt.checkpoints.begin();
+        while (it != prompt.checkpoints.end() && it->pos_min < cp.pos_min) {
+            ++it;
+        }
+        prompt.checkpoints.insert(it, std::move(cp));
+    }
+
+    SRV_WRN("REMOVE_ME merge_checkpoint_spills: after merge prompt.checkpoints.size=%zu\n",
+            prompt.checkpoints.size());
+}
+
 bool server_prompt_cache::try_match_disk(server_prompt & prompt, const server_tokens & tokens_new,
                                           llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
     SRV_WRN("REMOVE_ME try_match_disk: enter, disk_path='%s', tokens_new.size=%zu, id_slot=%d, ctx_dft=%p\n",
@@ -2562,12 +2783,18 @@ bool server_prompt_cache::try_match_disk(server_prompt & prompt, const server_to
 
         const auto magic   = get_u32();
         const auto version = get_u32();
-        if (!magic || *magic != DISK_CACHE_MAGIC || !version || *version != DISK_CACHE_VERSION) {
+
+        if (!magic || *magic != DISK_CACHE_MAGIC) {
+            // not a cache entry file — skip without deleting (may be a checkpoint spill file)
+            SRV_WRN("REMOVE_ME try_match_disk: '%s' wrong magic (0x%08x) — skip\n",
+                    entry.path().filename().c_str(), magic ? *magic : 0u);
+            continue;
+        }
+
+        if (!version || *version != DISK_CACHE_VERSION) {
             ++n_rejected_header;
-            SRV_WRN("REMOVE_ME try_match_disk: '%s' bad header (magic=%s, version=%s) → delete\n",
-                    entry.path().filename().c_str(),
-                    magic ? std::to_string(*magic).c_str() : "?",
-                    version ? std::to_string(*version).c_str() : "?");
+            SRV_WRN("REMOVE_ME try_match_disk: '%s' wrong version (%s) → delete\n",
+                    entry.path().filename().c_str(), version ? std::to_string(*version).c_str() : "?");
             f.close();
             std::filesystem::remove(entry.path(), ec);
             continue;

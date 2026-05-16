@@ -653,7 +653,14 @@ struct server_prompt_cache {
     // drains the writer queue then synchronously spills remaining states + pending entries.
     void shutdown_and_spill();
 
+    // spill a single checkpoint to disk before it is erased from the in-memory list.
+    // no-op if disk_path is empty. called from create_checkpoint() in server-context.cpp.
+    void spill_checkpoint(const common_prompt_checkpoint & cp);
+
 private:
+    // scan disk_path for checkpoint spill files and merge any that fill gaps in prompt.checkpoints.
+    // called after every successful RAM or disk cache match in load().
+    void merge_checkpoint_spills(server_prompt & prompt);
     struct spill_job {
         std::string uuid;
         std::string filepath;
