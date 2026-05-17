@@ -2273,7 +2273,7 @@ void server_prompt_cache::update() {
         // Spill: move oldest entry to pending_spill, enqueue for async write.
         // On queue overflow, fall through to a synchronous write on this thread (lossless).
         std::string uuid     = gen_disk_cache_uuid();
-        std::string filepath = disk_path + "/" + uuid + ".bin";
+        std::string filepath = (std::filesystem::path(disk_path) / (uuid + ".bin")).string();
 
         auto entry_ptr = std::make_shared<server_prompt>(std::move(states.front()));
         states.pop_front();
@@ -3058,7 +3058,7 @@ void server_prompt_cache::shutdown_and_spill() {
         ++n_done;
         SRV_WRN("disk cache: shutdown spill %d/%d (from pending)\n", n_done, n_total);
         const std::string uuid     = gen_disk_cache_uuid();
-        const std::string filepath = disk_path + "/" + uuid + ".bin";
+        const std::string filepath = (std::filesystem::path(disk_path) / (uuid + ".bin")).string();
         write_entry_to_file(filepath, *entry);
     }
 
@@ -3072,7 +3072,7 @@ void server_prompt_cache::shutdown_and_spill() {
         ++n_done;
         SRV_WRN("disk cache: shutdown spill %d/%d (from states)\n", n_done, n_total);
         const std::string uuid     = gen_disk_cache_uuid();
-        const std::string filepath = disk_path + "/" + uuid + ".bin";
+        const std::string filepath = (std::filesystem::path(disk_path) / (uuid + ".bin")).string();
         write_entry_to_file(filepath, states.front());
         states.pop_front();
     }
