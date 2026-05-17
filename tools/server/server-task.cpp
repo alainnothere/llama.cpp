@@ -2588,12 +2588,6 @@ void server_prompt_cache::spill_checkpoint(const common_prompt_checkpoint & cp) 
         SRV_WRN("checkpoint spill: rename failed '%s': %s\n", tmppath.string().c_str(), ec.message().c_str());
         return;
     }
-
-    SRV_WRN("REMOVE_ME checkpoint spill: pos_min=%d pos_max=%d n_tokens=%lld tgt=%.1f MiB dft=%.1f MiB → %s\n",
-            cp.pos_min, cp.pos_max, (long long) cp.n_tokens,
-            cp.data_tgt.size() / (1024.0 * 1024.0),
-            cp.data_dft.size() / (1024.0 * 1024.0),
-            filename.c_str());
 }
 
 void server_prompt_cache::merge_checkpoint_spills(server_prompt & prompt) {
@@ -2667,7 +2661,6 @@ void server_prompt_cache::merge_checkpoint_spills(server_prompt & prompt) {
         }
         if (dup) {
             ++n_skip_dup;
-            SRV_WRN("REMOVE_ME merge_checkpoint_spills: skip dup pos_min=%d from '%s'\n", pos_min_v, fname.c_str());
             continue;
         }
 
@@ -2705,18 +2698,9 @@ void server_prompt_cache::merge_checkpoint_spills(server_prompt & prompt) {
             }
         }
 
-        SRV_WRN("REMOVE_ME merge_checkpoint_spills: loaded pos_min=%d pos_max=%d n_tokens=%lld"
-                " tgt=%.1f MiB dft=%.1f MiB from '%s'\n",
-                pos_min_v, pos_max_v, (long long) n_tokens_v,
-                tgt_sz / (1024.0 * 1024.0), dft_sz / (1024.0 * 1024.0),
-                fname.c_str());
-
         new_ckpts.push_back(std::move(cp));
         ++n_loaded;
     }
-
-    SRV_WRN("REMOVE_ME merge_checkpoint_spills: scanned=%d loaded=%d skip_magic=%d skip_hash=%d skip_dup=%d existing=%zu\n",
-            n_scanned, n_loaded, n_skip_magic, n_skip_hash, n_skip_dup, prompt.checkpoints.size());
 
     if (new_ckpts.empty()) {
         return;
@@ -2730,23 +2714,20 @@ void server_prompt_cache::merge_checkpoint_spills(server_prompt & prompt) {
         }
         prompt.checkpoints.insert(it, std::move(cp));
     }
-
-    SRV_WRN("REMOVE_ME merge_checkpoint_spills: after merge prompt.checkpoints.size=%zu\n",
-            prompt.checkpoints.size());
 }
 
 bool server_prompt_cache::try_match_disk(server_prompt & prompt, const server_tokens & tokens_new,
                                           llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
-    SRV_WRN("REMOVE_ME try_match_disk: enter, disk_path='%s', tokens_new.size=%zu, id_slot=%d, ctx_dft=%p\n",
+    SRV_INF("try_match_disk: enter, disk_path='%s', tokens_new.size=%zu, id_slot=%d, ctx_dft=%p\n",
             disk_path.c_str(), tokens_new.size(), id_slot, (void *) ctx_dft);
     if (disk_path.empty()) {
-        SRV_WRN("%s", "REMOVE_ME try_match_disk: disk_path empty → return false\n");
+        SRV_INF("%s", "try_match_disk: disk_path empty → return false\n");
         return false;
     }
 
     std::error_code ec;
     if (!std::filesystem::exists(disk_path, ec) || ec) {
-        SRV_WRN("REMOVE_ME try_match_disk: disk_path does not exist (ec=%s) → return false\n", ec.message().c_str());
+        SRV_WRN("try_match_disk: disk_path does not exist (ec=%s) → return false\n", ec.message().c_str());
         return false;
     }
 
@@ -2797,18 +2778,19 @@ bool server_prompt_cache::try_match_disk(server_prompt & prompt, const server_to
         const auto version = get_u32();
 
         if (!magic || *magic != DISK_CACHE_MAGIC) {
-            // not a cache entry file — skip without deleting (may be a checkpoint spill file)
-            SRV_WRN("REMOVE_ME try_match_disk: '%s' wrong magic (0x%08x) — skip\n",
+            // not a cache entry file — skip without deleting, I want to avoid deleting as there may be anything else
+            // in the folder, and we should not delete unless it's obvious for the user that risk exists
+            SRV_INF("try_match_disk: '%s' wrong magic (0x%08x) — skip\n",
                     entry.path().filename().c_str(), magic ? *magic : 0u);
             continue;
         }
 
+        // I'm deciding to skip instead of deleting if the version doesn't match the current version, as the directory
+        // may be used by more than one version
         if (!version || *version != DISK_CACHE_VERSION) {
             ++n_rejected_header;
-            SRV_WRN("REMOVE_ME try_match_disk: '%s' wrong version (%s) → delete\n",
+            SRV_INF("try_match_disk: '%s' wrong version (%s) → skip\n",
                     entry.path().filename().c_str(), version ? std::to_string(*version).c_str() : "?");
-            f.close();
-            std::filesystem::remove(entry.path(), ec);
             continue;
         }
 
@@ -2820,13 +2802,13 @@ bool server_prompt_cache::try_match_disk(server_prompt & prompt, const server_to
         if (!fa || !fv || !n_tok) { ++n_rejected_header; continue; }
         if (*fa != arch_hash || *fv != vocab_hash) {
             ++n_rejected_hash;
-            SRV_WRN("REMOVE_ME try_match_disk: '%s' arch/vocab mismatch (file arch=0x%08x vocab=0x%08x, runtime arch=0x%08x vocab=0x%08x) → skip\n",
+            SRV_INF("try_match_disk: '%s' arch/vocab mismatch (file arch=0x%08x vocab=0x%08x, runtime arch=0x%08x vocab=0x%08x) → skip\n",
                     entry.path().filename().c_str(), *fa, *fv, arch_hash, vocab_hash);
             continue;
         }
         if (limit_tokens > 0 && *n_tok > limit_tokens) {
             ++n_rejected_capacity;
-            SRV_WRN("REMOVE_ME try_match_disk: '%s' too many tokens (%u > %zu) → skip\n",
+            SRV_INF("try_match_disk: '%s' too many tokens (%u > %zu) → skip\n",
                     entry.path().filename().c_str(), *n_tok, limit_tokens);
             continue;
         }
@@ -2848,7 +2830,7 @@ bool server_prompt_cache::try_match_disk(server_prompt & prompt, const server_to
         // asymmetric file rule: runtime has draft but file has none → skip
         if (runtime_has_dft && *drft_size == 0) {
             ++n_rejected_asym;
-            SRV_WRN("REMOVE_ME try_match_disk: '%s' asymmetric (runtime has drft, file does not) → skip\n",
+            SRV_INF("try_match_disk: '%s' asymmetric (runtime has drft, file does not) → skip\n",
                     entry.path().filename().c_str());
             continue;
         }
@@ -2864,7 +2846,7 @@ bool server_prompt_cache::try_match_disk(server_prompt & prompt, const server_to
         const float f_keep_cur = float(lcp) / float(toks.size());
         const float sim_cur    = tokens_new.size() > 0 ? float(lcp) / float(tokens_new.size()) : 0.0f;
 
-        SRV_WRN("REMOVE_ME try_match_disk: '%s' n_tok=%u main_size=%llu drft_size=%llu lcp=%d f_keep=%.3f sim=%.3f\n",
+        SRV_INF("try_match_disk: '%s' n_tok=%u main_size=%llu drft_size=%llu lcp=%d f_keep=%.3f sim=%.3f\n",
                 entry.path().filename().c_str(), *n_tok,
                 (unsigned long long) *main_size, (unsigned long long) *drft_size,
                 lcp, f_keep_cur, sim_cur);
@@ -2886,14 +2868,14 @@ bool server_prompt_cache::try_match_disk(server_prompt & prompt, const server_to
         }
     }
 
-    SRV_WRN("REMOVE_ME try_match_disk: scan summary — scanned=%d hdr_rej=%d hash_rej=%d cap_rej=%d asym_rej=%d score_rej=%d winner=%s\n",
+    SRV_INF("try_match_disk: scan summary — scanned=%d hdr_rej=%d hash_rej=%d cap_rej=%d asym_rej=%d score_rej=%d winner=%s\n",
             n_scanned, n_rejected_header, n_rejected_hash, n_rejected_capacity, n_rejected_asym, n_rejected_score,
             best ? best->path.filename().c_str() : "(none)");
 
     if (!best) {
         return false;
     }
-    SRV_WRN("REMOVE_ME try_match_disk: winner '%s' n_tok=%zu main_size=%llu drft_size=%llu f_keep=%.3f sim=%.3f\n",
+    SRV_INF("try_match_disk: winner '%s' n_tok=%zu main_size=%llu drft_size=%llu f_keep=%.3f sim=%.3f\n",
             best->path.filename().c_str(), best->tokens.size(),
             (unsigned long long) best->main_size, (unsigned long long) best->drft_size,
             best->f_keep, best->sim);
@@ -2969,36 +2951,36 @@ bool server_prompt_cache::try_match_disk(server_prompt & prompt, const server_to
             if (!f) return false;
         }
 
-        SRV_WRN("REMOVE_ME try_match_disk: read checkpoint %u/%u n_tokens=%lld pos_min=%d pos_max=%d tgt_sz=%llu dft_sz=%llu\n",
+        SRV_INF("try_match_disk: read checkpoint %u/%u n_tokens=%lld pos_min=%d pos_max=%d tgt_sz=%llu dft_sz=%llu\n",
                 i + 1, n_ckpts, (long long) n_tokens_v, pos_min_v, pos_max_v,
                 (unsigned long long) tgt_sz, (unsigned long long) dft_sz);
 
         restored_ckpts.push_back(std::move(cp));
     }
     f.close();
-    SRV_WRN("REMOVE_ME try_match_disk: read %u checkpoints from file, file closed\n", n_ckpts);
+    SRV_INF("try_match_disk: read %u checkpoints from file, file closed\n", n_ckpts);
 
     // Restore into the slot's seq via the same primitive the RAM path uses
     const size_t n_main = llama_state_seq_set_data_ext(ctx_tgt, main_bytes.data(),
                                                         main_bytes.size(), id_slot, 0);
-    SRV_WRN("REMOVE_ME try_match_disk: set_data_ext(main) returned %zu/%zu, post pos_min=%d pos_max=%d\n",
+    SRV_INF("try_match_disk: set_data_ext(main) returned %zu/%zu, post pos_min=%d pos_max=%d\n",
             n_main, main_bytes.size(),
             (int) llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id_slot),
             (int) llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), id_slot));
     if (n_main != main_bytes.size()) {
-        SRV_WRN("disk cache: set_data_ext (main) returned %zu of %zu\n", n_main, main_bytes.size());
+        SRV_INF("disk cache: set_data_ext (main) returned %zu of %zu\n", n_main, main_bytes.size());
         return false;
     }
 
     if (runtime_has_dft && best->drft_size > 0) {
         const size_t n_drft = llama_state_seq_set_data_ext(ctx_dft, drft_bytes.data(),
                                                             drft_bytes.size(), id_slot, 0);
-        SRV_WRN("REMOVE_ME try_match_disk: set_data_ext(drft) returned %zu/%zu, post pos_min=%d pos_max=%d\n",
+        SRV_INF("try_match_disk: set_data_ext(drft) returned %zu/%zu, post pos_min=%d pos_max=%d\n",
                 n_drft, drft_bytes.size(),
                 (int) llama_memory_seq_pos_min(llama_get_memory(ctx_dft), id_slot),
                 (int) llama_memory_seq_pos_max(llama_get_memory(ctx_dft), id_slot));
         if (n_drft != drft_bytes.size()) {
-            SRV_WRN("disk cache: set_data_ext (drft) returned %zu of %zu\n", n_drft, drft_bytes.size());
+            SRV_INF("disk cache: set_data_ext (drft) returned %zu of %zu\n", n_drft, drft_bytes.size());
             return false;
         }
     }
@@ -3006,7 +2988,7 @@ bool server_prompt_cache::try_match_disk(server_prompt & prompt, const server_to
     // populate prompt.tokens with the file's tokens
     prompt.tokens.clear();
     prompt.tokens.insert(best->tokens);
-    SRV_WRN("REMOVE_ME try_match_disk: post-restore prompt.tokens.size=%zu prompt.checkpoints.size_about_to_be=%zu\n",
+    SRV_INF("try_match_disk: post-restore prompt.tokens.size=%zu prompt.checkpoints.size_about_to_be=%zu\n",
             prompt.tokens.size(), restored_ckpts.size());
 
     // hand the checkpoints to the slot's prompt — the rewind logic at

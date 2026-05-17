@@ -2573,10 +2573,6 @@ private:
                             if (slot.task->params.cache_prompt) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
-                                SLT_WRN(slot, "REMOVE_ME prefix-match: n_past=%d slot.prompt.tokens.size=%zu input_tokens.size=%zu can_shift=%d checkpoints.size=%zu\n",
-                                        n_past, (size_t) slot.prompt.tokens.size(), (size_t) input_tokens.size(),
-                                        (int) llama_memory_can_shift(llama_get_memory(ctx_tgt)),
-                                        slot.prompt.checkpoints.size());
 
                                 // if there is an alora invoked, don't cache after the invocation start
                                 if (slot.alora_invocation_start > 0) {
@@ -2710,8 +2706,6 @@ private:
 
                                 if (pos_min >= pos_min_thold) {
                                     SLT_WRN(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d, n_swa = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min, n_swa);
-                                    SLT_WRN(slot, "REMOVE_ME rewind path entered: pos_min(%d) >= pos_min_thold(%d), checkpoints available=%zu, will search for one with pos_min < %d or == 0\n",
-                                            pos_min, pos_min_thold, slot.prompt.checkpoints.size(), pos_min_thold);
 
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
@@ -2741,12 +2735,8 @@ private:
                                     if (do_reset) {
                                         SLT_WRN(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
-                                        SLT_WRN(slot, "REMOVE_ME rewind FAILED: no usable checkpoint among %zu (need pos_min < %d or == 0). Forcing n_past=0.\n",
-                                                slot.prompt.checkpoints.size(), pos_min_thold);
                                         pos_next = 0;
                                         n_past = 0;
-                                    } else {
-                                        SLT_WRN(slot, "REMOVE_ME rewind OK: restored checkpoint, pos_next=%d, n_past=%d\n", pos_next, n_past);
                                     }
                                 }
                             }
@@ -2802,20 +2792,16 @@ private:
                     {
                         const auto pmin_tgt = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
                         const auto pmax_tgt = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
-                        SLT_WRN(slot, "REMOVE_ME pre-seq_rm: p0=%d slot.prompt.n_tokens=%d ctx_tgt pos_min=%d pos_max=%d checkpoints.size=%zu\n",
-                                p0, slot.prompt.n_tokens(), pmin_tgt, pmax_tgt, slot.prompt.checkpoints.size());
                     }
 
                     if (!llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, p0, -1)) {
                         SLT_WRN(slot, "failed to truncate tokens with position >= %d - clearing the memory\n", p0);
-                        SLT_WRN(slot, "%s", "REMOVE_ME seq_rm failed — model+cache combo refuses partial removal (e.g. quantized KV / unified cache). Disk-cache state cannot be used for this request; clearing and reprocessing.\n");
 
                         slot.prompt_clear(true);
 
                         // there is no common part left
                         slot.n_prompt_tokens_cache = 0;
                     } else {
-                       SLT_WRN(slot, "REMOVE_ME seq_rm OK at p0=%d — prefix preserved, will process tail\n", p0);
                        if (ctx_dft && !llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), slot.id, p0, -1)) {
                            GGML_ABORT("failed to truncate draft context\n");
                        }
