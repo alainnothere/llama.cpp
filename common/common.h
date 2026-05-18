@@ -596,7 +596,7 @@ struct common_params {
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     std::string cache_disk_path;          // empty = disabled. directory for disk-backed KV cache spill
     int32_t cache_disk_queue_depth  = 16; // bounded async writer queue; overflow falls through synchronously
-    int32_t checkpoint_spill_max    = -1; // max checkpoint spill files kept on disk by pos_min, -1 = no limit
+    int32_t checkpoint_spill_max    = 16; // max checkpoint spill files kept on disk per slot by pos_min, -1 = no limit
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
