@@ -636,8 +636,8 @@ struct server_prompt_cache {
     uint32_t    arch_hash   = 0;
     uint32_t    vocab_hash  = 0;
 
-    size_t size() const;
-    size_t n_tokens() const;
+    size_t size();
+    size_t n_tokens();
 
     server_prompt * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
@@ -666,8 +666,8 @@ private:
     };
 
     std::deque<spill_job>           queue;
-    mutable std::mutex              mtx;     // protects queue + pending_spill. mutable so const accessors can lock.
-    mutable std::condition_variable cv;
+    std::mutex              mtx;     // protects queue + pending_spill
+    std::condition_variable cv;
     std::thread                     worker;
     std::atomic<bool>               stop_flag{false};
 

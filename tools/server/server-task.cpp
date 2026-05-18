@@ -50,6 +50,18 @@ std::string gen_disk_cache_uuid() {
     return std::string(buf);
 }
 
+static bool read_disk_u32(std::ifstream & f, uint32_t & v)
+{
+    f.read(reinterpret_cast<char *>(&v), sizeof(v));
+    return static_cast<bool>(f);
+}
+
+static bool read_disk_u64(std::ifstream & f, uint64_t & v)
+{
+    f.read(reinterpret_cast<char *>(&v), sizeof(v));
+    return static_cast<bool>(f);
+}
+
 } // anonymous namespace
 
 //
@@ -2014,7 +2026,7 @@ json server_task_result_apply_lora::to_json() {
 //
 // server_prompt_cache
 //
-size_t server_prompt_cache::size() const {
+size_t server_prompt_cache::size() {
     size_t res = 0;
 
     for (const auto & state : states) {
@@ -2031,7 +2043,7 @@ size_t server_prompt_cache::size() const {
     return res;
 }
 
-size_t server_prompt_cache::n_tokens() const {
+size_t server_prompt_cache::n_tokens() {
     size_t res = 0;
 
     for (const auto & state : states) {
@@ -2741,7 +2753,8 @@ bool server_prompt_cache::try_match_disk(server_prompt & prompt, const server_to
         float sim    = 0.0f;
     };
 
-    std::optional<disk_match> best;
+      disk_match best;
+      bool have_best = false;
     float f_keep_best = 0.25f; // threshold floor
     float sim_best    = -1.0f;
 
@@ -2761,139 +2774,133 @@ bool server_prompt_cache::try_match_disk(server_prompt & prompt, const server_to
         std::ifstream f(entry.path(), std::ios::binary);
         if (!f) continue;
 
-        auto get_u32 = [&f]() -> std::optional<uint32_t> {
-            uint32_t v;
-            f.read(reinterpret_cast<char *>(&v), sizeof(v));
-            if (!f) return std::nullopt;
-            return v;
-        };
-        auto get_u64 = [&f]() -> std::optional<uint64_t> {
-            uint64_t v;
-            f.read(reinterpret_cast<char *>(&v), sizeof(v));
-            if (!f) return std::nullopt;
-            return v;
-        };
+          uint32_t magic;
+          if (!read_disk_u32(f, magic)) continue;
+          uint32_t version;
+          if (!read_disk_u32(f, version)) continue;
 
-        const auto magic   = get_u32();
-        const auto version = get_u32();
+          if (magic != DISK_CACHE_MAGIC) {
+              // not a cache entry file — skip without deleting, I want to avoid deleting as there may be anything else
+              // in the folder, and we should not delete unless it's obvious for the user that risk exists
+              SRV_INF("try_match_disk: '%s' wrong magic (0x%08x) — skip\n",
+                      entry.path().filename().c_str(), magic);
+              continue;
+          }
 
-        if (!magic || *magic != DISK_CACHE_MAGIC) {
-            // not a cache entry file — skip without deleting, I want to avoid deleting as there may be anything else
-            // in the folder, and we should not delete unless it's obvious for the user that risk exists
-            SRV_INF("try_match_disk: '%s' wrong magic (0x%08x) — skip\n",
-                    entry.path().filename().c_str(), magic ? *magic : 0u);
-            continue;
-        }
+          // I'm deciding to skip instead of deleting if the version doesn't match the current version, as the directory
+          // may be used by more than one version
+          if (version != DISK_CACHE_VERSION) {
+              ++n_rejected_header;
+              SRV_INF("try_match_disk: '%s' wrong version (%s) → skip\n",
+                      entry.path().filename().c_str(), std::to_string(version).c_str());
+              continue;
+          }
 
-        // I'm deciding to skip instead of deleting if the version doesn't match the current version, as the directory
-        // may be used by more than one version
-        if (!version || *version != DISK_CACHE_VERSION) {
-            ++n_rejected_header;
-            SRV_INF("try_match_disk: '%s' wrong version (%s) → skip\n",
-                    entry.path().filename().c_str(), version ? std::to_string(*version).c_str() : "?");
-            continue;
-        }
+          uint32_t fa;
+          if (!read_disk_u32(f, fa)) { ++n_rejected_header; continue; }
+          uint32_t fv;
+          if (!read_disk_u32(f, fv)) { ++n_rejected_header; continue; }
+          uint32_t fn_ctx;
+          if (!read_disk_u32(f, fn_ctx)) { ++n_rejected_header; continue; }
+          uint32_t n_tok;
+          if (!read_disk_u32(f, n_tok)) { ++n_rejected_header; continue; }
+          (void) fn_ctx;
+          if (!fa || !fv || !n_tok) { ++n_rejected_header; continue; }
+          if (fa != arch_hash || fv != vocab_hash) {
+              ++n_rejected_hash;
+              SRV_INF("try_match_disk: '%s' arch/vocab mismatch (file arch=0x%08x vocab=0x%08x, runtime arch=0x%08x vocab=0x%08x) → skip\n",
+                      entry.path().filename().c_str(), fa, fv, arch_hash, vocab_hash);
+              continue;
+          }
+          if (limit_tokens > 0 && n_tok > limit_tokens) {
+              ++n_rejected_capacity;
+              SRV_INF("try_match_disk: '%s' too many tokens (%u > %zu) → skip\n",
+                      entry.path().filename().c_str(), n_tok, limit_tokens);
+              continue;
+          }
 
-        const auto fa = get_u32();
-        const auto fv = get_u32();
-        const auto fn_ctx = get_u32();
-        const auto n_tok  = get_u32();
-        (void) fn_ctx;
-        if (!fa || !fv || !n_tok) { ++n_rejected_header; continue; }
-        if (*fa != arch_hash || *fv != vocab_hash) {
-            ++n_rejected_hash;
-            SRV_INF("try_match_disk: '%s' arch/vocab mismatch (file arch=0x%08x vocab=0x%08x, runtime arch=0x%08x vocab=0x%08x) → skip\n",
-                    entry.path().filename().c_str(), *fa, *fv, arch_hash, vocab_hash);
-            continue;
-        }
-        if (limit_tokens > 0 && *n_tok > limit_tokens) {
-            ++n_rejected_capacity;
-            SRV_INF("try_match_disk: '%s' too many tokens (%u > %zu) → skip\n",
-                    entry.path().filename().c_str(), *n_tok, limit_tokens);
-            continue;
-        }
+          std::vector<llama_token> toks(n_tok);
+          if (n_tok > 0) {
+              f.read(reinterpret_cast<char *>(toks.data()),
+                     static_cast<std::streamsize>(n_tok * sizeof(llama_token)));
+              if (!f) continue;
+          }
 
-        std::vector<llama_token> toks(*n_tok);
-        if (*n_tok > 0) {
-            f.read(reinterpret_cast<char *>(toks.data()),
-                   static_cast<std::streamsize>(*n_tok * sizeof(llama_token)));
-            if (!f) continue;
-        }
+          uint64_t main_sz;
+          if (!read_disk_u64(f, main_sz)) continue;
+          std::streampos main_off = f.tellg();
+          f.seekg(static_cast<std::streamoff>(main_sz), std::ios::cur);
+          uint64_t drft_sz;
+          if (!read_disk_u64(f, drft_sz)) continue;
 
-        const auto main_size = get_u64();
-        if (!main_size) continue;
-        const auto main_offset = f.tellg();
-        f.seekg(static_cast<std::streamoff>(*main_size), std::ios::cur);
-        const auto drft_size = get_u64();
-        if (!drft_size) continue;
+          // asymmetric file rule: runtime has draft but file has none → skip
+          if (runtime_has_dft && drft_sz == 0) {
+              ++n_rejected_asym;
+              SRV_INF("try_match_disk: '%s' asymmetric (runtime has drft, file does not) → skip\n",
+                      entry.path().filename().c_str());
+              continue;
+          }
 
-        // asymmetric file rule: runtime has draft but file has none → skip
-        if (runtime_has_dft && *drft_size == 0) {
-            ++n_rejected_asym;
-            SRV_INF("try_match_disk: '%s' asymmetric (runtime has drft, file does not) → skip\n",
-                    entry.path().filename().c_str());
-            continue;
-        }
+          // score against tokens_new
+          const llama_tokens & new_toks = tokens_new.get_tokens();
+          int lcp = 0;
+          const int n_min = std::min((int) toks.size(), (int) new_toks.size());
+          while (lcp < n_min && toks[lcp] == new_toks[lcp]) {
+              lcp++;
+          }
 
-        // score against tokens_new
-        const llama_tokens & new_toks = tokens_new.get_tokens();
-        int lcp = 0;
-        const int n_min = std::min((int) toks.size(), (int) new_toks.size());
-        while (lcp < n_min && toks[lcp] == new_toks[lcp]) {
-            lcp++;
-        }
+          const float f_keep_cur = float(lcp) / float(toks.size());
+          const float sim_cur    = tokens_new.size() > 0 ? float(lcp) / float(tokens_new.size()) : 0.0f;
 
-        const float f_keep_cur = float(lcp) / float(toks.size());
-        const float sim_cur    = tokens_new.size() > 0 ? float(lcp) / float(tokens_new.size()) : 0.0f;
+          SRV_INF("try_match_disk: '%s' n_tok=%u main_size=%llu drft_size=%llu lcp=%d f_keep=%.3f sim=%.3f\n",
+                  entry.path().filename().c_str(), n_tok,
+                  (unsigned long long) main_sz, (unsigned long long) drft_sz,
+                  lcp, f_keep_cur, sim_cur);
 
-        SRV_INF("try_match_disk: '%s' n_tok=%u main_size=%llu drft_size=%llu lcp=%d f_keep=%.3f sim=%.3f\n",
-                entry.path().filename().c_str(), *n_tok,
-                (unsigned long long) *main_size, (unsigned long long) *drft_size,
-                lcp, f_keep_cur, sim_cur);
+          if (f_keep_cur < 0.25f) { ++n_rejected_score; continue; }
 
-        if (f_keep_cur < 0.25f) { ++n_rejected_score; continue; }
-
-        if (f_keep_best < f_keep_cur && sim_best < sim_cur) {
-            f_keep_best = f_keep_cur;
-            sim_best    = sim_cur;
-            best = disk_match{
-                entry.path(),
-                std::move(toks),
-                *main_size,
-                *drft_size,
-                main_offset,
-                f_keep_cur,
-                sim_cur,
-            };
-        }
+          if (f_keep_best < f_keep_cur && sim_best < sim_cur) {
+              f_keep_best = f_keep_cur;
+              sim_best    = sim_cur;
+              best = disk_match{
+                  entry.path(),
+                  std::move(toks),
+                  main_sz,
+                  drft_sz,
+                  main_off,
+                  f_keep_cur,
+                  sim_cur,
+              };
+              have_best = true;
+          }
     }
 
     SRV_INF("try_match_disk: scan summary — scanned=%d hdr_rej=%d hash_rej=%d cap_rej=%d asym_rej=%d score_rej=%d winner=%s\n",
             n_scanned, n_rejected_header, n_rejected_hash, n_rejected_capacity, n_rejected_asym, n_rejected_score,
-            best ? best->path.filename().c_str() : "(none)");
+            have_best ? best.path.filename().c_str() : "(none)");
 
-    if (!best) {
+      if (!have_best) {
         return false;
     }
-    SRV_INF("try_match_disk: winner '%s' n_tok=%zu main_size=%llu drft_size=%llu f_keep=%.3f sim=%.3f\n",
-            best->path.filename().c_str(), best->tokens.size(),
-            (unsigned long long) best->main_size, (unsigned long long) best->drft_size,
-            best->f_keep, best->sim);
+      SRV_INF("try_match_disk: winner '%s' n_tok=%zu main_size=%llu drft_size=%llu f_keep=%.3f sim=%.3f\n",
+              best.path.filename().c_str(), best.tokens.size(),
+              (unsigned long long) best.main_size, (unsigned long long) best.drft_size,
+              best.f_keep, best.sim);
 
     // Re-open the chosen file and read the state blobs.
     // Layout from best->main_offset onward: [main_bytes][drft_size: u64][drft_bytes]
     //                                       [n_ckpts: u32][per-ckpt: n_tokens,i64; pos_min,i32; pos_max,i32;
     //                                       data_tgt_size,u64; data_tgt; data_dft_size,u64; data_dft]
-    std::ifstream f(best->path, std::ios::binary);
+      std::ifstream f(best.path, std::ios::binary);
     if (!f) {
         return false;
     }
-    f.seekg(best->main_offset);
+      f.seekg(best.main_offset);
 
-    std::vector<uint8_t> main_bytes(static_cast<size_t>(best->main_size));
-    if (best->main_size > 0) {
+      std::vector<uint8_t> main_bytes(static_cast<size_t>(best.main_size));
+      if (best.main_size > 0) {
         f.read(reinterpret_cast<char *>(main_bytes.data()),
-               static_cast<std::streamsize>(best->main_size));
+                 static_cast<std::streamsize>(best.main_size));
         if (!f) return false;
     }
 
@@ -2972,7 +2979,7 @@ bool server_prompt_cache::try_match_disk(server_prompt & prompt, const server_to
         return false;
     }
 
-    if (runtime_has_dft && best->drft_size > 0) {
+      if (runtime_has_dft && best.drft_size > 0) {
         const size_t n_drft = llama_state_seq_set_data_ext(ctx_dft, drft_bytes.data(),
                                                             drft_bytes.size(), id_slot, 0);
         SRV_INF("try_match_disk: set_data_ext(drft) returned %zu/%zu, post pos_min=%d pos_max=%d\n",
@@ -2987,7 +2994,7 @@ bool server_prompt_cache::try_match_disk(server_prompt & prompt, const server_to
 
     // populate prompt.tokens with the file's tokens
     prompt.tokens.clear();
-    prompt.tokens.insert(best->tokens);
+      prompt.tokens.insert(best.tokens);
     SRV_INF("try_match_disk: post-restore prompt.tokens.size=%zu prompt.checkpoints.size_about_to_be=%zu\n",
             prompt.tokens.size(), restored_ckpts.size());
 
@@ -2997,7 +3004,7 @@ bool server_prompt_cache::try_match_disk(server_prompt & prompt, const server_to
     prompt.checkpoints = std::move(restored_ckpts);
 
     // consumed — delete the file (cache is add-only; entries are used once)
-    std::filesystem::remove(best->path, ec);
+      std::filesystem::remove(best.path, ec);
 
     return true;
 }
