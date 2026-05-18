@@ -1276,6 +1276,17 @@ private:
                 prompt_cache->update();
 
                 SRV_INF("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+            } else if (prompt_cache) {
+                // When f_keep >= 0.5 the slot is reused directly — prompt_load() is never called,
+                // so merge_checkpoint_spills() never runs through the normal load path.
+                // Without this call, disk-spilled checkpoints (written when create_checkpoint()
+                // evicted the oldest entry to make room for a new one) are invisible to the rewind
+                // path in update_slots().  The rewind code only sees the 32 in-memory checkpoints,
+                // which cover only the tail of a long conversation.  If the new prompt diverges at
+                // a position earlier than the oldest in-memory checkpoint, the rewind fails and
+                // forces a full re-processing of the entire prompt — even though the data needed
+                // to restart from the divergence point is sitting in the disk-spill directory.
+                prompt_cache->merge_checkpoint_spills(ret->prompt);
             }
         }
 
