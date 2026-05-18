@@ -160,3 +160,7 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+build/*
+cmake-build-debug/*
+.claude/*
