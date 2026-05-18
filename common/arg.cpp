@@ -1362,6 +1362,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_QUEUE_DEPTH").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--checkpoint-spill-max"}, "N",
+        string_format("maximum number of checkpoint spill files to keep on disk (default: %d, -1 = no limit). "
+                      "when the limit is exceeded the files covering the lowest positions are deleted first. "
+                      "requires --cache-disk-path", params.checkpoint_spill_max),
+        [](common_params & params, int value) {
+            params.checkpoint_spill_max = value;
+        }
+    ).set_env("LLAMA_ARG_CHECKPOINT_SPILL_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

@@ -2352,13 +2352,15 @@ void server_prompt_cache::update() {
 
 server_prompt_cache::server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens_in,
                                           std::string disk_path_in, int32_t queue_depth_in,
+                                          int32_t checkpoint_spill_max_in,
                                           uint32_t arch_hash_in, uint32_t vocab_hash_in) {
-    this->limit_size   = 1024ull * 1024ull * (limit_size_mib < 0 ? 0 : limit_size_mib);
-    this->limit_tokens = limit_tokens_in;
-    this->disk_path    = std::move(disk_path_in);
-    this->queue_depth  = queue_depth_in > 0 ? queue_depth_in : 16;
-    this->arch_hash    = arch_hash_in;
-    this->vocab_hash   = vocab_hash_in;
+    this->limit_size            = 1024ull * 1024ull * (limit_size_mib < 0 ? 0 : limit_size_mib);
+    this->limit_tokens          = limit_tokens_in;
+    this->disk_path             = std::move(disk_path_in);
+    this->queue_depth           = queue_depth_in > 0 ? queue_depth_in : 16;
+    this->checkpoint_spill_max  = checkpoint_spill_max_in;
+    this->arch_hash             = arch_hash_in;
+    this->vocab_hash            = vocab_hash_in;
 
     if (!this->disk_path.empty()) {
         std::error_code ec;
@@ -2368,8 +2370,9 @@ server_prompt_cache::server_prompt_cache(int32_t limit_size_mib, size_t limit_to
                     this->disk_path.c_str(), ec.message().c_str());
             this->disk_path.clear();
         } else {
-            SRV_WRN("disk cache: enabled at '%s' (queue depth %d, arch=0x%08x, vocab=0x%08x)\n",
-                    this->disk_path.c_str(), this->queue_depth, this->arch_hash, this->vocab_hash);
+            SRV_WRN("disk cache: enabled at '%s' (queue depth %d, checkpoint spill max %d, arch=0x%08x, vocab=0x%08x)\n",
+                    this->disk_path.c_str(), this->queue_depth, this->checkpoint_spill_max,
+                    this->arch_hash, this->vocab_hash);
             start_writer_if_needed();
         }
     }
@@ -2599,6 +2602,64 @@ void server_prompt_cache::spill_checkpoint(const common_prompt_checkpoint & cp) 
         std::filesystem::remove(tmppath, ec);
         SRV_WRN("checkpoint spill: rename failed '%s': %s\n", tmppath.string().c_str(), ec.message().c_str());
         return;
+    }
+
+    // enforce the per-disk-directory checkpoint spill limit by deleting the files
+    // that cover the lowest positions (they are the least useful for future rewinds)
+    if (checkpoint_spill_max > 0) {
+        struct cp_entry {
+            std::filesystem::path path;
+            int32_t pos_min;
+        };
+        std::vector<cp_entry> cp_files;
+
+        std::error_code ec2;
+        for (const auto & e : std::filesystem::directory_iterator(disk_path, ec2)) {
+            if (ec2) break;
+            const std::string fn = e.path().filename().string();
+            if (fn.size() < 4 || fn.compare(0, 3, "cp_") != 0 || e.path().extension() != ".bin") {
+                continue;
+            }
+            // filename: cp_{pos_min}_{uuid}.bin — parse the pos_min field
+            const size_t start = 3;
+            const size_t end   = fn.find('_', start);
+            if (end == std::string::npos) {
+                continue;
+            }
+            int32_t pmin = 0;
+            bool ok = true;
+            for (size_t i = start; i < end; ++i) {
+                if (fn[i] < '0' || fn[i] > '9') { ok = false; break; }
+                pmin = pmin * 10 + (fn[i] - '0');
+            }
+            if (!ok) {
+                continue;
+            }
+            cp_entry entry;
+            entry.path    = e.path();
+            entry.pos_min = pmin;
+            cp_files.push_back(entry);
+        }
+
+        if ((int32_t) cp_files.size() > checkpoint_spill_max) {
+            // sort ascending by pos_min so the front of the vector has the oldest entries
+            for (size_t i = 0; i < cp_files.size(); ++i) {
+                for (size_t j = i + 1; j < cp_files.size(); ++j) {
+                    if (cp_files[j].pos_min < cp_files[i].pos_min) {
+                        cp_entry tmp  = cp_files[i];
+                        cp_files[i]   = cp_files[j];
+                        cp_files[j]   = tmp;
+                    }
+                }
+            }
+            const int n_delete = (int) cp_files.size() - checkpoint_spill_max;
+            for (int i = 0; i < n_delete; ++i) {
+                std::error_code ec3;
+                std::filesystem::remove(cp_files[i].path, ec3);
+                SRV_WRN("checkpoint spill: evicted '%s' (pos_min=%d, limit=%d)\n",
+                        cp_files[i].path.filename().string().c_str(), cp_files[i].pos_min, checkpoint_spill_max);
+            }
+        }
     }
 }
 

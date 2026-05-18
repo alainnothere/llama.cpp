@@ -610,7 +610,7 @@ struct server_prompt {
 
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens,
-                        std::string disk_path, int32_t queue_depth,
+                        std::string disk_path, int32_t queue_depth, int32_t checkpoint_spill_max,
                         uint32_t arch_hash, uint32_t vocab_hash);
     ~server_prompt_cache();
 
@@ -632,9 +632,10 @@ struct server_prompt_cache {
 
     // disk tier config — empty disk_path disables the tier
     std::string disk_path;
-    int32_t     queue_depth = 16;
-    uint32_t    arch_hash   = 0;
-    uint32_t    vocab_hash  = 0;
+    int32_t     queue_depth          = 16;
+    int32_t     checkpoint_spill_max = -1; // -1 = no limit
+    uint32_t    arch_hash            = 0;
+    uint32_t    vocab_hash           = 0;
 
     size_t size();
     size_t n_tokens();
