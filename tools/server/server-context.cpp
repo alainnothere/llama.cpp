@@ -1287,7 +1287,7 @@ private:
                 // a position earlier than the oldest in-memory checkpoint, the rewind fails and
                 // forces a full re-processing of the entire prompt — even though the data needed
                 // to restart from the divergence point is sitting in the disk-spill directory.
-                prompt_cache->merge_checkpoint_spills(ret->prompt);
+                prompt_cache->merge_checkpoint_spills(ret->prompt, ret->id);
             }
         }
 
@@ -1952,7 +1952,7 @@ private:
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
             if (prompt_cache) {
-                prompt_cache->spill_checkpoint(cur);
+                prompt_cache->spill_checkpoint(cur, slot.id);
             }
 
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());

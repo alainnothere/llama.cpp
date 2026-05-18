@@ -2204,7 +2204,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
         prompt = std::move(*pending_winner);
         if (!disk_path.empty()) {
-            merge_checkpoint_spills(prompt);
+            merge_checkpoint_spills(prompt, id_slot);
         }
         return true;
     }
@@ -2250,7 +2250,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
         states.erase(it_best);
         if (!disk_path.empty()) {
-            merge_checkpoint_spills(prompt);
+            merge_checkpoint_spills(prompt, id_slot);
         }
         return true;
     }
@@ -2259,7 +2259,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     if (!disk_path.empty()) {
         if (try_match_disk(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot)) {
             SRV_WRN("%s", " - restored from disk\n");
-            merge_checkpoint_spills(prompt);
+            merge_checkpoint_spills(prompt, id_slot);
             return true;
         }
     }
@@ -2544,13 +2544,14 @@ bool server_prompt_cache::write_entry_to_file(const std::string & filepath, cons
     return true;
 }
 
-void server_prompt_cache::spill_checkpoint(const common_prompt_checkpoint & cp) {
+void server_prompt_cache::spill_checkpoint(const common_prompt_checkpoint & cp, int32_t slot_id) {
     if (disk_path.empty()) {
         return;
     }
 
+    // filename encodes slot_id so the limit and merge logic can filter per conversation
     const std::string uuid     = gen_disk_cache_uuid();
-    const std::string filename = "cp_" + std::to_string(cp.pos_min) + "_" + uuid + ".bin";
+    const std::string filename = "cp_" + std::to_string(slot_id) + "_" + std::to_string(cp.pos_min) + "_" + uuid + ".bin";
     const std::filesystem::path filepath = std::filesystem::path(disk_path) / filename;
     const std::filesystem::path tmppath  = std::filesystem::path(disk_path) / (filename + ".tmp");
 
@@ -2604,8 +2605,8 @@ void server_prompt_cache::spill_checkpoint(const common_prompt_checkpoint & cp) 
         return;
     }
 
-    // enforce the per-disk-directory checkpoint spill limit by deleting the files
-    // that cover the lowest positions (they are the least useful for future rewinds)
+    // enforce the per-slot checkpoint spill limit by deleting the files that cover
+    // the lowest positions (they are the least useful for future rewinds)
     if (checkpoint_spill_max > 0) {
         struct cp_entry {
             std::filesystem::path path;
@@ -2613,22 +2614,28 @@ void server_prompt_cache::spill_checkpoint(const common_prompt_checkpoint & cp) 
         };
         std::vector<cp_entry> cp_files;
 
+        // only consider files belonging to this slot: cp_{slot_id}_{pos_min}_{uuid}.bin
+        const std::string slot_prefix = "cp_" + std::to_string(slot_id) + "_";
+
         std::error_code ec2;
         for (const auto & e : std::filesystem::directory_iterator(disk_path, ec2)) {
             if (ec2) break;
             const std::string fn = e.path().filename().string();
-            if (fn.size() < 4 || fn.compare(0, 3, "cp_") != 0 || e.path().extension() != ".bin") {
+            if (e.path().extension() != ".bin") {
                 continue;
             }
-            // filename: cp_{pos_min}_{uuid}.bin — parse the pos_min field
-            const size_t start = 3;
-            const size_t end   = fn.find('_', start);
-            if (end == std::string::npos) {
+            if (fn.size() <= slot_prefix.size() || fn.compare(0, slot_prefix.size(), slot_prefix) != 0) {
+                continue;
+            }
+            // parse pos_min: the field immediately after the slot_id prefix
+            const size_t pmin_start = slot_prefix.size();
+            const size_t pmin_end   = fn.find('_', pmin_start);
+            if (pmin_end == std::string::npos) {
                 continue;
             }
             int32_t pmin = 0;
             bool ok = true;
-            for (size_t i = start; i < end; ++i) {
+            for (size_t i = pmin_start; i < pmin_end; ++i) {
                 if (fn[i] < '0' || fn[i] > '9') { ok = false; break; }
                 pmin = pmin * 10 + (fn[i] - '0');
             }
@@ -2663,7 +2670,7 @@ void server_prompt_cache::spill_checkpoint(const common_prompt_checkpoint & cp) 
     }
 }
 
-void server_prompt_cache::merge_checkpoint_spills(server_prompt & prompt) {
+void server_prompt_cache::merge_checkpoint_spills(server_prompt & prompt, int32_t slot_id) {
     if (disk_path.empty()) {
         return;
     }
@@ -2681,13 +2688,16 @@ void server_prompt_cache::merge_checkpoint_spills(server_prompt & prompt) {
 
     std::list<common_prompt_checkpoint> new_ckpts;
 
+    // only load files that belong to this slot: cp_{slot_id}_{pos_min}_{uuid}.bin
+    const std::string slot_prefix = "cp_" + std::to_string(slot_id) + "_";
+
     for (const auto & entry : std::filesystem::directory_iterator(disk_path, ec)) {
         if (ec) break;
         const std::string fname = entry.path().filename().string();
-        if (fname.size() < 4 || fname.compare(0, 3, "cp_") != 0) {
+        if (entry.path().extension() != ".bin") {
             continue;
         }
-        if (entry.path().extension() != ".bin") {
+        if (fname.size() <= slot_prefix.size() || fname.compare(0, slot_prefix.size(), slot_prefix) != 0) {
             continue;
         }
         ++n_scanned;
