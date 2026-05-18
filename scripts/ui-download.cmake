@@ -87,6 +87,7 @@ if(NOT PROVISION_SUCCESS AND NOT "${NPM_DIR}" STREQUAL "")
                     RESULT_VARIABLE NPM_INSTALL_RESULT
                     OUTPUT_VARIABLE NPM_OUT
                     ERROR_VARIABLE  NPM_ERR
+                    TIMEOUT 10
                 )
                 if(NOT NPM_INSTALL_RESULT EQUAL 0)
                     message(STATUS "UI: npm install failed (${NPM_INSTALL_RESULT}), falling back to download")
@@ -101,6 +102,7 @@ if(NOT PROVISION_SUCCESS AND NOT "${NPM_DIR}" STREQUAL "")
                 RESULT_VARIABLE NPM_BUILD_RESULT
                 OUTPUT_VARIABLE NPM_OUT
                 ERROR_VARIABLE  NPM_ERR
+                TIMEOUT 10
             )
 
             if(NPM_BUILD_RESULT EQUAL 0)
@@ -156,7 +158,7 @@ if(NOT PROVISION_SUCCESS AND HF_ENABLED)
             set(download_url "${base_url}/${asset}?download=true")
             set(download_path "${PUBLIC_DIR}/${asset}")
             file(DOWNLOAD "${download_url}" "${download_path}"
-                STATUS download_status TIMEOUT 60
+                STATUS download_status TIMEOUT 10
             )
             list(GET download_status 0 download_result)
             if(NOT download_result EQUAL 0)
@@ -175,7 +177,7 @@ if(NOT PROVISION_SUCCESS AND HF_ENABLED)
         # Verify checksums if the server provides them
         file(DOWNLOAD "${base_url}/checksums.txt?download=true"
             "${PUBLIC_DIR}/checksums.txt"
-            STATUS checksum_status TIMEOUT 30
+            STATUS checksum_status TIMEOUT 10
         )
         list(GET checksum_status 0 checksum_result)
         if(checksum_result EQUAL 0)
