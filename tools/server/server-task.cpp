@@ -2147,7 +2147,13 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
     }
 
-    // Phase 2: scan pending_spill (locked). If a pending entry beats the states winner, consume it from pending.
+    // Phase 2: scan pending_spill (locked).  Same NON-CONSUMING semantics as
+    // Phase 1 — the in-flight write to disk continues unmolested and the
+    // entry stays in pending_spill until the writer's normal commit removes
+    // it.  See [TAG_CACHE_DONT_DELETE].  Because we don't cancel the write,
+    // there's no data-race risk reading data.main outside the lock (the
+    // writer is also reading it outside the lock — that's a multi-reader
+    // pattern, std::vector is safe for concurrent reads of the same data).
     std::shared_ptr<server_prompt> pending_winner;
     {
         std::unique_lock<std::mutex> lock(mtx);
@@ -2168,26 +2174,14 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             }
         }
         if (best != pending_spill.end()) {
-            // Only consume the entry if its write job is still queued (writer hasn't started
-            // reading data.main yet).  If the job was already dequeued by writer_loop(), the
-            // writer is reading data.main outside the lock right now — consuming and clearing
-            // here would be a data race.  In that case, leave the entry alone and fall through
-            // to try_match_disk(), which will find the file once the write completes.
-            bool job_still_queued = false;
-            for (auto jt = queue.begin(); jt != queue.end(); ++jt) {
-                if (jt->entry.get() == best->get()) {
-                    queue.erase(jt);
-                    job_still_queued = true;
-                    break;
-                }
-            }
-            if (job_still_queued) {
-                pending_winner = *best;
-                pending_spill.erase(best);
-                f_keep_best = pf_keep;
-                sim_best    = psim;
-                it_best     = states.end(); // pending wins over states
-            }
+            // Just grab the shared_ptr — the entry stays in pending_spill,
+            // the write job stays in queue.  Either or both eventually
+            // complete (writer commits + removes from pending_spill; or
+            // load() winner here picks the entry again later).
+            pending_winner = *best;
+            f_keep_best = pf_keep;
+            sim_best    = psim;
+            it_best     = states.end(); // pending wins over states
         }
     }
 
@@ -2195,19 +2189,17 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         SRV_WRN(" - found better prompt in pending_spill with f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
 
         {
-            auto & data = pending_winner->data.main;
+            const auto & data = pending_winner->data.main;
             const size_t size = data.size();
             const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
             if (n != size) {
                 SRV_WRN("failed to restore state with size %zu\n", size);
                 return false;
             }
-            data.clear();
-            data.shrink_to_fit();
         }
 
         {
-            auto & data = pending_winner->data.drft;
+            const auto & data = pending_winner->data.drft;
             if (!data.empty()) {
                 GGML_ASSERT(ctx_dft);
                 const size_t size = data.size();
@@ -2216,12 +2208,15 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                     SRV_WRN("failed to restore drft state with size %zu\n", size);
                     return false;
                 }
-                data.clear();
-                data.shrink_to_fit();
             }
         }
 
-        prompt = std::move(*pending_winner);
+        // Same field-by-field copy as the states branch — keep prompt.data
+        // empty so prompt_save's assertion (server-context.cpp:112) holds
+        // when this slot is later saved.
+        prompt.tokens      = pending_winner->tokens.clone();
+        prompt.data        = {};
+        prompt.checkpoints = pending_winner->checkpoints;
         if (!disk_path.empty()) {
             merge_checkpoint_spills(prompt, id_slot);
         }
@@ -2231,8 +2226,22 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     if (it_best != states.end()) {
         SRV_INF(" - found better prompt with f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
 
+        // NON-CONSUMING RESTORE — copy bytes into the live context, leave
+        // the cached entry intact in `states` so future requests can match
+        // it too.  See [TAG_CACHE_DONT_DELETE].  The earlier consume-on-load
+        // pattern (move + erase + clear data) caused alternating-workload
+        // thrash: on a poor cross-conversation match, the loaded bytes were
+        // immediately discarded via do_reset in update_slots(), but the
+        // cache entry was already gone — so when the original conversation
+        // returned, its state had to be re-prefilled from scratch.  See
+        // ContextFiles/context-disk-cache-eviction.md (2026-05-28 entry).
+        //
+        // Memory impact: the cached `data.main` / `data.drft` vectors stay
+        // resident until natural eviction by update().  Slot KV (the live
+        // copy inside ctx_tgt / ctx_dft) is in backend memory (GPU on Vulkan)
+        // and not a duplicate of the host-side cached bytes.
         {
-            auto & data = it_best->data.main;
+            const auto & data = it_best->data.main;
 
             const size_t size = data.size();
             const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
@@ -2241,13 +2250,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
                 return false;
             }
-
-            data.clear();
-            data.shrink_to_fit();
         }
 
         {
-            auto & data = it_best->data.drft;
+            const auto & data = it_best->data.drft;
 
             if (!data.empty()) {
                 GGML_ASSERT(ctx_dft);
@@ -2259,15 +2265,22 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
                     return false;
                 }
-
-                data.clear();
-                data.shrink_to_fit();
             }
         }
 
-        prompt = std::move(*it_best);
+        // Copy tokens + checkpoints into the slot's prompt. NOT data — the
+        // bytes were just loaded into ctx_tgt/ctx_dft via set_data_ext, so
+        // the live KV is the source of truth. server_slot::prompt_save()
+        // asserts prompt.data.size() == 0 (server-context.cpp:112) before
+        // it captures a fresh save from the live context, so leaving
+        // data empty here is required.  Cached entry's own copies stay
+        // in `states` for the next match.  alloc() will dedup on next
+        // save if this slot's post-generation state strictly supersedes
+        // the cached entry (prefix-of check at server-task.cpp:2078).
+        prompt.tokens      = it_best->tokens.clone();
+        prompt.data        = {};
+        prompt.checkpoints = it_best->checkpoints;
 
-        states.erase(it_best);
         if (!disk_path.empty()) {
             merge_checkpoint_spills(prompt, id_slot);
         }
@@ -3093,9 +3106,10 @@ bool server_prompt_cache::try_match_disk(server_prompt & prompt, const server_to
     // for SWA / hybrid / recurrent models when the main blob's window is past pos_min_thold.
     prompt.checkpoints = std::move(restored_ckpts);
 
-    // consumed — delete the file (cache is add-only; entries are used once)
-      std::filesystem::remove(best.path, ec);
-
+    // NON-CONSUMING: leave the file on disk for future matches.
+    // See [TAG_CACHE_DONT_DELETE] in this file and the 2026-05-28 entry in
+    // ContextFiles/context-disk-cache-eviction.md.  External cleanup
+    // (cron / systemd-timer) is responsible for deleting old files.
     return true;
 }
 
