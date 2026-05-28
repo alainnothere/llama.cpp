@@ -2168,11 +2168,26 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             }
         }
         if (best != pending_spill.end()) {
-            pending_winner = *best;
-            pending_spill.erase(best);
-            f_keep_best = pf_keep;
-            sim_best    = psim;
-            it_best     = states.end(); // pending wins over states
+            // Only consume the entry if its write job is still queued (writer hasn't started
+            // reading data.main yet).  If the job was already dequeued by writer_loop(), the
+            // writer is reading data.main outside the lock right now — consuming and clearing
+            // here would be a data race.  In that case, leave the entry alone and fall through
+            // to try_match_disk(), which will find the file once the write completes.
+            bool job_still_queued = false;
+            for (auto jt = queue.begin(); jt != queue.end(); ++jt) {
+                if (jt->entry.get() == best->get()) {
+                    queue.erase(jt);
+                    job_still_queued = true;
+                    break;
+                }
+            }
+            if (job_still_queued) {
+                pending_winner = *best;
+                pending_spill.erase(best);
+                f_keep_best = pf_keep;
+                sim_best    = psim;
+                it_best     = states.end(); // pending wins over states
+            }
         }
     }
 

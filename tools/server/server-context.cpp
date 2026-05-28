@@ -1411,15 +1411,18 @@ private:
 
                 SRV_INF("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             } else if (prompt_cache) {
-                // When f_keep >= 0.5 the slot is reused directly — prompt_load() is never called,
-                // so merge_checkpoint_spills() never runs through the normal load path.
-                // Without this call, disk-spilled checkpoints (written when create_checkpoint()
-                // evicted the oldest entry to make room for a new one) are invisible to the rewind
-                // path in update_slots().  The rewind code only sees the 32 in-memory checkpoints,
-                // which cover only the tail of a long conversation.  If the new prompt diverges at
-                // a position earlier than the oldest in-memory checkpoint, the rewind fails and
-                // forces a full re-processing of the entire prompt — even though the data needed
-                // to restart from the divergence point is sitting in the disk-spill directory.
+                // f_keep >= 0.5: the incoming request shares enough of the slot's current
+                // tokens that the slot is reused in-place without a save/load cycle.
+                // Without this save, the outgoing conversation's KV state is silently
+                // overwritten — when that conversation returns it must re-prefill all its
+                // tokens from scratch instead of resuming from cache.
+                if (tokens.size() > 0) {
+                    ret->prompt_save(*prompt_cache);
+                    prompt_cache->update();
+                }
+                // prompt_load() is never called on this path, so merge_checkpoint_spills()
+                // must be called explicitly to make disk-spilled checkpoints visible to the
+                // rewind logic in update_slots().
                 prompt_cache->merge_checkpoint_spills(ret->prompt, ret->id);
             }
         }
@@ -1447,7 +1450,14 @@ private:
             if (slot.prompt.n_tokens() > 0) {
                 SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
 
-                slot.prompt_clear(false);
+                // Park the state into the prompt cache before freeing the KV slot.
+                // Without this, the conversation's entire context is thrown away and
+                // the next request for it pays a full re-prefill instead of resuming.
+                if (prompt_cache) {
+                    slot_save_and_clear(slot);
+                } else {
+                    slot.prompt_clear(false);
+                }
 
                 res = true;
 
@@ -2122,6 +2132,18 @@ private:
                     const int id_slot = task.id_slot;
                     const int id_task = task.id;
 
+                    // Save and clear all idle slots before slot selection so the KV pool is
+                    // free when prompt_load() runs inside get_available_slot().  Doing this
+                    // after launch (the old location) meant the load could fail with "no
+                    // available cells" because a prior conversation still occupied the pool.
+                    if (params_base.cache_idle_slots) {
+                        for (auto & s : slots) {
+                            if (!s.is_processing()) {
+                                slot_save_and_clear(s);
+                            }
+                        }
+                    }
+
                     server_slot * slot = id_slot != -1 ? get_slot_by_id(id_slot) : get_available_slot(task);
 
                     //
@@ -2158,14 +2180,6 @@ private:
                     } else if (!launch_slot_with_task(*slot, std::move(task))) {
                         SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
                         break; // drop the task
-                    }
-
-                    if (params_base.cache_idle_slots) {
-                        for (auto & s : slots) {
-                            if (!s.is_processing()) {
-                                slot_save_and_clear(s);
-                            }
-                        }
                     }
                 } break;
             case SERVER_TASK_TYPE_CANCEL:
@@ -2804,7 +2818,12 @@ private:
                             // the largest pos_min required for a checkpoint to be useful
                             const auto pos_min_thold = std::max(0, pos_next - n_swa - 1);
 
-                            if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
+                            // Only enter checkpoint recovery when there is an actual divergence
+                            // (n_past < slot tokens). When n_past == slot.n_tokens() the new
+                            // request shares all cached tokens — no rewind is needed. Using <=
+                            // here triggered a spurious checkpoint search and "forcing full
+                            // prompt re-processing" for the common case of resending after ESC.
+                            if (n_past > 0 && n_past < slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
                                 if (pos_min == -1) {
                                     SLT_ERR(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min);
@@ -2854,7 +2873,10 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold) {
+                                // pos_min == pos_min_thold means the KV window starts exactly
+                                // where SWA requires — no rewind needed. > catches the case
+                                // where SWA has slid the window past the required minimum.
+                                if (pos_min > pos_min_thold) {
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
