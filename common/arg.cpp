@@ -1375,6 +1375,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_SPILL_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--http-request-dump-path"}, "PATH",
+        "diagnostic: dump every incoming POST body + meta sidecar to this directory "
+        "(filename: {seq:06}_{remote_port}_{utc_us}_{path-slug}.json). empty = disabled",
+        [](common_params & params, const std::string & value) {
+            params.http_request_dump_path = value;
+        }
+    ).set_env("LLAMA_ARG_HTTP_REQUEST_DUMP_PATH").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

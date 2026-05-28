@@ -599,6 +599,7 @@ struct common_params {
     std::string cache_disk_path;          // empty = disabled. directory for disk-backed KV cache spill
     int32_t cache_disk_queue_depth  = 16; // bounded async writer queue; overflow falls through synchronously
     int32_t checkpoint_spill_max    = 16; // max checkpoint spill files kept on disk per slot by pos_min, -1 = no limit
+    std::string http_request_dump_path; // empty = disabled. dump every POST body + meta sidecar here for diagnostic diffs
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT

@@ -76,6 +76,11 @@ struct server_http_context {
     int port;
     bool is_ssl = false;
 
+    // diagnostic: if non-empty, every POST body is dumped to this directory
+    // along with a .meta sidecar (utc timestamp, remote addr:port, headers).
+    // wired from common_params::http_request_dump_path in init().
+    std::string http_request_dump_path;
+
     server_http_context();
     ~server_http_context();
 

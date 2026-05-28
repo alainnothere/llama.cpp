@@ -5,7 +5,12 @@
 
 #include <cpp-httplib/httplib.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <future>
 #include <string>
@@ -80,6 +85,20 @@ bool server_http_context::init(const common_params & params) {
     path_prefix = params.api_prefix;
     port = params.port;
     hostname = params.hostname;
+
+    http_request_dump_path = params.http_request_dump_path;
+    if (!http_request_dump_path.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(http_request_dump_path, ec);
+        if (ec) {
+            SRV_WRN("http request dump: cannot create directory '%s': %s — disabling dump\n",
+                    http_request_dump_path.c_str(), ec.message().c_str());
+            http_request_dump_path.clear();
+        } else {
+            SRV_WRN("http request dump: enabled, writing every POST body to '%s'\n",
+                    http_request_dump_path.c_str());
+        }
+    }
 
     if (gcp.enabled) {
         SRV_INF("Google Cloud Platform compat: health route = %s, predict route = %s, port = %d\n", gcp.path_health.c_str(), gcp.path_predict.c_str(), gcp.port);
@@ -483,7 +502,7 @@ void server_http_context::get(const std::string & path, const server_http_contex
 
 void server_http_context::post(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
-    pimpl->srv->Post(path_prefix + path, [handler](const httplib::Request & req, httplib::Response & res) {
+    pimpl->srv->Post(path_prefix + path, [this, handler](const httplib::Request & req, httplib::Response & res) {
         std::string body = req.body;
         std::map<std::string, uploaded_file> files;
 
@@ -512,6 +531,61 @@ void server_http_context::post(const std::string & path, const server_http_conte
                     file.content_type,
                 };
             }
+        }
+
+        // diagnostic: dump raw POST body to disk if --http-request-dump-path is set.
+        // Filenames sort by sequence; remote_port lets you tag which client sent which.
+        if (!http_request_dump_path.empty()) {
+            static std::atomic<uint64_t> dump_seq{0};
+            const uint64_t seq = dump_seq.fetch_add(1) + 1;
+            const auto    now  = std::chrono::system_clock::now();
+            const uint64_t utc_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                now.time_since_epoch()).count();
+
+            std::string path_slug = req.path;
+            if (!path_slug.empty() && path_slug.front() == '/') path_slug.erase(0, 1);
+            for (char & c : path_slug) {
+                if (c == '/') c = '-';
+                else if (!(std::isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.')) c = '_';
+            }
+            if (path_slug.empty()) path_slug = "root";
+
+            char base[512];
+            std::snprintf(base, sizeof(base), "%s/%06llu_%05d_%llu_%s",
+                http_request_dump_path.c_str(),
+                (unsigned long long) seq,
+                req.remote_port,
+                (unsigned long long) utc_us,
+                path_slug.c_str());
+
+            // body
+            {
+                std::ofstream f(std::string(base) + ".json", std::ios::binary);
+                if (f) f.write(body.data(), body.size());
+            }
+            // meta sidecar
+            {
+                std::ofstream m(std::string(base) + ".meta");
+                if (m) {
+                    const auto t_c = std::chrono::system_clock::to_time_t(now);
+                    char tbuf[64];
+                    std::strftime(tbuf, sizeof(tbuf), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&t_c));
+                    m << "seq:           " << seq << "\n";
+                    m << "utc:           " << tbuf << "\n";
+                    m << "utc_us:        " << utc_us << "\n";
+                    m << "method:        " << req.method << "\n";
+                    m << "path:          " << req.path << "\n";
+                    m << "remote_addr:   " << req.remote_addr << "\n";
+                    m << "remote_port:   " << req.remote_port << "\n";
+                    m << "content_length:" << body.size() << "\n";
+                    m << "headers:\n";
+                    for (const auto & h : req.headers) {
+                        m << "  " << h.first << ": " << h.second << "\n";
+                    }
+                }
+            }
+            SRV_WRN("http dump: seq=%llu port=%d path=%s bytes=%zu\n",
+                (unsigned long long) seq, req.remote_port, req.path.c_str(), body.size());
         }
 
         server_http_req_ptr request = std::make_unique<server_http_req>(server_http_req{
