@@ -57,3 +57,13 @@ install(TARGETS ${TARGET} RUNTIME)
 
 target_link_libraries(${TARGET} PRIVATE llama-server-impl)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+# unit tests for the prompt-cache disk tier (host-only: no server / model / GPU)
+if (LLAMA_BUILD_TESTS AND NOT CMAKE_JS_VERSION)
+    set(TARGET test-prompt-cache-disk)
+    add_executable(${TARGET} tests/test-prompt-cache-disk.cpp)
+    target_include_directories(${TARGET} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ../mtmd ${CMAKE_SOURCE_DIR})
+    target_link_libraries(${TARGET} PRIVATE server-context llama-common ${CMAKE_THREAD_LIBS_INIT})
+    target_compile_features(${TARGET} PRIVATE cxx_std_17)
+    add_test(NAME ${TARGET} COMMAND ${TARGET})
+endif()

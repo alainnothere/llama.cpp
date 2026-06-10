@@ -683,6 +683,18 @@ struct server_prompt_cache {
     // cache save/load cycle (f_keep >= 0.5).
     void merge_checkpoint_spills(server_prompt & prompt, int32_t slot_id);
 
+    // true if the host-RAM cache currently exceeds its byte budget (limit_size > 0
+    // and size() > limit_size). gates the spill-before-load "valley" path.
+    bool over_budget();
+
+    // synchronously write every spillable resident state out to the disk tier and
+    // drop it from `states`, freeing host RAM. used before loading a new
+    // conversation when RAM-constrained, so the outgoing and incoming states are
+    // not both fully resident at once (the spike that can OOM the server when
+    // switching between large chats). mtmd entries (not spillable) are dropped.
+    // synchronous on the caller's thread; no-op if the disk tier is disabled.
+    void spill_all_to_disk();
+
 private:
     struct spill_job {
         std::string uuid;

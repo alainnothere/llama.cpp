@@ -1436,6 +1436,18 @@ private:
                     ret->prompt_save(*prompt_cache);
                 }
 
+                // VALLEY: if saving the outgoing slot's state pushed the host-RAM
+                // cache over its --cache-ram budget, spill everything to disk and
+                // free it BEFORE loading the incoming state — otherwise both large
+                // states are resident at once, the spike that can OOM-kill the server
+                // when switching between big conversations. This is a synchronous
+                // disk-write wait, but it only engages when actually RAM-constrained;
+                // with headroom over_budget() is false and the fast async path below
+                // (load, then lazy update) is unchanged.
+                if (prompt_cache->over_budget()) {
+                    prompt_cache->spill_all_to_disk();
+                }
+
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear(false);
                 }
@@ -2962,13 +2974,23 @@ private:
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
 
                                     if (!do_reset) {
-                                        // restore the context checkpoint
-                                        it->load_tgt(ctx_tgt,       slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                        it->load_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        // restore the context checkpoint. for disk-backed (lazy)
+                                        // checkpoints the KV blob is faulted in from disk here; a
+                                        // read failure (e.g. the spill file was evicted under us)
+                                        // returns false, so we fall back to a full reprocess rather
+                                        // than running on partially-restored state. the seq_rm below
+                                        // (do_reset path) wipes any partial KV before reprocessing.
+                                        const bool ok_tgt = it->load_tgt(ctx_tgt,       slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        const bool ok_dft = it->load_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
-                                        pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
-                                        n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
-                                        SLT_WRN(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+                                        if (!ok_tgt || !ok_dft) {
+                                            SLT_WRN(slot, "failed to load context checkpoint from disk (pos_min = %d, pos_max = %d) - forcing full reprocess\n", it->pos_min, it->pos_max);
+                                            do_reset = true;
+                                        } else {
+                                            pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
+                                            n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                            SLT_WRN(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+                                        }
                                     }
 
                                     if (do_reset) {

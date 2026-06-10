@@ -1066,6 +1066,16 @@ struct common_prompt_checkpoint {
     std::vector<uint8_t> data_tgt;
     std::vector<uint8_t> data_dft;
 
+    // disk-backed (lazy) source. When src_path is non-empty and the matching
+    // data_* vector is empty, the KV blob lives on disk at [off, off+sz) and is
+    // faulted in by load_tgt/load_dft on demand (then discarded), keeping it off
+    // the anonymous heap. Empty src_path == fully resident, in-RAM checkpoint.
+    std::string src_path;
+    uint64_t    off_tgt = 0;
+    uint64_t    sz_tgt  = 0;
+    uint64_t    off_dft = 0;
+    uint64_t    sz_dft  = 0;
+
     size_t size() const;
 
     bool empty() const;
@@ -1086,12 +1096,14 @@ struct common_prompt_checkpoint {
             llama_seq_id seq_id,
             llama_state_seq_flags flags);
 
-    void load_tgt(
+    // returns true on success (restored, or genuinely empty no-op); false if a
+    // disk-backed blob could not be read (caller should fall back to reprocess).
+    bool load_tgt(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;
 
-    void load_dft(
+    bool load_dft(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;

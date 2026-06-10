@@ -2096,40 +2096,79 @@ void common_prompt_checkpoint::update_dft(
     }
 }
 
-void common_prompt_checkpoint::load_tgt(
-        llama_context * ctx,
-        llama_seq_id seq_id,
-        llama_state_seq_flags flags) const {
-    if (ctx == nullptr) {
-        return;
+// read a disk-backed checkpoint blob ([off, off+sz) of src_path) into buf.
+// returns false if the file is missing / truncated (e.g. spilled file evicted).
+static bool load_checkpoint_blob_from_disk(const std::string & src_path, uint64_t off, uint64_t sz, std::vector<uint8_t> & buf) {
+    std::ifstream f(src_path, std::ios::binary);
+    if (!f) {
+        return false;
     }
-
-    if (data_tgt.empty()) {
-        return;
-    }
-
-    const size_t n = llama_state_seq_set_data_ext(ctx, data_tgt.data(), data_tgt.size(), seq_id, flags);
-    if (n != data_tgt.size()) {
-        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", data_tgt.size(), n);
-    }
+    f.seekg(static_cast<std::streamoff>(off));
+    buf.resize(static_cast<size_t>(sz));
+    f.read(reinterpret_cast<char *>(buf.data()), static_cast<std::streamsize>(sz));
+    return static_cast<bool>(f);
 }
 
-void common_prompt_checkpoint::load_dft(
+bool common_prompt_checkpoint::load_tgt(
         llama_context * ctx,
         llama_seq_id seq_id,
         llama_state_seq_flags flags) const {
     if (ctx == nullptr) {
-        return;
+        return true;
     }
 
-    if (data_dft.empty()) {
-        return;
+    // resident blob — restore directly
+    if (!data_tgt.empty()) {
+        const size_t n = llama_state_seq_set_data_ext(ctx, data_tgt.data(), data_tgt.size(), seq_id, flags);
+        if (n != data_tgt.size()) {
+            GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", data_tgt.size(), n);
+        }
+        return true;
     }
 
-    const size_t n = llama_state_seq_set_data_ext(ctx, data_dft.data(), data_dft.size(), seq_id, flags);
-    if (n != data_dft.size()) {
-        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", data_dft.size(), n);
+    // disk-backed (lazy) blob — fault in on demand, restore, then discard
+    if (!src_path.empty() && sz_tgt > 0) {
+        std::vector<uint8_t> buf;
+        if (!load_checkpoint_blob_from_disk(src_path, off_tgt, sz_tgt, buf)) {
+            return false;
+        }
+        const size_t n = llama_state_seq_set_data_ext(ctx, buf.data(), buf.size(), seq_id, flags);
+        return n == buf.size();
     }
+
+    // genuinely empty checkpoint — nothing to restore
+    return true;
+}
+
+bool common_prompt_checkpoint::load_dft(
+        llama_context * ctx,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags) const {
+    if (ctx == nullptr) {
+        return true;
+    }
+
+    // resident blob — restore directly
+    if (!data_dft.empty()) {
+        const size_t n = llama_state_seq_set_data_ext(ctx, data_dft.data(), data_dft.size(), seq_id, flags);
+        if (n != data_dft.size()) {
+            GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", data_dft.size(), n);
+        }
+        return true;
+    }
+
+    // disk-backed (lazy) blob — fault in on demand, restore, then discard
+    if (!src_path.empty() && sz_dft > 0) {
+        std::vector<uint8_t> buf;
+        if (!load_checkpoint_blob_from_disk(src_path, off_dft, sz_dft, buf)) {
+            return false;
+        }
+        const size_t n = llama_state_seq_set_data_ext(ctx, buf.data(), buf.size(), seq_id, flags);
+        return n == buf.size();
+    }
+
+    // genuinely empty checkpoint — nothing to restore
+    return true;
 }
 
 void common_prompt_checkpoint::clear_tgt() {

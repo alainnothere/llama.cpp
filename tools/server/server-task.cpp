@@ -2382,6 +2382,47 @@ void server_prompt_cache::update() {
     }
 }
 
+bool server_prompt_cache::over_budget() {
+    return limit_size > 0 && size() > limit_size;
+}
+
+void server_prompt_cache::spill_all_to_disk() {
+    if (disk_path.empty()) {
+        return;
+    }
+
+    size_t n_spilled = 0;
+    size_t n_dropped = 0;
+
+    while (!states.empty()) {
+        server_prompt & front = states.front();
+
+        if (front.tokens.has_mtmd) {
+            // mtmd state cannot be serialized to the disk tier — drop it (same as update())
+            ++n_dropped;
+            states.pop_front();
+            continue;
+        }
+
+        const std::string uuid     = gen_disk_cache_uuid();
+        const std::string filepath = (std::filesystem::path(disk_path) / (uuid + ".bin")).string();
+
+        // synchronous write on the calling thread, then free the host copy. losing a
+        // failed write only costs a reprocess on next use — never a crash.
+        if (write_entry_to_file(filepath, front)) {
+            ++n_spilled;
+        } else {
+            SRV_WRN("valley spill: failed to persist entry to '%s' (entry dropped)\n", filepath.c_str());
+        }
+        states.pop_front();
+    }
+
+    if (n_spilled > 0 || n_dropped > 0) {
+        SRV_WRN(" - valley: spilled %zu state(s) to disk, dropped %zu — freed host RAM before load\n",
+                n_spilled, n_dropped);
+    }
+}
+
 //
 // server_prompt_cache — disk tier
 //
@@ -2789,33 +2830,37 @@ void server_prompt_cache::merge_checkpoint_spills(server_prompt & prompt, int32_
             continue;
         }
 
+        // LAZY (disk-backed) registration: record the file + the byte offsets of
+        // the tgt/dft blobs, but DO NOT read them into RAM. The KV bytes stay on
+        // disk; load_tgt/load_dft fault them in only if a rewind actually selects
+        // this checkpoint, then discard them again. This is what keeps reviewed-
+        // from-disk checkpoints off the anonymous heap. The file is not consumed
+        // here — see [TAG_CACHE_DONT_DELETE].
         common_prompt_checkpoint cp;
         cp.pos_min  = pos_min_v;
         cp.pos_max  = pos_max_v;
         cp.n_tokens = n_tokens_v;
+        cp.src_path = entry.path().string();
 
-        if (tgt_sz > 0) {
-            cp.data_tgt.resize(static_cast<size_t>(tgt_sz));
-            f.read(reinterpret_cast<char *>(cp.data_tgt.data()),
-                   static_cast<std::streamsize>(tgt_sz));
-            if (!f) {
-                continue;
-            }
-        }
+        // tgt blob starts at the current position (just past the tgt_sz field)
+        const std::streamoff pos_tgt = f.tellg();
+        cp.off_tgt = static_cast<uint64_t>(pos_tgt);
+        cp.sz_tgt  = tgt_sz;
+
+        // skip over the tgt blob to reach the dft_sz field
+        f.seekg(static_cast<std::streamoff>(tgt_sz), std::ios::cur);
 
         uint64_t dft_sz = 0;
         f.read(reinterpret_cast<char *>(&dft_sz), sizeof(dft_sz));
         if (!f) {
+            // truncated / malformed file — skip without registering
             continue;
         }
-        if (dft_sz > 0) {
-            cp.data_dft.resize(static_cast<size_t>(dft_sz));
-            f.read(reinterpret_cast<char *>(cp.data_dft.data()),
-                   static_cast<std::streamsize>(dft_sz));
-            if (!f) {
-                continue;
-            }
-        }
+
+        // dft blob starts at the current position (just past the dft_sz field)
+        const std::streamoff pos_dft = f.tellg();
+        cp.off_dft = static_cast<uint64_t>(pos_dft);
+        cp.sz_dft  = dft_sz;
 
         new_ckpts.push_back(std::move(cp));
         ++n_loaded;

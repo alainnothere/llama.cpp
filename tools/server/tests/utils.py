@@ -105,6 +105,10 @@ class ServerProcess:
     media_path: str | None = None
     sleep_idle_seconds: int | None = None
     cache_ram: int | None = None
+    cache_disk_path: str | None = None
+    cache_disk_queue_depth: int | None = None
+    checkpoint_spill_max: int | None = None
+    ctx_checkpoints: int | None = None
     no_cache_idle_slots: bool = False
     log_path: str | None = None
     webui_mcp_proxy: bool = False
@@ -249,6 +253,14 @@ class ServerProcess:
             server_args.extend(["--sleep-idle-seconds", self.sleep_idle_seconds])
         if self.cache_ram is not None:
             server_args.extend(["--cache-ram", self.cache_ram])
+        if self.cache_disk_path is not None:
+            server_args.extend(["--cache-disk-path", self.cache_disk_path])
+        if self.cache_disk_queue_depth is not None:
+            server_args.extend(["--cache-disk-queue-depth", self.cache_disk_queue_depth])
+        if self.checkpoint_spill_max is not None:
+            server_args.extend(["--checkpoint-spill-max", self.checkpoint_spill_max])
+        if self.ctx_checkpoints is not None:
+            server_args.extend(["--ctx-checkpoints", self.ctx_checkpoints])
         if self.no_cache_idle_slots:
             server_args.append("--no-cache-idle-slots")
         if self.webui_mcp_proxy:
