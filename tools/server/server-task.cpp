@@ -657,7 +657,7 @@ task_params server_task::params_from_json_cmpl(
         const auto samplers = data.find("samplers");
         if (samplers != data.end()) {
             if (samplers->is_array()) {
-                params.sampling.samplers = common_sampler_types_from_names(*samplers, false);
+                params.sampling.samplers = common_sampler_types_from_names(*samplers);
             } else if (samplers->is_string()){
                 params.sampling.samplers = common_sampler_types_from_chars(samplers->get<std::string>());
             }
@@ -1445,6 +1445,9 @@ json server_task_result_cmpl_final::to_json_anthropic_stream() {
 //
 void server_task_result_cmpl_partial::update(task_result_state & state) {
     is_updated = true;
+    if (is_begin) {
+        return; // begin marker only flushes headers, skip parsing
+    }
     state.update_chat_msg(content, true, oaicompat_msg_diffs);
 
     // Copy current state for use in to_json_*() (reflects state BEFORE this chunk)
@@ -2143,7 +2146,11 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             continue;
         }
 
-        if (f_keep_best < f_keep_cur && sim_best < sim_cur) {
+        // sim-primary (see [TAG_CACHE_SELECT_SIM]). the f_keep tie-break only
+        // applies between scanned candidates (it_best already set), NOT against
+        // the slot's baseline sim_best — restoring a cache entry that merely ties
+        // the slot's existing prefix buys zero extra reuse and is pure overhead.
+        if (sim_cur > sim_best || (it_best != states.end() && sim_cur == sim_best && f_keep_cur > f_keep_best)) {
             f_keep_best = f_keep_cur;
             sim_best    = sim_cur;
 
@@ -2171,7 +2178,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             if (f_keep_cur < 0.25f) {
                 continue;
             }
-            if (pf_keep < f_keep_cur && psim < sim_cur) {
+            // sim-primary (see [TAG_CACHE_SELECT_SIM]); f_keep tie-break only
+            // between pending candidates, not against the carried-over baseline.
+            if (sim_cur > psim || (best != pending_spill.end() && sim_cur == psim && f_keep_cur > pf_keep)) {
                 pf_keep = f_keep_cur;
                 psim    = sim_cur;
                 best = it;
@@ -3011,7 +3020,14 @@ bool server_prompt_cache::try_match_disk(server_prompt & prompt, const server_to
 
           if (f_keep_cur < 0.25f) { ++n_rejected_score; continue; }
 
-          if (f_keep_best < f_keep_cur && sim_best < sim_cur) {
+          // maximize prefix reuse: pick the highest sim (= longest common prefix
+          // with the new prompt = fewest tokens to reprocess). break ties by
+          // higher f_keep (less of the cached state wasted on a non-matching tail).
+          // the f_keep >= 0.25 gate above is the floor; f_keep must NOT be a
+          // co-equal maximization term — it saturates at 1.0 and would otherwise
+          // lock the winner to the first fully-contained file in scan order,
+          // ignoring a much longer (higher-sim) match. [TAG_CACHE_SELECT_SIM]
+          if (sim_cur > sim_best || (sim_cur == sim_best && f_keep_cur > f_keep_best)) {
               f_keep_best = f_keep_cur;
               sim_best    = sim_cur;
               best = disk_match{
