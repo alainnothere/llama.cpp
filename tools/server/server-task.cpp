@@ -1691,7 +1691,7 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
         const int cur_lcp_len = it->tokens.get_common_prefix(prompt.tokens);
 
         if (cur_lcp_len == (int) prompt.tokens.size()) {
-            SRV_INF("%s", " - prompt is already in the cache, skipping\n");
+            SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
             return nullptr;
         }
     }
@@ -1701,7 +1701,7 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
         const int len = it->tokens.get_common_prefix(prompt.tokens);
 
         if (len == (int) it->tokens.size()) {
-            SRV_WRN(" - removing obsolete cached prompt with length %d\n", len);
+            SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
             it = states.erase(it);
         } else {
@@ -1746,7 +1746,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
     float sim_best    = float(lcp_best) / tokens_new.size();
 
-    SRV_INF(" - looking for better prompt, base f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
+    SRV_TRC(" - looking for better prompt, base f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
 
     auto it_best = states.end();
 
@@ -1852,7 +1852,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     }
 
     if (it_best != states.end()) {
-        SRV_INF(" - found better prompt with f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
+        SRV_TRC(" - found better prompt with f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
 
         // NON-CONSUMING RESTORE — copy bytes into the live context, leave
         // the cached entry intact in `states` so future requests can match
@@ -1996,12 +1996,11 @@ void server_prompt_cache::update() {
         }
     }
 
-    SRV_INF(" - cache state: %zu prompts, (+%zu pending), %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est)\n",
-            states.size(), pending_spill.size(), size() / (1024.0 * 1024.0),
-            limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
+    SRV_TRC(" - cache state: %zu prompts, %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est)\n",
+            states.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
 
     for (const auto & state : states) {
-        SRV_INF("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
+        SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
                 (const void *)&state, state.n_tokens(), state.checkpoints.size(), state.size() / (1024.0 * 1024.0));
     }
 }
