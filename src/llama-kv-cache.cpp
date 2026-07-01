@@ -191,17 +191,27 @@ llama_kv_cache::llama_kv_cache(
             const int32_t il_share = share(il);
 
             if (il_share >= 0) {
-                const auto & layer_share = other->layers[other->map_layer_ids[il_share]];
+                // Check if backend supports cross-context tensor sharing
+                auto * dev = model.dev_layer(il);
+                ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+                const char * backend_name = ggml_backend_buft_name(buft);
+                
+                // Vulkan doesn't support cross-context pre-allocated tensors
+                if (strstr(backend_name, "Vulkan") == nullptr) {
+                    const auto & layer_share = other->layers[other->map_layer_ids[il_share]];
 
-                LLAMA_LOG_WARN("%s: layer %3d: sharing with layer %d. k = %p, v = %p\n", __func__, il, il_share,
-                        layer_share.k->data, layer_share.v->data);
+                    LLAMA_LOG_WARN("%s: layer %3d: sharing with layer %d. k = %p, v = %p\n", __func__, il, il_share,
+                            layer_share.k->data, layer_share.v->data);
 
-                map_layer_ids[il] = layers.size();
+                    map_layer_ids[il] = layers.size();
 
-                layers.push_back(layer_share);
-                layers.back().il = il;
+                    layers.push_back(layer_share);
+                    layers.back().il = il;
 
-                continue;
+                    continue;
+                } else {
+                    LLAMA_LOG_WARN("%s: layer %3d: skipping cross-context sharing on Vulkan backend\n", __func__, il);
+                }
             }
         }
 

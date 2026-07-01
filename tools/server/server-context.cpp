@@ -1484,7 +1484,11 @@ private:
                 vocab_hash = h;
             }
 
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            prompt_cache = std::make_unique<server_prompt_cache>(
+                params_base.cache_ram_mib, n_ctx,
+                params_base.cache_disk_path, params_base.cache_disk_queue_depth,
+                params_base.checkpoint_spill_max,
+                arch_hash, vocab_hash);
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
