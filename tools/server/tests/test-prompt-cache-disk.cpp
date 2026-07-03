@@ -101,13 +101,14 @@ static void test_lazy_registration_roundtrip() {
     const uint32_t arch = 0xA0A0A0A0u, vocab = 0xB1B1B1B1u;
     server_prompt_cache cache(64, 0, dir, 16, -1, arch, vocab);
 
-    const int32_t slot = 1;
+    const std::string cid = "conv_lazy";
     const common_prompt_checkpoint cp = make_ckpt(/*pos_min*/ 100, /*pos_max*/ 150, /*n_tokens*/ 151,
                                                   /*tgt_n*/ 2048, /*dft_n*/ 512, /*seed*/ 42);
-    cache.spill_checkpoint(cp, slot);
+    cache.spill_checkpoint(cp, cid);
 
-    server_prompt prompt; // empty slot prompt
-    cache.merge_checkpoint_spills(prompt, slot);
+    server_prompt prompt;
+    prompt.conversation_id = cid;
+    cache.merge_checkpoint_spills(prompt);
 
     CHECK(prompt.checkpoints.size() == 1);
     if (prompt.checkpoints.empty()) {
@@ -149,12 +150,13 @@ static void test_hash_mismatch_rejected() {
     const std::string dir = make_temp_dir("mismatch");
     {
         server_prompt_cache writer(64, 0, dir, 16, -1, 0x11111111u, 0x22222222u);
-        writer.spill_checkpoint(make_ckpt(10, 20, 21, 256, 64, 1), 0);
+        writer.spill_checkpoint(make_ckpt(10, 20, 21, 256, 64, 1), "conv_hash_mm");
     }
     // reader has a different arch hash
     server_prompt_cache reader(64, 0, dir, 16, -1, 0x99999999u, 0x22222222u);
     server_prompt prompt;
-    reader.merge_checkpoint_spills(prompt, 0);
+    prompt.conversation_id = "conv_hash_mm";
+    reader.merge_checkpoint_spills(prompt);
     CHECK(prompt.checkpoints.empty());
     fs::remove_all(dir);
 }
@@ -164,9 +166,10 @@ static void test_dup_pos_min_skipped() {
     std::printf("test_dup_pos_min_skipped\n");
     const std::string dir = make_temp_dir("dup");
     server_prompt_cache cache(64, 0, dir, 16, -1, 0x5u, 0x6u);
-    cache.spill_checkpoint(make_ckpt(200, 250, 251, 128, 0, 9), 2);
+    cache.spill_checkpoint(make_ckpt(200, 250, 251, 128, 0, 9), "conv_dup");
 
     server_prompt prompt;
+    prompt.conversation_id = "conv_dup";
     common_prompt_checkpoint existing;
     existing.pos_min  = 200;
     existing.pos_max  = 250;
@@ -174,25 +177,27 @@ static void test_dup_pos_min_skipped() {
     existing.data_tgt.assign(10, 0xFF); // resident; must be left untouched
     prompt.checkpoints.push_back(existing);
 
-    cache.merge_checkpoint_spills(prompt, 2);
+    cache.merge_checkpoint_spills(prompt);
     CHECK(prompt.checkpoints.size() == 1);
     CHECK(prompt.checkpoints.front().data_tgt.size() == 10);
     fs::remove_all(dir);
 }
 
-// merge only picks up files belonging to the requested slot id
-static void test_slot_filter() {
-    std::printf("test_slot_filter\n");
-    const std::string dir = make_temp_dir("slot");
+// merge only picks up files belonging to the prompt's conversation_id
+static void test_conversation_filter() {
+    std::printf("test_conversation_filter\n");
+    const std::string dir = make_temp_dir("conv");
     server_prompt_cache cache(64, 0, dir, 16, -1, 0x7u, 0x8u);
-    cache.spill_checkpoint(make_ckpt(5, 9, 10, 64, 0, 3), /*slot*/ 0);
+    cache.spill_checkpoint(make_ckpt(5, 9, 10, 64, 0, 3), "conv_a");
 
     server_prompt other;
-    cache.merge_checkpoint_spills(other, /*slot*/ 1);
+    other.conversation_id = "conv_b";
+    cache.merge_checkpoint_spills(other);
     CHECK(other.checkpoints.empty());
 
     server_prompt same;
-    cache.merge_checkpoint_spills(same, /*slot*/ 0);
+    same.conversation_id = "conv_a";
+    cache.merge_checkpoint_spills(same);
     CHECK(same.checkpoints.size() == 1);
     fs::remove_all(dir);
 }
@@ -203,12 +208,13 @@ static void test_corrupt_file_skipped() {
     const std::string dir = make_temp_dir("corrupt");
     server_prompt_cache cache(64, 0, dir, 16, -1, 0x1u, 0x2u);
     {
-        std::ofstream f(fs::path(dir) / "cp_0_5_deadbeef.bin", std::ios::binary);
+        std::ofstream f(fs::path(dir) / "cp_conv_corrupt_5.bin", std::ios::binary);
         const uint32_t junk[8] = {0, 1, 2, 3, 4, 5, 6, 7};
         f.write(reinterpret_cast<const char *>(junk), sizeof(junk));
     }
     server_prompt prompt;
-    cache.merge_checkpoint_spills(prompt, 0);
+    prompt.conversation_id = "conv_corrupt";
+    cache.merge_checkpoint_spills(prompt);
     CHECK(prompt.checkpoints.empty());
     fs::remove_all(dir);
 }
@@ -218,12 +224,13 @@ static void test_sorted_by_pos_min() {
     std::printf("test_sorted_by_pos_min\n");
     const std::string dir = make_temp_dir("sorted");
     server_prompt_cache cache(64, 0, dir, 16, -1, 0x3u, 0x4u);
-    cache.spill_checkpoint(make_ckpt(300, 310, 311, 32, 0, 1), 0);
-    cache.spill_checkpoint(make_ckpt(100, 110, 111, 32, 0, 2), 0);
-    cache.spill_checkpoint(make_ckpt(200, 210, 211, 32, 0, 3), 0);
+    cache.spill_checkpoint(make_ckpt(300, 310, 311, 32, 0, 1), "conv_sorted");
+    cache.spill_checkpoint(make_ckpt(100, 110, 111, 32, 0, 2), "conv_sorted");
+    cache.spill_checkpoint(make_ckpt(200, 210, 211, 32, 0, 3), "conv_sorted");
 
     server_prompt prompt;
-    cache.merge_checkpoint_spills(prompt, 0);
+    prompt.conversation_id = "conv_sorted";
+    cache.merge_checkpoint_spills(prompt);
     CHECK(prompt.checkpoints.size() == 3);
 
     std::vector<int32_t> pos;
@@ -283,7 +290,7 @@ int main() {
     test_lazy_registration_roundtrip();
     test_hash_mismatch_rejected();
     test_dup_pos_min_skipped();
-    test_slot_filter();
+    test_conversation_filter();
     test_corrupt_file_skipped();
     test_sorted_by_pos_min();
     test_over_budget_reflects_ram_limit();

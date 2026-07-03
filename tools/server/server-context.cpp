@@ -230,6 +230,8 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
+        SRV_INF("prompt_save: conversation_id=%s\n", prompt.conversation_id.c_str());
+
         auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
         if (cur == nullptr) {
             return false;
@@ -243,8 +245,8 @@ struct server_slot {
         return true;
     }
 
-    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, const std::string & conversation_id) {
+        bool res = prompt_cache.load(prompt, tokens, conversation_id, ctx_tgt, ctx_dft, id);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -1774,7 +1776,7 @@ private:
                     prompt_cache->spill_all_to_disk();
                 }
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                if (!ret->prompt_load(*prompt_cache, task.tokens, task.conversation_id)) {
                     ret->prompt_clear(false);
                 }
 
@@ -1794,7 +1796,7 @@ private:
                 // prompt_load() is never called on this path, so merge_checkpoint_spills()
                 // must be called explicitly to make disk-spilled checkpoints visible to the
                 // rewind logic in update_slots().
-                prompt_cache->merge_checkpoint_spills(ret->prompt, ret->id);
+                prompt_cache->merge_checkpoint_spills(ret->prompt);
             }
         }
 
@@ -1962,6 +1964,7 @@ private:
         }
 
         slot.task = std::make_unique<const server_task>(std::move(task));
+        slot.prompt.conversation_id = slot.task->conversation_id;
 
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
@@ -2468,7 +2471,7 @@ private:
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
             if (prompt_cache) {
-                prompt_cache->spill_checkpoint(cur, slot.id);
+                prompt_cache->spill_checkpoint(cur, slot.prompt.conversation_id);
             }
 
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
@@ -4310,6 +4313,22 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     data);
 
             task.params.message_spans = task.tokens.find_message_spans(delimiters);
+
+            // Compute conversation ID: hash of system + first user message tokens.
+            {
+                size_t conv_boundary = 0;
+                for (const auto & span : task.params.message_spans.spans) {
+                    if (span.role == COMMON_CHAT_ROLE_USER) {
+                        conv_boundary = span.pos + span.len;
+                        break;
+                    }
+                }
+                if (conv_boundary > 0) {
+                    task.conversation_id = generate_conversation_id(task.tokens, conv_boundary);
+                }
+                SRV_INF("task created: conversation_id=%s (tokens 0..%zu, system+first_user)\n",
+                        task.conversation_id.c_str(), conv_boundary);
+            }
 
             task.id_slot = json_value(data, "id_slot", -1);
 

@@ -34,21 +34,12 @@ constexpr uint32_t DISK_CACHE_VERSION = 2;
 // checkpoint spill files — written by spill_checkpoint() when create_checkpoint() evicts an old
 // checkpoint to make room for a new one. format: magic, version, arch_hash, vocab_hash,
 // pos_min (i32), pos_max (i32), n_tokens (i64), data_tgt_size (u64), data_tgt, data_dft_size (u64), data_dft.
-// files are named cp_{pos_min}_{uuid}.bin and live in the same disk_path as cache entry files.
-// try_match_disk skips them (wrong magic); merge_checkpoint_spills() reads them.
+// checkpoint spill files are named cp_{conversation_id}_{pos_min}.bin
+// cache entry files are named {conversation_id}.bin
+// both live in disk_path
 constexpr uint32_t CHECKPOINT_SPILL_MAGIC   = 0x43504B44; // 'CPKD'
 constexpr uint32_t CHECKPOINT_SPILL_VERSION = 1;
 
-std::string gen_disk_cache_uuid() {
-    static thread_local std::mt19937_64 rng{std::random_device{}()};
-    std::uniform_int_distribution<uint64_t> dist;
-    const uint64_t a = dist(rng);
-    const uint64_t b = dist(rng);
-    char buf[33];
-    std::snprintf(buf, sizeof(buf), "%016llx%016llx",
-                  (unsigned long long) a, (unsigned long long) b);
-    return std::string(buf);
-}
 
 static bool read_disk_u32(std::ifstream & f, uint32_t & v)
 {
@@ -1735,12 +1726,13 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
             /*.drft =*/ std::move(state_data_dft),
         },
         /*.checkpoints =*/ prompt.checkpoints,
+        /*.conversation_id =*/ prompt.conversation_id,
     });
 
     return &states.back();
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, const std::string & conversation_id, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -1845,8 +1837,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         prompt.tokens      = pending_winner->tokens.clone();
         prompt.data        = {};
         prompt.checkpoints = pending_winner->checkpoints;
+        prompt.conversation_id = pending_winner->conversation_id;
         if (!disk_path.empty()) {
-            merge_checkpoint_spills(prompt, id_slot);
+            merge_checkpoint_spills(prompt);
         }
         return true;
     }
@@ -1908,18 +1901,19 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         prompt.tokens      = it_best->tokens.clone();
         prompt.data        = {};
         prompt.checkpoints = it_best->checkpoints;
+        prompt.conversation_id = it_best->conversation_id;
 
         if (!disk_path.empty()) {
-            merge_checkpoint_spills(prompt, id_slot);
+            merge_checkpoint_spills(prompt);
         }
         return true;
     }
 
-    // Phase 3: disk fallback
-    if (!disk_path.empty()) {
-        if (try_match_disk(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot)) {
+    // Phase 3: disk fallback — direct lookup by conversation_id
+    if (!disk_path.empty() && !conversation_id.empty()) {
+        if (load_from_disk(prompt, conversation_id, ctx_tgt, ctx_dft, id_slot)) {
             SRV_WRN("%s", " - restored from disk\n");
-            merge_checkpoint_spills(prompt, id_slot);
+            merge_checkpoint_spills(prompt);
             return true;
         }
     }
@@ -1944,8 +1938,8 @@ void server_prompt_cache::update() {
 
         // Spill: move oldest entry to pending_spill, enqueue for async write.
         // On queue overflow, fall through to a synchronous write on this thread (lossless).
-        std::string uuid     = gen_disk_cache_uuid();
-        std::string filepath = (std::filesystem::path(disk_path) / (uuid + ".bin")).string();
+        const std::string conv_id = states.front().conversation_id;
+        std::string filepath = (std::filesystem::path(disk_path) / (conv_id + ".bin")).string();
 
         auto entry_ptr = std::make_shared<server_prompt>(std::move(states.front()));
         states.pop_front();
@@ -1954,7 +1948,7 @@ void server_prompt_cache::update() {
         pending_spill.push_back(entry_ptr);
 
         if ((int32_t) queue.size() < queue_depth) {
-            queue.push_back({uuid, filepath, entry_ptr});
+            queue.push_back({conv_id, filepath, entry_ptr});
             cv.notify_one();
             SRV_WRN(" - spilling oldest entry to disk (async, queued %zu/%d, size = %.3f MiB)\n",
                     queue.size(), queue_depth, entry_ptr->size() / (1024.0 * 1024.0));
@@ -2027,8 +2021,7 @@ void server_prompt_cache::spill_all_to_disk() {
             continue;
         }
 
-        const std::string uuid     = gen_disk_cache_uuid();
-        const std::string filepath = (std::filesystem::path(disk_path) / (uuid + ".bin")).string();
+        const std::string filepath = (std::filesystem::path(disk_path) / (front.conversation_id + ".bin")).string();
 
         // synchronous write on the calling thread, then free the host copy. losing a
         // failed write only costs a reprocess on next use — never a crash.
@@ -2244,14 +2237,18 @@ bool server_prompt_cache::write_entry_to_file(const std::string & filepath, cons
     return true;
 }
 
-void server_prompt_cache::spill_checkpoint(const common_prompt_checkpoint & cp, int32_t slot_id) {
+void server_prompt_cache::spill_checkpoint(const common_prompt_checkpoint & cp, const std::string & conversation_id) {
     if (disk_path.empty()) {
         return;
     }
 
-    // filename encodes slot_id so the limit and merge logic can filter per conversation
-    const std::string uuid     = gen_disk_cache_uuid();
-    const std::string filename = "cp_" + std::to_string(slot_id) + "_" + std::to_string(cp.pos_min) + "_" + uuid + ".bin";
+    if (conversation_id.empty()) {
+            SRV_WRN("%s", "checkpoint spill: conversation_id is empty, refusing to write (no fallback)\n");
+        return;
+    }
+
+    // filename encodes conversation_id so the limit and merge logic can filter per conversation
+    const std::string filename = "cp_" + conversation_id + "_" + std::to_string(cp.pos_min) + ".bin";
     const std::filesystem::path filepath = std::filesystem::path(disk_path) / filename;
     const std::filesystem::path tmppath  = std::filesystem::path(disk_path) / (filename + ".tmp");
 
@@ -2305,7 +2302,7 @@ void server_prompt_cache::spill_checkpoint(const common_prompt_checkpoint & cp, 
         return;
     }
 
-    // enforce the per-slot checkpoint spill limit by deleting the files that cover
+    // enforce the per-conversation checkpoint spill limit by deleting the files that cover
     // the lowest positions (they are the least useful for future rewinds)
     if (checkpoint_spill_max > 0) {
         struct cp_entry {
@@ -2314,8 +2311,8 @@ void server_prompt_cache::spill_checkpoint(const common_prompt_checkpoint & cp, 
         };
         std::vector<cp_entry> cp_files;
 
-        // only consider files belonging to this slot: cp_{slot_id}_{pos_min}_{uuid}.bin
-        const std::string slot_prefix = "cp_" + std::to_string(slot_id) + "_";
+        // only consider files belonging to this conversation: cp_{conversation_id}_{pos_min}.bin
+        const std::string conv_prefix = "cp_" + conversation_id + "_";
 
         std::error_code ec2;
         for (const auto & e : std::filesystem::directory_iterator(disk_path, ec2)) {
@@ -2324,11 +2321,11 @@ void server_prompt_cache::spill_checkpoint(const common_prompt_checkpoint & cp, 
             if (e.path().extension() != ".bin") {
                 continue;
             }
-            if (fn.size() <= slot_prefix.size() || fn.compare(0, slot_prefix.size(), slot_prefix) != 0) {
+            if (fn.size() <= conv_prefix.size() || fn.compare(0, conv_prefix.size(), conv_prefix) != 0) {
                 continue;
             }
-            // parse pos_min: the field immediately after the slot_id prefix
-            const size_t pmin_start = slot_prefix.size();
+            // parse pos_min: the field immediately after the conversation_id prefix
+            const size_t pmin_start = conv_prefix.size();
             const size_t pmin_end   = fn.find('_', pmin_start);
             if (pmin_end == std::string::npos) {
                 continue;
@@ -2370,8 +2367,13 @@ void server_prompt_cache::spill_checkpoint(const common_prompt_checkpoint & cp, 
     }
 }
 
-void server_prompt_cache::merge_checkpoint_spills(server_prompt & prompt, int32_t slot_id) {
+void server_prompt_cache::merge_checkpoint_spills(server_prompt & prompt) {
     if (disk_path.empty()) {
+        return;
+    }
+
+    if (prompt.conversation_id.empty()) {
+            SRV_WRN("%s", "checkpoint merge: conversation_id is empty, refusing to scan disk (no fallback)\n");
         return;
     }
 
@@ -2388,8 +2390,8 @@ void server_prompt_cache::merge_checkpoint_spills(server_prompt & prompt, int32_
 
     std::list<common_prompt_checkpoint> new_ckpts;
 
-    // only load files that belong to this slot: cp_{slot_id}_{pos_min}_{uuid}.bin
-    const std::string slot_prefix = "cp_" + std::to_string(slot_id) + "_";
+    // only load files that belong to this conversation: cp_{conversation_id}_{pos_min}.bin
+    const std::string conv_prefix = "cp_" + prompt.conversation_id + "_";
 
     for (const auto & entry : std::filesystem::directory_iterator(disk_path, ec)) {
         if (ec) break;
@@ -2397,7 +2399,7 @@ void server_prompt_cache::merge_checkpoint_spills(server_prompt & prompt, int32_
         if (entry.path().extension() != ".bin") {
             continue;
         }
-        if (fname.size() <= slot_prefix.size() || fname.compare(0, slot_prefix.size(), slot_prefix) != 0) {
+        if (fname.size() <= conv_prefix.size() || fname.compare(0, conv_prefix.size(), conv_prefix) != 0) {
             continue;
         }
         ++n_scanned;
@@ -2503,192 +2505,98 @@ void server_prompt_cache::merge_checkpoint_spills(server_prompt & prompt, int32_
     }
 }
 
-bool server_prompt_cache::try_match_disk(server_prompt & prompt, const server_tokens & tokens_new,
+bool server_prompt_cache::load_from_disk(server_prompt & prompt, const std::string & conversation_id,
                                           llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
-    SRV_INF("try_match_disk: enter, disk_path='%s', tokens_new.size=%zu, id_slot=%d, ctx_dft=%p\n",
-            disk_path.c_str(), tokens_new.size(), id_slot, (void *) ctx_dft);
-    if (disk_path.empty()) {
-        SRV_INF("%s", "try_match_disk: disk_path empty → return false\n");
+    if (disk_path.empty() || conversation_id.empty()) {
         return false;
     }
+
+    const std::filesystem::path filepath = std::filesystem::path(disk_path) / (conversation_id + ".bin");
+    SRV_INF("load_from_disk: trying '%s'\n", filepath.string().c_str());
 
     std::error_code ec;
-    if (!std::filesystem::exists(disk_path, ec) || ec) {
-        SRV_WRN("try_match_disk: disk_path does not exist (ec=%s) → return false\n", ec.message().c_str());
+    if (!std::filesystem::exists(filepath, ec) || ec) {
+        SRV_INF("load_from_disk: '%s' not found\n", filepath.string().c_str());
         return false;
     }
 
-    struct disk_match {
-        std::filesystem::path path;
-        std::vector<llama_token> tokens;
-        uint64_t main_size = 0;
-        uint64_t drft_size = 0;
-        std::streampos main_offset {};
-        float f_keep = 0.0f;
-        float sim    = 0.0f;
-    };
-
-      disk_match best;
-      bool have_best = false;
-    float f_keep_best = 0.25f; // threshold floor
-    float sim_best    = -1.0f;
-
-    const bool runtime_has_dft = (ctx_dft != nullptr);
-
-    int n_scanned = 0;
-    int n_rejected_header = 0;
-    int n_rejected_hash = 0;
-    int n_rejected_capacity = 0;
-    int n_rejected_asym = 0;
-    int n_rejected_score = 0;
-    for (const auto & entry : std::filesystem::directory_iterator(disk_path, ec)) {
-        if (ec) break;
-        if (entry.path().extension() != ".bin") continue;
-        ++n_scanned;
-
-        std::ifstream f(entry.path(), std::ios::binary);
-        if (!f) continue;
-
-          uint32_t magic;
-          if (!read_disk_u32(f, magic)) continue;
-          uint32_t version;
-          if (!read_disk_u32(f, version)) continue;
-
-          if (magic != DISK_CACHE_MAGIC) {
-              // not a cache entry file — skip without deleting, I want to avoid deleting as there may be anything else
-              // in the folder, and we should not delete unless it's obvious for the user that risk exists
-              SRV_INF("try_match_disk: '%s' wrong magic (0x%08x) — skip\n",
-                      entry.path().filename().c_str(), magic);
-              continue;
-          }
-
-          // I'm deciding to skip instead of deleting if the version doesn't match the current version, as the directory
-          // may be used by more than one version
-          if (version != DISK_CACHE_VERSION) {
-              ++n_rejected_header;
-              SRV_INF("try_match_disk: '%s' wrong version (%s) → skip\n",
-                      entry.path().filename().c_str(), std::to_string(version).c_str());
-              continue;
-          }
-
-          uint32_t fa;
-          if (!read_disk_u32(f, fa)) { ++n_rejected_header; continue; }
-          uint32_t fv;
-          if (!read_disk_u32(f, fv)) { ++n_rejected_header; continue; }
-          uint32_t fn_ctx;
-          if (!read_disk_u32(f, fn_ctx)) { ++n_rejected_header; continue; }
-          uint32_t n_tok;
-          if (!read_disk_u32(f, n_tok)) { ++n_rejected_header; continue; }
-          (void) fn_ctx;
-          if (!fa || !fv || !n_tok) { ++n_rejected_header; continue; }
-          if (fa != arch_hash || fv != vocab_hash) {
-              ++n_rejected_hash;
-              SRV_INF("try_match_disk: '%s' arch/vocab mismatch (file arch=0x%08x vocab=0x%08x, runtime arch=0x%08x vocab=0x%08x) → skip\n",
-                      entry.path().filename().c_str(), fa, fv, arch_hash, vocab_hash);
-              continue;
-          }
-          if (limit_tokens > 0 && n_tok > limit_tokens) {
-              ++n_rejected_capacity;
-              SRV_INF("try_match_disk: '%s' too many tokens (%u > %zu) → skip\n",
-                      entry.path().filename().c_str(), n_tok, limit_tokens);
-              continue;
-          }
-
-          std::vector<llama_token> toks(n_tok);
-          if (n_tok > 0) {
-              f.read(reinterpret_cast<char *>(toks.data()),
-                     static_cast<std::streamsize>(n_tok * sizeof(llama_token)));
-              if (!f) continue;
-          }
-
-          uint64_t main_sz;
-          if (!read_disk_u64(f, main_sz)) continue;
-          std::streampos main_off = f.tellg();
-          f.seekg(static_cast<std::streamoff>(main_sz), std::ios::cur);
-          uint64_t drft_sz;
-          if (!read_disk_u64(f, drft_sz)) continue;
-
-          // asymmetric file rule: runtime has draft but file has none → skip
-          if (runtime_has_dft && drft_sz == 0) {
-              ++n_rejected_asym;
-              SRV_INF("try_match_disk: '%s' asymmetric (runtime has drft, file does not) → skip\n",
-                      entry.path().filename().c_str());
-              continue;
-          }
-
-          // score against tokens_new
-          const llama_tokens & new_toks = tokens_new.get_tokens();
-          int lcp = 0;
-          const int n_min = std::min((int) toks.size(), (int) new_toks.size());
-          while (lcp < n_min && toks[lcp] == new_toks[lcp]) {
-              lcp++;
-          }
-
-          const float f_keep_cur = float(lcp) / float(toks.size());
-          const float sim_cur    = tokens_new.size() > 0 ? float(lcp) / float(tokens_new.size()) : 0.0f;
-
-          SRV_INF("try_match_disk: '%s' n_tok=%u main_size=%llu drft_size=%llu lcp=%d f_keep=%.3f sim=%.3f\n",
-                  entry.path().filename().c_str(), n_tok,
-                  (unsigned long long) main_sz, (unsigned long long) drft_sz,
-                  lcp, f_keep_cur, sim_cur);
-
-          if (f_keep_cur < 0.25f) { ++n_rejected_score; continue; }
-
-          // maximize prefix reuse: pick the highest sim (= longest common prefix
-          // with the new prompt = fewest tokens to reprocess). break ties by
-          // higher f_keep (less of the cached state wasted on a non-matching tail).
-          // the f_keep >= 0.25 gate above is the floor; f_keep must NOT be a
-          // co-equal maximization term — it saturates at 1.0 and would otherwise
-          // lock the winner to the first fully-contained file in scan order,
-          // ignoring a much longer (higher-sim) match. [TAG_CACHE_SELECT_SIM]
-          if (sim_cur > sim_best || (sim_cur == sim_best && f_keep_cur > f_keep_best)) {
-              f_keep_best = f_keep_cur;
-              sim_best    = sim_cur;
-              best = disk_match{
-                  entry.path(),
-                  std::move(toks),
-                  main_sz,
-                  drft_sz,
-                  main_off,
-                  f_keep_cur,
-                  sim_cur,
-              };
-              have_best = true;
-          }
-    }
-
-    SRV_INF("try_match_disk: scan summary — scanned=%d hdr_rej=%d hash_rej=%d cap_rej=%d asym_rej=%d score_rej=%d winner=%s\n",
-            n_scanned, n_rejected_header, n_rejected_hash, n_rejected_capacity, n_rejected_asym, n_rejected_score,
-            have_best ? best.path.filename().c_str() : "(none)");
-
-      if (!have_best) {
-        return false;
-    }
-      SRV_INF("try_match_disk: winner '%s' n_tok=%zu main_size=%llu drft_size=%llu f_keep=%.3f sim=%.3f\n",
-              best.path.filename().c_str(), best.tokens.size(),
-              (unsigned long long) best.main_size, (unsigned long long) best.drft_size,
-              best.f_keep, best.sim);
-
-    // Re-open the chosen file and read the state blobs.
-    // Layout from best->main_offset onward: [main_bytes][drft_size: u64][drft_bytes]
-    //                                       [n_ckpts: u32][per-ckpt: n_tokens,i64; pos_min,i32; pos_max,i32;
-    //                                       data_tgt_size,u64; data_tgt; data_dft_size,u64; data_dft]
-      std::ifstream f(best.path, std::ios::binary);
+    std::ifstream f(filepath, std::ios::binary);
     if (!f) {
         return false;
     }
-      f.seekg(best.main_offset);
 
-      std::vector<uint8_t> main_bytes(static_cast<size_t>(best.main_size));
-      if (best.main_size > 0) {
-        f.read(reinterpret_cast<char *>(main_bytes.data()),
-                 static_cast<std::streamsize>(best.main_size));
+    // Read and validate header
+    uint32_t magic;
+    if (!read_disk_u32(f, magic)) return false;
+    uint32_t version;
+    if (!read_disk_u32(f, version)) return false;
+
+    if (magic != DISK_CACHE_MAGIC) {
+        SRV_INF("load_from_disk: '%s' wrong magic (0x%08x)\n", filepath.filename().c_str(), magic);
+        return false;
+    }
+    if (version != DISK_CACHE_VERSION) {
+        SRV_INF("load_from_disk: '%s' wrong version (%s)\n", filepath.filename().c_str(), std::to_string(version).c_str());
+        return false;
+    }
+
+    uint32_t fa;
+    if (!read_disk_u32(f, fa)) return false;
+    uint32_t fv;
+    if (!read_disk_u32(f, fv)) return false;
+    uint32_t fn_ctx;
+    if (!read_disk_u32(f, fn_ctx)) return false;
+    (void) fn_ctx;
+    uint32_t n_tok;
+    if (!read_disk_u32(f, n_tok)) return false;
+
+    if (!fa || !fv || !n_tok) return false;
+    if (fa != arch_hash || fv != vocab_hash) {
+        SRV_INF("load_from_disk: '%s' arch/vocab mismatch\n", filepath.filename().c_str());
+        return false;
+    }
+    if (limit_tokens > 0 && n_tok > limit_tokens) {
+        SRV_INF("load_from_disk: '%s' too many tokens (%u > %zu)\n", filepath.filename().c_str(), n_tok, limit_tokens);
+        return false;
+    }
+
+    // Read tokens
+    std::vector<llama_token> toks(n_tok);
+    if (n_tok > 0) {
+        f.read(reinterpret_cast<char *>(toks.data()), static_cast<std::streamsize>(n_tok * sizeof(llama_token)));
         if (!f) return false;
     }
 
-    // drft_size is always present (u64); skip past it (and any bytes) regardless of whether the
-    // file carries draft data. The asymmetric-file rule (file-no-drft × runtime-has-drft) was
-    // enforced during the scan phase above, so we can trust the file's drft_size here.
+    // Read main state size and position
+    uint64_t main_sz;
+    if (!read_disk_u64(f, main_sz)) return false;
+    std::streampos main_off = f.tellg();
+    f.seekg(static_cast<std::streamoff>(main_sz), std::ios::cur);
+
+    // Read draft state size
+    uint64_t drft_sz;
+    if (!read_disk_u64(f, drft_sz)) return false;
+
+    const bool runtime_has_dft = (ctx_dft != nullptr);
+    if (runtime_has_dft && drft_sz == 0) {
+        SRV_INF("load_from_disk: '%s' asymmetric (runtime has drft, file does not)\n", filepath.filename().c_str());
+        return false;
+    }
+
+    SRV_INF("load_from_disk: '%s' n_tok=%u main_size=%llu drft_size=%llu\n",
+            filepath.filename().c_str(), n_tok,
+            (unsigned long long) main_sz, (unsigned long long) drft_sz);
+
+    // Re-read from main state offset
+    f.seekg(main_off);
+
+    std::vector<uint8_t> main_bytes(static_cast<size_t>(main_sz));
+    if (main_sz > 0) {
+        f.read(reinterpret_cast<char *>(main_bytes.data()), static_cast<std::streamsize>(main_sz));
+        if (!f) return false;
+    }
+
+    // Draft state
     uint64_t drft_sz_read = 0;
     f.read(reinterpret_cast<char *>(&drft_sz_read), sizeof(drft_sz_read));
     if (!f) return false;
@@ -2696,12 +2604,11 @@ bool server_prompt_cache::try_match_disk(server_prompt & prompt, const server_to
     std::vector<uint8_t> drft_bytes;
     if (drft_sz_read > 0) {
         drft_bytes.resize(static_cast<size_t>(drft_sz_read));
-        f.read(reinterpret_cast<char *>(drft_bytes.data()),
-               static_cast<std::streamsize>(drft_sz_read));
+        f.read(reinterpret_cast<char *>(drft_bytes.data()), static_cast<std::streamsize>(drft_sz_read));
         if (!f) return false;
     }
 
-    // checkpoints section
+    // Checkpoints section
     uint32_t n_ckpts = 0;
     f.read(reinterpret_cast<char *>(&n_ckpts), sizeof(n_ckpts));
     if (!f) return false;
@@ -2726,8 +2633,7 @@ bool server_prompt_cache::try_match_disk(server_prompt & prompt, const server_to
         cp.pos_max  = pos_max_v;
         if (tgt_sz > 0) {
             cp.data_tgt.resize(static_cast<size_t>(tgt_sz));
-            f.read(reinterpret_cast<char *>(cp.data_tgt.data()),
-                   static_cast<std::streamsize>(tgt_sz));
+            f.read(reinterpret_cast<char *>(cp.data_tgt.data()), static_cast<std::streamsize>(tgt_sz));
             if (!f) return false;
         }
 
@@ -2735,60 +2641,37 @@ bool server_prompt_cache::try_match_disk(server_prompt & prompt, const server_to
         if (!f) return false;
         if (dft_sz > 0) {
             cp.data_dft.resize(static_cast<size_t>(dft_sz));
-            f.read(reinterpret_cast<char *>(cp.data_dft.data()),
-                   static_cast<std::streamsize>(dft_sz));
+            f.read(reinterpret_cast<char *>(cp.data_dft.data()), static_cast<std::streamsize>(dft_sz));
             if (!f) return false;
         }
-
-        SRV_INF("try_match_disk: read checkpoint %u/%u n_tokens=%lld pos_min=%d pos_max=%d tgt_sz=%llu dft_sz=%llu\n",
-                i + 1, n_ckpts, (long long) n_tokens_v, pos_min_v, pos_max_v,
-                (unsigned long long) tgt_sz, (unsigned long long) dft_sz);
 
         restored_ckpts.push_back(std::move(cp));
     }
     f.close();
-    SRV_INF("try_match_disk: read %u checkpoints from file, file closed\n", n_ckpts);
 
-    // Restore into the slot's seq via the same primitive the RAM path uses
-    const size_t n_main = llama_state_seq_set_data_ext(ctx_tgt, main_bytes.data(),
-                                                        main_bytes.size(), id_slot, 0);
-    SRV_INF("try_match_disk: set_data_ext(main) returned %zu/%zu, post pos_min=%d pos_max=%d\n",
-            n_main, main_bytes.size(),
-            (int) llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id_slot),
-            (int) llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), id_slot));
+    // Restore state into context
+    const size_t n_main = llama_state_seq_set_data_ext(ctx_tgt, main_bytes.data(), main_bytes.size(), id_slot, 0);
     if (n_main != main_bytes.size()) {
-        SRV_INF("disk cache: set_data_ext (main) returned %zu of %zu\n", n_main, main_bytes.size());
+        SRV_INF("load_from_disk: set_data_ext (main) returned %zu of %zu\n", n_main, main_bytes.size());
         return false;
     }
 
-      if (runtime_has_dft && best.drft_size > 0) {
-        const size_t n_drft = llama_state_seq_set_data_ext(ctx_dft, drft_bytes.data(),
-                                                            drft_bytes.size(), id_slot, 0);
-        SRV_INF("try_match_disk: set_data_ext(drft) returned %zu/%zu, post pos_min=%d pos_max=%d\n",
-                n_drft, drft_bytes.size(),
-                (int) llama_memory_seq_pos_min(llama_get_memory(ctx_dft), id_slot),
-                (int) llama_memory_seq_pos_max(llama_get_memory(ctx_dft), id_slot));
+    if (runtime_has_dft && !drft_bytes.empty()) {
+        const size_t n_drft = llama_state_seq_set_data_ext(ctx_dft, drft_bytes.data(), drft_bytes.size(), id_slot, 0);
         if (n_drft != drft_bytes.size()) {
-            SRV_INF("disk cache: set_data_ext (drft) returned %zu of %zu\n", n_drft, drft_bytes.size());
+            SRV_INF("load_from_disk: set_data_ext (drft) returned %zu of %zu\n", n_drft, drft_bytes.size());
             return false;
         }
     }
 
-    // populate prompt.tokens with the file's tokens
+    // Populate prompt
     prompt.tokens.clear();
-      prompt.tokens.insert(best.tokens);
-    SRV_INF("try_match_disk: post-restore prompt.tokens.size=%zu prompt.checkpoints.size_about_to_be=%zu\n",
-            prompt.tokens.size(), restored_ckpts.size());
-
-    // hand the checkpoints to the slot's prompt — the rewind logic at
-    // server-context.cpp:2620-2641 walks this list to recover earlier-position state
-    // for SWA / hybrid / recurrent models when the main blob's window is past pos_min_thold.
+    prompt.tokens.insert(toks);
     prompt.checkpoints = std::move(restored_ckpts);
 
-    // NON-CONSUMING: leave the file on disk for future matches.
-    // See [TAG_CACHE_DONT_DELETE] in this file and the 2026-05-28 entry in
-    // ContextFiles/context-disk-cache-eviction.md.  External cleanup
-    // (cron / systemd-timer) is responsible for deleting old files.
+    SRV_INF("load_from_disk: restored '%s' tokens=%zu checkpoints=%zu\n",
+            filepath.filename().c_str(), prompt.tokens.size(), prompt.checkpoints.size());
+
     return true;
 }
 
@@ -2847,8 +2730,7 @@ void server_prompt_cache::shutdown_and_spill() {
         pending_spill.pop_front();
         ++n_done;
         SRV_WRN("disk cache: shutdown spill %d/%d (from pending)\n", n_done, n_total);
-        const std::string uuid     = gen_disk_cache_uuid();
-        const std::string filepath = (std::filesystem::path(disk_path) / (uuid + ".bin")).string();
+        const std::string filepath = (std::filesystem::path(disk_path) / (entry->conversation_id + ".bin")).string();
         write_entry_to_file(filepath, *entry);
     }
 
@@ -2861,8 +2743,7 @@ void server_prompt_cache::shutdown_and_spill() {
         }
         ++n_done;
         SRV_WRN("disk cache: shutdown spill %d/%d (from states)\n", n_done, n_total);
-        const std::string uuid     = gen_disk_cache_uuid();
-        const std::string filepath = (std::filesystem::path(disk_path) / (uuid + ".bin")).string();
+        const std::string filepath = (std::filesystem::path(disk_path) / (states.front().conversation_id + ".bin")).string();
         write_entry_to_file(filepath, states.front());
         states.pop_front();
     }

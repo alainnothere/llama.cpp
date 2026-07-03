@@ -154,7 +154,11 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_INFERENCE
     task_params   params;
-    server_tokens tokens;
+      server_tokens tokens;
+
+      // Hash of system + first user message tokens.
+      // Computed at task creation, used for deterministic cache file naming.
+      std::string conversation_id;
 
     // only used by CLI, this allow tokenizing CLI inputs on server side
     // we need this because mtmd_context and vocab are not accessible outside of server_context
@@ -595,12 +599,38 @@ struct server_prompt_data {
     }
 };
 
+// FNV-1a 64-bit hash, returns lowercase hex string.
+// Used for checkpoint file naming.
+inline std::string generate_conversation_id(const server_tokens & tokens, size_t tokens_end) {
+    size_t count = std::min(tokens_end, tokens.size());
+    uint64_t hash = 0xcbf29ce484222325ULL;
+    const uint64_t fnv_prime = 0x100000001b3ULL;
+    for (size_t i = 0; i < count; ++i) {
+        const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&tokens[i]);
+        for (size_t b = 0; b < sizeof(llama_token); ++b) {
+            hash ^= bytes[b];
+            hash *= fnv_prime;
+        }
+    }
+    char buf[17];
+    std::snprintf(buf, sizeof(buf), "%016llx", (unsigned long long)hash);
+    return std::string(buf);
+}
 struct server_prompt {
     server_tokens tokens;
 
     server_prompt_data data;
 
     std::list<common_prompt_checkpoint> checkpoints;
+
+    // Conversation ID: hash of system + first user message tokens.
+    // Used for deterministic cache file naming (conversation_id.bin).
+    std::string conversation_id;
+
+    // Token position where the first user message ends.
+    // Used as the hash boundary for generate_conversation_id().
+    // 0 means "not set" — will be computed on first prompt_save().
+    size_t conversation_tokens_boundary = 0;
 
     size_t size() const {
         size_t res = 0;
@@ -623,8 +653,11 @@ struct server_prompt {
             tokens.clone(),
             data,
             checkpoints,
+            conversation_id,
+            conversation_tokens_boundary,
         };
     }
+
 };
 
 struct server_prompt_cache {
@@ -661,7 +694,7 @@ struct server_prompt_cache {
 
     server_prompt * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot);
+    bool load(server_prompt & prompt, const server_tokens & tokens_new, const std::string & conversation_id, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot);
 
     void update();
 
@@ -671,13 +704,13 @@ struct server_prompt_cache {
 
     // spill a single checkpoint to disk before it is erased from the in-memory list.
     // no-op if disk_path is empty. called from create_checkpoint() in server-context.cpp.
-    void spill_checkpoint(const common_prompt_checkpoint & cp, int32_t slot_id);
+    void spill_checkpoint(const common_prompt_checkpoint & cp, const std::string & conversation_id);
 
-    // scan disk_path for checkpoint spill files belonging to slot_id and merge any that fill
-    // gaps in prompt.checkpoints.  called after every successful RAM or disk cache match in
-    // load(), and also directly from get_available_slot() when a slot is reused without a
-    // cache save/load cycle (f_keep >= 0.5).
-    void merge_checkpoint_spills(server_prompt & prompt, int32_t slot_id);
+    // scan disk_path for checkpoint spill files belonging to the prompt's conversation
+    // and merge any that fill gaps in prompt.checkpoints.  called after every successful
+    // RAM or disk cache match in load(), and also directly from get_available_slot() when
+    // a slot is reused without a cache save/load cycle (f_keep >= 0.5).
+    void merge_checkpoint_spills(server_prompt & prompt);
 
     // true if the host-RAM cache currently exceeds its byte budget (limit_size > 0
     // and size() > limit_size). gates the spill-before-load "valley" path.
@@ -711,8 +744,8 @@ private:
     // file I/O — runs on the worker thread (async path) or on the calling thread (sync fall-through / shutdown)
     bool write_entry_to_file(const std::string & filepath, const server_prompt & entry);
 
-    // disk scan and restore. consumes the matched file on success.
-    bool try_match_disk(server_prompt & prompt, const server_tokens & tokens_new,
+    // direct disk load by conversation_id. opens {conversation_id}.bin.
+    bool load_from_disk(server_prompt & prompt, const std::string & conversation_id,
                         llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot);
 };
 
