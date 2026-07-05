@@ -76,6 +76,11 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0)       override;
 
+    // pos-range slice of the attention child only. the recurrent state is not sliceable by
+    // position (it is a running state, valid only at the latest pos) - callers persist it
+    // separately via the PARTIAL_ONLY flag on state_write/state_read.
+    void state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_state_seq_flags flags = 0) const override;
+
     //
     // llama_memory_hybrid specific API
     //

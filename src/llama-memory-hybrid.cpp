@@ -198,7 +198,14 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
         mem_attn->state_read(io, seq_id, flags);
     }
-    mem_recr->state_read(io, seq_id, flags);
+    // APPEND blobs come from state_write_range and contain only the attention child
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_APPEND) == 0) {
+        mem_recr->state_read(io, seq_id, flags);
+    }
+}
+
+void llama_memory_hybrid::state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_state_seq_flags flags) const {
+    mem_attn->state_write_range(io, seq_id, p0, p1, flags);
 }
 
 llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {

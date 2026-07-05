@@ -746,11 +746,15 @@ private:
         std::vector<llama_token> tokens; // tokens covered once this job commits ([0, p1))
         bool rewrite = false;            // first segment of a from-scratch write: truncate the files
 
+        // hybrid models only: recurrent-state snapshot ([u32 n_tok][PARTIAL_ONLY blob]),
+        // carried by the last segment of a flush and written to the .rec file (overwrite)
+        std::vector<uint8_t> rec;
+
         // checkpoint write (when set, the segment fields are unused)
         std::shared_ptr<common_prompt_checkpoint> ckpt;
 
         size_t bytes() const {
-            return kv.size() + drft.size() + tokens.size() * sizeof(llama_token) +
+            return kv.size() + drft.size() + rec.size() + tokens.size() * sizeof(llama_token) +
                    (ckpt ? ckpt->data_tgt.size() + ckpt->data_dft.size() : 0);
         }
     };
@@ -770,6 +774,7 @@ private:
         uint32_t n_tok     = 0;
         uint64_t kv_size   = 0;
         uint64_t drft_size = 0;
+        uint64_t rec_size  = 0; // size of the .rec file; 0 = non-hybrid (no recurrent state)
         std::vector<seg_entry> segments;
 
         // scheduled by the main thread - committed state plus everything still in the queue

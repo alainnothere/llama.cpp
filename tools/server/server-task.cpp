@@ -33,13 +33,16 @@ using json = nlohmann::ordered_json;
 namespace {
 
 constexpr uint32_t DISK_CACHE_MAGIC   = 0x53504344; // 'SPCD' - Server Prompt Cache Disk
-// v4: split files per conversation, one write mode each:
+// v5: split files per conversation, one write mode each:
 //   {conv}.hdr  - overwrite - magic/version/hashes, n_tok, sizes, segment table, checksum
 //   {conv}.tok  - overwrite - raw llama_token array
-//   {conv}.kv   - append    - self-contained pos-range state blobs, applied in order on load
+//   {conv}.kv   - append    - pos-range attention-state blobs, applied in order on load
 //   {conv}.drft - append    - same segmentation for the draft context (absent without a draft)
+//   {conv}.rec  - overwrite - hybrid models only: [u32 n_tok][PARTIAL_ONLY recurrent blob];
+//                             the recurrent state is a running state valid only at the latest
+//                             position, so overwrite is its only correct mode (and it is small)
 // checkpoints live in their own write-once cp_{conv}_{pos_min}.bin files (see below)
-constexpr uint32_t DISK_CACHE_VERSION = 4;
+constexpr uint32_t DISK_CACHE_VERSION = 5;
 
 // number of tokens covered by one .kv segment when writing a large state from scratch
 // (bounds RAM on both save and load - the peak is one segment, ~500 MiB at ~60 KB/token)
@@ -73,11 +76,12 @@ static bool read_disk_u64(std::ifstream & f, uint64_t & v)
     return static_cast<bool>(f);
 }
 
-// split-file extensions (v4)
+// split-file extensions (v5)
 constexpr std::string_view SPLIT_EXT_HDR  = ".hdr";
 constexpr std::string_view SPLIT_EXT_TOK  = ".tok";
 constexpr std::string_view SPLIT_EXT_KV   = ".kv";
 constexpr std::string_view SPLIT_EXT_DRFT = ".drft";
+constexpr std::string_view SPLIT_EXT_REC  = ".rec";
 
 inline std::string split_path(const std::string & base, std::string_view ext) {
     return base + std::string(ext);
@@ -2075,20 +2079,26 @@ bool server_prompt_cache::flush_from_context(const server_prompt & prompt, llama
         return false;
     }
 
-    // pos-range delta segments are only self-contained when the serialized state covers the
-    // whole history (plain full-attention unified KV). windowed state (SWA / hybrid /
-    // recurrent) is small by construction and gets a single full-state rewrite instead.
+    // pos-range delta segments require the attention KV to cover the whole history
+    // (no SWA sliding window) and a non-recurrent-only model. hybrid models qualify:
+    // their attention child is range-sliceable and the recurrent child (a running state,
+    // valid only at the latest position) is snapshotted separately into the .rec file.
+    // pure-recurrent and SWA models get a single full-state rewrite instead (their
+    // serialized state is small by construction).
     const llama_model * model_tgt = llama_get_model(ctx_tgt);
     bool delta_capable = llama_model_n_swa(model_tgt) == 0 &&
-                         !llama_model_is_recurrent(model_tgt) &&
-                         !llama_model_is_hybrid(model_tgt);
+                         !llama_model_is_recurrent(model_tgt);
     if (ctx_dft) {
         const llama_model * model_dft = llama_get_model(ctx_dft);
         delta_capable = delta_capable &&
                         llama_model_n_swa(model_dft) == 0 &&
-                        !llama_model_is_recurrent(model_dft) &&
-                        !llama_model_is_hybrid(model_dft);
+                        !llama_model_is_recurrent(model_dft);
     }
+
+    // note: a hybrid draft with hybrid memory (external -md model) would lose its recurrent
+    // state on restore - acceptance re-warms, correctness is unaffected. the MTP draft on
+    // hybrid Qwen3.5/3.6 uses a plain attention KV, which the segments cover fully.
+    const bool rec_needed = delta_capable && llama_model_is_hybrid(model_tgt);
 
     // first touch of this conversation: seed the in-RAM mirror from an existing .hdr
     {
@@ -2191,6 +2201,23 @@ bool server_prompt_cache::flush_from_context(const server_prompt & prompt, llama
 
         job.tokens.assign(toks.begin(), toks.begin() + p1);
 
+        // the last chunk of a hybrid flush carries the recurrent-state snapshot - it is
+        // captured from the live context and only valid at the current position (n_tok)
+        if (rec_needed && p1 == n_tok) {
+            const size_t sz = llama_state_seq_get_size_ext(ctx_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            if (sz == 0) {
+                capture_failed("rec");
+                return false;
+            }
+            job.rec.resize(sizeof(uint32_t) + sz);
+            memcpy(job.rec.data(), &n_tok, sizeof(uint32_t));
+            const size_t got = llama_state_seq_get_data_ext(ctx_tgt, job.rec.data() + sizeof(uint32_t), sz, id_slot, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            if (got != sz) {
+                capture_failed("rec");
+                return false;
+            }
+        }
+
         // enqueue with byte-budget backpressure so a big flush cannot pile up in host RAM
         {
             std::unique_lock<std::mutex> lock(mtx);
@@ -2218,6 +2245,7 @@ void server_prompt_cache::process_disk_job(const disk_job & job) {
     const std::string base      = (std::filesystem::path(disk_path) / job.conv_id).string();
     const std::string kv_path   = split_path(base, SPLIT_EXT_KV);
     const std::string drft_path = split_path(base, SPLIT_EXT_DRFT);
+    const std::string rec_path  = split_path(base, SPLIT_EXT_REC);
 
     const int64_t t_start = ggml_time_us();
 
@@ -2244,10 +2272,12 @@ void server_prompt_cache::process_disk_job(const disk_job & job) {
         st.segments.clear();
         st.kv_size   = 0;
         st.drft_size = 0;
+        st.rec_size  = 0;
         st.n_tok     = 0;
 
         std::filesystem::remove(kv_path, ec);
         std::filesystem::remove(drft_path, ec);
+        std::filesystem::remove(rec_path, ec);
     } else {
         // crash-orphan cleanup: the data files must be at least as large as the committed
         // sizes; extra tail bytes come from an append whose header never committed
@@ -2301,6 +2331,15 @@ void server_prompt_cache::process_disk_job(const disk_job & job) {
     st.drft_size += job.drft.size();
     st.n_tok      = (uint32_t) job.tokens.size();
 
+    // recurrent-state snapshot (hybrid models, last chunk of a flush) - overwrite mode
+    if (!job.rec.empty()) {
+        if (!disk_write_file_atomic(rec_path, job.rec.data(), job.rec.size())) {
+            fail("rec write");
+            return;
+        }
+        st.rec_size = job.rec.size();
+    }
+
     if (!disk_write_file_atomic(split_path(base, SPLIT_EXT_TOK), job.tokens.data(), job.tokens.size() * sizeof(llama_token))) {
         fail("tok write");
         return;
@@ -2322,6 +2361,7 @@ void server_prompt_cache::process_disk_job(const disk_job & job) {
     put((uint32_t) st.segments.size());
     put(st.kv_size);
     put(st.drft_size);
+    put(st.rec_size);
     for (const auto & s : st.segments) {
         put(s.kv_off);
         put(s.kv_size);
@@ -2346,14 +2386,16 @@ void server_prompt_cache::process_disk_job(const disk_job & job) {
         live.n_tok     = st.n_tok;
         live.kv_size   = st.kv_size;
         live.drft_size = st.drft_size;
+        live.rec_size  = st.rec_size;
         live.segments  = std::move(st.segments);
         live.broken    = false;
     }
 
     const double t_ms = (ggml_time_us() - t_start) / 1e3;
-    SRV_WRN("disk cache: wrote '%s' segment pos [%d, %d) %.1f MiB (drft %.1f MiB) in %.0f ms - now %u tokens in %zu segment(s)\n",
+    SRV_WRN("disk cache: wrote '%s' segment pos [%d, %d) %.1f MiB (drft %.1f MiB, rec %.1f MiB) in %.0f ms - now %u tokens in %zu segment(s)\n",
             job.conv_id.c_str(), job.p0, job.p1,
             job.kv.size() / (1024.0 * 1024.0), job.drft.size() / (1024.0 * 1024.0),
+            job.rec.size() / (1024.0 * 1024.0),
             t_ms, st.n_tok, n_segs);
 }
 
@@ -2369,8 +2411,8 @@ bool server_prompt_cache::read_disk_state(const std::string & conversation_id, d
         hdr.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
     }
 
-    // fixed part: 7 x u32 + 2 x u64, then the segment table, then a u64 checksum
-    constexpr size_t fixed_bytes = 7*sizeof(uint32_t) + 2*sizeof(uint64_t);
+    // fixed part: 7 x u32 + 3 x u64, then the segment table, then a u64 checksum
+    constexpr size_t fixed_bytes = 7*sizeof(uint32_t) + 3*sizeof(uint64_t);
     constexpr size_t seg_bytes   = 4*sizeof(uint64_t) + 2*sizeof(int32_t);
     if (hdr.size() < fixed_bytes + sizeof(uint64_t)) {
         return false;
@@ -2390,7 +2432,7 @@ bool server_prompt_cache::read_disk_state(const std::string & conversation_id, d
     };
 
     uint32_t magic = 0, version = 0, fa = 0, fv = 0, lt = 0, n_tok = 0, n_segs = 0;
-    uint64_t kv_size = 0, drft_size = 0;
+    uint64_t kv_size = 0, drft_size = 0, rec_size = 0;
     get(magic);
     get(version);
     get(fa);
@@ -2400,6 +2442,7 @@ bool server_prompt_cache::read_disk_state(const std::string & conversation_id, d
     get(n_segs);
     get(kv_size);
     get(drft_size);
+    get(rec_size);
     GGML_UNUSED(lt);
 
     if (magic != DISK_CACHE_MAGIC || version != DISK_CACHE_VERSION) {
@@ -2438,6 +2481,13 @@ bool server_prompt_cache::read_disk_state(const std::string & conversation_id, d
             return false;
         }
     }
+    if (rec_size > 0) {
+        const uint64_t rec_actual = (uint64_t) std::filesystem::file_size(split_path(base, SPLIT_EXT_REC), ec);
+        if (ec || rec_actual != rec_size) {
+            SRV_WRN("disk cache: '%s.rec' size mismatch - ignoring\n", conversation_id.c_str());
+            return false;
+        }
+    }
 
     std::vector<llama_token> toks(n_tok);
     {
@@ -2454,6 +2504,7 @@ bool server_prompt_cache::read_disk_state(const std::string & conversation_id, d
     st.n_tok            = n_tok;
     st.kv_size          = kv_size;
     st.drft_size        = drft_size;
+    st.rec_size         = rec_size;
     st.scheduled_n_tok  = n_tok;
     st.scheduled_tokens = std::move(toks);
     st.broken           = false;
@@ -2862,6 +2913,14 @@ bool server_prompt_cache::load_from_disk(server_prompt & prompt, const std::stri
             conversation_id.c_str(), st.n_tok,
             st.kv_size / (1024.0 * 1024.0), st.drft_size / (1024.0 * 1024.0), st.segments.size());
 
+    // stream the segments into the context one buffer at a time; peak host RAM = the
+    // largest single segment.
+    //
+    // rec_size == 0: full-state blobs - the first segment replaces the sequence (flags=0
+    // parses the complete state layout), later segments merge in with APPEND.
+    // rec_size > 0 (hybrid): every segment is attention-only, which only the APPEND path
+    // parses - so wipe the sequence explicitly and apply all segments with APPEND, then
+    // restore the recurrent state from .rec with PARTIAL_ONLY.
     auto wipe_slot = [&]() {
         llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, -1, -1);
         if (ctx_dft) {
@@ -2869,12 +2928,15 @@ bool server_prompt_cache::load_from_disk(server_prompt & prompt, const std::stri
         }
     };
 
-    // stream the segments into the context one buffer at a time: the first replaces the
-    // sequence, the rest merge into it. peak host RAM = the largest single segment.
+    const bool hybrid_file = st.rec_size > 0;
+    if (hybrid_file) {
+        wipe_slot();
+    }
+
     std::vector<uint8_t> buf;
     for (size_t i = 0; i < st.segments.size(); ++i) {
         const auto & seg = st.segments[i];
-        const llama_state_seq_flags flags = i == 0 ? LLAMA_STATE_SEQ_FLAGS_NONE : LLAMA_STATE_SEQ_FLAGS_APPEND;
+        const llama_state_seq_flags flags = (hybrid_file || i > 0) ? LLAMA_STATE_SEQ_FLAGS_APPEND : LLAMA_STATE_SEQ_FLAGS_NONE;
 
         buf.resize(seg.kv_size);
         kf.seekg((std::streamoff) seg.kv_off);
@@ -2908,6 +2970,41 @@ bool server_prompt_cache::load_from_disk(server_prompt & prompt, const std::stri
                 wipe_slot();
                 return false;
             }
+        }
+    }
+
+    // hybrid models: restore the recurrent state (valid at n_tok) on top of the attention cells
+    if (hybrid_file) {
+        std::vector<uint8_t> rec(st.rec_size);
+        std::ifstream rf(split_path(base, SPLIT_EXT_REC), std::ios::binary);
+        if (!rf) {
+            wipe_slot();
+            return false;
+        }
+        rf.read(reinterpret_cast<char *>(rec.data()), (std::streamsize) rec.size());
+        if (!rf || rec.size() <= sizeof(uint32_t)) {
+            wipe_slot();
+            return false;
+        }
+
+        // the snapshot must match the header's token count - a crash between the segment
+        // append and the .rec overwrite leaves them inconsistent, which cannot be restored
+        uint32_t rec_n_tok = 0;
+        memcpy(&rec_n_tok, rec.data(), sizeof(uint32_t));
+        if (rec_n_tok != st.n_tok) {
+            SRV_WRN("load_from_disk: '%s.rec' is for %u tokens but header says %u - reprocessing\n",
+                    conversation_id.c_str(), rec_n_tok, st.n_tok);
+            wipe_slot();
+            return false;
+        }
+
+        const size_t n = llama_state_seq_set_data_ext(ctx_tgt, rec.data() + sizeof(uint32_t),
+                                                      rec.size() - sizeof(uint32_t), id_slot,
+                                                      LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (n != rec.size() - sizeof(uint32_t)) {
+            SRV_WRN("load_from_disk: set_data (rec) returned %zu of %zu\n", n, rec.size() - sizeof(uint32_t));
+            wipe_slot();
+            return false;
         }
     }
 
