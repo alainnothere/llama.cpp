@@ -758,6 +758,24 @@ common_chat_templates_ptr common_chat_templates_init(const struct llama_model * 
                            "{%- if false %}");
     }
 
+    // Qwen 3.5/3.6-style templates strip prior-turn reasoning behind a hard-coded namespace
+    // gate, which breaks prompt-cache prefix stability across turns. Rewrite the gate so the
+    // template honors the standard preserve_thinking mechanism (--reasoning-preserve /
+    // preserve_reasoning kwarg, see caps_apply_preserve_reasoning); without it the gate
+    // evaluates exactly as before.
+    {
+        const std::string gate    = "loop.index0 > ns.last_query_index";
+        const std::string gate_pt = "((preserve_thinking is defined and preserve_thinking) or loop.index0 > ns.last_query_index)";
+        if (default_template_src.find(gate) != std::string::npos) {
+            string_replace_all(default_template_src, gate, gate_pt);
+            LOG_INF("%s: patched reasoning-strip gate in chat template to support preserve_reasoning\n", __func__);
+        }
+        if (template_tool_use_src.find(gate) != std::string::npos) {
+            string_replace_all(template_tool_use_src, gate, gate_pt);
+            LOG_INF("%s: patched reasoning-strip gate in tool_use chat template to support preserve_reasoning\n", __func__);
+        }
+    }
+
     std::string token_bos = bos_token_override;
     std::string token_eos = eos_token_override;
     bool        add_bos   = false;
