@@ -2915,20 +2915,20 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
 
 static constexpr uint32_t io_magic = 0xaf143cd8;
 
-size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags) {
+size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos p0, llama_pos p1) {
     llama_io_write_dummy io(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
     try {
         io.write(&io_magic, sizeof(io_magic));
         io.write(&seq_id, sizeof(seq_id));
 
-        return state_seq_write_data(io, seq_id, flags);
+        return state_seq_write_data(io, seq_id, flags, p0, p1);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error getting state size: %s\n", __func__, err.what());
         return 0;
     }
 }
 
-size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
+size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags, llama_pos p0, llama_pos p1) {
     std::unique_ptr<llama_io_write_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
@@ -2940,7 +2940,7 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
         io->write(&io_magic, sizeof(io_magic));
         io->write(&seq_id, sizeof(seq_id));
 
-        return state_seq_write_data(*io, seq_id, flags);
+        return state_seq_write_data(*io, seq_id, flags, p0, p1);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
         return 0;
@@ -3155,11 +3155,15 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
     return io.n_bytes();
 }
 
-size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos p0, llama_pos p1) {
     GGML_UNUSED(seq_id);
 
     if (memory) {
-        memory->state_write(io, seq_id, flags);
+        if (p0 >= 0 || p1 >= 0) {
+            memory->state_write_range(io, seq_id, p0, p1, flags);
+        } else {
+            memory->state_write(io, seq_id, flags);
+        }
     }
 
     return io.n_bytes();
@@ -4018,6 +4022,16 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
     ctx->synchronize();
 
     return ctx->state_seq_set_data(seq_id, src, size, flags);
+}
+
+size_t llama_state_seq_get_size_range(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_state_seq_flags flags) {
+    return ctx->state_seq_get_size(seq_id, flags, p0, p1);
+}
+
+size_t llama_state_seq_get_data_range(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_state_seq_flags flags) {
+    ctx->synchronize();
+
+    return ctx->state_seq_get_data(seq_id, dst, size, flags, p0, p1);
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {

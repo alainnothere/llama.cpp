@@ -884,6 +884,10 @@ extern "C" {
 // Getting the state for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag.
 #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
 
+// When setting sequence data, merge the cells into the destination sequence instead of replacing it.
+// Allows applying several position-range blobs (see llama_state_seq_get_data_range) in order.
+#define LLAMA_STATE_SEQ_FLAGS_APPEND 4
+
     typedef uint32_t llama_state_seq_flags;
 
     LLAMA_API size_t llama_state_seq_get_size_ext(
@@ -903,6 +907,27 @@ extern "C" {
                    const uint8_t * src,
                           size_t   size,
                     llama_seq_id   dest_seq_id,
+           llama_state_seq_flags   flags);
+
+    // Same as llama_state_seq_get_size_ext, but covering only the cells with pos in [p0, p1)
+    // p0 < 0 : from the start; p1 < 0 : to the end
+    // Supported only for non-SWA unified KV cache memory - other memory types abort
+    LLAMA_API size_t llama_state_seq_get_size_range(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                       llama_pos   p0,
+                       llama_pos   p1,
+           llama_state_seq_flags   flags);
+
+    // The resulting blob is self-contained and can be applied on top of other sequence state
+    // with llama_state_seq_set_data_ext using LLAMA_STATE_SEQ_FLAGS_APPEND
+    LLAMA_API size_t llama_state_seq_get_data_range(
+            struct llama_context * ctx,
+                         uint8_t * dst,
+                          size_t   size,
+                    llama_seq_id   seq_id,
+                       llama_pos   p0,
+                       llama_pos   p1,
            llama_state_seq_flags   flags);
 
     //

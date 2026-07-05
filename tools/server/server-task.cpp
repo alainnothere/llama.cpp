@@ -10,11 +10,19 @@
 #include "speculative.h"
 #include "server-common.h"
 
+#include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <optional>
 #include <random>
 #include <system_error>
+
+#ifdef _WIN32
+#    include <io.h>
+#else
+#    include <unistd.h>
+#endif
 
 using json = nlohmann::ordered_json;
 
@@ -24,21 +32,33 @@ using json = nlohmann::ordered_json;
 
 namespace {
 
-constexpr uint32_t DISK_CACHE_MAGIC   = 0x53504344; // 'SPCD' — Server Prompt Cache Disk
-// v2: appended per-entry checkpoints (n_tokens, pos_min, pos_max, data_tgt, data_dft) after the
-// main+drft blobs. Required for SWA / hybrid / recurrent models: PARTIAL_ONLY checkpoints are the
-// only way to reuse a prefix once the live KV window has slid past it. v1 files are auto-deleted
-// by header-mismatch handling in try_match_disk.
-constexpr uint32_t DISK_CACHE_VERSION = 2;
+constexpr uint32_t DISK_CACHE_MAGIC   = 0x53504344; // 'SPCD' - Server Prompt Cache Disk
+// v4: split files per conversation, one write mode each:
+//   {conv}.hdr  - overwrite - magic/version/hashes, n_tok, sizes, segment table, checksum
+//   {conv}.tok  - overwrite - raw llama_token array
+//   {conv}.kv   - append    - self-contained pos-range state blobs, applied in order on load
+//   {conv}.drft - append    - same segmentation for the draft context (absent without a draft)
+// checkpoints live in their own write-once cp_{conv}_{pos_min}.bin files (see below)
+constexpr uint32_t DISK_CACHE_VERSION = 4;
 
-// checkpoint spill files — written by spill_checkpoint() when create_checkpoint() evicts an old
-// checkpoint to make room for a new one. format: magic, version, arch_hash, vocab_hash,
+// number of tokens covered by one .kv segment when writing a large state from scratch
+// (bounds RAM on both save and load - the peak is one segment, ~500 MiB at ~60 KB/token)
+constexpr uint32_t DISK_SEGMENT_TOKENS = 8192;
+
+// backpressure for the async writer: enqueueing blocks while this many payload bytes
+// are already in flight, so a huge flush cannot pile up unbounded in host RAM
+constexpr size_t DISK_QUEUE_MAX_BYTES = 1ull << 30; // 1 GiB
+
+// checkpoint files - written by spill_checkpoint() the moment create_checkpoint() captures a
+// checkpoint. format: magic, version, arch_hash, vocab_hash,
 // pos_min (i32), pos_max (i32), n_tokens (i64), data_tgt_size (u64), data_tgt, data_dft_size (u64), data_dft.
-// checkpoint spill files are named cp_{conversation_id}_{pos_min}.bin
-// cache entry files are named {conversation_id}.bin
-// both live in disk_path
+// checkpoint files are named cp_{conversation_id}_{pos_min}.bin and live in disk_path
 constexpr uint32_t CHECKPOINT_SPILL_MAGIC   = 0x43504B44; // 'CPKD'
 constexpr uint32_t CHECKPOINT_SPILL_VERSION = 1;
+
+// byte offsets inside a cp_ file (see format above) - used to register disk-backed checkpoints
+// without reading the blobs: off_tgt = header, off_dft = header + tgt blob + its size field
+constexpr uint64_t CHECKPOINT_FILE_HEADER_BYTES = 4*sizeof(uint32_t) + 2*sizeof(int32_t) + sizeof(int64_t) + sizeof(uint64_t);
 
 
 static bool read_disk_u32(std::ifstream & f, uint32_t & v)
@@ -53,6 +73,73 @@ static bool read_disk_u64(std::ifstream & f, uint64_t & v)
     return static_cast<bool>(f);
 }
 
+// split-file extensions (v4)
+constexpr std::string_view SPLIT_EXT_HDR  = ".hdr";
+constexpr std::string_view SPLIT_EXT_TOK  = ".tok";
+constexpr std::string_view SPLIT_EXT_KV   = ".kv";
+constexpr std::string_view SPLIT_EXT_DRFT = ".drft";
+
+inline std::string split_path(const std::string & base, std::string_view ext) {
+    return base + std::string(ext);
+}
+
+static bool disk_fsync(FILE * f) {
+#ifdef _WIN32
+    return _commit(_fileno(f)) == 0;
+#else
+    return fsync(fileno(f)) == 0;
+#endif
+}
+
+// overwrite atomically: write tmp, fsync, rename over the target
+static bool disk_write_file_atomic(const std::string & path, const void * data, size_t n) {
+    const std::string tmppath = path + ".tmp";
+
+    FILE * f = fopen(tmppath.c_str(), "wb");
+    if (!f) {
+        return false;
+    }
+    bool ok = n == 0 || fwrite(data, 1, n, f) == n;
+    ok = ok && fflush(f) == 0;
+    ok = ok && disk_fsync(f);
+    ok = fclose(f) == 0 && ok;
+
+    std::error_code ec;
+    if (!ok) {
+        std::filesystem::remove(tmppath, ec);
+        return false;
+    }
+    std::filesystem::rename(tmppath, path, ec);
+    if (ec) {
+        std::filesystem::remove(tmppath, ec);
+        return false;
+    }
+    return true;
+}
+
+// append and fsync - the caller is responsible for truncating orphan tails first
+static bool disk_append_file(const std::string & path, const void * data, size_t n) {
+    FILE * f = fopen(path.c_str(), "ab");
+    if (!f) {
+        return false;
+    }
+    bool ok = n == 0 || fwrite(data, 1, n, f) == n;
+    ok = ok && fflush(f) == 0;
+    ok = ok && disk_fsync(f);
+    ok = fclose(f) == 0 && ok;
+    return ok;
+}
+
+// xor of 8-byte words (tail zero-padded)
+static uint64_t disk_hdr_checksum(const uint8_t * data, size_t n) {
+    uint64_t sum = 0;
+    for (size_t i = 0; i < n; i += 8) {
+        uint64_t word = 0;
+        memcpy(&word, data + i, std::min<size_t>(8, n - i));
+        sum ^= word;
+    }
+    return sum;
+}
 } // anonymous namespace
 
 //
@@ -1649,13 +1736,6 @@ size_t server_prompt_cache::size() {
     for (const auto & state : states) {
         res += state.size();
     }
-    // pending_spill is shared with the writer thread — lock briefly to walk it safely
-    {
-        std::lock_guard<std::mutex> lock(mtx);
-        for (const auto & ptr : pending_spill) {
-            res += ptr->size();
-        }
-    }
 
     return res;
 }
@@ -1665,12 +1745,6 @@ size_t server_prompt_cache::n_tokens() {
 
     for (const auto & state : states) {
         res += state.n_tokens();
-    }
-    {
-        std::lock_guard<std::mutex> lock(mtx);
-        for (const auto & ptr : pending_spill) {
-            res += ptr->n_tokens();
-        }
     }
 
     return res;
@@ -1765,85 +1839,6 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
     }
 
-    // Phase 2: scan pending_spill (locked).  Same NON-CONSUMING semantics as
-    // Phase 1 — the in-flight write to disk continues unmolested and the
-    // entry stays in pending_spill until the writer's normal commit removes
-    // it.  See [TAG_CACHE_DONT_DELETE].  Because we don't cancel the write,
-    // there's no data-race risk reading data.main outside the lock (the
-    // writer is also reading it outside the lock — that's a multi-reader
-    // pattern, std::vector is safe for concurrent reads of the same data).
-    std::shared_ptr<server_prompt> pending_winner;
-    {
-        std::unique_lock<std::mutex> lock(mtx);
-        auto best = pending_spill.end();
-        float pf_keep = f_keep_best;
-        float psim    = sim_best;
-        for (auto it = pending_spill.begin(); it != pending_spill.end(); ++it) {
-            const int lcp_cur = (*it)->tokens.get_common_prefix(tokens_new);
-            const float f_keep_cur = float(lcp_cur) / (*it)->tokens.size();
-            const float sim_cur    = float(lcp_cur) / tokens_new.size();
-            if (f_keep_cur < 0.25f) {
-                continue;
-            }
-            // sim-primary (see [TAG_CACHE_SELECT_SIM]); f_keep tie-break only
-            // between pending candidates, not against the carried-over baseline.
-            if (sim_cur > psim || (best != pending_spill.end() && sim_cur == psim && f_keep_cur > pf_keep)) {
-                pf_keep = f_keep_cur;
-                psim    = sim_cur;
-                best = it;
-            }
-        }
-        if (best != pending_spill.end()) {
-            // Just grab the shared_ptr — the entry stays in pending_spill,
-            // the write job stays in queue.  Either or both eventually
-            // complete (writer commits + removes from pending_spill; or
-            // load() winner here picks the entry again later).
-            pending_winner = *best;
-            f_keep_best = pf_keep;
-            sim_best    = psim;
-            it_best     = states.end(); // pending wins over states
-        }
-    }
-
-    if (pending_winner) {
-        SRV_WRN(" - found better prompt in pending_spill with f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
-
-        {
-            const auto & data = pending_winner->data.main;
-            const size_t size = data.size();
-            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
-            if (n != size) {
-                SRV_WRN("failed to restore state with size %zu\n", size);
-                return false;
-            }
-        }
-
-        {
-            const auto & data = pending_winner->data.drft;
-            if (!data.empty()) {
-                GGML_ASSERT(ctx_dft);
-                const size_t size = data.size();
-                const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
-                if (n != size) {
-                    SRV_WRN("failed to restore drft state with size %zu\n", size);
-                    return false;
-                }
-            }
-        }
-
-        // Same field-by-field copy as the states branch — keep prompt.data
-        // empty so prompt_save's assertion (server-context.cpp:112) holds
-        // when this slot is later saved.
-        prompt.tokens      = pending_winner->tokens.clone();
-        prompt.data        = {};
-        prompt.checkpoints = pending_winner->checkpoints;
-        prompt.conversation_id = pending_winner->conversation_id;
-        if (!disk_path.empty()) {
-            merge_checkpoint_spills(prompt);
-        }
-        return true;
-    }
-
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
 
@@ -1909,10 +1904,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         return true;
     }
 
-    // Phase 3: disk fallback — direct lookup by conversation_id
+    // Phase 3: disk fallback - direct lookup by conversation_id
     if (!disk_path.empty() && !conversation_id.empty()) {
         if (load_from_disk(prompt, conversation_id, ctx_tgt, ctx_dft, id_slot)) {
-            SRV_WRN("%s", " - restored from disk\n");
+            SRV_INF("load: restored '%s' from disk\n", conversation_id.c_str());
             merge_checkpoint_spills(prompt);
             return true;
         }
@@ -1923,52 +1918,15 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
 void server_prompt_cache::update() {
     auto evict_oldest = [this]() {
-        // Either spill to disk (preserving the entry) or destroy it.
-        // mtmd entries cannot be spilled — they get destroyed either way.
+        // with the disk tier enabled, non-mtmd states are flushed write-through at
+        // prompt_save time and never enter `states` - anything here is either mtmd
+        // (not serializable) or RAM-only mode, so eviction is a plain destroy
         if (states.empty()) return;
 
-        const bool has_mtmd = states.front().tokens.has_mtmd;
-        if (disk_path.empty() || has_mtmd) {
-            SRV_WRN(" - removing oldest entry (size = %.3f MiB)%s\n",
-                    states.front().size() / (1024.0 * 1024.0),
-                    (!disk_path.empty() && has_mtmd) ? " [mtmd: not spillable]" : "");
-            states.pop_front();
-            return;
-        }
-
-        // Spill: move oldest entry to pending_spill, enqueue for async write.
-        // On queue overflow, fall through to a synchronous write on this thread (lossless).
-        const std::string conv_id = states.front().conversation_id;
-        std::string filepath = (std::filesystem::path(disk_path) / (conv_id + ".bin")).string();
-
-        auto entry_ptr = std::make_shared<server_prompt>(std::move(states.front()));
+        SRV_WRN(" - removing oldest entry (size = %.3f MiB)%s\n",
+                states.front().size() / (1024.0 * 1024.0),
+                states.front().tokens.has_mtmd ? " [mtmd: not spillable]" : "");
         states.pop_front();
-
-        std::unique_lock<std::mutex> lock(mtx);
-        pending_spill.push_back(entry_ptr);
-
-        if ((int32_t) queue.size() < queue_depth) {
-            queue.push_back({conv_id, filepath, entry_ptr});
-            cv.notify_one();
-            SRV_WRN(" - spilling oldest entry to disk (async, queued %zu/%d, size = %.3f MiB)\n",
-                    queue.size(), queue_depth, entry_ptr->size() / (1024.0 * 1024.0));
-        } else {
-            // Queue full — write synchronously (the task thread pays the cost; never drop)
-            lock.unlock();
-            SRV_WRN(" - spilling oldest entry to disk (SYNC fall-through, size = %.3f MiB)\n",
-                    entry_ptr->size() / (1024.0 * 1024.0));
-            const bool ok = write_entry_to_file(filepath, *entry_ptr);
-            lock.lock();
-            for (auto it = pending_spill.begin(); it != pending_spill.end(); ++it) {
-                if (it->get() == entry_ptr.get()) {
-                    pending_spill.erase(it);
-                    break;
-                }
-            }
-            if (!ok) {
-                SRV_WRN("disk cache: synchronous spill failed for '%s' (entry dropped)\n", filepath.c_str());
-            }
-        }
     };
 
     if (limit_size > 0) {
@@ -2008,34 +1966,18 @@ void server_prompt_cache::spill_all_to_disk() {
         return;
     }
 
-    size_t n_spilled = 0;
+    // non-mtmd states are flushed write-through at prompt_save time and never enter
+    // `states` when the disk tier is on - anything resident here is mtmd (not
+    // serializable), so freeing RAM before a big load means dropping it
     size_t n_dropped = 0;
 
     while (!states.empty()) {
-        server_prompt & front = states.front();
-
-        if (front.tokens.has_mtmd) {
-            // mtmd state cannot be serialized to the disk tier — drop it (same as update())
-            ++n_dropped;
-            states.pop_front();
-            continue;
-        }
-
-        const std::string filepath = (std::filesystem::path(disk_path) / (front.conversation_id + ".bin")).string();
-
-        // synchronous write on the calling thread, then free the host copy. losing a
-        // failed write only costs a reprocess on next use — never a crash.
-        if (write_entry_to_file(filepath, front)) {
-            ++n_spilled;
-        } else {
-            SRV_WRN("valley spill: failed to persist entry to '%s' (entry dropped)\n", filepath.c_str());
-        }
+        ++n_dropped;
         states.pop_front();
     }
 
-    if (n_spilled > 0 || n_dropped > 0) {
-        SRV_WRN(" - valley: spilled %zu state(s) to disk, dropped %zu — freed host RAM before load\n",
-                n_spilled, n_dropped);
+    if (n_dropped > 0) {
+        SRV_WRN(" - valley: dropped %zu non-serializable state(s) - freed host RAM before load\n", n_dropped);
     }
 }
 
@@ -2087,7 +2029,7 @@ void server_prompt_cache::start_writer_if_needed() {
 
 void server_prompt_cache::writer_loop() {
     while (true) {
-        spill_job job;
+        disk_job job;
         {
             std::unique_lock<std::mutex> lock(mtx);
             cv.wait(lock, [this]() { return stop_flag.load() || !queue.empty(); });
@@ -2096,144 +2038,426 @@ void server_prompt_cache::writer_loop() {
             }
             job = std::move(queue.front());
             queue.pop_front();
+            writer_active_conv = job.conv_id;
         }
 
-        // I/O outside the lock — writes can take seconds
-        const bool ok = write_entry_to_file(job.filepath, *job.entry);
-        if (!ok) {
-            SRV_WRN("disk cache: async write failed for '%s' (entry dropped)\n", job.filepath.c_str());
-        }
+        // I/O outside the lock - writes can take seconds.
+        // write failures mark the conversation broken (next flush rewrites from scratch)
+        // rather than retrying: real failures here are persistent (ENOSPC, EIO, unmounted)
+        // and a retry loop would peg the disk without making progress.
+        process_disk_job(job);
 
-        // On failure: drop the entry from pending_spill rather than re-queuing it for retry.
-        //
-        // Why drop instead of retry:
-        // - Real-world write failures here are dominated by persistent causes (ENOSPC, EACCES,
-        //   EIO from failing hardware, path unmounted). Retry hits the same wall.
-        // - "Move back to states for retry" turns persistent failure into livelock: the failed
-        //   entry returns to states, next update() picks it up, spills, fails, returns... the
-        //   loop never terminates, RAM stays maxed, CPU pegged, logs flooded. Re-queue does not
-        //   achieve losslessness for persistent failures — it just relocates the loss into
-        //   "loop forever, never make progress."
-        // - The lossless property this cache actually provides is around queue overflow
-        //   (synchronous fall-through, not drop). Write-failure handling is a separate axis.
-        // - Drop with a warning gives the operator a clear signal something's wrong while
-        //   keeping the cache functional at reduced effective capacity.
-        //
-        // If transient-failure recovery ever becomes important, the right shape is bounded
-        // retry with backoff (e.g., 3 attempts, 100/500/2000 ms), then drop — not unconditional
-        // re-queue.
         {
-            std::unique_lock<std::mutex> lock(mtx);
-            for (auto it = pending_spill.begin(); it != pending_spill.end(); ++it) {
-                if (it->get() == job.entry.get()) {
-                    pending_spill.erase(it);
-                    break;
-                }
-            }
+            std::lock_guard<std::mutex> lock(mtx);
+            queue_bytes -= std::min(queue_bytes, job.bytes());
+            writer_active_conv.clear();
             cv.notify_all();
         }
     }
 }
 
-bool server_prompt_cache::write_entry_to_file(const std::string & filepath, const server_prompt & entry) {
-    const std::string tmppath = filepath + ".tmp";
-
-    size_t ckpts_bytes = 0;
-    for (const auto & cp : entry.checkpoints) {
-        ckpts_bytes += cp.data_tgt.size() + cp.data_dft.size();
-    }
-    const size_t bytes_total = entry.data.main.size() + entry.data.drft.size() + ckpts_bytes;
-    const int    n_tok       = entry.n_tokens();
-    const int64_t t_start    = ggml_time_us();
-
-    SRV_WRN("disk cache: writing %d tokens, %.1f MiB (main+drft) + %zu checkpoint(s) (%.1f MiB) → %s\n",
-            n_tok,
-            (entry.data.main.size() + entry.data.drft.size()) / (1024.0 * 1024.0),
-            entry.checkpoints.size(),
-            ckpts_bytes / (1024.0 * 1024.0),
-            filepath.c_str());
-
-    {
-        std::ofstream f(tmppath, std::ios::binary | std::ios::trunc);
-        if (!f) {
-            return false;
-        }
-
-        auto put_u32 = [&f](uint32_t v) {
-            f.write(reinterpret_cast<const char *>(&v), sizeof(v));
-        };
-        auto put_u64 = [&f](uint64_t v) {
-            f.write(reinterpret_cast<const char *>(&v), sizeof(v));
-        };
-
-        put_u32(DISK_CACHE_MAGIC);
-        put_u32(DISK_CACHE_VERSION);
-        put_u32(arch_hash);
-        put_u32(vocab_hash);
-        put_u32(static_cast<uint32_t>(limit_tokens)); // n_ctx at spill time (stored for diagnostics)
-
-        const auto & toks = entry.tokens.get_tokens();
-        const uint32_t n_tok = static_cast<uint32_t>(toks.size());
-        put_u32(n_tok);
-        if (n_tok > 0) {
-            f.write(reinterpret_cast<const char *>(toks.data()),
-                    static_cast<std::streamsize>(n_tok * sizeof(llama_token)));
-        }
-
-        put_u64(static_cast<uint64_t>(entry.data.main.size()));
-        if (!entry.data.main.empty()) {
-            f.write(reinterpret_cast<const char *>(entry.data.main.data()),
-                    static_cast<std::streamsize>(entry.data.main.size()));
-        }
-
-        put_u64(static_cast<uint64_t>(entry.data.drft.size()));
-        if (!entry.data.drft.empty()) {
-            f.write(reinterpret_cast<const char *>(entry.data.drft.data()),
-                    static_cast<std::streamsize>(entry.data.drft.size()));
-        }
-
-        // checkpoints — PARTIAL_ONLY KV snapshots taken during prefill. Required for SWA / hybrid /
-        // recurrent models: the main blob captures the trailing window only, so without these the
-        // rewind path at server-context.cpp can't recover earlier positions across restart.
-        put_u32(static_cast<uint32_t>(entry.checkpoints.size()));
-        for (const auto & cp : entry.checkpoints) {
-            const int64_t  n_tokens_v = cp.n_tokens;
-            const int32_t  pos_min_v  = cp.pos_min;
-            const int32_t  pos_max_v  = cp.pos_max;
-            f.write(reinterpret_cast<const char *>(&n_tokens_v), sizeof(n_tokens_v));
-            f.write(reinterpret_cast<const char *>(&pos_min_v),  sizeof(pos_min_v));
-            f.write(reinterpret_cast<const char *>(&pos_max_v),  sizeof(pos_max_v));
-
-            put_u64(static_cast<uint64_t>(cp.data_tgt.size()));
-            if (!cp.data_tgt.empty()) {
-                f.write(reinterpret_cast<const char *>(cp.data_tgt.data()),
-                        static_cast<std::streamsize>(cp.data_tgt.size()));
-            }
-            put_u64(static_cast<uint64_t>(cp.data_dft.size()));
-            if (!cp.data_dft.empty()) {
-                f.write(reinterpret_cast<const char *>(cp.data_dft.data()),
-                        static_cast<std::streamsize>(cp.data_dft.size()));
-            }
-        }
-
-        if (!f) {
-            std::error_code ec;
-            std::filesystem::remove(tmppath, ec);
-            return false;
-        }
-    }
-
-    std::error_code ec;
-    std::filesystem::rename(tmppath, filepath, ec);
-    if (ec) {
-        std::filesystem::remove(tmppath, ec);
+bool server_prompt_cache::flush_from_context(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+    if (disk_path.empty()) {
         return false;
     }
 
+    const std::string & conv_id = prompt.conversation_id;
+    if (conv_id.empty()) {
+        SRV_WRN("%s", "disk cache: conversation_id is empty, refusing to flush (no fallback)\n");
+        return false;
+    }
+
+    GGML_ASSERT(!prompt.tokens.has_mtmd);
+
+    const auto & toks = prompt.tokens.get_tokens();
+    const uint32_t n_tok = (uint32_t) toks.size();
+    if (n_tok == 0) {
+        return false;
+    }
+
+    // pos-range delta segments are only self-contained when the serialized state covers the
+    // whole history (plain full-attention unified KV). windowed state (SWA / hybrid /
+    // recurrent) is small by construction and gets a single full-state rewrite instead.
+    const llama_model * model_tgt = llama_get_model(ctx_tgt);
+    bool delta_capable = llama_model_n_swa(model_tgt) == 0 &&
+                         !llama_model_is_recurrent(model_tgt) &&
+                         !llama_model_is_hybrid(model_tgt);
+    if (ctx_dft) {
+        const llama_model * model_dft = llama_get_model(ctx_dft);
+        delta_capable = delta_capable &&
+                        llama_model_n_swa(model_dft) == 0 &&
+                        !llama_model_is_recurrent(model_dft) &&
+                        !llama_model_is_hybrid(model_dft);
+    }
+
+    // first touch of this conversation: seed the in-RAM mirror from an existing .hdr
+    {
+        bool have_state = false;
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            have_state = disk_convs.count(conv_id) > 0;
+        }
+        if (!have_state) {
+            disk_conv_state seed;
+            read_disk_state(conv_id, seed); // missing/invalid files leave the default (rewrite)
+
+            std::lock_guard<std::mutex> lock(mtx);
+            disk_convs.emplace(conv_id, std::move(seed));
+        }
+    }
+
+    // decide append-from-high-water-mark vs rewrite-from-scratch
+    uint32_t base    = 0;
+    bool     rewrite = true;
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        auto & st = disk_convs[conv_id];
+
+        const bool prefix_ok = !st.broken &&
+                               st.scheduled_n_tok > 0 &&
+                               st.scheduled_n_tok <= n_tok &&
+                               std::equal(st.scheduled_tokens.begin(), st.scheduled_tokens.end(), toks.begin());
+
+        if (prefix_ok && st.scheduled_n_tok == n_tok) {
+            SRV_INF("disk cache: '%s' already flushed (%u tokens) - nothing to write\n", conv_id.c_str(), n_tok);
+            return true;
+        }
+        if (prefix_ok && delta_capable) {
+            base    = st.scheduled_n_tok;
+            rewrite = false;
+        }
+    }
+
+    const uint32_t chunk = delta_capable ? DISK_SEGMENT_TOKENS : n_tok - base;
+
+    SRV_WRN("disk cache: flushing '%s' tokens [%u, %u) as %u segment(s) (%s)\n",
+            conv_id.c_str(), base, n_tok,
+            (n_tok - base + chunk - 1) / chunk,
+            rewrite ? "rewrite" : "append");
+
+    bool first = rewrite;
+    for (uint32_t p0 = base; p0 < n_tok; p0 += chunk) {
+        const uint32_t p1 = std::min(p0 + chunk, n_tok);
+
+        disk_job job;
+        job.conv_id = conv_id;
+        job.rewrite = first;
+        first = false;
+        job.p0 = (llama_pos) p0;
+        job.p1 = (llama_pos) p1;
+
+        auto capture_failed = [&](const char * which) {
+            SRV_WRN("disk cache: state capture (%s) failed for '%s' pos [%u, %u) - marking for rewrite\n",
+                    which, conv_id.c_str(), p0, p1);
+            std::lock_guard<std::mutex> lock(mtx);
+            disk_convs[conv_id].broken = true;
+        };
+
+        {
+            const size_t sz = delta_capable
+                ? llama_state_seq_get_size_range(ctx_tgt, id_slot, (llama_pos) p0, (llama_pos) p1, LLAMA_STATE_SEQ_FLAGS_NONE)
+                : llama_state_seq_get_size_ext(ctx_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (sz == 0) {
+                capture_failed("main");
+                return false;
+            }
+            job.kv.resize(sz);
+            const size_t got = delta_capable
+                ? llama_state_seq_get_data_range(ctx_tgt, job.kv.data(), sz, id_slot, (llama_pos) p0, (llama_pos) p1, LLAMA_STATE_SEQ_FLAGS_NONE)
+                : llama_state_seq_get_data_ext(ctx_tgt, job.kv.data(), sz, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (got != sz) {
+                capture_failed("main");
+                return false;
+            }
+        }
+
+        if (ctx_dft) {
+            const size_t sz = delta_capable
+                ? llama_state_seq_get_size_range(ctx_dft, id_slot, (llama_pos) p0, (llama_pos) p1, LLAMA_STATE_SEQ_FLAGS_NONE)
+                : llama_state_seq_get_size_ext(ctx_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (sz == 0) {
+                capture_failed("drft");
+                return false;
+            }
+            job.drft.resize(sz);
+            const size_t got = delta_capable
+                ? llama_state_seq_get_data_range(ctx_dft, job.drft.data(), sz, id_slot, (llama_pos) p0, (llama_pos) p1, LLAMA_STATE_SEQ_FLAGS_NONE)
+                : llama_state_seq_get_data_ext(ctx_dft, job.drft.data(), sz, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (got != sz) {
+                capture_failed("drft");
+                return false;
+            }
+        }
+
+        job.tokens.assign(toks.begin(), toks.begin() + p1);
+
+        // enqueue with byte-budget backpressure so a big flush cannot pile up in host RAM
+        {
+            std::unique_lock<std::mutex> lock(mtx);
+            cv.wait(lock, [this]() { return queue_bytes < DISK_QUEUE_MAX_BYTES; });
+
+            auto & st = disk_convs[conv_id];
+            st.scheduled_n_tok  = p1;
+            st.scheduled_tokens = job.tokens;
+
+            queue_bytes += job.bytes();
+            queue.push_back(std::move(job));
+            cv.notify_all();
+        }
+    }
+
+    return true;
+}
+
+void server_prompt_cache::process_disk_job(const disk_job & job) {
+    if (job.ckpt) {
+        write_checkpoint_file(*job.ckpt, job.conv_id);
+        return;
+    }
+
+    const std::string base      = (std::filesystem::path(disk_path) / job.conv_id).string();
+    const std::string kv_path   = split_path(base, SPLIT_EXT_KV);
+    const std::string drft_path = split_path(base, SPLIT_EXT_DRFT);
+
+    const int64_t t_start = ggml_time_us();
+
+    // snapshot the committed state
+    disk_conv_state st;
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        st = disk_convs[job.conv_id];
+    }
+    if (st.broken && !job.rewrite) {
+        SRV_WRN("disk cache: dropping append for broken conversation '%s' (a rewrite will follow)\n", job.conv_id.c_str());
+        return;
+    }
+
+    auto fail = [&](const char * what) {
+        SRV_WRN("disk cache: %s failed for '%s' - marking conversation for rewrite\n", what, job.conv_id.c_str());
+        std::lock_guard<std::mutex> lock(mtx);
+        disk_convs[job.conv_id].broken = true;
+    };
+
+    std::error_code ec;
+
+    if (job.rewrite) {
+        st.segments.clear();
+        st.kv_size   = 0;
+        st.drft_size = 0;
+        st.n_tok     = 0;
+
+        std::filesystem::remove(kv_path, ec);
+        std::filesystem::remove(drft_path, ec);
+    } else {
+        // crash-orphan cleanup: the data files must be at least as large as the committed
+        // sizes; extra tail bytes come from an append whose header never committed
+        const uint64_t kv_actual = (uint64_t) std::filesystem::file_size(kv_path, ec);
+        if (ec || kv_actual < st.kv_size) {
+            fail("kv size check");
+            return;
+        }
+        if (kv_actual > st.kv_size) {
+            std::filesystem::resize_file(kv_path, st.kv_size, ec);
+            if (ec) {
+                fail("kv truncate");
+                return;
+            }
+        }
+        if (st.drft_size > 0) {
+            const uint64_t drft_actual = (uint64_t) std::filesystem::file_size(drft_path, ec);
+            if (ec || drft_actual < st.drft_size) {
+                fail("drft size check");
+                return;
+            }
+            if (drft_actual > st.drft_size) {
+                std::filesystem::resize_file(drft_path, st.drft_size, ec);
+                if (ec) {
+                    fail("drft truncate");
+                    return;
+                }
+            }
+        }
+    }
+
+    disk_conv_state::seg_entry seg;
+    seg.kv_off    = st.kv_size;
+    seg.kv_size   = job.kv.size();
+    seg.drft_off  = st.drft_size;
+    seg.drft_size = job.drft.size();
+    seg.p0        = job.p0;
+    seg.p1        = job.p1;
+
+    if (!disk_append_file(kv_path, job.kv.data(), job.kv.size())) {
+        fail("kv append");
+        return;
+    }
+    if (!job.drft.empty() && !disk_append_file(drft_path, job.drft.data(), job.drft.size())) {
+        fail("drft append");
+        return;
+    }
+
+    st.segments.push_back(seg);
+    st.kv_size   += job.kv.size();
+    st.drft_size += job.drft.size();
+    st.n_tok      = (uint32_t) job.tokens.size();
+
+    if (!disk_write_file_atomic(split_path(base, SPLIT_EXT_TOK), job.tokens.data(), job.tokens.size() * sizeof(llama_token))) {
+        fail("tok write");
+        return;
+    }
+
+    // header last - a crash before this point leaves only an orphan tail in the data
+    // files, which the next append (or load) truncates away using the old header
+    std::vector<uint8_t> hdr;
+    auto put = [&hdr](const auto & v) {
+        const uint8_t * p = reinterpret_cast<const uint8_t *>(&v);
+        hdr.insert(hdr.end(), p, p + sizeof(v));
+    };
+    put(DISK_CACHE_MAGIC);
+    put(DISK_CACHE_VERSION);
+    put(arch_hash);
+    put(vocab_hash);
+    put((uint32_t) limit_tokens);
+    put(st.n_tok);
+    put((uint32_t) st.segments.size());
+    put(st.kv_size);
+    put(st.drft_size);
+    for (const auto & s : st.segments) {
+        put(s.kv_off);
+        put(s.kv_size);
+        put(s.drft_off);
+        put(s.drft_size);
+        put(s.p0);
+        put(s.p1);
+    }
+    put(disk_hdr_checksum(hdr.data(), hdr.size()));
+
+    if (!disk_write_file_atomic(split_path(base, SPLIT_EXT_HDR), hdr.data(), hdr.size())) {
+        fail("hdr write");
+        return;
+    }
+
+    const size_t n_segs = st.segments.size();
+
+    // commit
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        auto & live = disk_convs[job.conv_id];
+        live.n_tok     = st.n_tok;
+        live.kv_size   = st.kv_size;
+        live.drft_size = st.drft_size;
+        live.segments  = std::move(st.segments);
+        live.broken    = false;
+    }
+
     const double t_ms = (ggml_time_us() - t_start) / 1e3;
-    const double mb_s = t_ms > 0.0 ? (bytes_total / (1024.0 * 1024.0)) / (t_ms / 1e3) : 0.0;
-    SRV_WRN("disk cache: wrote %.1f MiB in %.1f s (%.1f MiB/s) → %s\n",
-            bytes_total / (1024.0 * 1024.0), t_ms / 1e3, mb_s, filepath.c_str());
+    SRV_WRN("disk cache: wrote '%s' segment pos [%d, %d) %.1f MiB (drft %.1f MiB) in %.0f ms - now %u tokens in %zu segment(s)\n",
+            job.conv_id.c_str(), job.p0, job.p1,
+            job.kv.size() / (1024.0 * 1024.0), job.drft.size() / (1024.0 * 1024.0),
+            t_ms, st.n_tok, n_segs);
+}
+
+bool server_prompt_cache::read_disk_state(const std::string & conversation_id, disk_conv_state & st) {
+    const std::string base = (std::filesystem::path(disk_path) / conversation_id).string();
+
+    std::vector<uint8_t> hdr;
+    {
+        std::ifstream f(split_path(base, SPLIT_EXT_HDR), std::ios::binary);
+        if (!f) {
+            return false;
+        }
+        hdr.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    }
+
+    // fixed part: 7 x u32 + 2 x u64, then the segment table, then a u64 checksum
+    constexpr size_t fixed_bytes = 7*sizeof(uint32_t) + 2*sizeof(uint64_t);
+    constexpr size_t seg_bytes   = 4*sizeof(uint64_t) + 2*sizeof(int32_t);
+    if (hdr.size() < fixed_bytes + sizeof(uint64_t)) {
+        return false;
+    }
+
+    uint64_t stored_checksum = 0;
+    memcpy(&stored_checksum, hdr.data() + hdr.size() - sizeof(uint64_t), sizeof(uint64_t));
+    if (disk_hdr_checksum(hdr.data(), hdr.size() - sizeof(uint64_t)) != stored_checksum) {
+        SRV_WRN("disk cache: '%s.hdr' checksum mismatch - ignoring\n", conversation_id.c_str());
+        return false;
+    }
+
+    size_t off = 0;
+    auto get = [&hdr, &off](auto & v) {
+        memcpy(&v, hdr.data() + off, sizeof(v));
+        off += sizeof(v);
+    };
+
+    uint32_t magic = 0, version = 0, fa = 0, fv = 0, lt = 0, n_tok = 0, n_segs = 0;
+    uint64_t kv_size = 0, drft_size = 0;
+    get(magic);
+    get(version);
+    get(fa);
+    get(fv);
+    get(lt);
+    get(n_tok);
+    get(n_segs);
+    get(kv_size);
+    get(drft_size);
+    GGML_UNUSED(lt);
+
+    if (magic != DISK_CACHE_MAGIC || version != DISK_CACHE_VERSION) {
+        SRV_INF("disk cache: '%s.hdr' wrong magic/version (0x%08x, %u)\n", conversation_id.c_str(), magic, version);
+        return false;
+    }
+    if (fa != arch_hash || fv != vocab_hash) {
+        SRV_INF("disk cache: '%s.hdr' arch/vocab mismatch\n", conversation_id.c_str());
+        return false;
+    }
+    if (n_tok == 0 || hdr.size() != fixed_bytes + (size_t) n_segs * seg_bytes + sizeof(uint64_t)) {
+        return false;
+    }
+
+    st.segments.resize(n_segs);
+    for (auto & s : st.segments) {
+        get(s.kv_off);
+        get(s.kv_size);
+        get(s.drft_off);
+        get(s.drft_size);
+        get(s.p0);
+        get(s.p1);
+    }
+
+    // the data files must hold at least the committed bytes (orphan tails are fine)
+    std::error_code ec;
+    const uint64_t kv_actual = (uint64_t) std::filesystem::file_size(split_path(base, SPLIT_EXT_KV), ec);
+    if (ec || kv_actual < kv_size) {
+        SRV_WRN("disk cache: '%s.kv' smaller than header says - ignoring\n", conversation_id.c_str());
+        return false;
+    }
+    if (drft_size > 0) {
+        const uint64_t drft_actual = (uint64_t) std::filesystem::file_size(split_path(base, SPLIT_EXT_DRFT), ec);
+        if (ec || drft_actual < drft_size) {
+            SRV_WRN("disk cache: '%s.drft' smaller than header says - ignoring\n", conversation_id.c_str());
+            return false;
+        }
+    }
+
+    std::vector<llama_token> toks(n_tok);
+    {
+        std::ifstream f(split_path(base, SPLIT_EXT_TOK), std::ios::binary);
+        if (!f) {
+            return false;
+        }
+        f.read(reinterpret_cast<char *>(toks.data()), (std::streamsize)(n_tok * sizeof(llama_token)));
+        if (!f) {
+            return false;
+        }
+    }
+
+    st.n_tok            = n_tok;
+    st.kv_size          = kv_size;
+    st.drft_size        = drft_size;
+    st.scheduled_n_tok  = n_tok;
+    st.scheduled_tokens = std::move(toks);
+    st.broken           = false;
+
     return true;
 }
 
@@ -2243,10 +2467,81 @@ void server_prompt_cache::spill_checkpoint(const common_prompt_checkpoint & cp, 
     }
 
     if (conversation_id.empty()) {
-            SRV_WRN("%s", "checkpoint spill: conversation_id is empty, refusing to write (no fallback)\n");
+        SRV_WRN("%s", "checkpoint spill: conversation_id is empty, refusing to write (no fallback)\n");
         return;
     }
 
+    if (cp.data_tgt.empty() && cp.data_dft.empty()) {
+        // disk-backed (lazy) or empty checkpoint - its file already exists
+        return;
+    }
+
+    // write-at-creation, async: copy the blobs into the job so the resident checkpoint can be
+    // converted to disk-backed (or evicted) while the write is still in flight
+    disk_job job;
+    job.conv_id = conversation_id;
+    job.ckpt = std::make_shared<common_prompt_checkpoint>();
+    job.ckpt->pos_min  = cp.pos_min;
+    job.ckpt->pos_max  = cp.pos_max;
+    job.ckpt->n_tokens = cp.n_tokens;
+    job.ckpt->data_tgt = cp.data_tgt;
+    job.ckpt->data_dft = cp.data_dft;
+
+    {
+        std::unique_lock<std::mutex> lock(mtx);
+        cv.wait(lock, [this]() { return queue_bytes < DISK_QUEUE_MAX_BYTES; });
+        queue_bytes += job.bytes();
+        queue.push_back(std::move(job));
+        cv.notify_all();
+    }
+}
+
+void server_prompt_cache::lazify_checkpoints(server_prompt & prompt) {
+    if (disk_path.empty() || prompt.conversation_id.empty() || prompt.checkpoints.size() < 2) {
+        return;
+    }
+
+    // keep the newest checkpoint resident (including its speculative state); convert older
+    // ones whose cp_ file has committed to disk-backed form so at most one checkpoint's
+    // KV blobs occupy host RAM
+    auto last = std::prev(prompt.checkpoints.end());
+    for (auto it = prompt.checkpoints.begin(); it != last; ++it) {
+        auto & cp = *it;
+
+        if (!cp.src_path.empty()) {
+            continue; // already disk-backed
+        }
+        if (cp.data_tgt.empty() && cp.data_dft.empty()) {
+            continue;
+        }
+
+        const std::string filename = "cp_" + prompt.conversation_id + "_" + std::to_string(cp.pos_min) + ".bin";
+        const std::string path     = (std::filesystem::path(disk_path) / filename).string();
+
+        const uint64_t sz_tgt   = cp.data_tgt.size();
+        const uint64_t sz_dft   = cp.data_dft.size();
+        const uint64_t expected = CHECKPOINT_FILE_HEADER_BYTES + sz_tgt + sizeof(uint64_t) + sz_dft;
+
+        std::error_code ec;
+        const uint64_t actual = (uint64_t) std::filesystem::file_size(path, ec);
+        if (ec || actual != expected) {
+            continue; // write still in flight (or failed) - try again on the next checkpoint
+        }
+
+        cp.src_path = path;
+        cp.off_tgt  = CHECKPOINT_FILE_HEADER_BYTES;
+        cp.sz_tgt   = sz_tgt;
+        cp.off_dft  = CHECKPOINT_FILE_HEADER_BYTES + sz_tgt + sizeof(uint64_t);
+        cp.sz_dft   = sz_dft;
+        cp.clear_tgt();
+        cp.clear_dft();
+
+        SRV_INF("checkpoint: converted pos_min=%d to disk-backed ('%s', %.1f MiB freed)\n",
+                cp.pos_min, filename.c_str(), (sz_tgt + sz_dft) / (1024.0 * 1024.0));
+    }
+}
+
+bool server_prompt_cache::write_checkpoint_file(const common_prompt_checkpoint & cp, const std::string & conversation_id) {
     // filename encodes conversation_id so the limit and merge logic can filter per conversation
     const std::string filename = "cp_" + conversation_id + "_" + std::to_string(cp.pos_min) + ".bin";
     const std::filesystem::path filepath = std::filesystem::path(disk_path) / filename;
@@ -2256,7 +2551,7 @@ void server_prompt_cache::spill_checkpoint(const common_prompt_checkpoint & cp, 
         std::ofstream f(tmppath, std::ios::binary | std::ios::trunc);
         if (!f) {
             SRV_WRN("checkpoint spill: failed to open '%s' for write\n", tmppath.string().c_str());
-            return;
+            return false;
         }
 
         auto put_u32 = [&f](uint32_t v) { f.write(reinterpret_cast<const char *>(&v), sizeof(v)); };
@@ -2290,7 +2585,7 @@ void server_prompt_cache::spill_checkpoint(const common_prompt_checkpoint & cp, 
             std::error_code ec;
             std::filesystem::remove(tmppath, ec);
             SRV_WRN("checkpoint spill: write error for '%s'\n", tmppath.string().c_str());
-            return;
+            return false;
         }
     }
 
@@ -2299,7 +2594,7 @@ void server_prompt_cache::spill_checkpoint(const common_prompt_checkpoint & cp, 
     if (ec) {
         std::filesystem::remove(tmppath, ec);
         SRV_WRN("checkpoint spill: rename failed '%s': %s\n", tmppath.string().c_str(), ec.message().c_str());
-        return;
+        return false;
     }
 
     // enforce the per-conversation checkpoint spill limit by deleting the files that cover
@@ -2365,6 +2660,8 @@ void server_prompt_cache::spill_checkpoint(const common_prompt_checkpoint & cp, 
             }
         }
     }
+
+    return true;
 }
 
 void server_prompt_cache::merge_checkpoint_spills(server_prompt & prompt) {
@@ -2505,248 +2802,170 @@ void server_prompt_cache::merge_checkpoint_spills(server_prompt & prompt) {
     }
 }
 
+
 bool server_prompt_cache::load_from_disk(server_prompt & prompt, const std::string & conversation_id,
                                           llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
     if (disk_path.empty() || conversation_id.empty()) {
         return false;
     }
 
-    const std::filesystem::path filepath = std::filesystem::path(disk_path) / (conversation_id + ".bin");
-    SRV_INF("load_from_disk: trying '%s'\n", filepath.string().c_str());
+    // wait until no write for this conversation is queued or in flight
+    {
+        std::unique_lock<std::mutex> lock(mtx);
+        cv.wait(lock, [&]() {
+            if (writer_active_conv == conversation_id) {
+                return false;
+            }
+            for (const auto & j : queue) {
+                if (j.conv_id == conversation_id) {
+                    return false;
+                }
+            }
+            return true;
+        });
+    }
 
-    std::error_code ec;
-    if (!std::filesystem::exists(filepath, ec) || ec) {
-        SRV_INF("load_from_disk: '%s' not found\n", filepath.string().c_str());
+    disk_conv_state st;
+    if (!read_disk_state(conversation_id, st)) {
+        SRV_INF("load_from_disk: no valid cache files for '%s'\n", conversation_id.c_str());
         return false;
     }
 
-    std::ifstream f(filepath, std::ios::binary);
-    if (!f) {
+    if (limit_tokens > 0 && st.n_tok > limit_tokens) {
+        SRV_INF("load_from_disk: '%s' too many tokens (%u > %zu)\n", conversation_id.c_str(), st.n_tok, limit_tokens);
         return false;
     }
 
-    // Read and validate header
-    uint32_t magic;
-    if (!read_disk_u32(f, magic)) return false;
-    uint32_t version;
-    if (!read_disk_u32(f, version)) return false;
-
-    if (magic != DISK_CACHE_MAGIC) {
-        SRV_INF("load_from_disk: '%s' wrong magic (0x%08x)\n", filepath.filename().c_str(), magic);
-        return false;
-    }
-    if (version != DISK_CACHE_VERSION) {
-        SRV_INF("load_from_disk: '%s' wrong version (%s)\n", filepath.filename().c_str(), std::to_string(version).c_str());
+    const bool runtime_has_dft = ctx_dft != nullptr;
+    if (runtime_has_dft && st.drft_size == 0) {
+        SRV_INF("load_from_disk: '%s' asymmetric (runtime has draft, file does not)\n", conversation_id.c_str());
         return false;
     }
 
-    uint32_t fa;
-    if (!read_disk_u32(f, fa)) return false;
-    uint32_t fv;
-    if (!read_disk_u32(f, fv)) return false;
-    uint32_t fn_ctx;
-    if (!read_disk_u32(f, fn_ctx)) return false;
-    (void) fn_ctx;
-    uint32_t n_tok;
-    if (!read_disk_u32(f, n_tok)) return false;
+    const std::string base = (std::filesystem::path(disk_path) / conversation_id).string();
 
-    if (!fa || !fv || !n_tok) return false;
-    if (fa != arch_hash || fv != vocab_hash) {
-        SRV_INF("load_from_disk: '%s' arch/vocab mismatch\n", filepath.filename().c_str());
+    std::ifstream kf(split_path(base, SPLIT_EXT_KV), std::ios::binary);
+    if (!kf) {
         return false;
     }
-    if (limit_tokens > 0 && n_tok > limit_tokens) {
-        SRV_INF("load_from_disk: '%s' too many tokens (%u > %zu)\n", filepath.filename().c_str(), n_tok, limit_tokens);
-        return false;
-    }
-
-    // Read tokens
-    std::vector<llama_token> toks(n_tok);
-    if (n_tok > 0) {
-        f.read(reinterpret_cast<char *>(toks.data()), static_cast<std::streamsize>(n_tok * sizeof(llama_token)));
-        if (!f) return false;
-    }
-
-    // Read main state size and position
-    uint64_t main_sz;
-    if (!read_disk_u64(f, main_sz)) return false;
-    std::streampos main_off = f.tellg();
-    f.seekg(static_cast<std::streamoff>(main_sz), std::ios::cur);
-
-    // Read draft state size
-    uint64_t drft_sz;
-    if (!read_disk_u64(f, drft_sz)) return false;
-
-    const bool runtime_has_dft = (ctx_dft != nullptr);
-    if (runtime_has_dft && drft_sz == 0) {
-        SRV_INF("load_from_disk: '%s' asymmetric (runtime has drft, file does not)\n", filepath.filename().c_str());
-        return false;
-    }
-
-    SRV_INF("load_from_disk: '%s' n_tok=%u main_size=%llu drft_size=%llu\n",
-            filepath.filename().c_str(), n_tok,
-            (unsigned long long) main_sz, (unsigned long long) drft_sz);
-
-    // Re-read from main state offset
-    f.seekg(main_off);
-
-    std::vector<uint8_t> main_bytes(static_cast<size_t>(main_sz));
-    if (main_sz > 0) {
-        f.read(reinterpret_cast<char *>(main_bytes.data()), static_cast<std::streamsize>(main_sz));
-        if (!f) return false;
-    }
-
-    // Draft state
-    uint64_t drft_sz_read = 0;
-    f.read(reinterpret_cast<char *>(&drft_sz_read), sizeof(drft_sz_read));
-    if (!f) return false;
-
-    std::vector<uint8_t> drft_bytes;
-    if (drft_sz_read > 0) {
-        drft_bytes.resize(static_cast<size_t>(drft_sz_read));
-        f.read(reinterpret_cast<char *>(drft_bytes.data()), static_cast<std::streamsize>(drft_sz_read));
-        if (!f) return false;
-    }
-
-    // Checkpoints section
-    uint32_t n_ckpts = 0;
-    f.read(reinterpret_cast<char *>(&n_ckpts), sizeof(n_ckpts));
-    if (!f) return false;
-
-    std::list<common_prompt_checkpoint> restored_ckpts;
-    for (uint32_t i = 0; i < n_ckpts; i++) {
-        int64_t  n_tokens_v = 0;
-        int32_t  pos_min_v  = 0;
-        int32_t  pos_max_v  = 0;
-        uint64_t tgt_sz     = 0;
-        uint64_t dft_sz     = 0;
-
-        f.read(reinterpret_cast<char *>(&n_tokens_v), sizeof(n_tokens_v));
-        f.read(reinterpret_cast<char *>(&pos_min_v),  sizeof(pos_min_v));
-        f.read(reinterpret_cast<char *>(&pos_max_v),  sizeof(pos_max_v));
-        f.read(reinterpret_cast<char *>(&tgt_sz),     sizeof(tgt_sz));
-        if (!f) return false;
-
-        common_prompt_checkpoint cp;
-        cp.n_tokens = n_tokens_v;
-        cp.pos_min  = pos_min_v;
-        cp.pos_max  = pos_max_v;
-        if (tgt_sz > 0) {
-            cp.data_tgt.resize(static_cast<size_t>(tgt_sz));
-            f.read(reinterpret_cast<char *>(cp.data_tgt.data()), static_cast<std::streamsize>(tgt_sz));
-            if (!f) return false;
-        }
-
-        f.read(reinterpret_cast<char *>(&dft_sz), sizeof(dft_sz));
-        if (!f) return false;
-        if (dft_sz > 0) {
-            cp.data_dft.resize(static_cast<size_t>(dft_sz));
-            f.read(reinterpret_cast<char *>(cp.data_dft.data()), static_cast<std::streamsize>(dft_sz));
-            if (!f) return false;
-        }
-
-        restored_ckpts.push_back(std::move(cp));
-    }
-    f.close();
-
-    // Restore state into context
-    const size_t n_main = llama_state_seq_set_data_ext(ctx_tgt, main_bytes.data(), main_bytes.size(), id_slot, 0);
-    if (n_main != main_bytes.size()) {
-        SRV_INF("load_from_disk: set_data_ext (main) returned %zu of %zu\n", n_main, main_bytes.size());
-        return false;
-    }
-
-    if (runtime_has_dft && !drft_bytes.empty()) {
-        const size_t n_drft = llama_state_seq_set_data_ext(ctx_dft, drft_bytes.data(), drft_bytes.size(), id_slot, 0);
-        if (n_drft != drft_bytes.size()) {
-            SRV_INF("load_from_disk: set_data_ext (drft) returned %zu of %zu\n", n_drft, drft_bytes.size());
+    std::ifstream df;
+    if (runtime_has_dft) {
+        df.open(split_path(base, SPLIT_EXT_DRFT), std::ios::binary);
+        if (!df) {
             return false;
         }
     }
 
-    // Populate prompt
-    prompt.tokens.clear();
-    prompt.tokens.insert(toks);
-    prompt.checkpoints = std::move(restored_ckpts);
+    const int64_t t_start = ggml_time_us();
 
-    SRV_INF("load_from_disk: restored '%s' tokens=%zu checkpoints=%zu\n",
-            filepath.filename().c_str(), prompt.tokens.size(), prompt.checkpoints.size());
+    SRV_INF("load_from_disk: '%s' n_tok=%u kv=%.1f MiB drft=%.1f MiB segments=%zu\n",
+            conversation_id.c_str(), st.n_tok,
+            st.kv_size / (1024.0 * 1024.0), st.drft_size / (1024.0 * 1024.0), st.segments.size());
+
+    auto wipe_slot = [&]() {
+        llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, -1, -1);
+        if (ctx_dft) {
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, -1, -1);
+        }
+    };
+
+    // stream the segments into the context one buffer at a time: the first replaces the
+    // sequence, the rest merge into it. peak host RAM = the largest single segment.
+    std::vector<uint8_t> buf;
+    for (size_t i = 0; i < st.segments.size(); ++i) {
+        const auto & seg = st.segments[i];
+        const llama_state_seq_flags flags = i == 0 ? LLAMA_STATE_SEQ_FLAGS_NONE : LLAMA_STATE_SEQ_FLAGS_APPEND;
+
+        buf.resize(seg.kv_size);
+        kf.seekg((std::streamoff) seg.kv_off);
+        kf.read(reinterpret_cast<char *>(buf.data()), (std::streamsize) seg.kv_size);
+        if (!kf) {
+            SRV_WRN("load_from_disk: '%s.kv' read failed at segment %zu\n", conversation_id.c_str(), i);
+            wipe_slot();
+            return false;
+        }
+
+        size_t n = llama_state_seq_set_data_ext(ctx_tgt, buf.data(), buf.size(), id_slot, flags);
+        if (n != buf.size()) {
+            SRV_WRN("load_from_disk: set_data (main, segment %zu) returned %zu of %zu\n", i, n, buf.size());
+            wipe_slot();
+            return false;
+        }
+
+        if (runtime_has_dft && seg.drft_size > 0) {
+            buf.resize(seg.drft_size);
+            df.seekg((std::streamoff) seg.drft_off);
+            df.read(reinterpret_cast<char *>(buf.data()), (std::streamsize) seg.drft_size);
+            if (!df) {
+                SRV_WRN("load_from_disk: '%s.drft' read failed at segment %zu\n", conversation_id.c_str(), i);
+                wipe_slot();
+                return false;
+            }
+
+            n = llama_state_seq_set_data_ext(ctx_dft, buf.data(), buf.size(), id_slot, flags);
+            if (n != buf.size()) {
+                SRV_WRN("load_from_disk: set_data (drft, segment %zu) returned %zu of %zu\n", i, n, buf.size());
+                wipe_slot();
+                return false;
+            }
+        }
+    }
+
+    // populate the prompt. checkpoints are not stored with the entry - the caller runs
+    // merge_checkpoint_spills() which registers this conversation's cp_ files lazily.
+    prompt.tokens.clear();
+    {
+        llama_tokens toks = st.scheduled_tokens;
+        prompt.tokens.insert(toks);
+    }
+    prompt.data = {};
+    prompt.checkpoints.clear();
+    prompt.conversation_id = conversation_id;
+
+    // seed the in-RAM mirror so the next flush appends instead of re-reading the header
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (disk_convs.count(conversation_id) == 0) {
+            disk_convs.emplace(conversation_id, std::move(st));
+        }
+    }
+
+    const double t_ms = (ggml_time_us() - t_start) / 1e3;
+    SRV_WRN("load_from_disk: restored '%s' tokens=%zu in %.0f ms (%.1f MiB/s)\n",
+            conversation_id.c_str(), prompt.tokens.size(), t_ms,
+            t_ms > 0.0 ? ((st.kv_size + st.drft_size) / (1024.0 * 1024.0)) / (t_ms / 1e3) : 0.0);
 
     return true;
 }
 
+void server_prompt_cache::wait_idle() {
+    std::unique_lock<std::mutex> lock(mtx);
+    cv.wait(lock, [this]() { return queue.empty() && writer_active_conv.empty(); });
+}
+
 void server_prompt_cache::shutdown_and_spill() {
-    // Idempotent: if there's nothing left to do, return silently (no logs).
-    if (!worker.joinable() && pending_spill.empty() && states.empty()) {
-        return;
-    }
-
-    if (disk_path.empty()) {
-        stop_flag.store(true);
-        cv.notify_all();
-        if (worker.joinable()) {
-            worker.join();
-        }
-        return;
-    }
-
-    // Snapshot counts so the user sees what's coming before any blocking I/O happens.
-    size_t queued_writes;
-    size_t pending_now;
-    size_t states_now;
-    size_t bytes_in_flight;
+    // idempotent: everything durable was flushed write-through at prompt_save time, so
+    // shutdown only needs to drain the async writer queue
+    size_t queued_jobs  = 0;
+    size_t queued_bytes = 0;
     {
         std::lock_guard<std::mutex> lock(mtx);
-        queued_writes = queue.size();
-        pending_now   = pending_spill.size();
-        states_now    = states.size();
-        bytes_in_flight = 0;
-        for (const auto & p : pending_spill) bytes_in_flight += p->size();
+        queued_jobs  = queue.size();
+        queued_bytes = queue_bytes;
     }
-    for (const auto & s : states) bytes_in_flight += s.size();
 
-    SRV_WRN("disk cache: shutdown — draining %zu queued, %zu pending in-flight, %zu states "
-            "(total %.1f MiB to persist)\n",
-            queued_writes, pending_now, states_now, bytes_in_flight / (1024.0 * 1024.0));
+    if (queued_jobs > 0) {
+        SRV_WRN("disk cache: shutdown - draining %zu queued write(s) (%.1f MiB)\n",
+                queued_jobs, queued_bytes / (1024.0 * 1024.0));
+    }
 
-    // Drain the async worker. This blocks until any in-flight write completes, then any further queued.
     stop_flag.store(true);
     cv.notify_all();
     if (worker.joinable()) {
-        SRV_WRN("%s", "disk cache: waiting for async writer to finish (this may take seconds-to-minutes for large states)...\n");
-        worker.join();
-        SRV_WRN("%s", "disk cache: async writer drained\n");
+        worker.join(); // the writer drains the whole queue before exiting
+        SRV_WRN("%s", "disk cache: async writer drained - shutdown complete\n");
     }
 
-    // Now synchronously spill anything left in pending_spill (failed-async cases), then states.
-    int n_done  = 0;
-    int n_total = (int) states.size() + (int) pending_spill.size();
-    if (n_total > 0) {
-        SRV_WRN("disk cache: synchronously spilling %d remaining entries\n", n_total);
-    }
-
-    while (!pending_spill.empty()) {
-        auto entry = pending_spill.front();
-        pending_spill.pop_front();
-        ++n_done;
-        SRV_WRN("disk cache: shutdown spill %d/%d (from pending)\n", n_done, n_total);
-        const std::string filepath = (std::filesystem::path(disk_path) / (entry->conversation_id + ".bin")).string();
-        write_entry_to_file(filepath, *entry);
-    }
-
-    while (!states.empty()) {
-        if (states.front().tokens.has_mtmd) {
-            states.pop_front();
-            ++n_done;
-            SRV_WRN("disk cache: shutdown spill %d/%d (mtmd entry — destroyed, not spillable)\n", n_done, n_total);
-            continue;
-        }
-        ++n_done;
-        SRV_WRN("disk cache: shutdown spill %d/%d (from states)\n", n_done, n_total);
-        const std::string filepath = (std::filesystem::path(disk_path) / (states.front().conversation_id + ".bin")).string();
-        write_entry_to_file(filepath, states.front());
-        states.pop_front();
-    }
-
-    SRV_WRN("%s", "disk cache: shutdown complete\n");
+    // mtmd states cannot be persisted
+    states.clear();
 }

@@ -105,6 +105,7 @@ static void test_lazy_registration_roundtrip() {
     const common_prompt_checkpoint cp = make_ckpt(/*pos_min*/ 100, /*pos_max*/ 150, /*n_tokens*/ 151,
                                                   /*tgt_n*/ 2048, /*dft_n*/ 512, /*seed*/ 42);
     cache.spill_checkpoint(cp, cid);
+    cache.wait_idle(); // spill is async - drain before reading the file back
 
     server_prompt prompt;
     prompt.conversation_id = cid;
@@ -167,6 +168,7 @@ static void test_dup_pos_min_skipped() {
     const std::string dir = make_temp_dir("dup");
     server_prompt_cache cache(64, 0, dir, 16, -1, 0x5u, 0x6u);
     cache.spill_checkpoint(make_ckpt(200, 250, 251, 128, 0, 9), "conv_dup");
+    cache.wait_idle();
 
     server_prompt prompt;
     prompt.conversation_id = "conv_dup";
@@ -189,6 +191,7 @@ static void test_conversation_filter() {
     const std::string dir = make_temp_dir("conv");
     server_prompt_cache cache(64, 0, dir, 16, -1, 0x7u, 0x8u);
     cache.spill_checkpoint(make_ckpt(5, 9, 10, 64, 0, 3), "conv_a");
+    cache.wait_idle();
 
     server_prompt other;
     other.conversation_id = "conv_b";
@@ -227,6 +230,7 @@ static void test_sorted_by_pos_min() {
     cache.spill_checkpoint(make_ckpt(300, 310, 311, 32, 0, 1), "conv_sorted");
     cache.spill_checkpoint(make_ckpt(100, 110, 111, 32, 0, 2), "conv_sorted");
     cache.spill_checkpoint(make_ckpt(200, 210, 211, 32, 0, 3), "conv_sorted");
+    cache.wait_idle();
 
     server_prompt prompt;
     prompt.conversation_id = "conv_sorted";
@@ -255,10 +259,11 @@ static void test_over_budget_reflects_ram_limit() {
     fs::remove_all(dir);
 }
 
-// the valley mechanic: spill_all_to_disk() frees host RAM AND persists every
-// state to disk (the "save AND remove from RAM" the swap path relies on)
-static void test_spill_all_frees_ram_and_persists() {
-    std::printf("test_spill_all_frees_ram_and_persists\n");
+// the valley mechanic: spill_all_to_disk() frees host RAM. with write-through
+// (flush at prompt_save), anything resident in `states` is not serializable
+// (mtmd), so freeing means dropping - nothing is written here.
+static void test_spill_all_frees_ram() {
+    std::printf("test_spill_all_frees_ram\n");
     const std::string dir = make_temp_dir("valley");
     server_prompt_cache cache(1, 0, dir, 16, -1, 0xC0FFEEu, 0xD00Du);
 
@@ -270,9 +275,8 @@ static void test_spill_all_frees_ram_and_persists() {
     cache.spill_all_to_disk();
 
     CHECK(cache.states.empty());          // host RAM freed
-    CHECK(cache.pending_spill.empty());   // synchronous: nothing left in flight
     CHECK(!cache.over_budget());          // size() back to ~0
-    CHECK(count_bin_files(dir) == 2);     // both states persisted to disk, not destroyed
+    CHECK(count_bin_files(dir) == 0);     // nothing written - these entries were not spillable
 
     fs::remove_all(dir);
 }
@@ -294,7 +298,7 @@ int main() {
     test_corrupt_file_skipped();
     test_sorted_by_pos_min();
     test_over_budget_reflects_ram_limit();
-    test_spill_all_frees_ram_and_persists();
+    test_spill_all_frees_ram();
     test_spill_all_noop_without_disk();
 
     if (g_failures == 0) {

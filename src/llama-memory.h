@@ -124,6 +124,12 @@ struct llama_memory_i {
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
+
+    // write the state of only the cells with pos in [p0, p1) for the given seq (p0/p1 < 0 = unbounded).
+    // the result is self-contained and can be applied on top of existing sequence state via
+    // state_read with LLAMA_STATE_SEQ_FLAGS_APPEND. supported only where such a slice is
+    // self-contained (non-SWA unified KV cache) - the default implementation aborts.
+    virtual void state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_state_seq_flags flags = 0) const;
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;

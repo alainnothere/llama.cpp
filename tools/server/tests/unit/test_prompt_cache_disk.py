@@ -12,11 +12,9 @@ from utils import *
 # checkpoint format; here we cover the end-to-end behaviour: a cached prompt
 # state is evicted to disk and later restored from disk.
 #
-# NOTE (threshold dependency): forcing an eviction-to-disk relies on the cached
-# state exceeding `--cache-ram`. We use the smallest budget (1 MiB), a single
-# slot, and several distinct long prompts so the cache overflows. With a very
-# small test model the exact prompt count needed may vary; if a spill assertion
-# fails on first run, raise the number/length of prompts below.
+# NOTE: with write-through the state is flushed to disk at every prompt_save
+# (slot switch), independent of `--cache-ram`. A single slot plus several
+# distinct prompts guarantees save/load cycles.
 
 server = ServerPreset.tinyllama2()
 
@@ -94,8 +92,8 @@ def test_prompt_state_spills_and_restores_from_disk():
     assert res.status_code == 200
     first_prompt_n = res.body["timings"]["prompt_n"]
 
-    # drive several more distinct prompts through the single slot; with a 1 MiB
-    # RAM budget the oldest entries (including PROMPTS[0]) get spilled to disk
+    # drive several more distinct prompts through the single slot; each slot switch
+    # flushes the outgoing conversation's state to disk (write-through)
     for p in PROMPTS[1:]:
         res = server.make_request("POST", "/completion", data={
             "prompt": p,
@@ -103,23 +101,23 @@ def test_prompt_state_spills_and_restores_from_disk():
         })
         assert res.status_code == 200
 
-    assert "spilling oldest entry to disk" in log.drain()
+    assert "disk cache: flushing" in log.drain()
 
     # re-send the first prompt: it is no longer resident, so it must come back
-    # from the disk tier (load() Phase 3 -> try_match_disk -> "restored from disk")
+    # from the disk tier (load() Phase 3 -> load_from_disk)
     res = server.make_request("POST", "/completion", data={
         "prompt": PROMPTS[0],
         "cache_prompt": True,
     })
     assert res.status_code == 200
-    assert "restored from disk" in log.drain()
+    assert "load_from_disk: restored" in log.drain()
     # restoring from disk means most of the prompt was cached, not recomputed
     assert res.body["timings"]["cache_n"] > 0
     assert res.body["timings"]["prompt_n"] < first_prompt_n
 
 
-# eviction should produce cache-entry .bin files in the disk directory
-def test_disk_cache_writes_bin_files():
+# saving should produce split cache files (.hdr, .tok, .kv, and .drft with a draft) per conversation
+def test_disk_cache_writes_split_files():
     server.start()
     for p in PROMPTS:
         res = server.make_request("POST", "/completion", data={
@@ -128,8 +126,8 @@ def test_disk_cache_writes_bin_files():
         })
         assert res.status_code == 200
 
-    bins = glob.glob(os.path.join(_disk_dir, "*.bin"))
-    assert len(bins) >= 1, f"expected at least one spilled cache file in {_disk_dir}"
+    hdrs = glob.glob(os.path.join(_disk_dir, "*.hdr"))
+    assert len(hdrs) >= 1, f"expected at least one flushed cache header in {_disk_dir}"
 
 
 # a corrupt/foreign .bin in the directory must not crash the server or be matched

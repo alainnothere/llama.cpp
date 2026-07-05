@@ -4,6 +4,7 @@
 #include "llama.h"
 
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <list>
 #include <map>
@@ -671,11 +672,6 @@ struct server_prompt_cache {
 
     std::list<server_prompt> states;
 
-    // pending_spill: entries already enqueued for disk write but not yet committed.
-    // shared_ptr so the writer worker keeps the data alive if load() consumes the pending entry first.
-    // counted by size() / n_tokens() — RAM ceiling = limit_size + (queue_depth × avg_entry_size)
-    std::list<std::shared_ptr<server_prompt>> pending_spill;
-
     // in bytes, 0 = no limit
     size_t limit_size = 0;
 
@@ -699,12 +695,25 @@ struct server_prompt_cache {
     void update();
 
     // called once on the main thread post start_loop() during graceful shutdown.
-    // drains the writer queue then synchronously spills remaining states + pending entries.
+    // drains the async writer queue (everything scheduled reaches disk), then joins the worker.
     void shutdown_and_spill();
 
-    // spill a single checkpoint to disk before it is erased from the in-memory list.
-    // no-op if disk_path is empty. called from create_checkpoint() in server-context.cpp.
+    // write-through: capture the not-yet-flushed tail of the slot's live state as pos-range
+    // segments and enqueue them for append to the conversation's .kv/.drft files. models whose
+    // serialized state is windowed (SWA / hybrid / recurrent) get a single full-state segment
+    // rewrite instead. called from server_slot::prompt_save() while the sequence is still live.
+    bool flush_from_context(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+
+    // write a single checkpoint to its own cp_ file (async). called from create_checkpoint()
+    // in server-context.cpp the moment the checkpoint is captured. no-op if disk_path is empty.
     void spill_checkpoint(const common_prompt_checkpoint & cp, const std::string & conversation_id);
+
+    // convert older resident checkpoints whose cp_ file has committed to disk-backed (lazy)
+    // form, keeping only the newest checkpoint's data (and speculative state) in RAM.
+    void lazify_checkpoints(server_prompt & prompt);
+
+    // block until the async writer has drained everything currently queued
+    void wait_idle();
 
     // scan disk_path for checkpoint spill files belonging to the prompt's conversation
     // and merge any that fill gaps in prompt.checkpoints.  called after every successful
@@ -725,28 +734,78 @@ struct server_prompt_cache {
     void spill_all_to_disk();
 
 private:
-    struct spill_job {
-        std::string uuid;
-        std::string filepath;
-        std::shared_ptr<server_prompt> entry;
+    // async writer job: either one KV segment append/rewrite or one checkpoint write
+    struct disk_job {
+        std::string conv_id;
+
+        // segment flush: self-contained state blob covering pos [p0, p1)
+        llama_pos p0 = 0;
+        llama_pos p1 = 0;
+        std::vector<uint8_t> kv;
+        std::vector<uint8_t> drft;
+        std::vector<llama_token> tokens; // tokens covered once this job commits ([0, p1))
+        bool rewrite = false;            // first segment of a from-scratch write: truncate the files
+
+        // checkpoint write (when set, the segment fields are unused)
+        std::shared_ptr<common_prompt_checkpoint> ckpt;
+
+        size_t bytes() const {
+            return kv.size() + drft.size() + tokens.size() * sizeof(llama_token) +
+                   (ckpt ? ckpt->data_tgt.size() + ckpt->data_dft.size() : 0);
+        }
     };
 
-    std::deque<spill_job>           queue;
-    std::mutex              mtx;     // protects queue + pending_spill
+    // per-conversation mirror of the on-disk .hdr plus what has been scheduled into the queue
+    struct disk_conv_state {
+        struct seg_entry {
+            uint64_t kv_off    = 0;
+            uint64_t kv_size   = 0;
+            uint64_t drft_off  = 0;
+            uint64_t drft_size = 0;
+            int32_t  p0        = 0;
+            int32_t  p1        = 0;
+        };
+
+        // committed by the writer thread - matches the files on disk
+        uint32_t n_tok     = 0;
+        uint64_t kv_size   = 0;
+        uint64_t drft_size = 0;
+        std::vector<seg_entry> segments;
+
+        // scheduled by the main thread - committed state plus everything still in the queue
+        uint32_t scheduled_n_tok = 0;
+        std::vector<llama_token> scheduled_tokens;
+
+        // a write failed or the files are inconsistent: the next flush must rewrite from scratch
+        bool broken = false;
+    };
+
+    std::deque<disk_job>    queue;
+    std::mutex              mtx;     // protects queue, queue_bytes, disk_convs, writer_active_conv
     std::condition_variable cv;
-    std::thread                     worker;
-    std::atomic<bool>               stop_flag{false};
+    std::thread             worker;
+    std::atomic<bool>       stop_flag{false};
+
+    std::unordered_map<std::string, disk_conv_state> disk_convs;
+
+    size_t      queue_bytes = 0;        // payload bytes currently sitting in `queue`
+    std::string writer_active_conv;     // conv_id the writer is persisting right now
 
     // launched lazily once disk_path is non-empty
     void start_writer_if_needed();
     void writer_loop();
 
-    // file I/O — runs on the worker thread (async path) or on the calling thread (sync fall-through / shutdown)
-    bool write_entry_to_file(const std::string & filepath, const server_prompt & entry);
+    // file I/O -- runs on the worker thread
+    void process_disk_job(const disk_job & job);
+    bool write_checkpoint_file(const common_prompt_checkpoint & cp, const std::string & conversation_id);
 
-    // direct disk load by conversation_id. opens {conversation_id}.bin.
+    // seed a disk_conv_state's committed fields from an existing .hdr (server restart case)
+    bool read_disk_state(const std::string & conversation_id, disk_conv_state & st);
+
+    // direct disk load by conversation_id: reads .hdr and .tok, then streams the .kv/.drft
+    // segments into the context one at a time (bounded RAM - peak is one segment)
     bool load_from_disk(server_prompt & prompt, const std::string & conversation_id,
-                        llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot);
+                        llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 };
 
 // used exclusively by router mode

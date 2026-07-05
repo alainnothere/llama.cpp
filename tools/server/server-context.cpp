@@ -222,6 +222,14 @@ struct server_slot {
 
         GGML_ASSERT(prompt.data.size() == 0);
 
+        // disk tier: stream only the not-yet-flushed tail of the live state to disk
+        // (write-through). nothing is kept in host RAM - restores come from disk.
+        // mtmd prompts cannot be serialized and stay on the RAM path below.
+        if (!prompt_cache.disk_path.empty() && !prompt.tokens.has_mtmd) {
+            SRV_INF("prompt_save: flushing conversation_id=%s to disk\n", prompt.conversation_id.c_str());
+            return prompt_cache.flush_from_context(prompt, ctx_tgt, ctx_dft, id);
+        }
+
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
@@ -2464,15 +2472,12 @@ private:
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
-            // make room for the new checkpoint, if needed
+            // make room for the new checkpoint, if needed. its cp_ file was already
+            // written when it was created, so erasing here loses nothing durable.
             const auto & cur = slot.prompt.checkpoints.front();
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
-
-            if (prompt_cache) {
-                prompt_cache->spill_checkpoint(cur, slot.prompt.conversation_id);
-            }
 
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
         }
@@ -2488,6 +2493,13 @@ private:
         cur.update_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+
+        // persist the checkpoint the moment it exists (async); older checkpoints whose
+        // file has committed become disk-backed so only the newest stays resident
+        if (prompt_cache) {
+            prompt_cache->spill_checkpoint(cur, slot.prompt.conversation_id);
+            prompt_cache->lazify_checkpoints(slot.prompt);
+        }
 
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",

@@ -1,5 +1,17 @@
 #include "llama-memory.h"
 
+#include "llama-impl.h"
+
+void llama_memory_i::state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_state_seq_flags flags) const {
+    GGML_UNUSED(io);
+    GGML_UNUSED(seq_id);
+    GGML_UNUSED(p0);
+    GGML_UNUSED(p1);
+    GGML_UNUSED(flags);
+
+    GGML_ABORT("pos-range state write is not supported by this memory type");
+}
+
 llama_memory_status llama_memory_status_combine(llama_memory_status s0, llama_memory_status s1) {
     bool has_update = false;
 
