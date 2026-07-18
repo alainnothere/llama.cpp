@@ -61,6 +61,8 @@ struct task_params {
     bool return_tokens   = false;
     bool return_progress = false;
 
+    int32_t sse_ping_interval = 30; // seconds between SSE comment pings while the stream stays silent, -1 disables
+
     int32_t n_keep    =  0; // number of tokens to keep from initial prompt
     int32_t n_discard =  0; // number of tokens after n_keep that may be discarded when shifting context, 0 defaults to half
     int32_t n_predict = -1; // new tokens to predict
@@ -122,6 +124,7 @@ struct task_result_state {
     bool text_block_started = false;
 
     // for OpenAI Responses streaming API
+    bool oai_resp_created = false;
     const std::string oai_resp_id;
     const std::string oai_resp_reasoning_id;
     const std::string oai_resp_message_id;
@@ -449,6 +452,7 @@ struct server_task_result_cmpl_partial : server_task_result {
     bool text_block_started     = false;
 
     // for OpenAI Responses API
+    bool oai_resp_created = false;
     std::string oai_resp_id;
     std::string oai_resp_reasoning_id;
     std::string oai_resp_message_id;
@@ -591,15 +595,6 @@ struct server_task_result_apply_lora : server_task_result {
     virtual json to_json() override;
 };
 
-struct server_prompt_data {
-    std::vector<uint8_t> main;
-    std::vector<uint8_t> drft;
-
-    size_t size() const {
-        return main.size() + drft.size();
-    }
-};
-
 // FNV-1a 64-bit hash, returns lowercase hex string.
 // Used for checkpoint file naming.
 inline std::string generate_conversation_id(const server_tokens & tokens, size_t tokens_end) {
@@ -617,10 +612,9 @@ inline std::string generate_conversation_id(const server_tokens & tokens, size_t
     std::snprintf(buf, sizeof(buf), "%016llx", (unsigned long long)hash);
     return std::string(buf);
 }
+
 struct server_prompt {
     server_tokens tokens;
-
-    server_prompt_data data;
 
     std::list<common_prompt_checkpoint> checkpoints;
 
@@ -628,21 +622,9 @@ struct server_prompt {
     // Used for deterministic cache file naming (conversation_id.bin).
     std::string conversation_id;
 
-    // Token position where the first user message ends.
-    // Used as the hash boundary for generate_conversation_id().
-    // 0 means "not set" — will be computed on first prompt_save().
-    size_t conversation_tokens_boundary = 0;
-
-    size_t size() const {
-        size_t res = 0;
-
-        res += data.size();
-
-        for (const auto & ckpt : checkpoints) {
-            res += ckpt.size();
-        }
-
-        return res;
+    void clear() {
+        tokens.clear();
+        checkpoints.clear();
     }
 
     int n_tokens() const {
@@ -652,13 +634,34 @@ struct server_prompt {
     server_prompt clone() const {
         return server_prompt {
             tokens.clone(),
-            data,
             checkpoints,
             conversation_id,
-            conversation_tokens_boundary,
         };
     }
+};
 
+struct server_prompt_data {
+    std::vector<uint8_t> main;
+    std::vector<uint8_t> drft;
+
+    size_t size() const {
+        return main.size() + drft.size();
+    }
+};
+
+struct server_prompt_cache_state {
+    server_prompt prompt;
+    server_prompt_data data;
+
+    size_t size() const {
+        size_t res = data.size();
+
+        for (const auto & ckpt : prompt.checkpoints) {
+            res += ckpt.size();
+        }
+
+        return res;
+    }
 };
 
 struct server_prompt_cache {
@@ -670,7 +673,7 @@ struct server_prompt_cache {
     server_prompt_cache(const server_prompt_cache &)             = delete;
     server_prompt_cache & operator=(const server_prompt_cache &) = delete;
 
-    std::list<server_prompt> states;
+    std::list<server_prompt_cache_state> states;
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;
@@ -688,7 +691,7 @@ struct server_prompt_cache {
     size_t size();
     size_t n_tokens();
 
-    server_prompt * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, const std::string & conversation_id, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot);
 

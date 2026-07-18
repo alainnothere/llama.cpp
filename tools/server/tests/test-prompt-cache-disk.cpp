@@ -87,8 +87,8 @@ static size_t count_bin_files(const std::string & dir) {
 }
 
 // build a cache-entry state with `n` bytes of host KV in data.main
-static server_prompt make_state(size_t n, uint8_t fill) {
-    server_prompt e;
+static server_prompt_cache_state make_state(size_t n, uint8_t fill) {
+    server_prompt_cache_state e;
     e.data.main.assign(n, fill);
     return e;
 }

@@ -864,6 +864,10 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
         }}
     });
 
+    if (timings.prompt_n >= 0) {
+        server_sent_events.back().at("data").push_back({"timings", timings.to_json()});
+    }
+
     return server_sent_events;
 }
 
@@ -1150,6 +1154,7 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
     thinking_block_started = state.thinking_block_started;
     text_block_started     = state.text_block_started;
 
+    oai_resp_created       = state.oai_resp_created;
     oai_resp_id            = state.oai_resp_id;
     oai_resp_reasoning_id  = state.oai_resp_reasoning_id;
     oai_resp_message_id    = state.oai_resp_message_id;
@@ -1157,6 +1162,10 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
 
     // track if the accumulated message has any reasoning content
     anthropic_has_reasoning = !state.chat_msg.reasoning_content.empty();
+
+    if (res_type == TASK_RESPONSE_TYPE_OAI_RESP && !state.oai_resp_created && (is_progress || n_decoded == 1)) {
+        state.oai_resp_created = true;
+    }
 
     // Pre-compute state updates based on diffs (for next chunk)
     for (const common_chat_msg_diff & diff : oaicompat_msg_diffs) {
@@ -1315,7 +1324,7 @@ json server_task_result_cmpl_partial::to_json_oaicompat_chat() {
 json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
     std::vector<json> events;
 
-    if (n_decoded == 1) {
+    if (!oai_resp_created) {
         events.push_back(json {
             {"event", "response.created"},
             {"data", json {
@@ -1327,6 +1336,18 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
                 }},
             }},
         });
+        events.push_back(json {
+            {"event", "response.in_progress"},
+            {"data", json {
+                {"type", "response.in_progress"},
+                {"response", json {
+                    {"id",     oai_resp_id},
+                    {"object", "response"},
+                    {"status", "in_progress"},
+                }},
+            }},
+        });
+    } else if (is_progress) {
         events.push_back(json {
             {"event", "response.in_progress"},
             {"data", json {
@@ -1436,6 +1457,17 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
             });
         }
     }
+
+    if (!events.empty()) {
+        json & data = events.back().at("data");
+        if (timings.prompt_n >= 0) {
+            data.push_back({"timings", timings.to_json()});
+        }
+        if (is_progress) {
+            data.push_back({"prompt_progress", progress.to_json()});
+        }
+    }
+
     return events;
 }
 
@@ -1748,16 +1780,16 @@ size_t server_prompt_cache::n_tokens() {
     size_t res = 0;
 
     for (const auto & state : states) {
-        res += state.n_tokens();
+        res += state.prompt.n_tokens();
     }
 
     return res;
 }
 
-server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
-        const int cur_lcp_len = it->tokens.get_common_prefix(prompt.tokens);
+        const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
         if (cur_lcp_len == (int) prompt.tokens.size()) {
             SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
@@ -1765,16 +1797,41 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
         }
     }
 
-    // next, remove any cached prompts that are fully contained in the current prompt
-    for (auto it = states.begin(); it != states.end();) {
-        const int len = it->tokens.get_common_prefix(prompt.tokens);
+    // calculate checkpoints size to see if it will fit with the prompt
+    size_t checkpoints_size = 0;
+    for (const auto & ckpt : prompt.checkpoints) {
+        checkpoints_size += ckpt.size();
+    }
 
-        if (len == (int) it->tokens.size()) {
+    const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
+
+    // skip over-limit entries to avoid disturbing the cache
+    if (limit_size > 0 && state_size_new > limit_size) {
+        SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
+                state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
+        return nullptr;
+    }
+
+    // remove any cached prompts that are fully contained in the current prompt
+    for (auto it = states.begin(); it != states.end();) {
+        const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
+
+        if (len == (int) it->prompt.tokens.size()) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
             it = states.erase(it);
         } else {
             ++it;
+        }
+    }
+
+    if (limit_size > 0) {
+        // make room before allocating the new vectors to avoid breaching the limit
+        while (!states.empty() && size() + state_size_new > limit_size) {
+            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
+                    states.front().size() / (1024.0 * 1024.0));
+
+            states.pop_front();
         }
     }
 
@@ -1798,13 +1855,15 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
     }
 
     states.push_back({
-        /*.tokens      =*/ prompt.tokens.clone(),
-        /*.data        =*/ {
+        /*.prompt =*/ {
+            /*.tokens          =*/ prompt.tokens.clone(),
+            /*.checkpoints     =*/ prompt.checkpoints,
+            /*.conversation_id =*/ prompt.conversation_id,
+        },
+        /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
             /*.drft =*/ std::move(state_data_dft),
         },
-        /*.checkpoints =*/ prompt.checkpoints,
-        /*.conversation_id =*/ prompt.conversation_id,
     });
 
     return &states.back();
@@ -1822,9 +1881,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     // Phase 1: find best match in states
     for (auto it = states.begin(); it != states.end(); ++it) {
-        const int lcp_cur = it->tokens.get_common_prefix(tokens_new);
+        const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
 
-        const float f_keep_cur = float(lcp_cur) / it->tokens.size();
+        const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
         const float sim_cur    = float(lcp_cur) / tokens_new.size();
 
         if (f_keep_cur < 0.25f) {
@@ -1888,19 +1947,14 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             }
         }
 
-        // Copy tokens + checkpoints into the slot's prompt. NOT data — the
-        // bytes were just loaded into ctx_tgt/ctx_dft via set_data_ext, so
-        // the live KV is the source of truth. server_slot::prompt_save()
-        // asserts prompt.data.size() == 0 (server-context.cpp:112) before
-        // it captures a fresh save from the live context, so leaving
-        // data empty here is required.  Cached entry's own copies stay
-        // in `states` for the next match.  alloc() will dedup on next
-        // save if this slot's post-generation state strictly supersedes
-        // the cached entry (prefix-of check at server-task.cpp:2078).
-        prompt.tokens      = it_best->tokens.clone();
-        prompt.data        = {};
-        prompt.checkpoints = it_best->checkpoints;
-        prompt.conversation_id = it_best->conversation_id;
+        // Copy the prompt (tokens + checkpoints + conversation_id) into the
+        // slot. The state bytes were just loaded into ctx_tgt/ctx_dft via
+        // set_data_ext, so the live KV is the source of truth - the blobs
+        // themselves stay on the cached entry in `states` for the next
+        // match.  alloc() will dedup on next save if this slot's
+        // post-generation state strictly supersedes the cached entry
+        // (prefix-of check in alloc()).
+        prompt = it_best->prompt.clone();
 
         if (!disk_path.empty()) {
             merge_checkpoint_spills(prompt);
@@ -1929,13 +1983,12 @@ void server_prompt_cache::update() {
 
         SRV_WRN(" - removing oldest entry (size = %.3f MiB)%s\n",
                 states.front().size() / (1024.0 * 1024.0),
-                states.front().tokens.has_mtmd ? " [mtmd: not spillable]" : "");
+                states.front().prompt.tokens.has_mtmd ? " [mtmd: not spillable]" : "");
         states.pop_front();
     };
 
     if (limit_size > 0) {
-        // always keep at least one state, regardless of the limits
-        while (states.size() > 1 && size() > limit_size) {
+        while (!states.empty() && size() > limit_size) {
             evict_oldest();
         }
     }
@@ -1947,7 +2000,7 @@ void server_prompt_cache::update() {
     const size_t limit_tokens_cur = limit_size > 0 ? std::max<size_t>(limit_tokens, limit_size/size_per_token) : limit_tokens;
 
     if (limit_tokens > 0) {
-        while (states.size() > 1 && n_tokens() > limit_tokens_cur) {
+        while (!states.empty() && n_tokens() > limit_tokens_cur) {
             evict_oldest();
         }
     }
@@ -1957,7 +2010,7 @@ void server_prompt_cache::update() {
 
     for (const auto & state : states) {
         SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
-                (const void *)&state, state.n_tokens(), state.checkpoints.size(), state.size() / (1024.0 * 1024.0));
+                (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0));
     }
 }
 
@@ -3015,7 +3068,6 @@ bool server_prompt_cache::load_from_disk(server_prompt & prompt, const std::stri
         llama_tokens toks = st.scheduled_tokens;
         prompt.tokens.insert(toks);
     }
-    prompt.data = {};
     prompt.checkpoints.clear();
     prompt.conversation_id = conversation_id;
 
