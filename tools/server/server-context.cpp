@@ -3468,9 +3468,6 @@ private:
                                             SLT_WRN(slot, "failed to load context checkpoint from disk (pos_min = %d, pos_max = %d) - forcing full reprocess\n", it->pos_min, it->pos_max);
                                             do_reset = true;
                                         } else {
-                                            // restore the context checkpoint
-                                            it->load_tgt(ctx_tgt,       slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                            it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                             // restore the draft's speculative state
                                             common_speculative_set_state(spec.get(), slot.id, it->data_spec);
 
@@ -3542,11 +3539,6 @@ private:
                     const llama_pos p0 = slot.prompt.tokens.pos_next();
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
-                    {
-                        const auto pmin_tgt = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
-                        const auto pmax_tgt = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
-                    }
-
                     if (!llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, p0, -1)) {
                         SLT_WRN(slot, "failed to truncate tokens with position >= %d - clearing the memory\n", p0);
 
