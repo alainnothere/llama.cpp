@@ -197,6 +197,8 @@ json task_params::to_json(bool only_metrics) const {
             {"mirostat",                  sampling.mirostat},
             {"mirostat_tau",              sampling.mirostat_tau},
             {"mirostat_eta",              sampling.mirostat_eta},
+            {"adaptive_target",           sampling.adaptive_target},
+            {"adaptive_decay",            sampling.adaptive_decay},
             {"max_tokens",                n_predict},
             {"n_predict",                 n_predict}, // TODO: deduplicate?
             {"n_keep",                    n_keep},
@@ -248,6 +250,8 @@ json task_params::to_json(bool only_metrics) const {
         {"mirostat",                  sampling.mirostat},
         {"mirostat_tau",              sampling.mirostat_tau},
         {"mirostat_eta",              sampling.mirostat_eta},
+        {"adaptive_target",           sampling.adaptive_target},
+        {"adaptive_decay",            sampling.adaptive_decay},
         {"stop",                      antiprompt},
         {"max_tokens",                n_predict},
         {"n_predict",                 n_predict}, // TODO: deduplicate?
@@ -1873,9 +1877,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
-    float sim_best    = float(lcp_best) / tokens_new.size();
+    float f_sim_best  = float(lcp_best) / tokens_new.size();
 
-    SRV_TRC(" - looking for better prompt, base f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
+    SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
     auto it_best = states.end();
 
@@ -1884,7 +1888,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
 
         const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
-        const float sim_cur    = float(lcp_cur) / tokens_new.size();
+        const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
+
+        SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
 
         if (f_keep_cur < 0.25f) {
             continue;
@@ -1892,18 +1898,18 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
         // sim-primary (see [TAG_CACHE_SELECT_SIM]). the f_keep tie-break only
         // applies between scanned candidates (it_best already set), NOT against
-        // the slot's baseline sim_best — restoring a cache entry that merely ties
+        // the slot's baseline f_sim_best — restoring a cache entry that merely ties
         // the slot's existing prefix buys zero extra reuse and is pure overhead.
-        if (sim_cur > sim_best || (it_best != states.end() && sim_cur == sim_best && f_keep_cur > f_keep_best)) {
+        if (f_sim_cur > f_sim_best || (it_best != states.end() && f_sim_cur == f_sim_best && f_keep_cur > f_keep_best)) {
             f_keep_best = f_keep_cur;
-            sim_best    = sim_cur;
+            f_sim_best  = f_sim_cur;
 
             it_best = it;
         }
     }
 
     if (it_best != states.end()) {
-        SRV_TRC(" - found better prompt with f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
+        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
         // NON-CONSUMING RESTORE — copy bytes into the live context, leave
         // the cached entry intact in `states` so future requests can match

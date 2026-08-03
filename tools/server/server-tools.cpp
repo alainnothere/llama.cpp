@@ -1,18 +1,19 @@
 #include "server-tools.h"
 
-#include <sheredom/subprocess.h>
+#include "subproc.h"
 
 #include <filesystem>
 #include <fstream>
 #include <regex>
 #include <thread>
 #include <chrono>
+#include <ctime>
 #include <atomic>
 #include <cstring>
-#include <climits>
 #include <algorithm>
 #include <unordered_set>
 #include <functional>
+#include <memory>
 
 namespace fs = std::filesystem;
 
@@ -24,7 +25,7 @@ json server_tool::to_json() const {
     return {
         {"display_name", display_name},
         {"tool", name},
-        {"type", "builtin"},
+        {"type", type()},
         {"permissions", json{
             {"write", permission_write}
         }},
@@ -63,24 +64,27 @@ public:
 
 class tools_io_basic : public tools_io {
 public:
+    // cwd, if non-empty, is used to resolve relative paths and as the working directory for run()
+    explicit tools_io_basic(std::string cwd = "") : cwd(std::move(cwd)) {}
+
     bool is_directory(const std::string & path) const override {
         std::error_code ec;
-        return fs::is_directory(path, ec) && !ec;
+        return fs::is_directory(resolve(path), ec) && !ec;
     }
 
     bool is_regular_file(const std::string & path) const override {
         std::error_code ec;
-        return fs::is_regular_file(path, ec) && !ec;
+        return fs::is_regular_file(resolve(path), ec) && !ec;
     }
 
     bool file_size(const std::string & path, uintmax_t & out_size) const override {
         std::error_code ec;
-        out_size = fs::file_size(path, ec);
+        out_size = fs::file_size(resolve(path), ec);
         return !ec;
     }
 
     bool read_file(const std::string & path, std::string & out) const override {
-        std::ifstream f(path, std::ios::binary);
+        std::ifstream f(resolve(path), std::ios::binary);
         if (!f) return false;
         std::ostringstream ss;
         ss << f.rdbuf();
@@ -90,12 +94,12 @@ public:
 
     bool write_file(const std::string & path, const std::string & content) const override {
         std::error_code ec;
-        fs::path fpath(path);
+        fs::path fpath(resolve(path));
         if (fpath.has_parent_path()) {
             fs::create_directories(fpath.parent_path(), ec);
             if (ec) return false;
         }
-        std::ofstream f(path, std::ios::binary);
+        std::ofstream f(fpath, std::ios::binary);
         if (!f) return false;
         f << content;
         return (bool) f;
@@ -103,13 +107,14 @@ public:
 
     std::vector<std::string> list_files(const std::string & base, std::string & err) const override {
         err.clear();
+        std::string abs_base = resolve(base);
         if (!is_directory(base)) {
             err = "path does not exist or is not a directory: " + base;
             return {};
         }
 
         auto res = run(
-            {"git", "-C", base, "ls-files", "--cached", "--others", "--exclude-standard"},
+            {"git", "-C", abs_base, "ls-files", "--cached", "--others", "--exclude-standard"},
             SERVER_TOOL_GIT_LS_FILES_MAX_OUTPUT, SERVER_TOOL_GIT_LS_FILES_TIMEOUT);
 
         if (res.exit_code == 0 && !res.timed_out) {
@@ -127,7 +132,7 @@ public:
             return result;
         }
 
-        return list_files_fallback(base);
+        return list_files_fallback(abs_base);
     }
 
     exec_result run(
@@ -137,15 +142,14 @@ public:
             const std::function<bool(const std::string &)> & on_chunk = nullptr) const override {
         exec_result res;
 
-        subprocess_s proc;
-        auto argv = to_cstr_vec(args);
+        common_subproc proc;
 
         int options = subprocess_option_no_window
                     | subprocess_option_combined_stdout_stderr
                     | subprocess_option_inherit_environment
                     | subprocess_option_search_user_path;
 
-        if (subprocess_create(argv.data(), options, &proc) != 0) {
+        if (!proc.create(args, options, {}, cwd.empty() ? nullptr : cwd.c_str())) {
             res.output = "failed to spawn process";
             return res;
         }
@@ -158,14 +162,14 @@ public:
             while (!done.load()) {
                 if (std::chrono::steady_clock::now() >= deadline) {
                     timed_out.store(true);
-                    subprocess_terminate(&proc);
+                    proc.terminate();
                     return;
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
         });
 
-        FILE * f = subprocess_stdout(&proc);
+        FILE * f = proc.stdout_file();
         std::string output;
         bool truncated = false;
         if (f) {
@@ -176,7 +180,7 @@ public:
                     if (output.size() + len <= max_output) {
                         output.append(buf, len);
                         if (on_chunk && !on_chunk(std::string(buf, len))) {
-                            subprocess_terminate(&proc);
+                            proc.terminate();
                             break;
                         }
                     } else {
@@ -194,8 +198,7 @@ public:
             timeout_thread.join();
         }
 
-        subprocess_join(&proc, &res.exit_code);
-        subprocess_destroy(&proc);
+        res.exit_code = proc.join();
 
         res.output    = output;
         res.timed_out = timed_out.load();
@@ -206,14 +209,14 @@ public:
     }
 
 private:
-    static std::vector<char *> to_cstr_vec(const std::vector<std::string> & v) {
-        std::vector<char *> r;
-        r.reserve(v.size() + 1);
-        for (const auto & s : v) {
-            r.push_back(const_cast<char *>(s.c_str()));
+    std::string cwd;
+
+    // resolves `path` against `cwd` if `path` is relative and `cwd` is set; otherwise returns `path` unchanged
+    std::string resolve(const std::string & path) const {
+        if (cwd.empty() || fs::path(path).is_absolute()) {
+            return path;
         }
-        r.push_back(nullptr);
-        return r;
+        return (fs::path(cwd) / path).string();
     }
 
     static const std::unordered_set<std::string> & junk_dir_names() {
@@ -255,8 +258,8 @@ private:
 };
 
 static std::unique_ptr<tools_io> make_tools_io(const json & params) {
-    GGML_UNUSED(params); // TODO in follow-up PR
-    return std::make_unique<tools_io_basic>();
+    std::string cwd = json_value(params, "cwd", std::string());
+    return std::make_unique<tools_io_basic>(cwd);
 }
 
 // no '/' in pattern -> match basename at any depth; else match full relative path
@@ -1048,16 +1051,42 @@ struct server_tool_get_datetime : server_tool {
             {"type", "function"},
             {"function", {
                 {"name", name},
-                {"description", "Returns the current date and time"},
+                {"description", "Returns the current date and time in UTC"},
+                {"parameters", {
+                    {"type", "object"},
+                    {"properties", {
+                        {"format", {
+                            {"type", "string"},
+                            {"description",
+                                "strftime()-style format string for the output (default: \"%Y-%m-%dT%H:%M:%SZ\", "
+                                "e.g. ISO 8601). Choose your own format if you need something else, "
+                                "e.g. \"%A, %B %d %Y\" for a human-readable date."},
+                        }},
+                    }},
+                }},
             }},
         };
     }
 
-    json invoke(json, server_tool::stream *) const override {
-        auto now = std::chrono::system_clock::now();
-        auto time = std::chrono::system_clock::to_time_t(now);
+    json invoke(json params, server_tool::stream *) const override {
+        std::string format = json_value(params, "format", std::string("%Y-%m-%dT%H:%M:%SZ"));
 
-        return {{"result", std::ctime(&time)}};
+        auto now  = std::chrono::system_clock::now();
+        auto time = std::chrono::system_clock::to_time_t(now);
+        std::tm tm_utc;
+#ifdef _WIN32
+        gmtime_s(&tm_utc, &time);
+#else
+        gmtime_r(&time, &tm_utc);
+#endif
+
+        char buf[256];
+        size_t len = std::strftime(buf, sizeof(buf), format.c_str(), &tm_utc);
+        if (len == 0) {
+            return {{"error", "invalid format string"}};
+        }
+
+        return {{"result", std::string(buf, len)}};
     }
 };
 
@@ -1102,6 +1131,49 @@ struct server_tools_res : server_http_res {
     }
 };
 
+//
+// server_mcp_tool: exposes one tool from a running MCP server as a server_tool.
+//
+struct server_mcp_tool : server_tool {
+    std::string server_name;
+    std::string tool_name;
+    server_mcp_tool_def def;
+    server_mcp & mcp_mgr;
+
+    server_mcp_tool(server_mcp_tool_def d, server_mcp & mgr)
+        : server_name(d.server_name)
+        , tool_name(d.name)
+        , def(std::move(d))
+        , mcp_mgr(mgr)
+    {
+        name = server_name + "_" + tool_name;
+        display_name = name;
+        permission_write = false;
+        support_stream = false;
+    }
+
+    std::string type() const override { return "mcp"; }
+
+    json get_definition() const override {
+        json schema = def.input_schema;
+        if (schema.is_null() || !schema.is_object()) {
+            schema = json::object();
+        }
+        return {
+            {"type", "function"},
+            {"function", {
+                {"name", name},
+                {"description", def.description},
+                {"parameters", schema},
+            }},
+        };
+    }
+
+    json invoke(json params, server_tool::stream *) const override {
+        return mcp_mgr.call_tool(server_name, tool_name, params);
+    }
+};
+
 static server_tool & find_tool(std::vector<std::unique_ptr<server_tool>> & tools, const std::string & name, bool require_stream) {
     for (auto & t : tools) {
         if (t->name == name) {
@@ -1130,8 +1202,29 @@ static std::vector<std::unique_ptr<server_tool>> build_tools() {
     return tools;
 }
 
-void server_tools::setup(const std::vector<std::string> & enabled_tools) {
+static std::string str_to_lower(const std::string & value) {
+    std::string lowered(value.size(), '\0');
+    std::transform(value.begin(), value.end(), lowered.begin(), [](unsigned char c) { return std::tolower(c); });
+    return lowered;
+}
+
+static std::string get_header(const std::map<std::string, std::string> & headers, const std::string & key, std::string default_value = "") {
+    const auto lowered_key = str_to_lower(key);
+    for (const auto & h : headers) {
+        if (str_to_lower(h.first) == lowered_key) {
+            return h.second;
+        }
+    }
+    return default_value;
+}
+
+void server_tools::setup(const std::vector<std::string> & enabled_tools,
+                         server_mcp & mcp_mgr) {
     if (!enabled_tools.empty()) {
+        if (!common_subproc::is_supported()) {
+            throw std::runtime_error("subprocess is not enabled on this build");
+        }
+
         std::unordered_set<std::string> enabled_set(enabled_tools.begin(), enabled_tools.end());
         auto all_tools = build_tools();
 
@@ -1161,6 +1254,29 @@ void server_tools::setup(const std::vector<std::string> & enabled_tools) {
         }
     }
 
+    // append MCP tools, skipping any that collide with a built-in or another MCP tool of the same "<server>_<tool>" name
+    if (!mcp_mgr.empty()) {
+        std::unordered_set<std::string> seen_names;
+        for (auto & t : tools) {
+            seen_names.insert(t->name);
+        }
+        size_t n_added = 0;
+        for (const auto & def : mcp_mgr.list_tools()) {
+            std::string mcp_name = def.server_name + "_" + def.name;
+            if (seen_names.count(mcp_name)) {
+                SRV_WRN("MCP tool \"%s\" from server \"%s\" collides with an existing tool, skipping\n",
+                    mcp_name.c_str(), def.server_name.c_str());
+                continue;
+            }
+            seen_names.insert(mcp_name);
+            tools.push_back(std::make_unique<server_mcp_tool>(def, mcp_mgr));
+            n_added++;
+        }
+        if (n_added > 0) {
+            SRV_INF("Added %zu MCP tools\n", n_added);
+        }
+    }
+
     handle_get = [this](const server_http_req &) -> server_http_res_ptr {
         auto res = std::make_unique<server_http_res>();
         try {
@@ -1184,6 +1300,12 @@ void server_tools::setup(const std::vector<std::string> & enabled_tools) {
             std::string tool_name = body.at("tool").get<std::string>();
             json params = body.value("params", json::object());
             bool stream = body.value("stream", false);
+
+            // accept x-tool-cwd header to override of the process
+            auto cwd = get_header(req.headers, "x-tool-cwd");
+            if (!cwd.empty()) {
+                params["cwd"] = cwd;
+            }
 
             server_tool & tool = find_tool(tools, tool_name, stream);
 
