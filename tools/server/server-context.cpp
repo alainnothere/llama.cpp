@@ -3728,6 +3728,11 @@ private:
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
+                    if (n_tokens_cur > 0) {
+                        SLT_INF(slot, "prompt processing batch, tokens %d..%d of %d\n",
+                                (int) n_tokens_start, (int) slot.prompt.n_tokens(), slot.task->n_tokens());
+                    }
+
                     const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
 
                     const bool is_user_start = spans.is_user_start(n_tokens_start);

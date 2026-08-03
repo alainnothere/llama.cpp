@@ -1339,6 +1339,55 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
 
+    // summarize the layer -> device assignment
+    // logged at WARN because since "logs : reduce v2" the common log callback demotes
+    // library INFO to TRACE verbosity, which is hidden at the default -lv 3
+    LLAMA_LOG_WARN("load_tensors: layer split from %s (values:%s, split points:%s)\n",
+            all_zero ? "free memory per device" : "user tensor_split",
+            [&]() {
+                std::string s;
+                for (size_t i = 0; i < n_devices(); ++i) {
+                    // recover the raw pre-normalization value from the cumulative splits
+                    s += format(" %g", (splits[i] - (i > 0 ? splits[i - 1] : 0.0f)) * split_sum);
+                }
+                return s;
+            }().c_str(),
+            [&]() {
+                std::string s;
+                for (size_t i = 0; i < n_devices(); ++i) {
+                    s += format(" %.3f", splits[i]);
+                }
+                return s;
+            }().c_str());
+    if (i_gpu_start > 0) {
+        LLAMA_LOG_WARN("load_tensors: %10s: %2d repeating layers [%d, %d]\n",
+                ggml_backend_dev_name(cpu_dev), i_gpu_start, 0, i_gpu_start - 1);
+    }
+    for (size_t i = 0; i < n_devices(); ++i) {
+        ggml_backend_dev_t dev = devices[i].dev;
+        int il_first = -1;
+        int il_last  = -1;
+        int count    = 0;
+        for (int il = 0; il < n_layer_all; ++il) {
+            if (pimpl->dev_layer[il].dev == dev) {
+                if (il_first < 0) {
+                    il_first = il;
+                }
+                il_last = il;
+                count++;
+            }
+        }
+        if (count == 0) {
+            LLAMA_LOG_WARN("load_tensors: %10s: no repeating layers%s\n",
+                    ggml_backend_dev_name(dev),
+                    pimpl->dev_output.dev == dev ? ", output layer" : "");
+        } else {
+            LLAMA_LOG_WARN("load_tensors: %10s: %2d repeating layers [%d, %d]%s\n",
+                    ggml_backend_dev_name(dev), count, il_first, il_last,
+                    pimpl->dev_output.dev == dev ? ", plus output layer" : "");
+        }
+    }
+
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
     // create tensors for the weights
@@ -1639,7 +1688,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // print memory requirements per buffer type
     for (auto & [_, bufs] : pimpl->ctxs_bufs) {
         for (auto & buf: bufs) {
-            LLAMA_LOG_INFO("%s: %12s model buffer size = %8.2f MiB\n",
+            LLAMA_LOG_WARN("%s: %12s model buffer size = %8.2f MiB\n",
                 __func__, ggml_backend_buffer_name(buf.get()), ggml_backend_buffer_get_size(buf.get()) / 1024.0 / 1024.0);
         }
     }
