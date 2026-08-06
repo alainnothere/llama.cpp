@@ -2729,9 +2729,10 @@ bool server_prompt_cache::write_checkpoint_file(const common_prompt_checkpoint &
             if (fn.size() <= conv_prefix.size() || fn.compare(0, conv_prefix.size(), conv_prefix) != 0) {
                 continue;
             }
-            // parse pos_min: the field immediately after the conversation_id prefix
+            // parse pos_min: the last field of cp_{conversation_id}_{pos_min}.bin, so it is
+            // terminated by the '.' of ".bin" and not by another underscore
             const size_t pmin_start = conv_prefix.size();
-            const size_t pmin_end   = fn.find('_', pmin_start);
+            const size_t pmin_end   = fn.find('.', pmin_start);
             if (pmin_end == std::string::npos) {
                 continue;
             }

@@ -14,6 +14,7 @@
 
 #include "server-task.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -245,6 +246,136 @@ static void test_sorted_by_pos_min() {
     fs::remove_all(dir);
 }
 
+// collect the pos_min values encoded in the cp_ filenames of one conversation
+static std::vector<int32_t> cp_pos_min_on_disk(const std::string & dir, const std::string & cid) {
+    const std::string prefix = "cp_" + cid + "_";
+    std::vector<int32_t> pos;
+    for (const auto & e : fs::directory_iterator(dir)) {
+        const std::string fn = e.path().filename().string();
+        if (e.path().extension() != ".bin") {
+            continue;
+        }
+        if (fn.size() <= prefix.size() || fn.compare(0, prefix.size(), prefix) != 0) {
+            continue;
+        }
+        pos.push_back(static_cast<int32_t>(std::stoi(fn.substr(prefix.size()))));
+    }
+    std::sort(pos.begin(), pos.end());
+    return pos;
+}
+
+// the per-conversation spill limit must delete the LOWEST pos_min files first and must not
+// touch other conversations. regression guard: the prune parses pos_min out of the filename,
+// where it is the last field and is terminated by ".bin", not by another underscore.
+static void test_spill_prune_keeps_highest_pos_min() {
+    std::printf("test_spill_prune_keeps_highest_pos_min\n");
+    const std::string dir = make_temp_dir("prune");
+    server_prompt_cache cache(64, 0, dir, 16, /*checkpoint_spill_max*/ 3, 0xAAu, 0xBBu);
+
+    // conversation A: 5 checkpoints, ascending pos_min -> only the top 3 may survive
+    cache.spill_checkpoint(make_ckpt(100, 110, 111, 64, 0, 1), "conv_prune_a");
+    cache.wait_idle();
+    cache.spill_checkpoint(make_ckpt(200, 210, 211, 64, 0, 2), "conv_prune_a");
+    cache.wait_idle();
+    cache.spill_checkpoint(make_ckpt(300, 310, 311, 64, 0, 3), "conv_prune_a");
+    cache.wait_idle();
+    cache.spill_checkpoint(make_ckpt(400, 410, 411, 64, 0, 4), "conv_prune_a");
+    cache.wait_idle();
+    cache.spill_checkpoint(make_ckpt(500, 510, 511, 64, 0, 5), "conv_prune_a");
+    cache.wait_idle();
+
+    // conversation B: below the limit, must be left alone
+    cache.spill_checkpoint(make_ckpt(10, 20, 21, 64, 0, 6), "conv_prune_b");
+    cache.wait_idle();
+    cache.spill_checkpoint(make_ckpt(20, 30, 31, 64, 0, 7), "conv_prune_b");
+    cache.wait_idle();
+
+    const std::vector<int32_t> pos_a = cp_pos_min_on_disk(dir, "conv_prune_a");
+    const std::vector<int32_t> pos_b = cp_pos_min_on_disk(dir, "conv_prune_b");
+
+    CHECK(pos_a.size() == 3);
+    CHECK((pos_a == std::vector<int32_t>{300, 400, 500}));
+    CHECK((pos_b == std::vector<int32_t>{10, 20}));
+
+    // and the survivors are still loadable
+    server_prompt prompt;
+    prompt.conversation_id = "conv_prune_a";
+    cache.merge_checkpoint_spills(prompt);
+    CHECK(prompt.checkpoints.size() == 3);
+
+    fs::remove_all(dir);
+}
+
+// a checkpoint with an empty draft blob (the normal case for a range-truncatable draft)
+// must round-trip: written, lazified and merged with sz_dft == 0 and consistent offsets.
+static void test_empty_draft_checkpoint() {
+    std::printf("test_empty_draft_checkpoint\n");
+    const std::string dir = make_temp_dir("emptydft");
+    server_prompt_cache cache(64, 0, dir, 16, -1, 0xE1u, 0xE2u);
+
+    const std::string cid = "conv_empty_dft";
+    const common_prompt_checkpoint cp = make_ckpt(/*pos_min*/ 700, /*pos_max*/ 750, /*n_tokens*/ 751,
+                                                  /*tgt_n*/ 1024, /*dft_n*/ 0, /*seed*/ 11);
+    CHECK(cp.data_dft.empty());
+
+    cache.spill_checkpoint(cp, cid);
+    cache.wait_idle();
+
+    const std::string path = (fs::path(dir) / ("cp_" + cid + "_700.bin")).string();
+    CHECK(fs::exists(path));
+    // no dft bytes on disk: header + tgt + the dft length field only
+    CHECK(fs::file_size(path) == HEADER_BEFORE_TGT + 1024 + 8);
+
+    // lazify converts the older resident checkpoint to disk-backed form with sz_dft == 0
+    {
+        server_prompt lazy;
+        lazy.conversation_id = cid;
+        lazy.checkpoints.push_back(cp);
+        lazy.checkpoints.push_back(make_ckpt(800, 850, 851, 32, 0, 12)); // newest stays resident
+
+        cache.lazify_checkpoints(lazy);
+
+        const auto & older = lazy.checkpoints.front();
+        CHECK(!older.src_path.empty());
+        CHECK(older.data_tgt.empty());
+        CHECK(older.data_dft.empty());
+        CHECK(older.off_tgt == HEADER_BEFORE_TGT);
+        CHECK(older.sz_tgt  == 1024);
+        CHECK(older.off_dft == HEADER_BEFORE_TGT + 1024 + 8);
+        CHECK(older.sz_dft  == 0);
+    }
+
+    // merge reads it back with the same offsets
+    server_prompt prompt;
+    prompt.conversation_id = cid;
+    cache.merge_checkpoint_spills(prompt);
+
+    CHECK(prompt.checkpoints.size() == 1);
+    if (prompt.checkpoints.empty()) {
+        fs::remove_all(dir);
+        return;
+    }
+    const auto & got = prompt.checkpoints.front();
+
+    CHECK(got.pos_min == 700);
+    CHECK(got.pos_max == 750);
+    CHECK(got.n_tokens == 751);
+    CHECK(got.sz_tgt == 1024);
+    CHECK(got.sz_dft == 0);
+    CHECK(got.off_tgt == HEADER_BEFORE_TGT);
+    CHECK(got.off_dft == HEADER_BEFORE_TGT + 1024 + 8);
+    CHECK(read_file_range(got.src_path, got.off_tgt, got.sz_tgt) == cp.data_tgt);
+
+    // nothing for load_dft to restore: both the resident blob and the disk-backed guard
+    // (sz_dft > 0) are empty, so it takes the "genuinely empty checkpoint" no-op path and
+    // never reads at off_dft, which sits at EOF. no llama_context here, so this only
+    // exercises the null-ctx short circuit - the state above is the real assertion.
+    CHECK(got.data_dft.empty());
+    CHECK(got.load_dft(nullptr, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+
+    fs::remove_all(dir);
+}
+
 // over_budget() reflects the host-RAM byte budget (the valley gate)
 static void test_over_budget_reflects_ram_limit() {
     std::printf("test_over_budget_reflects_ram_limit\n");
@@ -297,6 +428,8 @@ int main() {
     test_conversation_filter();
     test_corrupt_file_skipped();
     test_sorted_by_pos_min();
+    test_spill_prune_keeps_highest_pos_min();
+    test_empty_draft_checkpoint();
     test_over_budget_reflects_ram_limit();
     test_spill_all_frees_ram();
     test_spill_all_noop_without_disk();
