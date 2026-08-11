@@ -624,10 +624,12 @@ struct common_params {
     std::string cache_disk_path;          // empty = disabled. directory for disk-backed KV cache spill
     int32_t cache_disk_queue_depth  = 16; // bounded async writer queue; overflow falls through synchronously
     int32_t checkpoint_spill_max    = 16; // max checkpoint spill files kept on disk per slot by pos_min, -1 = no limit
+    bool    cache_multiverse        = false; // keep the checkpoint spill files of abandoned conversation branches
     std::string http_request_dump_path; // empty = disabled. dump every POST body + meta sidecar here for diagnostic diffs
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
+    std::vector<std::string> ui_files_paths; // directories and/or single files served for download at /files
     std::string api_prefix    = "";                                                                         // NOLINT
     std::string chat_template = "";                                                                         // NOLINT
     bool use_jinja = true;                                                                                  // NOLINT
@@ -1115,6 +1117,11 @@ struct common_prompt_checkpoint {
 
     llama_pos pos_min;
     llama_pos pos_max;
+
+    // FNV-1a over the token ids [0, n_tokens) of the prompt this checkpoint was taken from.
+    // binds the checkpoint to one token timeline, so a file left by an abandoned branch of
+    // the conversation is rejected instead of being restored into a diverged prompt.
+    uint64_t token_prefix_hash = 0;
 
     std::vector<uint8_t> data_tgt;
     std::vector<uint8_t> data_dft;

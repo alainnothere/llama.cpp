@@ -34,9 +34,18 @@ class LogReader:
         return content
 
 
+# the disk tier derives conversation ids from the first user message span, so
+# every prompt carries a user delimiter and every request names it
+# no trailing space in the delimiter: the tokenizer merges a trailing space into
+# the next word, and the span search matches token sequences, not characters
+DELIMITERS = [
+    {"role": "user", "delimiter": "User:"},
+]
+
+
 def _long_prompt(theme: str) -> str:
     # distinct, reasonably long prompts so each produces its own cache entry
-    return (
+    return "User: " + (
         f"Tell me a detailed story about {theme}. "
         f"Describe {theme} across mountains, rivers, cities and the deep sea, "
         f"naming every companion {theme} meets and every trial {theme} endures, "
@@ -88,6 +97,7 @@ def test_prompt_state_spills_and_restores_from_disk():
     res = server.make_request("POST", "/completion", data={
         "prompt": PROMPTS[0],
         "cache_prompt": True,
+        "message_delimiters": DELIMITERS,
     })
     assert res.status_code == 200
     first_prompt_n = res.body["timings"]["prompt_n"]
@@ -98,6 +108,7 @@ def test_prompt_state_spills_and_restores_from_disk():
         res = server.make_request("POST", "/completion", data={
             "prompt": p,
             "cache_prompt": True,
+            "message_delimiters": DELIMITERS,
         })
         assert res.status_code == 200
 
@@ -108,6 +119,7 @@ def test_prompt_state_spills_and_restores_from_disk():
     res = server.make_request("POST", "/completion", data={
         "prompt": PROMPTS[0],
         "cache_prompt": True,
+        "message_delimiters": DELIMITERS,
     })
     assert res.status_code == 200
     assert "load_from_disk: restored" in log.drain()
@@ -123,6 +135,7 @@ def test_disk_cache_writes_split_files():
         res = server.make_request("POST", "/completion", data={
             "prompt": p,
             "cache_prompt": True,
+            "message_delimiters": DELIMITERS,
         })
         assert res.status_code == 200
 
@@ -141,5 +154,6 @@ def test_disk_cache_ignores_foreign_file():
     res = server.make_request("POST", "/completion", data={
         "prompt": PROMPTS[0],
         "cache_prompt": True,
+        "message_delimiters": DELIMITERS,
     })
     assert res.status_code == 200  # server healthy despite the foreign file

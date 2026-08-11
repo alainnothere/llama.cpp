@@ -2506,6 +2506,10 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
+        // bind the checkpoint to this token timeline here, so the async spill writer never
+        // needs the token list
+        cur.token_prefix_hash = hash_token_prefix(slot.prompt.tokens, (size_t) cur.n_tokens);
+
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
         // a range-truncatable draft (PART) is rolled back by the seq_rm that follows every
@@ -3355,6 +3359,9 @@ private:
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
+                                // the divergence point, before the checkpoint rewind below lowers n_past
+                                const int n_lcp = n_past;
+
                                 // if there is an alora invoked, don't cache after the invocation start
                                 if (slot.alora_invocation_start > 0) {
                                     SLT_DBG(slot, "only caching to alora invocation start (n_past = %d, alora_invocation_start = %d)\n", n_past, slot.alora_invocation_start);
@@ -3419,6 +3426,26 @@ private:
                                     }
 
                                     SLT_DBG(slot, "after context reuse, new n_past = %d\n", n_past);
+                                }
+
+                                // a rollback abandons every token after the divergence point. the cp_
+                                // files bound past it can never bind to this conversation again (see
+                                // hash_token_prefix), they only eat into the spill budget.
+                                if (prompt_cache && !params_base.cache_multiverse && n_lcp < (int) slot.prompt.n_tokens()) {
+                                    // the conversation id hashes the tokens up to the end of the first user
+                                    // message. a shorter common prefix means the slot holds another
+                                    // conversation, whose spill files are not ours to drop.
+                                    size_t conv_boundary = 0;
+                                    for (const auto & span : slot.task->params.message_spans.spans) {
+                                        if (span.role == COMMON_CHAT_ROLE_USER) {
+                                            conv_boundary = span.pos + span.len;
+                                            break;
+                                        }
+                                    }
+
+                                    if (conv_boundary > 0 && n_lcp >= (int) conv_boundary) {
+                                        prompt_cache->drop_stale_checkpoint_spills(slot.prompt, n_lcp);
+                                    }
                                 }
                             } else {
                                 // if we don't cache the prompt, we have to remove all previous tokens
@@ -3492,44 +3519,50 @@ private:
                                 // where SWA requires — no rewind needed. > catches the case
                                 // where SWA has slid the window past the required minimum.
                                 if (pos_min > pos_min_thold) {
-                                    // search for a context checkpoint
-                                    const auto it = std::find_if(
-                                        slot.prompt.checkpoints.rbegin(),
-                                        slot.prompt.checkpoints.rend(),
-                                        [&](const auto & cur) {
-                                            // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
-                                            SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
-                                            // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
-                                            if (cur.pos_max > pos_next) {
-                                                return false;
-                                            }
-                                            return cur.pos_min < pos_min_thold || cur.pos_min == 0;
+                                    // min-step thinning erases list entries but never their cp_ files.
+                                    // re-register the surviving files so the search below can use them.
+                                    if (prompt_cache) {
+                                        prompt_cache->merge_checkpoint_spills(slot.prompt);
+                                    }
+
+                                    bool do_reset = true;
+
+                                    // search for a context checkpoint, newest first
+                                    for (auto it = slot.prompt.checkpoints.rbegin(); it != slot.prompt.checkpoints.rend(); ) {
+                                        // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
+                                        SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", it->pos_min, it->pos_max, pos_min_thold);
+
+                                        // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
+                                        if (it->pos_max > pos_next || !(it->pos_min < pos_min_thold || it->pos_min == 0)) {
+                                            ++it;
+                                            continue;
                                         }
-                                    );
 
-                                    bool do_reset = it == slot.prompt.checkpoints.rend();
-
-                                    if (!do_reset) {
                                         // restore the context checkpoint. for disk-backed (lazy)
                                         // checkpoints the KV blob is faulted in from disk here; a
                                         // read failure (e.g. the spill file was evicted under us)
-                                        // returns false, so we fall back to a full reprocess rather
-                                        // than running on partially-restored state. the seq_rm below
-                                        // (do_reset path) wipes any partial KV before reprocessing.
+                                        // returns false and we keep searching older checkpoints.
                                         const bool ok_tgt = it->load_tgt(ctx_tgt,       slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         const bool ok_dft = it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                                         if (!ok_tgt || !ok_dft) {
-                                            SLT_WRN(slot, "failed to load context checkpoint from disk (pos_min = %d, pos_max = %d) - forcing full reprocess\n", it->pos_min, it->pos_max);
-                                            do_reset = true;
-                                        } else {
-                                            // restore the draft's speculative state
-                                            common_speculative_set_state(spec.get(), slot.id, it->data_spec);
+                                            SLT_WRN(slot, "failed to load context checkpoint from disk (pos_min = %d, pos_max = %d) - falling back to an older checkpoint\n", it->pos_min, it->pos_max);
 
-                                            pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
-                                            n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
-                                            SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+                                            // the file is gone - drop the entry, else every future rollback retries it
+                                            const auto next = slot.prompt.checkpoints.erase(std::next(it).base());
+                                            it = std::make_reverse_iterator(next);
+                                            continue;
                                         }
+
+                                        // restore the draft's speculative state
+                                        common_speculative_set_state(spec.get(), slot.id, it->data_spec);
+
+                                        pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
+                                        n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                        SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+
+                                        do_reset = false;
+                                        break;
                                     }
 
                                     if (do_reset) {
@@ -4823,6 +4856,7 @@ void server_routes::init_routes() {
             { "build_info",                  meta->build_info },
             { "is_sleeping",                 queue_tasks.is_sleeping() },
             { "cors_proxy_enabled",          params.ui_mcp_proxy },
+            { "files_enabled",               !params.ui_files_paths.empty() },
         };
         if (params.use_jinja) {
             if (!tmpl_tools.empty()) {

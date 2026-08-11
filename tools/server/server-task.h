@@ -595,9 +595,8 @@ struct server_task_result_apply_lora : server_task_result {
     virtual json to_json() override;
 };
 
-// FNV-1a 64-bit hash, returns lowercase hex string.
-// Used for checkpoint file naming.
-inline std::string generate_conversation_id(const server_tokens & tokens, size_t tokens_end) {
+// FNV-1a 64-bit hash over the token ids [0, tokens_end).
+inline uint64_t hash_token_prefix(const server_tokens & tokens, size_t tokens_end) {
     size_t count = std::min(tokens_end, tokens.size());
     uint64_t hash = 0xcbf29ce484222325ULL;
     const uint64_t fnv_prime = 0x100000001b3ULL;
@@ -608,8 +607,14 @@ inline std::string generate_conversation_id(const server_tokens & tokens, size_t
             hash *= fnv_prime;
         }
     }
+    return hash;
+}
+
+// FNV-1a 64-bit hash, returns lowercase hex string.
+// Used for checkpoint file naming.
+inline std::string generate_conversation_id(const server_tokens & tokens, size_t tokens_end) {
     char buf[17];
-    std::snprintf(buf, sizeof(buf), "%016llx", (unsigned long long)hash);
+    std::snprintf(buf, sizeof(buf), "%016llx", (unsigned long long) hash_token_prefix(tokens, tokens_end));
     return std::string(buf);
 }
 
@@ -723,6 +728,12 @@ struct server_prompt_cache {
     // RAM or disk cache match in load(), and also directly from get_available_slot() when
     // a slot is reused without a cache save/load cycle (f_keep >= 0.5).
     void merge_checkpoint_spills(server_prompt & prompt);
+
+    // delete this conversation's checkpoint spill files that are bound to more than n_valid
+    // tokens. after a rollback those files sit on an abandoned branch: merge always rejects
+    // them (see hash_token_prefix), but they still consume the spill budget. called from
+    // update_slots() when the new task diverges from the slot's cached tokens.
+    void drop_stale_checkpoint_spills(const server_prompt & prompt, int64_t n_valid);
 
     // true if the host-RAM cache currently exceeds its byte budget (limit_size > 0
     // and size() > limit_size). gates the spill-before-load "valley" path.

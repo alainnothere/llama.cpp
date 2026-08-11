@@ -113,6 +113,8 @@ class ServerProcess:
     cache_disk_queue_depth: int | None = None
     checkpoint_spill_max: int | None = None
     ctx_checkpoints: int | None = None
+    checkpoint_min_step: int | None = None
+    cache_multiverse: bool = False
     no_cache_idle_slots: bool = False
     log_path: str | None = None
     ui_mcp_proxy: bool = False
@@ -273,6 +275,10 @@ class ServerProcess:
             server_args.extend(["--checkpoint-spill-max", self.checkpoint_spill_max])
         if self.ctx_checkpoints is not None:
             server_args.extend(["--ctx-checkpoints", self.ctx_checkpoints])
+        if self.checkpoint_min_step is not None:
+            server_args.extend(["--checkpoint-min-step", self.checkpoint_min_step])
+        if self.cache_multiverse:
+            server_args.append("--cache-multiverse")
         if self.no_cache_idle_slots:
             server_args.append("--no-cache-idle-slots")
         if self.ui_mcp_proxy:

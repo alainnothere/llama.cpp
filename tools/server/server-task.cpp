@@ -54,14 +54,16 @@ constexpr size_t DISK_QUEUE_MAX_BYTES = 1ull << 30; // 1 GiB
 
 // checkpoint files - written by spill_checkpoint() the moment create_checkpoint() captures a
 // checkpoint. format: magic, version, arch_hash, vocab_hash,
-// pos_min (i32), pos_max (i32), n_tokens (i64), data_tgt_size (u64), data_tgt, data_dft_size (u64), data_dft.
+// pos_min (i32), pos_max (i32), n_tokens (i64), token_prefix_hash (u64),
+// data_tgt_size (u64), data_tgt, data_dft_size (u64), data_dft.
 // checkpoint files are named cp_{conversation_id}_{pos_min}.bin and live in disk_path
+// v2: added token_prefix_hash. v1 files fail the version check and are ignored until evicted.
 constexpr uint32_t CHECKPOINT_SPILL_MAGIC   = 0x43504B44; // 'CPKD'
-constexpr uint32_t CHECKPOINT_SPILL_VERSION = 1;
+constexpr uint32_t CHECKPOINT_SPILL_VERSION = 2;
 
 // byte offsets inside a cp_ file (see format above) - used to register disk-backed checkpoints
 // without reading the blobs: off_tgt = header, off_dft = header + tgt blob + its size field
-constexpr uint64_t CHECKPOINT_FILE_HEADER_BYTES = 4*sizeof(uint32_t) + 2*sizeof(int32_t) + sizeof(int64_t) + sizeof(uint64_t);
+constexpr uint64_t CHECKPOINT_FILE_HEADER_BYTES = 4*sizeof(uint32_t) + 2*sizeof(int32_t) + sizeof(int64_t) + 2*sizeof(uint64_t);
 
 
 static bool read_disk_u32(std::ifstream & f, uint32_t & v)
@@ -2591,11 +2593,12 @@ void server_prompt_cache::spill_checkpoint(const common_prompt_checkpoint & cp, 
     disk_job job;
     job.conv_id = conversation_id;
     job.ckpt = std::make_shared<common_prompt_checkpoint>();
-    job.ckpt->pos_min  = cp.pos_min;
-    job.ckpt->pos_max  = cp.pos_max;
-    job.ckpt->n_tokens = cp.n_tokens;
-    job.ckpt->data_tgt = cp.data_tgt;
-    job.ckpt->data_dft = cp.data_dft;
+    job.ckpt->pos_min           = cp.pos_min;
+    job.ckpt->pos_max           = cp.pos_max;
+    job.ckpt->n_tokens          = cp.n_tokens;
+    job.ckpt->token_prefix_hash = cp.token_prefix_hash;
+    job.ckpt->data_tgt          = cp.data_tgt;
+    job.ckpt->data_dft          = cp.data_dft;
 
     {
         std::unique_lock<std::mutex> lock(mtx);
@@ -2679,6 +2682,8 @@ bool server_prompt_cache::write_checkpoint_file(const common_prompt_checkpoint &
         f.write(reinterpret_cast<const char *>(&pos_max_v),  sizeof(pos_max_v));
         f.write(reinterpret_cast<const char *>(&n_tokens_v), sizeof(n_tokens_v));
 
+        put_u64(cp.token_prefix_hash);
+
         put_u64(static_cast<uint64_t>(cp.data_tgt.size()));
         if (!cp.data_tgt.empty()) {
             f.write(reinterpret_cast<const char *>(cp.data_tgt.data()),
@@ -2707,8 +2712,8 @@ bool server_prompt_cache::write_checkpoint_file(const common_prompt_checkpoint &
         return false;
     }
 
-    // enforce the per-conversation checkpoint spill limit by deleting the files that cover
-    // the lowest positions (they are the least useful for future rewinds)
+    // enforce the per-conversation checkpoint spill limit, thinning the retained set towards
+    // uniform spacing over the conversation (see the victim choice below)
     if (checkpoint_spill_max > 0) {
         struct cp_entry {
             std::filesystem::path path;
@@ -2762,12 +2767,41 @@ bool server_prompt_cache::write_checkpoint_file(const common_prompt_checkpoint &
                     }
                 }
             }
-            const int n_delete = (int) cp_files.size() - checkpoint_spill_max;
-            for (int i = 0; i < n_delete; ++i) {
+            // the newest files are never thinned - a rewind almost always lands near the tip
+            int n_protect = 8;
+            if (checkpoint_spill_max <= n_protect) {
+                n_protect = checkpoint_spill_max / 2;
+                if (n_protect < 1) {
+                    n_protect = 1;
+                }
+            }
+
+            // below the protected tail, drop the file closest to its predecessor. that keeps
+            // the survivors spread over the whole conversation depth instead of collapsing
+            // them onto its tail, which is what makes deep rewinds cheap.
+            while ((int32_t) cp_files.size() > checkpoint_spill_max) {
+                const int n_deletable = (int) cp_files.size() - n_protect;
+                if (n_deletable <= 0) {
+                    break;
+                }
+
+                int     victim  = 0;
+                int32_t gap_min = cp_files[0].pos_min; // gap of the first file: distance from position 0
+                for (int i = 1; i < n_deletable; ++i) {
+                    const int32_t gap = cp_files[i].pos_min - cp_files[i - 1].pos_min;
+                    if (gap < gap_min) {
+                        gap_min = gap;
+                        victim  = i;
+                    }
+                }
+
                 std::error_code ec3;
-                std::filesystem::remove(cp_files[i].path, ec3);
-                SRV_WRN("checkpoint spill: evicted '%s' (pos_min=%d, limit=%d)\n",
-                        cp_files[i].path.filename().string().c_str(), cp_files[i].pos_min, checkpoint_spill_max);
+                std::filesystem::remove(cp_files[victim].path, ec3);
+                SRV_WRN("checkpoint spill: evicted '%s' (pos_min=%d, gap=%d, limit=%d)\n",
+                        cp_files[victim].path.filename().string().c_str(), cp_files[victim].pos_min,
+                        gap_min, checkpoint_spill_max);
+
+                cp_files.erase(cp_files.begin() + victim);
             }
         }
     }
@@ -2794,6 +2828,7 @@ void server_prompt_cache::merge_checkpoint_spills(server_prompt & prompt) {
     int n_loaded     = 0;
     int n_skip_magic = 0;
     int n_skip_hash  = 0;
+    int n_skip_tok   = 0;
     int n_skip_dup   = 0;
 
     std::list<common_prompt_checkpoint> new_ckpts;
@@ -2834,13 +2869,24 @@ void server_prompt_cache::merge_checkpoint_spills(server_prompt & prompt) {
             continue;
         }
 
-        int32_t pos_min_v  = 0;
-        int32_t pos_max_v  = 0;
-        int64_t n_tokens_v = 0;
+        int32_t  pos_min_v  = 0;
+        int32_t  pos_max_v  = 0;
+        int64_t  n_tokens_v = 0;
+        uint64_t tok_hash_v = 0;
         f.read(reinterpret_cast<char *>(&pos_min_v),  sizeof(pos_min_v));
         f.read(reinterpret_cast<char *>(&pos_max_v),  sizeof(pos_max_v));
         f.read(reinterpret_cast<char *>(&n_tokens_v), sizeof(n_tokens_v));
+        f.read(reinterpret_cast<char *>(&tok_hash_v), sizeof(tok_hash_v));
         if (!f) {
+            continue;
+        }
+
+        // the file must belong to this exact token timeline. a cp_ file left by an abandoned
+        // branch shares the conversation_id but not the prefix, and restoring it would put
+        // KV from the other branch into this prompt.
+        if (n_tokens_v < 0 || (size_t) n_tokens_v > prompt.tokens.size() ||
+            hash_token_prefix(prompt.tokens, (size_t) n_tokens_v) != tok_hash_v) {
+            ++n_skip_tok;
             continue;
         }
 
@@ -2870,10 +2916,11 @@ void server_prompt_cache::merge_checkpoint_spills(server_prompt & prompt) {
         // from-disk checkpoints off the anonymous heap. The file is not consumed
         // here — see [TAG_CACHE_DONT_DELETE].
         common_prompt_checkpoint cp;
-        cp.pos_min  = pos_min_v;
-        cp.pos_max  = pos_max_v;
-        cp.n_tokens = n_tokens_v;
-        cp.src_path = entry.path().string();
+        cp.pos_min           = pos_min_v;
+        cp.pos_max           = pos_max_v;
+        cp.n_tokens          = n_tokens_v;
+        cp.token_prefix_hash = tok_hash_v;
+        cp.src_path          = entry.path().string();
 
         // tgt blob starts at the current position (just past the tgt_sz field)
         const std::streamoff pos_tgt = f.tellg();
@@ -2899,6 +2946,9 @@ void server_prompt_cache::merge_checkpoint_spills(server_prompt & prompt) {
         ++n_loaded;
     }
 
+    SRV_TRC("checkpoint merge: scanned %d, loaded %d, skipped: magic %d, hash %d, tokens %d, dup %d\n",
+            n_scanned, n_loaded, n_skip_magic, n_skip_hash, n_skip_tok, n_skip_dup);
+
     if (new_ckpts.empty()) {
         return;
     }
@@ -2910,6 +2960,71 @@ void server_prompt_cache::merge_checkpoint_spills(server_prompt & prompt) {
             ++it;
         }
         prompt.checkpoints.insert(it, std::move(cp));
+    }
+}
+
+
+void server_prompt_cache::drop_stale_checkpoint_spills(const server_prompt & prompt, int64_t n_valid) {
+    if (disk_path.empty() || prompt.conversation_id.empty()) {
+        return;
+    }
+
+    std::error_code ec;
+    if (!std::filesystem::exists(disk_path, ec) || ec) {
+        return;
+    }
+
+    const std::string conv_prefix = "cp_" + prompt.conversation_id + "_";
+
+    for (const auto & entry : std::filesystem::directory_iterator(disk_path, ec)) {
+        if (ec) break;
+        const std::string fname = entry.path().filename().string();
+        if (entry.path().extension() != ".bin") {
+            continue;
+        }
+        if (fname.size() <= conv_prefix.size() || fname.compare(0, conv_prefix.size(), conv_prefix) != 0) {
+            continue;
+        }
+
+        int32_t pos_min_v  = 0;
+        int64_t n_tokens_v = 0;
+        bool    drop       = false;
+
+        {
+            std::ifstream f(entry.path(), std::ios::binary);
+            if (!f) {
+                continue;
+            }
+
+            uint32_t magic = 0, version = 0, fa = 0, fv = 0;
+            int32_t  pos_max_v  = 0;
+            uint64_t tok_hash_v = 0;
+            f.read(reinterpret_cast<char *>(&magic),      sizeof(magic));
+            f.read(reinterpret_cast<char *>(&version),    sizeof(version));
+            f.read(reinterpret_cast<char *>(&fa),         sizeof(fa));
+            f.read(reinterpret_cast<char *>(&fv),         sizeof(fv));
+            f.read(reinterpret_cast<char *>(&pos_min_v),  sizeof(pos_min_v));
+            f.read(reinterpret_cast<char *>(&pos_max_v),  sizeof(pos_max_v));
+            f.read(reinterpret_cast<char *>(&n_tokens_v), sizeof(n_tokens_v));
+            f.read(reinterpret_cast<char *>(&tok_hash_v), sizeof(tok_hash_v));
+
+            if (!f || magic != CHECKPOINT_SPILL_MAGIC || version != CHECKPOINT_SPILL_VERSION) {
+                drop = true; // unreadable for this build - dead weight in the spill budget
+            } else {
+                // bound to more tokens than the shared prefix: no future request of this
+                // conversation can bind it again, whatever the client sends next
+                drop = n_tokens_v > n_valid;
+            }
+        }
+
+        if (!drop) {
+            continue;
+        }
+
+        std::error_code ec2;
+        std::filesystem::remove(entry.path(), ec2);
+        SRV_WRN("checkpoint spill: dropping checkpoint from abandoned branch '%s' (pos_min = %d, n_tokens = %" PRId64 ", n_valid = %" PRId64 ")\n",
+                fname.c_str(), pos_min_v, n_tokens_v, n_valid);
     }
 }
 

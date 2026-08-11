@@ -36,11 +36,37 @@ static int g_failures = 0;
 
 // header layout written by spill_checkpoint():
 //   magic u32 | version u32 | arch u32 | vocab u32 | pos_min i32 | pos_max i32
-//   | n_tokens i64 | tgt_sz u64 | <tgt bytes> | dft_sz u64 | <dft bytes>
-// => tgt blob starts at byte 40; dft blob starts at byte 48 + sz_tgt.
-static constexpr uint64_t HEADER_BEFORE_TGT = 40;
+//   | n_tokens i64 | token_prefix_hash u64 | tgt_sz u64 | <tgt bytes> | dft_sz u64 | <dft bytes>
+// => tgt blob starts at byte 48; dft blob starts at byte 56 + sz_tgt.
+static constexpr uint64_t HEADER_BEFORE_TGT = 48;
+
+// mirrors of the file-local constants in server-task.cpp
+static constexpr uint32_t CP_MAGIC   = 0x43504B44; // 'CPKD'
+static constexpr uint32_t CP_VERSION = 2;
 
 static int g_dir_counter = 0;
+
+// the token timeline every test checkpoint is bound to. all prefixes of it match, so a
+// prompt built with make_token_ids(n) accepts any checkpoint with n_tokens <= n.
+// TIMELINE_TOKENS is the upper bound on the n_tokens a test checkpoint may use.
+static constexpr size_t TIMELINE_TOKENS = 16384;
+
+static llama_tokens make_token_ids(size_t n) {
+    llama_tokens ids(n);
+    for (size_t i = 0; i < n; ++i) {
+        ids[i] = static_cast<llama_token>(i * 7 + 1);
+    }
+    return ids;
+}
+
+static const server_tokens & timeline() {
+    static const server_tokens t(make_token_ids(TIMELINE_TOKENS), false);
+    return t;
+}
+
+static void bind_prompt(server_prompt & prompt, size_t n_tokens) {
+    prompt.tokens = server_tokens(make_token_ids(n_tokens), false);
+}
 
 static std::string make_temp_dir(const std::string & tag) {
     const auto base = fs::temp_directory_path() /
@@ -55,9 +81,10 @@ static std::string make_temp_dir(const std::string & tag) {
 static common_prompt_checkpoint make_ckpt(int32_t pos_min, int32_t pos_max, int64_t n_tokens,
                                           size_t tgt_n, size_t dft_n, uint8_t seed) {
     common_prompt_checkpoint cp;
-    cp.pos_min  = pos_min;
-    cp.pos_max  = pos_max;
-    cp.n_tokens = n_tokens;
+    cp.pos_min           = pos_min;
+    cp.pos_max           = pos_max;
+    cp.n_tokens          = n_tokens;
+    cp.token_prefix_hash = hash_token_prefix(timeline(), static_cast<size_t>(n_tokens));
     cp.data_tgt.resize(tgt_n);
     for (size_t i = 0; i < tgt_n; ++i) {
         cp.data_tgt[i] = static_cast<uint8_t>(seed + i * 3 + 1);
@@ -110,6 +137,7 @@ static void test_lazy_registration_roundtrip() {
 
     server_prompt prompt;
     prompt.conversation_id = cid;
+    bind_prompt(prompt, 512);
     cache.merge_checkpoint_spills(prompt);
 
     CHECK(prompt.checkpoints.size() == 1);
@@ -136,8 +164,8 @@ static void test_lazy_registration_roundtrip() {
     CHECK(got.sz_dft == 512);
 
     // exact offsets for the fixed on-disk layout
-    CHECK(got.off_tgt == HEADER_BEFORE_TGT);                       // 40
-    CHECK(got.off_dft == HEADER_BEFORE_TGT + got.sz_tgt + 8);      // 48 + sz_tgt
+    CHECK(got.off_tgt == HEADER_BEFORE_TGT);                       // 48
+    CHECK(got.off_dft == HEADER_BEFORE_TGT + got.sz_tgt + 8);      // 56 + sz_tgt
 
     // the recorded offsets point at the original bytes (what load_tgt/load_dft read)
     CHECK(read_file_range(got.src_path, got.off_tgt, got.sz_tgt) == cp.data_tgt);
@@ -158,6 +186,7 @@ static void test_hash_mismatch_rejected() {
     server_prompt_cache reader(64, 0, dir, 16, -1, 0x99999999u, 0x22222222u);
     server_prompt prompt;
     prompt.conversation_id = "conv_hash_mm";
+    bind_prompt(prompt, 512);
     reader.merge_checkpoint_spills(prompt);
     CHECK(prompt.checkpoints.empty());
     fs::remove_all(dir);
@@ -173,6 +202,7 @@ static void test_dup_pos_min_skipped() {
 
     server_prompt prompt;
     prompt.conversation_id = "conv_dup";
+    bind_prompt(prompt, 512);
     common_prompt_checkpoint existing;
     existing.pos_min  = 200;
     existing.pos_max  = 250;
@@ -196,11 +226,13 @@ static void test_conversation_filter() {
 
     server_prompt other;
     other.conversation_id = "conv_b";
+    bind_prompt(other, 512);
     cache.merge_checkpoint_spills(other);
     CHECK(other.checkpoints.empty());
 
     server_prompt same;
     same.conversation_id = "conv_a";
+    bind_prompt(same, 512);
     cache.merge_checkpoint_spills(same);
     CHECK(same.checkpoints.size() == 1);
     fs::remove_all(dir);
@@ -235,6 +267,7 @@ static void test_sorted_by_pos_min() {
 
     server_prompt prompt;
     prompt.conversation_id = "conv_sorted";
+    bind_prompt(prompt, 512);
     cache.merge_checkpoint_spills(prompt);
     CHECK(prompt.checkpoints.size() == 3);
 
@@ -264,44 +297,171 @@ static std::vector<int32_t> cp_pos_min_on_disk(const std::string & dir, const st
     return pos;
 }
 
-// the per-conversation spill limit must delete the LOWEST pos_min files first and must not
-// touch other conversations. regression guard: the prune parses pos_min out of the filename,
-// where it is the last field and is terminated by ".bin", not by another underscore.
-static void test_spill_prune_keeps_highest_pos_min() {
-    std::printf("test_spill_prune_keeps_highest_pos_min\n");
+// the per-conversation spill limit thins by gap: the file closest to its predecessor is the
+// victim, and the newest n_protect files are never touched. that keeps deep-rewind coverage
+// instead of collapsing the retained set onto the tip of the conversation.
+// must not touch other conversations. regression guard: the prune parses pos_min out of the
+// filename, where it is the last field and is terminated by ".bin", not by another underscore.
+static void test_spill_prune_thins_by_gap() {
+    std::printf("test_spill_prune_thins_by_gap\n");
     const std::string dir = make_temp_dir("prune");
-    server_prompt_cache cache(64, 0, dir, 16, /*checkpoint_spill_max*/ 3, 0xAAu, 0xBBu);
+    // limit 10 -> n_protect is the full 8
+    server_prompt_cache cache(64, 0, dir, 16, /*checkpoint_spill_max*/ 10, 0xAAu, 0xBBu);
 
-    // conversation A: 5 checkpoints, ascending pos_min -> only the top 3 may survive
-    cache.spill_checkpoint(make_ckpt(100, 110, 111, 64, 0, 1), "conv_prune_a");
-    cache.wait_idle();
-    cache.spill_checkpoint(make_ckpt(200, 210, 211, 64, 0, 2), "conv_prune_a");
-    cache.wait_idle();
-    cache.spill_checkpoint(make_ckpt(300, 310, 311, 64, 0, 3), "conv_prune_a");
-    cache.wait_idle();
-    cache.spill_checkpoint(make_ckpt(400, 410, 411, 64, 0, 4), "conv_prune_a");
-    cache.wait_idle();
-    cache.spill_checkpoint(make_ckpt(500, 510, 511, 64, 0, 5), "conv_prune_a");
-    cache.wait_idle();
+    // 5 sparse checkpoints deep in the conversation, then a dense cluster at the tip
+    const std::vector<int32_t> written = {
+        100, 1000, 2000, 3000, 4000,
+        5000, 5010, 5020, 5030, 5040, 5050, 5060, 5070, 5080, 5090,
+    };
+    for (size_t i = 0; i < written.size(); ++i) {
+        const int32_t p = written[i];
+        cache.spill_checkpoint(make_ckpt(p, p + 5, p + 6, 64, 0, static_cast<uint8_t>(i + 1)), "conv_prune_a");
+        cache.wait_idle(); // prune runs inside the writer, one file at a time
+    }
 
     // conversation B: below the limit, must be left alone
-    cache.spill_checkpoint(make_ckpt(10, 20, 21, 64, 0, 6), "conv_prune_b");
+    cache.spill_checkpoint(make_ckpt(10, 20, 21, 64, 0, 60), "conv_prune_b");
     cache.wait_idle();
-    cache.spill_checkpoint(make_ckpt(20, 30, 31, 64, 0, 7), "conv_prune_b");
+    cache.spill_checkpoint(make_ckpt(20, 30, 31, 64, 0, 61), "conv_prune_b");
     cache.wait_idle();
 
     const std::vector<int32_t> pos_a = cp_pos_min_on_disk(dir, "conv_prune_a");
     const std::vector<int32_t> pos_b = cp_pos_min_on_disk(dir, "conv_prune_b");
 
-    CHECK(pos_a.size() == 3);
-    CHECK((pos_a == std::vector<int32_t>{300, 400, 500}));
+    CHECK(pos_a.size() == 10);
     CHECK((pos_b == std::vector<int32_t>{10, 20}));
+
+    // the 8 newest files are protected
+    for (int32_t p : {5020, 5030, 5040, 5050, 5060, 5070, 5080, 5090}) {
+        CHECK(std::find(pos_a.begin(), pos_a.end(), p) != pos_a.end());
+    }
+
+    // deep coverage survives: at least one file below the middle of the written range.
+    // the old keep-the-highest-pos_min policy would have retained nothing below 4000.
+    if (!pos_a.empty()) {
+        CHECK(pos_a.front() < (written.front() + written.back()) / 2);
+    }
+
+    // exact victim order: 100 (gap to 0), then 1000, 3000, 2000 and 5010 as the set thins
+    CHECK((pos_a == std::vector<int32_t>{2000, 4000, 5020, 5030, 5040, 5050, 5060, 5070, 5080, 5090}));
 
     // and the survivors are still loadable
     server_prompt prompt;
     prompt.conversation_id = "conv_prune_a";
+    bind_prompt(prompt, 8192);
     cache.merge_checkpoint_spills(prompt);
-    CHECK(prompt.checkpoints.size() == 3);
+    CHECK(prompt.checkpoints.size() == 10);
+
+    fs::remove_all(dir);
+}
+
+// with a limit at or below 8 the protected tail is clamped to limit/2 (min 1), so thinning
+// still has something to work with
+static void test_spill_prune_small_limit_clamp() {
+    std::printf("test_spill_prune_small_limit_clamp\n");
+    const std::string dir = make_temp_dir("prunesmall");
+    server_prompt_cache cache(64, 0, dir, 16, /*checkpoint_spill_max*/ 3, 0xACu, 0xBCu);
+
+    for (int32_t p : {100, 200, 300, 400, 500}) {
+        cache.spill_checkpoint(make_ckpt(p, p + 5, p + 6, 64, 0, 1), "conv_small");
+        cache.wait_idle();
+    }
+
+    const std::vector<int32_t> pos = cp_pos_min_on_disk(dir, "conv_small");
+    CHECK(pos.size() == 3);
+    CHECK((pos == std::vector<int32_t>{200, 400, 500}));
+
+    fs::remove_all(dir);
+}
+
+// a cp_ file is bound to the token prefix it was taken at: a file left by an abandoned
+// branch of the same conversation must not be registered
+static void test_token_binding_rejects_diverged_prefix() {
+    std::printf("test_token_binding_rejects_diverged_prefix\n");
+    const std::string dir = make_temp_dir("tokbind");
+    server_prompt_cache cache(64, 0, dir, 16, -1, 0x31u, 0x32u);
+
+    const std::string cid = "conv_tokbind";
+    cache.spill_checkpoint(make_ckpt(400, 450, /*n_tokens*/ 451, 128, 0, 21), cid);
+    cache.wait_idle();
+
+    // divergence below n_tokens -> rejected
+    {
+        server_prompt diverged;
+        diverged.conversation_id = cid;
+        llama_tokens ids = make_token_ids(1024);
+        ids[300] += 1;
+        diverged.tokens = server_tokens(ids, false);
+        cache.merge_checkpoint_spills(diverged);
+        CHECK(diverged.checkpoints.empty());
+    }
+
+    // divergence above n_tokens -> accepted, the checkpoint only covers the prefix
+    {
+        server_prompt later;
+        later.conversation_id = cid;
+        llama_tokens ids = make_token_ids(1024);
+        ids[600] += 1;
+        later.tokens = server_tokens(ids, false);
+        cache.merge_checkpoint_spills(later);
+        CHECK(later.checkpoints.size() == 1);
+    }
+
+    // matching prefix -> accepted
+    {
+        server_prompt match;
+        match.conversation_id = cid;
+        bind_prompt(match, 1024);
+        cache.merge_checkpoint_spills(match);
+        CHECK(match.checkpoints.size() == 1);
+    }
+
+    // prompt shorter than the prefix the checkpoint covers -> rejected
+    {
+        server_prompt shorter;
+        shorter.conversation_id = cid;
+        bind_prompt(shorter, 100);
+        cache.merge_checkpoint_spills(shorter);
+        CHECK(shorter.checkpoints.empty());
+    }
+
+    fs::remove_all(dir);
+}
+
+// files written before the token-binding header bump have no hash to check, so they are
+// skipped on the version check alone
+static void test_old_version_file_skipped() {
+    std::printf("test_old_version_file_skipped\n");
+    const std::string dir = make_temp_dir("oldver");
+    const uint32_t arch = 0x41u, vocab = 0x42u;
+    server_prompt_cache cache(64, 0, dir, 16, -1, arch, vocab);
+
+    // v1 layout: same as v2 but without the token_prefix_hash field
+    {
+        std::ofstream f(fs::path(dir) / "cp_conv_oldver_400.bin", std::ios::binary);
+        auto put_u32 = [&f](uint32_t v) { f.write(reinterpret_cast<const char *>(&v), sizeof(v)); };
+        auto put_u64 = [&f](uint64_t v) { f.write(reinterpret_cast<const char *>(&v), sizeof(v)); };
+        put_u32(CP_MAGIC);
+        put_u32(CP_VERSION - 1);
+        put_u32(arch);
+        put_u32(vocab);
+        const int32_t pos_min = 400, pos_max = 450;
+        const int64_t n_tokens = 451;
+        f.write(reinterpret_cast<const char *>(&pos_min),  sizeof(pos_min));
+        f.write(reinterpret_cast<const char *>(&pos_max),  sizeof(pos_max));
+        f.write(reinterpret_cast<const char *>(&n_tokens), sizeof(n_tokens));
+        put_u64(64);
+        const std::vector<uint8_t> tgt(64, 0x5C);
+        f.write(reinterpret_cast<const char *>(tgt.data()), static_cast<std::streamsize>(tgt.size()));
+        put_u64(0);
+    }
+
+    server_prompt prompt;
+    prompt.conversation_id = "conv_oldver";
+    bind_prompt(prompt, 1024);
+    cache.merge_checkpoint_spills(prompt);
+    CHECK(prompt.checkpoints.empty());
+    CHECK(fs::exists(fs::path(dir) / "cp_conv_oldver_400.bin")); // skipped, not consumed
 
     fs::remove_all(dir);
 }
@@ -348,6 +508,7 @@ static void test_empty_draft_checkpoint() {
     // merge reads it back with the same offsets
     server_prompt prompt;
     prompt.conversation_id = cid;
+    bind_prompt(prompt, 1024);
     cache.merge_checkpoint_spills(prompt);
 
     CHECK(prompt.checkpoints.size() == 1);
@@ -372,6 +533,56 @@ static void test_empty_draft_checkpoint() {
     // exercises the null-ctx short circuit - the state above is the real assertion.
     CHECK(got.data_dft.empty());
     CHECK(got.load_dft(nullptr, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+
+    fs::remove_all(dir);
+}
+
+// a rollback drops this conversation's spill files bound past the divergence point,
+// keeps the ones on the shared timeline and never touches another conversation
+static void test_drop_stale_checkpoint_spills() {
+    std::printf("test_drop_stale_checkpoint_spills\n");
+    const std::string dir = make_temp_dir("dropstale");
+    const uint32_t arch = 0x71u, vocab = 0x72u;
+    server_prompt_cache cache(64, 0, dir, 16, -1, arch, vocab);
+
+    const std::string cid = "conv_drop";
+    for (int32_t p : {100, 500, 900, 1300}) {
+        cache.spill_checkpoint(make_ckpt(p, p + 5, p + 6, 64, 0, static_cast<uint8_t>(p / 100)), cid);
+    }
+    cache.spill_checkpoint(make_ckpt(1000, 1010, 1011, 64, 0, 77), "conv_other");
+    cache.wait_idle();
+
+    // a file this build cannot read is dead weight in the spill budget as well
+    {
+        std::ofstream f(fs::path(dir) / "cp_conv_drop_2000.bin", std::ios::binary);
+        auto put_u32 = [&f](uint32_t v) { f.write(reinterpret_cast<const char *>(&v), sizeof(v)); };
+        put_u32(CP_MAGIC);
+        put_u32(CP_VERSION - 1);
+        put_u32(arch);
+        put_u32(vocab);
+    }
+
+    // no conversation_id -> nothing to scan for
+    {
+        server_prompt anon;
+        bind_prompt(anon, 2048);
+        cache.drop_stale_checkpoint_spills(anon, 0);
+        CHECK(cp_pos_min_on_disk(dir, cid).size() == 5);
+        CHECK((cp_pos_min_on_disk(dir, "conv_other") == std::vector<int32_t>{1000}));
+    }
+
+    // divergence at 700 tokens: 906 and 1306 are on the abandoned branch
+    server_prompt prompt;
+    prompt.conversation_id = cid;
+    bind_prompt(prompt, 2048);
+    cache.drop_stale_checkpoint_spills(prompt, 700);
+
+    CHECK((cp_pos_min_on_disk(dir, cid) == std::vector<int32_t>{100, 500}));
+    CHECK((cp_pos_min_on_disk(dir, "conv_other") == std::vector<int32_t>{1000}));
+
+    // the survivors still bind to the timeline
+    cache.merge_checkpoint_spills(prompt);
+    CHECK(prompt.checkpoints.size() == 2);
 
     fs::remove_all(dir);
 }
@@ -428,8 +639,12 @@ int main() {
     test_conversation_filter();
     test_corrupt_file_skipped();
     test_sorted_by_pos_min();
-    test_spill_prune_keeps_highest_pos_min();
+    test_spill_prune_thins_by_gap();
+    test_spill_prune_small_limit_clamp();
+    test_token_binding_rejects_diverged_prefix();
+    test_old_version_file_skipped();
     test_empty_draft_checkpoint();
+    test_drop_stale_checkpoint_spills();
     test_over_budget_reflects_ram_limit();
     test_spill_all_frees_ram();
     test_spill_all_noop_without_disk();

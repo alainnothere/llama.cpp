@@ -1691,6 +1691,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_SPILL_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-multiverse"},
+        "keep checkpoint spill files from abandoned conversation branches when the conversation is rolled back (default: deleted)",
+        [](common_params & params) {
+            params.cache_multiverse = true;
+        }
+    ).set_env("LLAMA_ARG_CACHE_MULTIVERSE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--http-request-dump-path"}, "PATH",
         "diagnostic: dump every incoming POST body + meta sidecar to this directory "
         "(filename: {seq:06}_{remote_port}_{utc_us}_{path-slug}.json). empty = disabled",
@@ -3293,6 +3300,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.public_path = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_STATIC_PATH"));
+    add_opt(common_arg(
+        {"--path-to-serve-from-ui"}, "PATH",
+        "directory or single file served for download at /files and linked from the web UI,\n"
+        "can be repeated to serve several paths (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.ui_files_paths.push_back(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_UI_FILES_PATH"));
     add_opt(common_arg(
         {"--cors-origins"}, "ORIGINS",
         string_format(
