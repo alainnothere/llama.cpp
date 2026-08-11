@@ -9,8 +9,10 @@
 		ICON_STRIP_TRANSITION_DURATION,
 		ICON_STRIP_TRANSITION_DELAY_MULTIPLIER,
 		ROUTES,
-		SIDEBAR_ACTIONS_ITEMS
+		SIDEBAR_ACTIONS_ITEMS,
+		SIDEBAR_FILES_ITEM
 	} from '$lib/constants';
+	import { serverProps } from '$lib/stores/server.svelte';
 	import { isMobile } from '$lib/stores/viewport.svelte';
 	import { TooltipSide } from '$lib/enums';
 	import { fade } from 'svelte/transition';
@@ -43,6 +45,11 @@
 	let searchInputRef = $state<HTMLInputElement | null>(null);
 
 	const isOnMobile = $derived(isMobile.current);
+	const actionItems = $derived(
+		serverProps()?.files_enabled
+			? [...SIDEBAR_ACTIONS_ITEMS, SIDEBAR_FILES_ITEM]
+			: SIDEBAR_ACTIONS_ITEMS
+	);
 
 	$effect(() => {
 		if (isSearchModeActive && searchInputRef) {
@@ -55,7 +62,7 @@
 
 		setTimeout(() => {
 			initialized = true;
-		}, ICON_STRIP_TRANSITION_DELAY_MULTIPLIER * SIDEBAR_ACTIONS_ITEMS.length);
+		}, ICON_STRIP_TRANSITION_DELAY_MULTIPLIER * actionItems.length);
 	});
 
 	function handleSearchModeDeactivate() {
@@ -105,18 +112,20 @@
 			? 'hidden pointer-events-none'
 			: ''}"
 	>
-		{#each SIDEBAR_ACTIONS_ITEMS as item, i (item.tooltip)}
+		{#each actionItems as item, i (item.tooltip)}
 			{@const isActive = isItemActive(item)}
 			{@const isSearchOnMobile = item.icon === Search && isMobile.current}
-			{@const itemHref = isSearchOnMobile ? ROUTES.SEARCH : item.route}
-			{@const itemOnClick = item.route
-				? () => {
-						onNewChat?.();
-						goto(item.route!);
-					}
-				: isSearchOnMobile
-					? undefined
-					: onSearchClick}
+			{@const itemHref = item.externalHref ?? (isSearchOnMobile ? ROUTES.SEARCH : item.route)}
+			{@const itemOnClick = item.externalHref
+				? undefined
+				: item.route
+					? () => {
+							onNewChat?.();
+							goto(item.route!);
+						}
+					: isSearchOnMobile
+						? undefined
+						: onSearchClick}
 			{@const itemTransition = {
 				duration: ICON_STRIP_TRANSITION_DURATION,
 				delay: !initialized ? i * ICON_STRIP_TRANSITION_DELAY_MULTIPLIER : 0,
@@ -131,6 +140,8 @@
 							: ''}"
 						href={itemHref}
 						onclick={itemOnClick}
+						target={item.externalHref ? '_blank' : undefined}
+						data-sveltekit-reload={item.externalHref ? true : undefined}
 						variant="ghost"
 						size="default"
 					>
@@ -154,17 +165,19 @@
 	</div>
 {:else}
 	<div class="{className} flex-col gap-1 hidden md:flex">
-		{#each SIDEBAR_ACTIONS_ITEMS as item, i (item.tooltip)}
+		{#each actionItems as item, i (item.tooltip)}
 			{@const isActive = isItemActive(item)}
 			{@const isSearchOnMobile = item.icon === Search && isMobile.current}
-			{@const itemOnClick = item.route
-				? () => {
-						onNewChat?.();
-						goto(item.route!);
-					}
-				: isSearchOnMobile
-					? undefined
-					: onSearchClick}
+			{@const itemOnClick = item.externalHref
+				? undefined
+				: item.route
+					? () => {
+							onNewChat?.();
+							goto(item.route!);
+						}
+					: isSearchOnMobile
+						? undefined
+						: onSearchClick}
 			{@const itemTransition = {
 				duration: ICON_STRIP_TRANSITION_DURATION,
 				delay: !initialized ? i * ICON_STRIP_TRANSITION_DELAY_MULTIPLIER : 0,
@@ -182,6 +195,8 @@
 						class="h-9 w-9 rounded-full hover:bg-accent! {isActive
 							? 'bg-accent text-accent-foreground'
 							: ''}"
+						href={item.externalHref}
+						external={!!item.externalHref}
 						onclick={itemOnClick}
 					/>
 				</div>

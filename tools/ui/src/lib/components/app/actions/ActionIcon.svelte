@@ -8,6 +8,8 @@
 		ariaLabel?: string;
 		class?: string;
 		disabled?: boolean;
+		/** `href` points outside the SPA - open a new tab and bypass client-side routing. */
+		external?: boolean;
 		href?: string;
 		icon: Component;
 		iconSize?: string;
@@ -27,6 +29,7 @@
 		size = 'sm',
 		class: className = '',
 		disabled = false,
+		external = false,
 		iconSize = 'h-3 w-3',
 		tooltipSide = TooltipSide.TOP,
 		stopPropagationOnClick = false,
@@ -45,6 +48,8 @@
 		{variant}
 		{size}
 		{disabled}
+		target={external ? '_blank' : undefined}
+		data-sveltekit-reload={external ? true : undefined}
 		onclick={(e: MouseEvent) => {
 			if (stopPropagationOnClick) e.stopPropagation();
 

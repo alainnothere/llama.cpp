@@ -1,4 +1,4 @@
-import { Search, Settings, SquarePen } from '@lucide/svelte';
+import { Folder, Search, Settings, SquarePen } from '@lucide/svelte';
 import McpLogo from '$lib/components/app/mcp/McpLogo.svelte';
 import type { Component } from 'svelte';
 import { ROUTES } from './routes';
@@ -16,6 +16,8 @@ export interface DesktopIconStripItem {
 	icon: Component;
 	tooltip: string;
 	route?: string;
+	/** URL served outside the SPA - opened in a new tab, bypassing client-side routing. */
+	externalHref?: string;
 	activeRouteId?: string;
 	activeRoutePrefix?: string;
 	activeUrlIncludes?: string;
@@ -38,3 +40,10 @@ export const SIDEBAR_ACTIONS_ITEMS: DesktopIconStripItem[] = [
 		activeUrlIncludes: '#/settings'
 	}
 ];
+
+/** Server-rendered file listing - only shown when the server reports `files_enabled`. */
+export const SIDEBAR_FILES_ITEM: DesktopIconStripItem = {
+	icon: Folder,
+	tooltip: 'Files',
+	externalHref: './files'
+};

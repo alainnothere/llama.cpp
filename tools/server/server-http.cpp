@@ -6,6 +6,7 @@
 
 #include <cpp-httplib/httplib.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -14,9 +15,11 @@
 #include <fstream>
 #include <functional>
 #include <future>
+#include <map>
 #include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 
 //
 // HTTP implementation using cpp-httplib
@@ -341,6 +344,163 @@ bool server_http_context::init(const common_params & params) {
         const auto max_threads = static_cast<size_t>(n_threads_http + 1024);
         return new httplib::ThreadPool(n_threads_http, max_threads);
     };
+
+    //
+    // Downloadable files setup
+    //
+
+    // registered before the web UI, so that these routes win over a potential `--path` root mount
+    if (!params.ui_files_paths.empty()) {
+        for (const auto & entry : params.ui_files_paths) {
+            std::error_code ec;
+            // symlinks are deliberately followed here and everywhere below
+            if (!std::filesystem::is_directory(entry, ec) && !std::filesystem::is_regular_file(entry, ec)) {
+                SRV_ERR("files path is neither a directory nor a regular file: %s\n", entry.c_str());
+                return false;
+            }
+        }
+
+        auto handle_files_listing = [entries = params.ui_files_paths](const httplib::Request & req, httplib::Response & res) {
+            auto html_escape = [](const std::string & str) {
+                std::string out;
+                for (const char c : str) {
+                    switch (c) {
+                        case '&':  out += "&amp;";  break;
+                        case '<':  out += "&lt;";   break;
+                        case '>':  out += "&gt;";   break;
+                        case '"':  out += "&quot;"; break;
+                        default:   out += c;        break;
+                    }
+                }
+                return out;
+            };
+
+            auto percent_encode = [](const std::string & str) {
+                std::string out;
+                for (const unsigned char c : str) {
+                    // unreserved characters (RFC 3986) pass through, everything else is encoded
+                    if (isalnum(c) || c == '-' || c == '.' || c == '_' || c == '~') {
+                        out += static_cast<char>(c);
+                    } else {
+                        char buf[4];
+                        snprintf(buf, sizeof(buf), "%%%02X", c);
+                        out += buf;
+                    }
+                }
+                return out;
+            };
+
+            auto human_size = [](const uintmax_t size) {
+                static const char * units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
+                double value = static_cast<double>(size);
+                size_t unit  = 0;
+                while (value >= 1024.0 && unit + 1 < sizeof(units)/sizeof(units[0])) {
+                    value /= 1024.0;
+                    unit++;
+                }
+                char buf[64];
+                snprintf(buf, sizeof(buf), unit == 0 ? "%.0f %s" : "%.1f %s", value, units[unit]);
+                return std::string(buf);
+            };
+
+            // std::map keeps the listing sorted by name, while emplace keeps the first entry
+            // of a duplicated name, which is the one that is actually served
+            std::map<std::string, uintmax_t> files;
+            try {
+                for (const auto & entry : entries) {
+                    if (std::filesystem::is_directory(entry)) {
+                        for (const auto & it : std::filesystem::directory_iterator(entry)) {
+                            if (std::filesystem::is_regular_file(it.path())) {
+                                files.emplace(it.path().filename().string(), std::filesystem::file_size(it.path()));
+                            }
+                        }
+                    } else if (std::filesystem::is_regular_file(entry)) {
+                        const std::filesystem::path path(entry);
+                        files.emplace(path.filename().string(), std::filesystem::file_size(path));
+                    }
+                }
+            } catch (const std::filesystem::filesystem_error & e) {
+                SRV_ERR("failed to list the served files: %s\n", e.what());
+                res.status = 500;
+                res.set_content("Error: failed to list the served files", "text/plain");
+                return;
+            }
+
+            // relative hrefs, so that the listing keeps working behind a reverse proxy or an api prefix
+            const std::string href_prefix = !req.path.empty() && req.path.back() == '/' ? "" : "files/";
+
+            std::string html =
+                "<!DOCTYPE html>\n"
+                "<html><head><meta charset=\"utf-8\"><title>Files</title></head>\n"
+                "<body>\n<h1>Files</h1>\n<ul>\n";
+            for (const auto & [name, size] : files) {
+                html += "<li><a href=\"" + href_prefix + percent_encode(name) + "\">" + html_escape(name) + "</a> (" + human_size(size) + ")</li>\n";
+            }
+            html += "</ul>\n</body></html>\n";
+
+            res.set_content(html, "text/html");
+        };
+
+        // registered before the ":name" route below, which would otherwise match "/files/" with an empty name
+        srv->Get(params.api_prefix + "/files",  handle_files_listing);
+        srv->Get(params.api_prefix + "/files/", handle_files_listing);
+
+        auto serve_file = [](const std::filesystem::path & path, httplib::Response & res) {
+            auto file = std::make_shared<std::ifstream>(path, std::ios::binary);
+            std::error_code ec;
+            // the size is taken per request, so that an updated file is still served correctly
+            const auto size = std::filesystem::file_size(path, ec);
+            if (!file->is_open() || ec) {
+                res.status = 404;
+                res.set_content("Error: file not found", "text/plain");
+                return;
+            }
+            res.set_header("Content-Disposition", "attachment; filename=\"" + path.filename().string() + "\"");
+            res.set_content_provider(static_cast<size_t>(size), "application/octet-stream",
+                [file](size_t offset, size_t length, httplib::DataSink & sink) {
+                    constexpr size_t chunk_size = 64 * 1024;
+                    std::vector<char> buf(std::min(chunk_size, length));
+                    file->clear();
+                    file->seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+                    file->read(buf.data(), static_cast<std::streamsize>(buf.size()));
+                    const auto n_read = file->gcount();
+                    if (n_read <= 0) {
+                        return false;
+                    }
+                    sink.write(buf.data(), static_cast<size_t>(n_read));
+                    return true;
+                });
+        };
+
+        // the path params matcher stops the capture at '/' and the request path is url-decoded before
+        // matching, so the name is always a single path component, resolved against the entries in flag order
+        srv->Get(params.api_prefix + "/files/:name",
+            [entries = params.ui_files_paths, serve_file](const httplib::Request & req, httplib::Response & res) {
+                const std::string & name = req.path_params.at("name");
+                if (name.empty() || name == "." || name == "..") {
+                    res.status = 404;
+                    res.set_content("Error: file not found", "text/plain");
+                    return;
+                }
+                for (const auto & entry : entries) {
+                    std::error_code ec;
+                    const std::filesystem::path path(entry);
+                    if (std::filesystem::is_directory(path, ec)) {
+                        if (const auto candidate = path / name; std::filesystem::is_regular_file(candidate, ec)) {
+                            serve_file(candidate, res);
+                            return;
+                        }
+                    } else if (path.filename().string() == name && std::filesystem::is_regular_file(path, ec)) {
+                        serve_file(path, res);
+                        return;
+                    }
+                }
+                res.status = 404;
+                res.set_content("Error: file not found", "text/plain");
+            });
+
+        SRV_INF("serving %zu path(s) for download at %s/files\n", params.ui_files_paths.size(), params.api_prefix.c_str());
+    }
 
     //
     // Web UI setup
