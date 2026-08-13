@@ -1,24 +1,23 @@
 <script lang="ts">
-	import { ICON_CLASS_DEFAULT } from '$lib/constants/css-classes';
+	import { Search } from '@lucide/svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import { Search } from '@lucide/svelte';
 	import { ActionIcon, KeyboardShortcutInfo, SearchInput } from '$lib/components/app';
 	import { Button } from '$lib/components/ui/button';
 	import {
-		ICON_STRIP_TRANSITION_DURATION,
+		ICON_CLASS_DEFAULT,
 		ICON_STRIP_TRANSITION_DELAY_MULTIPLIER,
+		ICON_STRIP_TRANSITION_DURATION,
 		ROUTES,
 		SIDEBAR_ACTIONS_ITEMS,
 		SIDEBAR_FILES_ITEM
 	} from '$lib/constants';
-	import { serverProps } from '$lib/stores/server.svelte';
-	import { isMobile } from '$lib/stores/viewport.svelte';
 	import { TooltipSide } from '$lib/enums';
-	import { fade } from 'svelte/transition';
-	import { circIn } from 'svelte/easing';
-	import { onMount } from 'svelte';
+	import { isMobile, serverStore } from '$lib/stores';
 	import type { Component } from 'svelte';
+	import { onMount } from 'svelte';
+	import { circIn } from 'svelte/easing';
+	import { fade } from 'svelte/transition';
 
 	interface Props {
 		class: string;
@@ -34,22 +33,22 @@
 		class: className,
 		isExpandedMode = false,
 		isSearchModeActive = $bindable(false),
-		searchQuery = $bindable(''),
-		onSearchDeactivated,
+		onNewChat,
 		onSearchClick,
-		onNewChat
+		onSearchDeactivated,
+		searchQuery = $bindable('')
 	}: Props = $props();
 
 	let initialized = $state(false);
 	let showIcons = $state(false);
 	let searchInputRef = $state<HTMLInputElement | null>(null);
 
-	const isOnMobile = $derived(isMobile.current);
 	const actionItems = $derived(
-		serverProps()?.files_enabled
+		serverStore.props?.files_enabled
 			? [...SIDEBAR_ACTIONS_ITEMS, SIDEBAR_FILES_ITEM]
 			: SIDEBAR_ACTIONS_ITEMS
 	);
+	const isOnMobile = $derived(isMobile.current);
 
 	$effect(() => {
 		if (isSearchModeActive && searchInputRef) {
@@ -127,8 +126,8 @@
 						? undefined
 						: onSearchClick}
 			{@const itemTransition = {
-				duration: ICON_STRIP_TRANSITION_DURATION,
 				delay: !initialized ? i * ICON_STRIP_TRANSITION_DELAY_MULTIPLIER : 0,
+				duration: ICON_STRIP_TRANSITION_DURATION,
 				easing: circIn
 			}}
 
@@ -179,8 +178,8 @@
 						? undefined
 						: onSearchClick}
 			{@const itemTransition = {
-				duration: ICON_STRIP_TRANSITION_DURATION,
 				delay: !initialized ? i * ICON_STRIP_TRANSITION_DELAY_MULTIPLIER : 0,
+				duration: ICON_STRIP_TRANSITION_DURATION,
 				easing: circIn
 			}}
 
