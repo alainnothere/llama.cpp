@@ -412,6 +412,7 @@ static void assert_msg_equals(const common_chat_msg & expected,
     } else {
         assert_equals(expected.reasoning_content, actual.reasoning_content);
     }
+    assert_equals(expected.reasoning_effort, actual.reasoning_effort);
     assert_equals(expected.tool_calls.size(), actual.tool_calls.size());
     for (size_t i = 0; i < expected.tool_calls.size(); i++) {
         const auto & expected_tool_call = expected.tool_calls[i];
@@ -936,6 +937,17 @@ const common_chat_msg message_user{
     /* .reasoning_content = */ "",
     /* .tool_name = */ "",
     /* .tool_call_id = */ "",
+};
+
+const common_chat_msg message_user_effort{
+    "user",
+    "Hey there!",
+    /* .content_parts = */ {},
+    /* .tool_calls = */ {},
+    /* .reasoning_content = */ "",
+    /* .tool_name = */ "",
+    /* .tool_call_id = */ "",
+    /* .reasoning_effort = */ "xhigh",
 };
 
 const common_chat_msg message_user_parts{
@@ -1571,6 +1583,7 @@ static void test_msgs_oaicompat_json_conversion() {
     LOG_DBG("%s\n", __func__);
     std::vector<common_chat_msg> msgs{
         message_user,
+        message_user_effort,
         message_user_parts,
         message_assist_call,
         message_assist_call_thoughts,
@@ -1621,6 +1634,27 @@ static void test_msgs_oaicompat_json_conversion() {
                               "  }\n"
                               "]"),
                   common_chat_msgs_to_json_oaicompat({ message_assist_call_python }).dump(2));
+
+    // reasoning_effort is emitted on the wire only when set, and parsed back
+    assert_equals(std::string("[\n"
+                              "  {\n"
+                              "    \"role\": \"user\",\n"
+                              "    \"content\": \"Hey there!\",\n"
+                              "    \"reasoning_effort\": \"xhigh\"\n"
+                              "  }\n"
+                              "]"),
+                  common_chat_msgs_to_json_oaicompat({ message_user_effort }).dump(2));
+    {
+        auto parsed = common_chat_msgs_parse_oaicompat(
+            json::parse("[{\"role\": \"user\", \"content\": \"hi\", \"reasoning_effort\": \"low\"}]"));
+        assert_equals<size_t>(1, parsed.size());
+        assert_equals<std::string>("low", parsed[0].reasoning_effort);
+    }
+    {
+        auto parsed = common_chat_msgs_parse_oaicompat(json::parse("[{\"role\": \"user\", \"content\": \"hi\"}]"));
+        assert_equals<size_t>(1, parsed.size());
+        assert_equals(true, parsed[0].reasoning_effort.empty());
+    }
 
     auto res = common_chat_msgs_parse_oaicompat(json::parse("[{\"role\": \"assistant\", \"tool_calls\": []}]"));
     assert_equals<size_t>(1, res.size());

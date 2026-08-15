@@ -86,6 +86,10 @@ struct common_chat_msg {
     std::string                               reasoning_content;
     std::string                               tool_name;
     std::string                               tool_call_id;
+    // Per-message reasoning effort ("low" / "medium" / "xhigh"). Non-standard
+    // passthrough: preserved from the request message into the template's
+    // message object so a template can render per-turn effort instructions.
+    std::string                               reasoning_effort;
 
     nlohmann::ordered_json to_json_oaicompat(bool concat_typed_text = false) const;
 
@@ -122,7 +126,8 @@ struct common_chat_msg {
     bool operator==(const common_chat_msg & other) const {
         return role == other.role && content == other.content && content_parts == other.content_parts &&
                tool_calls == other.tool_calls && reasoning_content == other.reasoning_content &&
-               tool_name == other.tool_name && tool_call_id == other.tool_call_id;
+               tool_name == other.tool_name && tool_call_id == other.tool_call_id &&
+               reasoning_effort == other.reasoning_effort;
     }
 
     bool operator!=(const common_chat_msg & other) const { return !(*this == other); }

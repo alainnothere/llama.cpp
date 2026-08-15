@@ -238,6 +238,9 @@ json common_chat_msg::to_json_oaicompat(bool concat_typed_text) const {
     if (!tool_call_id.empty()) {
         jmsg["tool_call_id"] = tool_call_id;
     }
+    if (!reasoning_effort.empty()) {
+        jmsg["reasoning_effort"] = reasoning_effort;
+    }
     if (!tool_calls.empty()) {
         jmsg["tool_calls"] = json::array();
         auto & jtool_calls = jmsg["tool_calls"];
@@ -457,6 +460,9 @@ std::vector<common_chat_msg> common_chat_msgs_parse_oaicompat(const json & messa
             }
             if (message.contains("tool_call_id")) {
                 msg.tool_call_id = message.at("tool_call_id");
+            }
+            if (message.contains("reasoning_effort")) {
+                msg.reasoning_effort = message.at("reasoning_effort");
             }
 
             msgs.push_back(msg);
