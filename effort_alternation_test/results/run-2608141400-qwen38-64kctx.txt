@@ -1,0 +1,2663 @@
+url=http://127.0.0.1:8091 (Qwen3.8-27B-UD-Q8_K_XL, 64k ctx, q8_0 KV, --reasoning-preserve)
+scenario=questions_backup_saga.json
+date=2026-08-14
+
+======================================================================
+TURN1 xhigh: reasoning_chars= 54713 content_chars= 8992 completion_tokens=16384 prompt_tokens=202 finish=length
+
+USER: ok so here is the thing, I have a home server, well actually two if you count the old laptop, and I want to back up my photos, but ALSO I do not want to pay for cloud storage because reasons, and my sister has a NAS at her place across town, and I was thinking maybe syncthing? or maybe rsync over a VPN? or wireguard something something... but then what happens when her NAS dies, do I need a third copy? people say 3-2-1 backup but honestly who has the time, and should the backups be encrypted before they leave my machine because I do not want my sister seeing my memes folder... anyway WHAT should I actually set up, give me a concrete recommendation, not seventeen options.
+
+REASONING:
+We need answer user's request in English. Need provide concrete recommendation, not seventeen options. Need think carefully. User has home server (two if count old laptop), wants backup photos, no cloud, sister's NAS across town, considering Syncthing, rsync over VPN, WireGuard. Concerns NAS dies, 3-2-1, encryption before leaving machine because privacy (memes folder). Wants WHAT should I actually set up, concrete recommendation.
+
+Need likely recommend: Use Syncthing over WireGuard with encryption at rest on source and destination? Or maybe rclone/restic? Let's analyze.
+
+Goal: backup photos, not just sync. They say backup, but Syncthing is sync, not versioned backup unless configured with versions? Syncthing can do file sync, deletion propagation can be dangerous. For photos, maybe use rsync over SSH with versioning? Or restic to NAS? Need concrete.
+
+Constraints: two home machines? "home server, well actually two if you count the old laptop" maybe they have two devices locally. Sister NAS across town. No cloud. Need privacy encryption before leaving. Need redundancy? Sister NAS dies. 3-2-1: 3 copies, 2 media, 1 offsite. They have home server + old laptop + sister NAS = 3 copies? But old laptop maybe not reliable. If photos on home server, backup to old laptop (local second media) and sister NAS (offsite). That's 3-2-1-ish: 3 copies (original + laptop + NAS), 2 media types (server disk, laptop disk, NAS disk maybe 2? if server and laptop different), 1 offsite. But if original is server, local backup laptop, offsite NAS. Need protect against deletion/accident: versioned backups.
+
+Concrete recommendation: Use restic (or Borg) encrypted backup to two targets: local old laptop via SSH and sister NAS via SSH/WireGuard. Restic provides encrypted, deduplicated, versioned, incremental, cross-platform, snapshots, can verify, can back up to SFTP/REST? If NAS supports SSH/SFTP or local disk. If not, use Syncthing? But restic is better for backup. Need handle privacy: restic encrypts everything (files, names, metadata) with repo key; sister can't see contents. Need key management: keep key offline/encrypted, not on sister NAS? Restic key can be stored in repo or separate. To prevent sister from accessing if she has key? If repo on her NAS and key only on your machines, she can't read. But if she has admin to NAS and key is in repo? Restic key is stored in repo by default? Actually restic stores key in repo's config/key? If key is in repo, anyone with repo access can read. Need use --key-file or --password-file? Restic key is a file containing key; can store key externally and not in repo? Let's recall: restic can use --key-file to specify key file; if not in repo? The key file can be stored outside repo. But default key is in repo? For security, keep key separate from repo. Or use age? Restic supports age keys? Maybe. Need mention: store recovery key offline (printed/encrypted USB), not on NAS. If key lost, data unreadable. If key stolen, data safe.
+
+But user wants concrete not many options. Could recommend: "Set up WireGuard between your home and sister's NAS, then use restic over SSH to back up encrypted snapshots to the NAS, and also to the old laptop locally. Turn on Syncthing only for live photo sync if you need continuous, but not as your backup." But they ask what should I actually set up. Need maybe choose one: WireGuard + restic. Why not Syncthing? Syncthing is sync, not backup; it propagates deletes; not versioned by default; can be encrypted in transit and at rest? Syncthing can encrypt? It has TLS in transit, but files stored plaintext unless you use encrypted folder? Syncthing supports encrypted folders? There is "encrypted folder" feature? I think Syncthing has an encrypted folder type that encrypts files before sending, but maybe still not versioning. It can be used for privacy. But for backup, restic better.
+
+Need address sister NAS dies: 3-2-1. Since they have old laptop, use it as local second copy. If old laptop is unreliable, maybe external USB drive? But they said old laptop. Concrete: "Do this: 1) WireGuard between home and sister. 2) Restic backup from home server to old laptop (local, encrypted, versioned) and to sister NAS (offsite, encrypted, versioned). 3) Keep restic key offline. 4) Optionally, if you want continuous photo sync, use Syncthing for only the folder you want mirrored, with versioning enabled and not deleting? But not necessary." Need maybe avoid too many options. But can mention "Don't use plain rsync; don't use Syncthing as your only backup." Need be firm.
+
+Need consider if sister NAS can run restic server? Restic client can connect to SFTP/SSH or local disk. If NAS is Synology/QNAP, can install restic via package? Or just expose SFTP/SSH. If no SSH, maybe use restic with SFTP via port forward? Or use rclone? But concrete: "If her NAS supports SSH/SFTP (most do), use restic over SSH. If not, use a small always-on machine at her place?" But she has NAS, likely Linux-like. Could also use "rsync over SSH with --backup and timestamped dirs" but less robust. Restic is better.
+
+Need maybe recommend "BorgBackup" instead of restic? Borg is encrypted, dedup, versioned, incremental, works over SSH/BorgBase. But Borg requires borg server on destination; if NAS can run Borg. Restic simpler? Restic can use SSH/SFTP, no server needed beyond SFTP. For NAS, SFTP is common. Restic is good.
+
+Need ensure privacy: restic encrypts file names and contents. But if using SFTP over WireGuard/SSH, transit encrypted. If using local laptop, no transit. Need store key. Need maybe use "restic --password-file" and key file. Need mention "do not put the key on the NAS". But if restic repo on NAS and key file on home server/laptop, sister can't read. But if she has root and can read repo, without key cannot decrypt. However, restic may store key in repo if not using external key? Need instruct: create repo with --key-file pointing to a key file you keep only on your machines (or offline). Let's verify restic behavior: restic init --key-file /path/key? I think restic init creates key and stores in repo by default; --key-file can specify where to store key, can be outside repo. Also --password-file. There is also --key-psk? For age. Need not overcomplicate. Say: "initialize the repo with an external key file (or age key) that lives only on your machines and an offline backup; do not copy it to her NAS." Need mention if you lose key, photos unrecoverable.
+
+Need 3-2-1: original on home server, backup to old laptop, backup to sister NAS. If original is on home server and old laptop is backup, that's two copies? Wait 3 copies: original + two backups. If home server original, old laptop backup, sister NAS backup = 3 copies. Media: server disk, laptop disk, NAS disk = 3 media? At least 2. Offsite: sister NAS. Good. But if old laptop is just old and may die, still acceptable? Could recommend "treat old laptop as local backup; if you care more, add a cheap USB SSD as the local second copy instead of/alongside laptop." But user wants concrete, maybe include as fallback: "If the laptop is flaky, swap it for a $100 USB SSD; the rest of the plan stays identical." That's not seventeen options.
+
+Need maybe address "do I need a third copy?" Yes, because sister NAS can die. But they already have old laptop, so use it. If old laptop not trustworthy, get external drive. But concrete: "Yes, use your old laptop as the third copy; if it's too unreliable, replace it with a USB SSD." Need not be wishy-washy.
+
+Need maybe mention "photos" often large, versioning/dedup helps. Restic dedup and incremental. Need schedule: daily/weekly. Use cron/systemd timers. Need verify: monthly restic check/verify, restore test. Need retention: keep e.g. last 7 daily, 4 weekly, 12 monthly. Need concrete commands? User likely technical. Could give exact setup steps.
+
+Potential final structure:
+- Short answer: "Use WireGuard + restic. Not Syncthing as backup, not plain rsync."
+- Why: restic = encrypted, versioned, incremental, dedup, snapshots; WireGuard = private tunnel; 3-2-1 with old laptop + sister NAS.
+- Architecture:
+  1. Home server: photo originals.
+  2. Old laptop: local encrypted restic repo (or USB SSD).
+  3. Sister's NAS: offsite encrypted restic repo over WireGuard/SSH.
+- What to install/configure:
+  - WireGuard between home and sister (or use existing VPN). If sister's NAS can run WireGuard or router can, set up; otherwise use SSH over public IP? But recommendation: WireGuard if possible; if not, SSH with key auth and firewall.
+  - On home server and old laptop: install restic.
+  - Create local repo on old laptop: `restic init --repo /mnt/backup/restic --key-file ~/.config/restic/key --password-file ~/.config/restic/password`? Need be careful: if key file on old laptop and home server? If the key file is on both machines, sister can't access. But if old laptop is local, okay. If key file only on home server, and old laptop repo, can home server backup to old laptop? Need key accessible to client. For local repo, key can be on home server. But if old laptop dies and key only on home server? Need offline key. Better: store key in a secure location (e.g. encrypted USB, printed, password manager) and on home server; maybe not on old laptop? But to restore from old laptop, need key. If old laptop is backup media, having key on it is not ideal? But local. Could use age key file on home server and offline. For simplicity: keep key file on home server and an offline copy; do not store on NAS. If old laptop is just repo, home server uses key to write. For restoring from old laptop, you need key; you have it. If home server dies, offline key. Good.
+  - Create offsite repo on NAS: path e.g. `/volume1/restic/you` or SFTP. If using SSH: `restic init --repo sftp:user@nas:/volume1/restic`? Restic supports SFTP via `sftp:`? I think restic backend: `sftp:user@host:path` maybe. Or use `ssh`? Restic backends: local, sftp, s3, b2, azure, gcs, swift, rest, rest-nginx. It uses SFTP. For SSH tunnel maybe `sftp:user@wg-ip:/path`. Or if restic can use SSH? It uses SFTP. Need mention "SFTP/SSH". If using WireGuard, target is `sftp:backupuser@10.66.66.2:/volume1/restic`. Need ensure SFTP enabled on NAS. If NAS doesn't have SFTP, maybe use local disk if restic installed on NAS? But home server can't access local path on NAS unless mounted. Could use NFS/CIFS? But restic backend local only. Better: use SFTP. Most NAS support SFTP. If not, use `rclone`? But keep concrete: require SFTP. If her NAS doesn't support SFTP, then "put a small Linux box at her place or use Syncthing?" But likely supports.
+  - Backup command: `restic backup /photos --repo ... --tag photos --use-snapshots`? Need include `--exclude`? Maybe not.
+  - Retention: `restic forget --keep-daily 7 --keep-weekly 4 --keep-monthly 12 --prune` (prune optional). For two repos, same.
+  - Schedule: systemd timer/cron daily.
+  - Verification: monthly `restic check` and restore test.
+- Privacy: restic encrypts contents + file names. Keep key offline. If sister gets repo, can't read. If you lose key, data lost. Use strong password.
+- What about Syncthing? "Only if you also want continuous mirror of a selected folder; enable versioning and don't let it delete your originals; but it is not your backup. Do not use it to sync deletions from a laptop to your server." Maybe include as optional, but user asked not seventeen options. We can say "If you want real-time, add Syncthing only for a 'new photos import' folder, not for the backup." But maybe keep minimal.
+- What about rsync? "Don't use plain rsync as your only backup; it can overwrite/delete and doesn't encrypt at rest." But if they like rsync, could use `rsync --backup` over SSH, but restic is better. Need not list.
+- Address "who has the time": This is set-and-forget; one command and timers.
+- Address "what happens when her NAS dies": You still have local copy on old laptop and original; restore from local or re-offsite later. If old laptop dies, you still have sister NAS (encrypted) and original. If both? 3-2-1 reduces risk. Need maybe "If you want true 3-2-1 and the laptop is questionable, add a USB SSD as local backup; otherwise the laptop is your third copy."
+- Need concrete recommendation maybe "Here is the exact stack: WireGuard + restic + old laptop + sister NAS." That's one recommendation.
+
+Need maybe consider "home server, well actually two if you count old laptop" Could mean they have two home servers? Actually "I have a home server, well actually two if you count the old laptop" maybe they have a home server and an old laptop (as second machine). They want backup photos. Could use old laptop as local backup. Good.
+
+Need maybe mention "if your photos are already on the old laptop?" Hmm.
+
+Potential pitfalls:
+- Restic key management: If key file is on home server and offline, but repo on sister NAS. If sister NAS dies, key safe. If home server dies, offline key. Good. But if old laptop repo, key not on old laptop? If home server dies and offline key accessible, can restore from old laptop. Good. But if old laptop is used as backup, and key is not on it, it's okay because key is elsewhere. But if you need to restore from old laptop to a new machine, need key. Fine.
+- If using restic with SFTP, the SFTP user on NAS must have write permission to repo. Need create dedicated user.
+- If using WireGuard, need allow SFTP port through firewall. Or use WireGuard to tunnel all traffic, then SFTP to NAS IP. If sister's NAS behind NAT, WireGuard server at her place? Need maybe "set up WireGuard with your home as client and sister's router/NAS as server, or use a small always-on endpoint." But if no endpoint? She has NAS; can run WireGuard on NAS if supported (Synology has WireGuard package? yes). If not, use SSH over internet with key and fail2ban? But recommendation: WireGuard if possible; if not, SSH over public IP with firewall. User mentioned wireguard something something. We can say "Use WireGuard if her NAS/router can run it; otherwise use SSH with key auth and a firewall. The backup tool is restic either way." But that's two options? Still concrete: restic over SSH/WireGuard.
+- Need maybe not overdo with commands? But user likely wants concrete. Provide a minimal command set.
+
+Need maybe mention "encrypted before they leave my machine" Restic encrypts at backup time, so files on NAS/laptop are encrypted. But if using local repo on old laptop, they don't "leave" but still encrypted. Good.
+
+Need maybe mention "memes folder" privacy: restic encrypts file names, so sister can't even see folder names. If using Syncthing encrypted folder, also. But restic better.
+
+Need maybe mention "deletions": Restic snapshots don't delete old versions unless you forget/prune. It protects against accidental deletion. But if you delete from source and run backup with `--prune`? Restic backup does not delete from repo; old snapshots remain until forget. Good.
+
+Need maybe mention "malware/ransomware": Versioned snapshots help; verify.
+
+Need maybe mention "capacity": Photos can be large; restic dedup helps but not as much for JPEGs? JPEGs not dedup well, but incremental snapshots store changed files. Need size estimate: first backup full, subsequent small. Need maybe "make sure NAS and laptop have enough space; plan for ~1.5-2x original over time if keeping long retention, less with prune." But not necessary.
+
+Need maybe mention "don't put the only key on the NAS". Good.
+
+Need maybe mention "test restore" because backup without restore test is just hope.
+
+Need maybe final answer in a decisive tone.
+
+Let's craft final answer:
+
+"Use: WireGuard + restic. Specifically: original photos on home server; encrypted restic repo on old laptop; encrypted restic repo on sister's NAS over WireGuard/SFTP. That is your 3-2-1. Don't use Syncthing as the backup; don't use plain rsync."
+
+Then steps:
+1. Network:
+   - If sister's NAS/router supports WireGuard, install it and make a private network (e.g. 10.200.0.0/24). Your home server connects to her WireGuard IP. If not, use SSH with key auth and firewall; restic still works.
+2. Restic:
+   - Install restic on home server (and optionally old laptop for local repo? Actually if local repo path on old laptop, home server can access via local? If old laptop is separate machine, need mount its disk over network? Hmm. Important: If old laptop is a separate machine, how does home server write to it? Options:
+      a. Mount old laptop's disk via NFS/SMB/SSHFS and use restic local repo path on mounted disk. But restic local backend on network mount may be okay but not ideal? It can work. Or use SFTP to old laptop too. Simpler: run restic on home server and use SFTP to old laptop as well. But old laptop may not be always on? If it's a backup target, it needs to be on during backup. Could schedule when on. Or use local USB drive attached to home server instead of old laptop. User says old laptop as second machine. If they want 3-2-1, local backup can be an external drive attached to home server, not old laptop. But they have old laptop; could use it as a second machine to store repo, but then home server must access it over network. That's okay: restic over SFTP to old laptop. But if old laptop is off, backup fails. Could keep it on. Or use old laptop as a separate restic client to back up from home server? Hmm.
+
+Need think: The user has home server and old laptop. They want backup photos. If photos are on home server, to make local backup on old laptop, you can:
+- Mount old laptop's storage on home server (NFS/SMB) and run restic local repo to that mount. But restic local backend over network filesystem may be less reliable but okay. Better use SFTP to old laptop: `sftp:user@laptop:/path`. That requires old laptop running SFTP. It's another machine, but can be on. Or use old laptop as a Syncthing target? But not backup.
+- Alternatively, use old laptop to run restic client that pulls from home server via SSH/SFTP and stores locally. That's more complex: two clients, key management. But could be: old laptop backs up home server's photos over SSH to its local disk. But then home server also backs up to sister NAS. That gives local and offsite. But key management: old laptop needs key. If old laptop has key, and it's local, okay. But if old laptop is compromised? It's local.
+- Simpler for user: "Attach a USB SSD to the home server for the local copy; use the old laptop only if you want to avoid buying a drive." But user wants concrete; maybe recommend USB SSD as local backup because it's more reliable and simpler than old laptop. But they already have old laptop and don't want spend? They didn't say no spend, just no cloud. Could recommend "If the old laptop is reliable, use it; otherwise a USB SSD is the boring correct local copy." But they asked not options. Need choose: Use old laptop as local backup? Since they mentioned it, likely yes. But maybe better: "Use the old laptop as the local 3-2-1 copy; if it is too flaky, the only change is to swap in a USB SSD." That's concrete enough.
+
+How to implement with old laptop:
+Option A: Home server writes restic repo to old laptop via SFTP. This is simple: one restic client on home server, two repos: local? Actually both repos remote via SFTP: one to old laptop, one to sister NAS. But local backup over network to old laptop is still local network, okay. Need old laptop always on or scheduled. It can be a Linux laptop with SFTP. If old laptop is Windows? SFTP? Could use WinSCP? Not easy. But home server likely Linux. If old laptop is Linux, okay. If not, maybe use SMB/NFS mount and restic local. But restic local over SMB may be okay? Hmm.
+
+Option B: Old laptop runs restic client and backs up its own local repo from home server via SSH. But then it needs to access photos on home server. Could be: `restic backup sftp:user@homeserver:/photos --repo /local/restic`. This stores local repo on old laptop. It also can back up to sister NAS? Could run same on old laptop? But then two machines have key. More complexity.
+
+Option C: Use old laptop as a Syncthing destination for a photo folder, then restic backs up from home server to old laptop's synced folder? No.
+
+Maybe the cleanest concrete recommendation: "Use restic from the home server to two repositories: a local USB drive attached to the home server, and the sister's NAS over WireGuard/SFTP. If you don't want to buy a USB drive, use the old laptop as a local SFTP target instead of the USB drive." But user wants no cloud, not necessarily no hardware. But they said old laptop counts as second. I can say "Use the old laptop as your local backup target, but only if you will keep it powered; otherwise a USB SSD is the better local copy." That's not seventeen options.
+
+Need maybe avoid making setup too complex. Could recommend "restic to sister NAS + restic to old laptop via SFTP". That's concrete.
+
+Let's design exact architecture:
+- Home server: source `/photos`.
+- Old laptop: runs OpenSSH/SFTP, has a partition `/backup/restic-local`. It is on the local network. It is the local encrypted repo.
+- Sister NAS: runs SFTP, has `/volume1/restic-offsite`. Access via WireGuard IP. It is offsite encrypted repo.
+- Home server runs restic with two repository URLs:
+  - `sftp:backup@192.168.1.50:/backup/restic-local` (old laptop)
+  - `sftp:backup@10.200.0.2:/volume1/restic-offsite` (sister NAS via WireGuard)
+- Key file: on home server + offline. Not on NAS or laptop? But if key not on laptop, laptop repo is encrypted and unreadable without key. That's fine. But if home server dies, offline key. If old laptop dies, no key issue. If sister NAS dies, no key issue. If you need to restore from old laptop, use key from home server/offline. Good.
+- But if key file only on home server, and home server dies, offline key. Good.
+- Need ensure old laptop SFTP user can write to repo. The repo is encrypted, so even if laptop is stolen, no key. But if laptop is local and stolen, encrypted. Good.
+- However, restic SFTP backend requires the SFTP server to allow writing. The key file not on laptop means if laptop is stolen, attacker has encrypted repo but no key. Good.
+- But if old laptop is the only local backup and it's off, backup fails. Need schedule when on or keep on. Could say "keep it powered or run backup when it's on; if you don't want that, use a USB drive." Good.
+
+Alternative: Use old laptop as a local restic repo directly attached? If old laptop is just a machine, not attached. SFTP is okay.
+
+Need maybe mention if old laptop is Windows: use SFTP server? Windows has OpenSSH server now. Or use SMB mount. But not necessary.
+
+Need maybe mention "If the old laptop is not Linux or you don't trust it, replace it with a USB SSD attached to the home server; the restic command changes only the repo path." That's a fallback.
+
+Need maybe include commands:
+Assume restic installed.
+Key setup:
+```
+mkdir -p ~/.config/restic
+umask 077
+# create a key file (or use restic init --key-file)
+openssl rand -hex 32 > ~/.config/restic/restic.key
+# or use age? Keep simple.
+chmod 600 ~/.config/restic/restic.key
+# password file maybe
+echo 'strong-passphrase' > ~/.config/restic/restic.password
+chmod 600 ~/.config/restic/restic.password
+```
+But restic `--key-file` expects a file containing key, not just random hex? I think restic key file is a base64-encoded key? If you use `openssl rand -hex 32`, is that valid? Need verify. Restic key file format: It stores key as base64? Let's recall: `restic init --key-file /path/to/key` creates key file. It might be a file with base64 encoded key. If you manually create random hex, maybe not valid? Better not instruct manual key generation unless sure. Could say "let restic create the key file with `--key-file` and then copy it offline." For init:
+```
+restic init --repo sftp:backup@192.168.1.50:/backup/restic-local \
+  --key-file /etc/restic/key \
+  --password-file /etc/restic/password
+```
+But if key-file is outside repo? Yes. It will create key file there. Need password file. Then copy key and password to offline storage. Do not put on NAS. But if key-file is on home server, okay.
+For second repo, can use same key? Yes, restic repos can share key? I think a key can be used for multiple repos? The key is tied to repo? In restic, key is not tied to repo? It can be used to access multiple repos? I think yes, a key can be used for multiple repositories, but each repo has a key? Actually restic key is a key used to encrypt data; it can be used across repos? I think you can use the same key for multiple repos, but not sure. It might be possible. To be safe, use separate key per repo? But then more keys. Simpler: use one key for all your restic repos; it's okay? Let's verify: Restic key file contains a key; repository config stores the key? If using external key, the key can be used for any repo? I think yes, the key is not bound to repo, but the repo's config may store the key? Hmm. Restic docs: "The key is stored in the repository by default. You can use --key-file to specify an external key file." "You can use the same key for multiple repositories." I think yes. But if not, we can say "initialize each repo with its own key file, or use one key you manage carefully." To avoid incorrect, maybe say "initialize each repository with an external key file; keep the key(s) offline. If you prefer, use one key for both, but never store it on the destination." Need not be exact.
+
+Need maybe use age keys for restic? Restic supports `--key-psk`? Let's not.
+
+Commands:
+```
+# local repo on old laptop
+restic init --repo sftp:backup@192.168.1.50:/backup/restic-local \
+  --key-file /etc/restic/local.key \
+  --password-file /etc/restic/local.password
+
+# offsite repo on sister NAS
+restic init --repo sftp:backup@10.200.0.2:/volume1/restic-offsite \
+  --key-file /etc/restic/offsite.key \
+  --password-file /etc/restic/offsite.password
+```
+Then backup:
+```
+restic backup /photos --repo sftp:backup@192.168.1.50:/backup/restic-local --key-file ... --password-file ... --tag photos --use-snapshots
+restic backup /photos --repo sftp:backup@10.200.0.2:/volume1/restic-offsite --key-file ... --password-file ... --tag photos --use-snapshots
+```
+Retention:
+```
+restic forget --repo ... --key-file ... --password-file ... --keep-daily 7 --keep-weekly 4 --keep-monthly 12 --prune
+```
+Maybe use environment variables `RESTIC_REPOSITORY`, `RESTIC_KEY_FILE`, `RESTIC_PASSWORD_FILE` to simplify.
+```
+export RESTIC_REPOSITORY=sftp:...
+export RESTIC_KEY_FILE=...
+export RESTIC_PASSWORD_FILE=...
+restic backup /photos --tag photos
+restic forget --keep-daily 7 --keep-weekly 4 --keep-monthly 12 --prune
+```
+Need mention `--use-snapshots`? Restic backup by default uses snapshots? It creates a snapshot. `--use-snapshots` maybe not needed? Restic has `--use-snapshots`? I think restic backup uses snapshots by default? There is `--use-snapshots` maybe for using snapshot times? Let's not include if unsure. Use `--tag photos` and `--exclude-if-present`? Not needed.
+
+Need maybe mention "restic check" monthly:
+```
+restic check --read-data-subset=1% # or full check monthly
+restic restore latest /tmp/restore-test
+```
+Need not too much.
+
+Need maybe mention "WireGuard setup" concrete:
+- On sister's NAS/router: create WireGuard server with allowed IPs. On home server: client. Test `ping 10.200.0.2`. If NAS can't run WireGuard, use her router or a small always-on device. If no WireGuard, use SFTP over SSH with key auth and firewall; less nice but works.
+- If using WireGuard, SFTP over WG: `sftp:backup@10.200.0.2:/volume1/restic-offsite`.
+
+Need maybe mention "Do not expose SFTP to internet without WireGuard; if you must, use key-only auth, no passwords, fail2ban, and restrict source IPs." But keep concise.
+
+Need maybe mention "Syncthing" specifically: "Syncthing is fine for live sync of a camera/phone folder, but it is not a backup: it can delete files, it does not give you historical snapshots, and its privacy model is less turnkey than restic. If you add it later, use it only for an import folder, enable versioning, and don't let it sync deletions from untrusted devices." Good.
+
+Need maybe mention "rsync": "rsync over SSH is okay for a mirror, but it is not encrypted at rest, not versioned by default, and a bad sync can overwrite your only copy. Restic solves that." Good.
+
+Need maybe answer "do I need a third copy?" "Yes, unless you are okay losing everything if the NAS dies. Your old laptop is the third copy. If the laptop is unreliable, use a USB SSD." Good.
+
+Need maybe answer "should backups be encrypted before leaving machine?" "Yes. Restic does that. Keep key separate." Good.
+
+Need maybe final with "The one thing to do" and "Do not do".
+
+Potential issue: Restic over SFTP to old laptop and sister NAS means the old laptop is not a "media" separate? It is a separate disk. Good.
+
+Need maybe mention "3-2-1 with restic":
+- 3 copies: original on home server, local restic repo on old laptop, offsite restic repo on sister NAS.
+- 2 media: server disk, laptop disk/NAS disk (actually 3). Good.
+- 1 offsite: sister NAS.
+Need maybe if original and local backup are on same power/physical? Old laptop separate. Good.
+
+Need maybe mention "If your home server and old laptop are in the same house, a house fire/flood can take both. The sister NAS covers that. If you want more, add an offline USB drive rotated, but that's beyond baseline." Maybe not.
+
+Need maybe mention "If the sister NAS dies, you can restore from old laptop and re-offsite when new NAS is up. If old laptop dies, you can restore from sister NAS. If home server dies, you have two backups." Good.
+
+Need maybe mention "key loss is the main failure mode". Good.
+
+Need maybe mention "memes folder": restic encrypts file names, so sister can't see `/memes` even if she has repo access. If you don't want even metadata, restic does it.
+
+Need maybe mention "if you want to exclude memes from backup"? They said don't want sister seeing memes folder, but maybe they want backup all? If they don't want sister seeing, encryption solves. If they don't want to backup memes, exclude. But likely they want backup but privacy. Could mention "If you don't want the memes backed up at all, exclude them; if you want them backed up but hidden, encryption hides them." Good.
+
+Need maybe final answer not too long but detailed. Desired oververbosity 9, so thorough. But user asked concrete, not seventeen options. We can be thorough but decisive.
+
+Let's consider if there is a better recommendation: "Use Syncthing with encrypted folders and versioning, plus a local copy"? Syncthing can encrypt file names? It has encrypted folder type that uses a key, encrypts file names and contents. It can run over WireGuard. It can sync from home server to sister NAS and old laptop. It can have file versioning (trashcan/simple/age-size). But it's not a backup because it syncs deletions? Versioning can keep deleted files for a period. But restic is more robust for backup, incremental, dedup, snapshots. For photos, restic is better. So recommend restic.
+
+Could recommend "BorgBackup" instead of restic. Borg is excellent, encrypted, dedup, versioned. But Borg requires a Borg server on destination or local disk. If sister NAS can run Borg, good. But SFTP with restic is simpler. Restic is client-only, works with SFTP. So restic.
+
+Need maybe mention "rclone"? No.
+
+Need maybe mention "Syncthing as transport for restic"? No.
+
+Potential issue: Restic over SFTP to a NAS: SFTP can be slow for large backups, but okay. If NAS supports local disk and restic can be installed on NAS, you could run restic on NAS and pull from home server via SFTP? But home server pushing is simpler.
+
+Need maybe mention "If the first backup is huge, do it over LAN to old laptop first, then offsite; expect it to take time." Not necessary.
+
+Need maybe mention "Use a dedicated backup user on sister NAS with write access only to repo, no admin." Good.
+
+Need maybe mention "Do not store the restic password/key in the backup repo or on the NAS." Good.
+
+Need maybe mention "If sister has admin on NAS and can read the repo, she still cannot decrypt without key. But if you ever give her the key, privacy gone." Good.
+
+Need maybe mention "If you lose the key, the backups are unusable. Keep an offline copy in a safe place, not in the same house if possible? But if offline key is in same house, fire risk. Could put key with sister? But she shouldn't see? Could give her an encrypted key? Hmm. For key backup, maybe store offline in a different location or password manager. But user wants privacy from sister; giving her key defeats. Could store encrypted key in a password manager? If she has access? No. Maybe "keep the key in a fireproof safe or with a trusted person who is not your sister; if you lose it, the data is gone." Good.
+
+Need maybe mention "Use a strong passphrase, not just key file?" Restic uses key + password. The key file is secret; password protects key? Actually restic key file may be encrypted with password? I think key file is encrypted with password? Let's recall: restic uses a key and a password. The key is stored encrypted with the password? If you have key file and password, you can access. If key file is external, it's still encrypted? Maybe. So keep both. Simpler: use `--password-file` and key file. Need not explain.
+
+Need maybe mention "restic is encrypted by default; no separate GPG needed." Good.
+
+Need maybe mention "If you want to be extra paranoid, use two restic keys: one on home server, one offline; never on destination." Good.
+
+Let's think about exact restic key file usage. If I tell user to use `--key-file /etc/restic/key` and `--password-file /etc/restic/password`, and init repo, restic will create key file. But if key file is outside repo, does restic store a reference? It should. Need maybe command:
+```
+restic init --repo sftp:user@host:/path --key-file /etc/restic/key --password-file /etc/restic/password
+```
+But I recall `restic init` has `--key-file` to specify key file, but if file doesn't exist, it creates it. It may also require `--password` or `--password-file`. Good.
+For backup, use same.
+Need maybe mention "If you use one key for both repos, init second with same key file? Does restic allow? It might say key already exists? If key file exists, it uses it. But if repo already has a key? If using external key, okay. To be safe, use separate key files for local and offsite. That means two keys to manage. But simpler for user? One key is simpler. But if one key is compromised, all repos exposed. But if key is on home server, compromise of home server exposes all. Separate keys could limit. But user wants simple. Maybe "Use one key for both if you want simplicity; use two if you want to be more careful. Either way, keep it off the NAS." That's an option but not seventeen. Could choose one: "Use one key for both, stored on the home server and offline." That's concrete. Is it valid? I need be sure. Let's verify from memory: Restic key is a random key used to encrypt the repository. It is not tied to a specific repository? The repository config file contains the key? Actually in restic, the key is stored in the config file of the repository (or external). The key is used to encrypt the data. If you use the same key for multiple repos, it should work because the key is just a key. The repo config stores the key? If external, the key file is used. I think yes. But if not, using separate keys is safer and definitely works. We can recommend separate keys to avoid uncertainty. But then user has two keys. Still manageable.
+
+Maybe use environment variables per repo:
+```
+# Local
+RESTIC_REPOSITORY=sftp:backup@192.168.1.50:/backup/restic-local \
+RESTIC_KEY_FILE=/etc/restic/local.key \
+RESTIC_PASSWORD_FILE=/etc/restic/local.password \
+restic backup /photos --tag photos
+
+# Offsite
+RESTIC_REPOSITORY=sftp:backup@10.200.0.2:/volume1/restic-offsite \
+RESTIC_KEY_FILE=/etc/restic/offsite.key \
+RESTIC_PASSWORD_FILE=/etc/restic/offsite.password \
+restic backup /photos --tag photos
+```
+This is clear. Keep both key/password files offline. If separate, more secure.
+
+Need maybe mention "If you want to reduce key management, use one key, but separate is fine." Hmm.
+
+Need maybe include a systemd timer example? Could be too much. But concrete recommendation can include "schedule daily". Maybe give a simple cron line:
+```
+0 3 * * * /usr/local/bin/restic-backup.sh
+```
+Script:
+```
+#!/usr/bin/env bash
+set -euo pipefail
+export RESTIC_REPOSITORY=...
+export RESTIC_KEY_FILE=...
+export RESTIC_PASSWORD_FILE=...
+restic backup /photos --tag photos
+restic forget --keep-daily 7 --keep-weekly 4 --keep-monthly 12 --prune
+```
+But for two repos, script with two env blocks. Could include minimal.
+
+Need maybe mention "prune" can be expensive; run weekly. `forget --prune` after backup. Good.
+
+Need maybe mention "Use `--ignore-inode`? Not needed.
+
+Need maybe mention "If photos are on a network mount, restic can handle but ensure stable." Not needed.
+
+Need maybe mention "If you have a lot of photos, first backup may be large; use `restic stats` to check." Not needed.
+
+Need maybe mention "Do not use `--cache-dir` on a filesystem that can fill up." Not needed.
+
+Need maybe final answer in a friendly tone: "Here is the concrete plan." Use bullet points.
+
+Let's outline final:
+
+1. "My recommendation: WireGuard + restic, with your old laptop as the local copy and sister's NAS as offsite. Not Syncthing, not plain rsync."
+2. "Why this is the right answer"
+   - restic = encrypted, versioned, incremental, dedup, snapshots, works over SFTP.
+   - WireGuard = private tunnel.
+   - 3-2-1: original + laptop + NAS.
+3. "What to build"
+   - Network: WireGuard between home and sister's NAS/router. If no WireGuard, SSH key-only with firewall.
+   - Create dedicated SFTP users on old laptop and NAS.
+   - Install restic on home server.
+   - Init two encrypted repos with external keys.
+   - Backup commands.
+   - Retention and schedule.
+   - Verify and restore test.
+4. "Key/privacy rules"
+   - Keep key/password off NAS/laptop? Actually if using SFTP to laptop, key not on laptop. But if old laptop is local, maybe okay. But best: key only on home server + offline. But if home server is the only place with key, and old laptop repo is encrypted, good. If home server dies, offline key. If you need to run restic from old laptop for restore, you need key; you can copy offline key temporarily.
+   - Sister can't see file names/contents.
+   - If you lose key, backups are gone.
+5. "What if things die"
+   - NAS dies: restore from laptop/original; re-offsite later.
+   - Laptop dies: restore from NAS.
+   - Home server dies: restore from either.
+   - If laptop is flaky: swap for USB SSD; same plan.
+6. "Where Syncthing/rsync fit"
+   - Syncthing: optional live sync only, not backup; if used, versioning and no delete sync.
+   - rsync: not encrypted at rest, no versions; avoid as only backup.
+7. "Exact minimal commands" maybe integrated.
+
+Need be careful: If key not on old laptop, and old laptop is SFTP target, restic home server writes encrypted data. Good. But if old laptop is the local backup and it dies, the data is gone, but key not on it. Fine. If you need to restore from old laptop, you need key. You have it. If old laptop is stolen, encrypted.
+
+But if old laptop is a separate machine, and you keep key only on home server, and home server dies, offline key. Good.
+
+Need maybe mention "Do not put the key on the old laptop either, unless you accept that risk; the point is the media can be lost/stolen without exposing data." But if old laptop is in your house, maybe okay. However, if old laptop is used to store repo, and key is on home server, an attacker with old laptop can't read. Good.
+
+Need maybe mention "If you want to be able to restore from the old laptop without the home server, keep the offline key accessible." Good.
+
+Potential issue: Restic cache. If using SFTP, restic maintains a cache locally. If cache is on home server, okay. If home server dies, cache lost but can rebuild. Not important.
+
+Need maybe mention "Use `restic snapshots` to see versions." Not necessary.
+
+Need maybe mention "If your NAS is Synology, enable SFTP, create user, set path. If QNAP, same." Good.
+
+Need maybe mention "If sister's NAS cannot run WireGuard, use a small router or always-on box at her place; if she won't do that, use SSH over the internet with key auth and firewall, but WireGuard is better." That's a conditional, but still concrete.
+
+Need maybe answer "WHAT should I actually set up" with "Set up exactly this: ..." Good.
+
+Let's think if there is any reason to recommend Syncthing instead because user specifically mentions it and privacy. Syncthing can encrypt folders, sync over WireGuard, and can do versioning. But for photos, if you want backup not sync, restic. User says "back up my photos" but also "what happens when her NAS dies, do I need a third copy? people say 3-2-1". That screams backup. Restic is correct.
+
+Need maybe mention "Syncthing is not a backup because if you delete a file on one side, it can delete on the other; versioning only keeps limited copies; it is not designed for long-term retention." Good.
+
+Need maybe mention "rsync over VPN can be part of a backup if you use `--backup` and timestamped directories, but it's more work and less robust; restic is the concrete choice." Good.
+
+Need maybe mention "If you really want a simple one-command solution, restic is it." Good.
+
+Need maybe include "Do a restore test once a quarter: restore a random photo from each repo." Good.
+
+Need maybe mention "If you have a lot of photos and the first offsite backup is huge, run it when you have time; subsequent backups are incremental." Good.
+
+Need maybe mention "Use `--exclude` for cache/temp, but include memes if you want them backed up; encryption hides them." Good.
+
+Need maybe final answer with commands in code blocks. Ensure not too many options. But we can include fallback for laptop reliability.
+
+Let's draft final in detail:
+
+"Use restic, not Syncthing, as the backup engine. Use WireGuard as the private tunnel. Use your old laptop as the local 3-2-1 copy and your sister's NAS as the offsite copy."
+
+Then "The topology":
+```
+Home server /photos
+   |
+   | restic (encrypted, versioned)
+   +--> old laptop: sftp repo (local)
+   +--> sister NAS: sftp repo over WireGuard (offsite)
+```
+Actually ASCII maybe.
+
+"Concrete setup":
+1. WireGuard:
+   - Sister's NAS/router runs WireGuard server; home server client; private subnet e.g. 10.200.0.0/24. If NAS can't, use her router or a small always-on box. If no WireGuard, use SSH with key-only and firewall, but prefer WireGuard.
+2. SFTP targets:
+   - Old laptop: user `backup`, path `/backup/restic-local`, keep laptop on during backup window.
+   - Sister NAS: user `backup`, path `/volume1/restic-offsite` (or equivalent), SFTP enabled, no password, SSH key from home server.
+3. Restic on home server:
+   - Create `/etc/restic` with 600 perms.
+   - Init repos:
+```
+restic init --repo sftp:backup@192.168.1.50:/backup/restic-local \
+  --key-file /etc/restic/local.key \
+  --password-file /etc/restic/local.password
+
+restic init --repo sftp:backup@10.200.0.2:/volume1/restic-offsite \
+  --key-file /etc/restic/offsite.key \
+  --password-file /etc/restic/offsite.password
+```
+   - Copy key/password files to offline storage (encrypted USB, printed in safe, password manager). Do not put them on sister NAS. If you want to avoid two keys, use one key for both, but separate is fine.
+   - Backup script:
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+backup_repo() {
+  local repo="$1" key="$2" pass="$3"
+  RESTIC_REPOSITORY="$repo" \
+  RESTIC_KEY_FILE="$key" \
+  RESTIC_PASSWORD_FILE="$pass" \
+  restic backup /photos --tag photos
+
+  RESTIC_REPOSITORY="$repo" \
+  RESTIC_KEY_FILE="$key" \
+  RESTIC_PASSWORD_FILE="$pass" \
+  restic forget --keep-daily 7 --keep-weekly 4 --keep-monthly 12 --prune
+}
+
+backup_repo "sftp:backup@192.168.1.50:/backup/restic-local" /etc/restic/local.key /etc/restic/local.password
+backup_repo "sftp:backup@10.200.0.2:/volume1/restic-offsite" /etc/restic/offsite.key /etc/restic/offsite.password
+```
+   - Schedule daily at 3am with cron/systemd timer.
+   - Monthly: `restic check` and restore test.
+```
+RESTIC_REPOSITORY=... RESTIC_KEY_FILE=... RESTIC_PASSWORD_FILE=... restic check
+RESTIC_REPOSITORY=... ... restic restore latest /tmp/restore-test
+```
+
+Need maybe `restic forget --prune` can be heavy; maybe run prune weekly. But script daily with prune maybe okay for small. Could say "run prune weekly, not daily, if large." But concrete: daily backup, weekly prune. Maybe script:
+```
+restic backup ...
+restic forget --keep-daily 7 --keep-weekly 4 --keep-monthly 12
+# weekly: restic forget --prune
+```
+But simplicity: `--prune` daily might be okay but can be slow. Let's recommend "daily backup; weekly prune". In script, maybe `restic forget --keep-daily 7 --keep-weekly 4 --keep-monthly 12` daily, and a separate weekly `restic forget --prune`. But user wants simple. Could say "Use `--prune` weekly; daily just `forget` without prune." Good.
+
+Need maybe mention "restic forget without prune removes snapshot references but doesn't reclaim disk immediately; prune reclaims." Good but not necessary.
+
+Need maybe mention "If you don't want to keep old versions of memes, adjust retention." Not necessary.
+
+Need maybe mention "If the old laptop is Windows, enable OpenSSH SFTP server; if not, use a USB SSD attached to home server instead." Good.
+
+Need maybe mention "If sister's NAS is not Linux/SFTP, you may need to install a SFTP server or use a small box. If she won't, the plan changes." But likely.
+
+Need maybe mention "Do not use Syncthing to sync the whole photo library to the NAS as your backup. If you later want continuous sync from a phone/camera, use Syncthing for an import folder only, with versioning and no delete propagation." Good.
+
+Need maybe final "Bottom line" summary.
+
+Let's ensure no contradictions:
+- We say keep key off old laptop. But if old laptop is SFTP target, the repo is encrypted. Good.
+- We say use old laptop as local backup. If key not on old laptop, and old laptop is stolen, safe. If old laptop is in same house, fire risk, but sister NAS offsite. Good.
+- We say 3 copies: original, laptop repo, NAS repo. But restic repo is not a direct copy; it's an encrypted versioned backup. Still counts as copy. Good.
+- We say 2 media: server, laptop, NAS. Good.
+- We say 1 offsite: NAS. Good.
+
+Need maybe mention "If your original photos are on the old laptop, adjust: original on laptop, local backup on server/USB, offsite NAS." But user likely photos on home server. Could say "assuming photos live on the home server; if they live on the laptop, flip the labels—the plan is the same: original + local backup + offsite backup." Good.
+
+Need maybe mention "If the old laptop is too old/slow, use a USB SSD. The restic repo can be on a local disk path instead of SFTP. That is actually simpler." Could be a strong recommendation: "Honestly, if you can spend $80, use a USB SSD as the local copy instead of the old laptop; keep the laptop as a spare. But if you want zero new hardware, use the laptop." Is that too optiony? It's a practical note. The user asked concrete, not seventeen options. One fallback is okay.
+
+Need maybe think about "I do not want to pay for cloud storage because reasons" - no cloud. Good.
+
+Need maybe mention "sister's NAS across town" - offsite. Good.
+
+Need maybe mention "what happens when her NAS dies" - answer. Good.
+
+Need maybe mention "people say 3-2-1 but honestly who has the time" - answer: this is set-and-forget; time is a few hours setup, then automatic. Good.
+
+Need maybe mention "should backups be encrypted before they leave my machine" - yes, restic. Good.
+
+Need maybe mention "memes folder" - encryption hides names. Good.
+
+Need maybe mention "If you want to exclude memes from backup, use `--exclude` in restic; if you want them backed up but hidden, encrypt." Good.
+
+Let's consider if restic encrypts file names by default. Yes, restic encrypts file names and metadata. Good.
+
+Need maybe mention "If you use SFTP, the file names on the NAS are just repo files, not your photo names, because restic stores chunks; even without encryption, she wouldn't see individual file names? Actually restic repo stores chunks, not original file names, but metadata is encrypted. So even if unencrypted, she can't browse photos easily, but restic encrypts anyway. Good.
+
+Need maybe mention "The repo on her NAS will look like meaningless chunks; without key, useless." Good.
+
+Potential issue: If using restic over SFTP, the SFTP user can list repo files but they are encrypted chunks. Good.
+
+Need maybe mention "Use a strong passphrase; restic password is not optional?" It can be empty? Better strong.
+
+Need maybe mention "Do not use the same password as your NAS user." Good.
+
+Need maybe mention "If you ever change the key, you need to migrate; don't." Not necessary.
+
+Need maybe mention "If you lose the key, you can still have the data but can't read it; that's the tradeoff." Good.
+
+Need maybe mention "If you want sister to be able to restore in case you die? Not asked. Could mention if you want a trusted person to have key, give them offline key, but then they can read. Not necessary.
+
+Need maybe final answer with a clear "Do this" and "Don't do this".
+
+Let's write final in a confident tone.
+
+Possible final:
+
+"Concrete recommendation: set up WireGuard + restic. Your old laptop is the local backup target; your sister's NAS is the offsite target. That is your 3-2-1. Syncthing is not the backup; rsync is not enough."
+
+Then details.
+
+Need ensure commands are correct enough. Let's verify restic init with external key file. I want to avoid wrong command. Restic docs: `restic init` options include `--key-file string` "file to store the repository key in", `--password-file string` "file to read the password from". If `--key-file` is outside repo, it will create it. Good.
+Backup uses same. Good.
+
+Need maybe mention "If your restic version is old, update." Not necessary.
+
+Need maybe mention "Use `restic --version`." Not necessary.
+
+Need maybe mention "SFTP URL format". Restic SFTP backend: `sftp:user@host:/path`. Yes. If using WireGuard, host is WG IP. Good.
+
+Need maybe mention "If the NAS uses a non-standard SFTP port, use `sftp:user@host:port:/path`? I think restic SFTP URL may support `sftp:user@host:port/path`? Not sure. Avoid.
+
+Need maybe mention "If using SSH tunnel instead of WireGuard, you can do `ssh -L` and restic local? But simpler: restic SFTP over SSH directly. Good.
+
+Need maybe mention "If you don't want WireGuard, use SSH with key auth and firewall; restic SFTP already uses SSH, so 'rsync over a VPN' becomes 'restic over SSH'." Good.
+
+Need maybe mention "WireGuard is optional but recommended because it gives a clean private network and can protect other management traffic." Good.
+
+Need maybe mention "If sister's NAS is behind CGNAT and cannot run WireGuard server, you need a way to reach it. Options: port forward SFTP with firewall, or a small always-on box, or Tailscale? But user said no cloud? Tailscale is free but uses DERP relays? It's not cloud storage but uses coordination. They said no cloud storage because reasons, maybe Tailscale okay? But don't introduce. Stick to WireGuard/SSH.
+
+Need maybe mention "If she won't let you port forward or run WireGuard, the offsite part is not possible; then use a USB drive you physically take to her place occasionally." But that's another option. Maybe not.
+
+Need maybe final with "The boring, correct answer".
+
+Let's think if there is any issue with using old laptop as SFTP target and restic repo: If old laptop is not always on, backup fails. Could recommend "keep it powered 24/7 or schedule backup when it's on; if you don't want that, use a USB SSD attached to the home server." Good.
+
+Need maybe mention "If the old laptop is your only local backup and it is in the same house, a fire can take it; the offsite NAS covers that. If you want offline local, rotate a USB drive." Not necessary but could mention.
+
+Need maybe mention "3-2-1 doesn't require cloud; it just requires copies." Good.
+
+Need maybe mention "Time: setup maybe 2-4 hours, then cron." Good.
+
+Need maybe final answer length: around 1500-2500 words? Desired oververbosity 9, but user wants concrete. Maybe 1200-1800 words. We can be thorough but not bloated.
+
+Let's draft final now.
+
+Potential final text:
+
+"Use restic over WireGuard/SFTP. Not Syncthing as backup."
+
+Then "The exact plan" with numbered steps.
+
+Need maybe include a small diagram:
+```
+[home server /photos]
+      |
+      | restic (encrypted, versioned, incremental)
+      +--> [old laptop] local repo
+      +--> [sister NAS] offsite repo via WireGuard
+```
+
+Need maybe include "If photos are on laptop, swap labels." Good.
+
+Let's ensure final doesn't say "I think" too much. Be decisive.
+
+Need maybe mention "Do not use Syncthing to sync deletions from the laptop to the server." Good.
+
+Need maybe mention "If you add Syncthing later, use it for an 'incoming' folder only." Good.
+
+Need maybe mention "rsync over VPN is a mirror, not a backup; a bad flag can delete." Good.
+
+Need maybe mention "restic's `forget` retention gives you history." Good.
+
+Need maybe mention "The memes folder: restic encrypts names, so the NAS will not show `/memes`; it shows chunk files." Good.
+
+Need maybe mention "Key storage: two copies offline, not on destination. If you lose key, data is gone." Good.
+
+Need maybe mention "If you want to be able to recover without home server, keep offline key in a separate location." Good.
+
+Need maybe mention "If you want sister to be able to restore if you die, you need to give someone the key; otherwise no one can read it." Not asked but important. Could include briefly.
+
+Let's consider if restic key file should be on old laptop for local restore. If key only on home server and offline, and home server dies, offline key. If offline key is in same house fire, lost. Maybe keep one offline key in a different location (e.g. bank, trusted friend) but not sister if privacy. Could say "Keep at least one key copy in a different physical location from the data; if that means not your sister, use a trusted person or a safe deposit box." Good.
+
+Need maybe mention "If you use a password manager, store key/password there, but ensure offline export." Good.
+
+Need maybe final "What to do tonight" maybe:
+- Install WireGuard, SFTP, restic.
+- Init repos, run first backup, test restore.
+- Set cron.
+- Done.
+
+Good.
+
+Let's write final with code blocks. Ensure no analysis. final only.
+
+
+ANSWER:
+Concrete recommendation: **use `restic` over a private tunnel, with your old laptop as the local backup target and your sister’s NAS as the offsite backup target.**
+
+Do **not** make Syncthing your backup. Do **not** make plain `rsync` your backup.  
+Use them, if at all, only for other jobs later.
+
+## What you should actually set up
+
+Assuming your photos live on the home server:
+
+```text
+[Home server: /photos]
+        |
+        |  restic: encrypted, versioned, incremental backups
+        |
+        +--> [Old laptop]  local encrypted restic repo
+        +--> [Sister NAS]  offsite encrypted restic repo over WireGuard/SFTP
+```
+
+That gives you:
+
+- **3 copies**: original on home server, local backup on old laptop, offsite backup on sister NAS
+- **2+ media types**: server disk, laptop disk, NAS disk
+- **1 offsite copy**: sister’s NAS
+- **Encryption before data leaves your machine**: `restic` encrypts file contents **and file names**
+- **Versioning / snapshots**: accidental deletes, bad syncs, ransomware-ish incidents are recoverable
+
+This is the boring, correct answer.
+
+---
+
+# Why `restic`, not Syncthing or rsync
+
+## Syncthing is not a backup
+
+Syncthing is a **sync** tool. That means:
+
+- if a file is deleted on one side, it may be deleted on the other
+- it is not primarily designed for long-term versioned retention
+- it can be great for live mirroring an “incoming photos” folder, but it is not the right tool as your main photo backup
+
+If you later want Syncthing, use it only for a narrow job, like syncing a camera/phone import folder, and **do not let it propagate deletions from untrusted machines into your main library**.
+
+## rsync is a mirror, not a backup
+
+`rsync` over SSH is useful, but as a backup strategy it has problems:
+
+- no encryption at rest by default
+- no real versioning unless you build it yourself
+- a bad flag or bad script can overwrite/delete your only copy
+- you end up maintaining more custom logic than you need
+
+`restic` gives you the backup behavior you actually want:
+
+- encrypted
+- deduplicated
+- incremental
+- snapshot/versioned
+- easy to schedule
+- works over SFTP/SSH
+- can verify and restore
+
+---
+
+# The concrete stack
+
+## 1. Use WireGuard between your home and your sister’s place
+
+If her NAS or router can run WireGuard, do that.
+
+Example:
+
+- private subnet: `10.200.0.0/24`
+- sister’s NAS: `10.200.0.2`
+- your home server: `10.200.0.1`
+
+Then your home server talks to the NAS over the private WireGuard IP.
+
+If her NAS/router cannot run WireGuard, your next-best option is:
+
+- SSH/SFTP with key-only auth
+- strict firewall rules
+- no password auth
+
+But **WireGuard is the cleaner answer** if she can run it.
+
+---
+
+## 2. Use SFTP on both backup targets
+
+You want two backup repositories:
+
+### Local repo on the old laptop
+
+Example:
+
+- host: `192.168.1.50`
+- user: `backup`
+- path: `/backup/restic-local`
+
+### Offsite repo on sister’s NAS
+
+Example:
+
+- host: `10.200.0.2` over WireGuard
+- user: `backup`
+- path: `/volume1/restic-offsite`
+
+Use a **dedicated backup user** on each machine.  
+Do not use her admin account. Give it write access only to the backup path.
+
+---
+
+## 3. Install `restic` on the home server
+
+That is the machine that runs the backup job.
+
+You do **not** need to run a special restic server on the NAS.  
+If the NAS supports SFTP, that is enough.
+
+---
+
+## 4. Create two encrypted restic repos
+
+Use **external key files** so the key is not stored on the backup destination.
+
+Create a secure config directory:
+
+```bash
+sudo mkdir -p /etc/restic
+sudo chmod 700 /etc/restic
+```
+
+Then initialize the local repo on the old laptop:
+
+```bash
+restic init \
+  --repo sftp:backup@192.168.1.50:/backup/restic-local \
+  --key-file /etc/restic/local.key \
+  --password-file /etc/restic/local.password
+```
+
+Then initialize the offsite repo on sister’s NAS:
+
+```bash
+restic init \
+  --repo sftp:backup@10.200.0.2:/volume1/restic-offsite \
+  --key-file /etc/restic/offsite.key \
+  --password-file /etc/restic/offsite.password
+```
+
+### Important key rules
+
+- **Do not put the key files on sister’s NAS.**
+- **Do not put the key files on the old laptop either**, if you want maximum paranoia.
+- Keep the key/password files:
+  - on the home server for normal operation
+  - and in at least one **offline** copy
+- If you lose the key, the backups are effectively unrecoverable.
+
+That last part is the whole privacy tradeoff:
+
+- if your sister gets the repo, she still cannot read it
+- if you lose the key, you cannot read it either
+
+So the key is sacred.
+
+For the “memes folder” problem: this is exactly why `restic` is a good answer.  
+It encrypts file names too, so the repo does not just say “encrypted contents”; it does not even expose the original folder/file names in plain text.
+
+---
+
+# 5. Run the backups
+
+A simple backup script on the home server:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+backup_repo() {
+  local repo="$1"
+  local key="$2"
+  local pass="$3"
+
+  RESTIC_REPOSITORY="$repo" \
+  RESTIC_KEY_FILE="$key" \
+  RESTIC_PASSWORD_FILE="$pass" \
+  restic backup /photos --tag photos
+
+  RESTIC_REPOSITORY="$repo" \
+  RESTIC_KEY_FILE="$key" \
+  RESTIC_PASSWORD_FILE="$pass" \
+  restic forget \
+    --keep-daily 7 \
+    --keep-weekly 4 \
+    --keep-monthly 12
+}
+
+# Local backup
+backup_repo \
+  "sftp:backup@192.168.1.50:/backup/restic-local" \
+  /etc/restic/local.key \
+  /etc/restic/local.password
+
+# Offsite backup
+backup_repo \
+  "sftp:backup@10.200.0.2:/volume1/restic-offsite" \
+  /etc/restic/offsite.key \
+  /etc/restic/offsite.password
+```
+
+Then run it on a schedule, e.g. daily:
+
+```cron
+0 3 * * * /usr/local/bin/restic-backup.sh
+```
+
+If you want to reclaim disk space more aggressively, add a **weekly prune**:
+
+```bash
+RESTIC_REPOSITORY="$repo" \
+RESTIC_KEY_FILE="$key" \
+RESTIC_PASSWORD_FILE="$pass" \
+restic forget --prune
+```
+
+You do not necessarily need to prune daily.  
+Daily backup + weekly prune is a sane default.
+
+---
+
+# 6. Verify it actually works
+
+A backup you have not restored is just a hope.
+
+Do this at least once, and then periodically:
+
+```bash
+RESTIC_REPOSITORY="sftp:backup@192.168.1.50:/backup/restic-local" \
+RESTIC_KEY_FILE=/etc/restic/local.key \
+RESTIC_PASSWORD_FILE=/etc/restic/local.password \
+restic check
+```
+
+And do a real restore test:
+
+```bash
+RESTIC_REPOSITORY="sftp:backup@192.168.1.50:/backup/restic-local" \
+RESTIC_KEY_FILE=/etc/restic/local.key \
+RESTIC_PASSWORD_FILE=/etc/restic/local.password \
+restic restore latest /tmp/restore-test
+```
+
+Do the same for the offsite repo.
+
+If you can restore a photo from both targets, you are done.
+
+---
+
+# What happens when things die
+
+This is the part you asked about.
+
+## If sister’s NAS dies
+
+You still have:
+
+- the original on your home server
+- the local backup on the old laptop
+
+So you are not hosed.  
+You restore from local if needed, and you re-offsite later when she has a new NAS.
+
+## If the old laptop dies
+
+You still have:
+
+- the original on your home server
+- the offsite backup on sister’s NAS
+
+So you are not hosed.
+
+## If the home server dies
+
+You still have:
+
+- the local backup on the old laptop
+- the offsite backup on sister’s NAS
+
+So you are not hosed.
+
+That is the whole point of 3-2-1.
+
+---
+
+# One practical caveat about the old laptop
+
+The old laptop is fine as your local copy **if you will keep it powered and reachable** during your backup window.
+
+If the old laptop is:
+
+- flaky
+- rarely on
+- slow
+- annoying to keep alive
+
+then the cleaner local copy is a **USB SSD attached directly to the home server**.
+
+If you do that, the plan stays exactly the same; only the local repo path changes from SFTP to a local disk path.
+
+So:
+
+- **zero new hardware**: use the old laptop
+- **more robust local copy**: use a USB SSD
+
+Either way, the architecture is the same.
+
+---
+
+# Should the backups be encrypted before they leave your machine?
+
+Yes.
+
+With `restic`, they are.
+
+That means:
+
+- contents are encrypted
+- file names are encrypted
+- metadata is encrypted
+- the repo on her NAS is useless without your key
+
+So your sister can host the backup without being able to browse your photos or your memes folder.
+
+If you **do not** want the memes folder backed up at all, exclude it.  
+If you **do** want it backed up but hidden, encryption solves that.
+
+---
+
+# Where Syncthing and rsync fit, if at all
+
+## Syncthing
+
+Use it later only if you want continuous sync for a specific folder, like:
+
+- phone imports
+- camera offload
+- a shared “new photos” folder
+
+If you do use it:
+
+- enable versioning
+- do not let random machines delete files from your main library
+- do not treat it as your backup
+
+## rsync
+
+Use it for operational mirroring if you want, but not as your primary photo backup.
+
+For your actual use case, `restic` is the better tool.
+
+---
+
+# The shortest possible answer
+
+**Set up exactly this:**
+
+1. **WireGuard** between your home and your sister’s NAS/router  
+2. **SFTP** on the old laptop and sister’s NAS  
+3. **restic** on the home server  
+4. Two encrypted restic repos:
+   - one on the old laptop
+
+======================================================================
+TURN2 low  : reasoning_chars=  3060 content_chars= 3674 completion_tokens=1535 prompt_tokens=16636 finish=stop
+
+USER: and what if my sister moves abroad, does anything change?
+
+REASONING:
+User asks: what if sister moves abroad, does anything change? Need answer practical. Need consider offsite backup becomes international, latency, bandwidth, cost, legal/data sovereignty, WireGuard/VPN, reliability, restore time, maybe 3-2-1 still works but offsite farther. Need recommend maybe keep same setup if feasible, but if distance too great, offsite backup becomes slow/large first backup painful, restore slow. Could replace sister NAS with another offsite option? But user doesn't want cloud. Maybe use a cheap VPS? But no cloud storage? They said no cloud storage because reasons; VPS is cloud-ish. Could use another person's NAS, or local offline drive rotation. Need concrete. Since they asked not seventeen options earlier, keep concise. Need maybe say: yes, changes: latency/bandwidth, data sovereignty, legal, restore. If she moves abroad but still has NAS and you can reach it, restic/WireGuard still works; just expect slower offsite backups and restores. If too slow/unreliable, replace offsite copy with a different offsite target: another friend/family NAS, or a small always-on box, or periodic offline drive you physically ship/store elsewhere. But if no cloud, maybe "don't make the international NAS your only offsite; keep local copy and consider a second offsite or offline drive." Need mention key still same. Need maybe mention if her internet is bad, large photo backups over WAN are painful; restic incremental helps after first. First full backup may be huge. Use compression? restic has compression. Could use `--compress auto`? By default restic compresses? I think restic uses zlib by default? Actually restic default compression is auto? It compresses data. Could mention if photos already compressed (JPEG), compression won't help much. Need maybe mention bandwidth caps. Need maybe mention legal: data is encrypted, but stored abroad; if you have privacy needs, encryption mitigates but jurisdiction still matters. If she moves to country with different laws, her NAS may be subject to local law; encrypted key held by you reduces risk. Need maybe mention if she no longer wants to host, plan B. Need maybe answer "does anything change?" Yes: not the architecture, but the offsite copy becomes WAN instead of LAN-ish. Need concrete recommendation: keep local backup as primary restore; treat sister NAS as cold offsite. If first backup is huge, do it in chunks or over time. If it's too slow, use a different offsite. Maybe "if she moves abroad and you still want no cloud, the cleanest change is: keep restic local to old laptop/USB, and make the international NAS a monthly/weekly offsite rather than daily, or replace it with another offsite you can reach." Need be decisive.
+
+Need maybe mention WireGuard over long distance is fine, but MTU/performance. SFTP over WAN okay but slower. Use WireGuard or SSH. If her NAS behind NAT, same. Need maybe mention "restore from abroad will be slow; if you need fast recovery, local copy is your fast restore." Good.
+
+Need final in English, concise but thorough. No need huge.
+
+
+ANSWER:
+Yes, a little — but the **same setup still works**. What changes is that your offsite copy is now over the internet instead of “across town.”
+
+## What stays the same
+
+Your core plan remains:
+
+```text
+Home server /photos
+   ├── local restic backup on old laptop / USB SSD
+   └── offsite restic backup on sister’s NAS
+```
+
+`restic` + WireGuard/SFTP still works internationally.  
+The backups are still encrypted, versioned, and offsite.
+
+## What changes
+
+### 1. The offsite backup becomes slower
+Across town is one thing. Another country is another.
+
+Expect:
+
+- slower backups
+- slower restores
+- more sensitivity to her internet quality
+- a painful first full backup if you have a lot of photos
+
+After the first backup, `restic` is incremental, so it should be much less painful. But if you have hundreds of GB of photos, the first offsite sync over a WAN link can be annoying.
+
+### 2. Her internet becomes part of your backup reliability
+If her connection is:
+
+- slow
+- capped
+- unstable
+- often offline
+
+then your offsite backup becomes less reliable.
+
+That does not break the plan, but it changes what that copy is good for.
+
+### 3. “Offsite” now also means “different jurisdiction”
+Even though the data is encrypted, the **repo physically lives in another country**.
+
+That may not matter to you. But if privacy/legal exposure matters, keep this in mind:
+
+- the data is encrypted
+- she cannot read it without your key
+- but the storage medium is still subject to wherever it physically is
+
+If that bothers you, encryption helps a lot, but it is not the same as the data never leaving your country.
+
+---
+
+# My concrete recommendation if she moves abroad
+
+## Keep the local backup as your fast, reliable copy
+Your old laptop or a USB SSD should now be the copy you trust for:
+
+- fast restores
+- day-to-day recovery
+- “I deleted something yesterday” situations
+
+That local copy becomes more important, not less.
+
+## Treat the sister NAS as a cold offsite copy
+It is still valuable, but think of it as:
+
+- protection against house fire/flood/theft
+- long-term offsite retention
+- not your primary fast restore source
+
+So if the international link is flaky, it is still useful — just don’t depend on it for quick recovery.
+
+---
+
+# If the international backup is too slow or unreliable
+
+Then you have two clean options.
+
+## Option A: Keep it, but lower expectations
+Back up to her NAS:
+
+- less often, e.g. weekly or monthly
+- or only for a subset of your library
+- or only after major additions
+
+This is fine if you mainly want offsite protection, not fast offsite restore.
+
+## Option B: Replace the offsite target
+If her NAS is no longer a good offsite option, replace it with another offsite you can actually reach.
+
+Best non-cloud options:
+
+1. **Another friend/family NAS**
+2. **A small always-on box at another location**
+3. **A rotated offline drive you physically store elsewhere**
+
+If you want to keep the “no cloud” rule strict, the simplest real-world answer is:
+
+- keep local `restic` backup at home
+- use a second offsite that is reachable
+- or use an offline drive you periodically take/store in another location
+
+---
+
+# Bottom line
+
+If your sister moves abroad:
+
+- **the architecture does not need to change**
+- **the offsite copy becomes slower and more dependent on her internet**
+- **your local backup becomes more important**
+- **if the international link is bad, replace the offsite target rather than forcing the same daily behavior**
+
+If you want the one-line version:
+
+**Keep `restic` + local backup + encrypted offsite backup; just treat the abroad NAS as a slower, colder offsite copy, and if it’s too unreliable, swap it for a different offsite target.**
+
+======================================================================
+TURN3 xhigh: reasoning_chars= 22086 content_chars= 7085 completion_tokens=7805 prompt_tokens=18265 finish=stop
+
+USER: ok she moved and took the NAS, but her new ISP is doing CGNAT so no port forwarding on her side at all. rework the plan around that, and remember I still refuse to pay for cloud anything.
+
+REASONING:
+Need rework plan: sister moved, took NAS, new ISP CGNAT no port forwarding on her side. User refuses pay for cloud anything. Need concrete recommendation, not seventeen options. Need think carefully.
+
+We need solve inbound connectivity to sister's NAS behind CGNAT. No port forwarding on her side. No paid cloud. Options:
+- Use outbound-only connection from sister's NAS to home server. Since CGNAT blocks inbound, but outbound works. Need reverse tunnel / client-to-server. WireGuard can work if her NAS runs WireGuard client to home server? Usually WireGuard server needs public reachable endpoint. If home server has public IP / port forwarding? User has home server, likely home internet maybe can port forward? They didn't say home side CGNAT. We can assume home can accept inbound? Need maybe if home also CGNAT? Need address. But question specifically her new ISP CGNAT no port forwarding on her side. So home side may be able to port forward or have public IP. We can set up WireGuard with home server as server, sister NAS as client, outbound from NAS to home. That gives private tunnel; then home server can reach NAS over WG IP. No port forwarding on her side. This is likely best. Need no cloud. Requirements: home server must be reachable from internet (port forward UDP WG) or have IPv6. If home also CGNAT, then need other outbound-only method from both sides? But likely not. Need mention if home is also CGNAT, use a free relay? But user refuses cloud anything. Free Tailscale? It uses coordination servers/DERP, arguably cloud-ish but free. They refuse pay for cloud anything, maybe free cloud not okay? "cloud anything" likely paid cloud storage, but could include Tailscale? Need avoid recommending paid cloud. Could mention Tailscale as zero-cost but uses coordination/relay; but they said refuse pay for cloud anything, not refuse all third-party. But to be safe, avoid as primary. Could mention only if they accept free coordination, but concrete recommendation should be WireGuard home server as endpoint.
+
+Alternative: Use SSH reverse tunnel from sister NAS to home server. Her NAS initiates SSH to home server (outbound), creates reverse tunnel exposing SFTP/SSH locally. Then restic backs up to local tunneled port. No port forwarding on her side. This is very practical if home server has public IP or port forward. Could use autossh to keep alive. WireGuard is cleaner and more robust than SSH tunnel. But if home server cannot be public? Could use her NAS to initiate WireGuard to home if home has public. If home not public, then both behind NAT/CGNAT: need a rendezvous server. No paid cloud. Could use a free service? Or use outbound from one side to a free relay? But user no cloud. Could use sister's NAS as server? No inbound. Could use home as server if public. If neither public, options: use a free dynamic DNS with a small always-on VPS? paid. Use free Tailscale (cloud coordination) maybe violates. Use manual offline drive. Need rework plan around constraints.
+
+Need consider "she moved and took the NAS" maybe she has NAS with her, but CGNAT. She can run software on NAS? Likely yes. Need plan: home server as WireGuard server, NAS as WireGuard client. Then restic over WireGuard. If home internet also no inbound, then use reverse SSH from NAS to home? Still needs home inbound. If home no inbound, maybe use her NAS outbound to a free endpoint? Hmm.
+
+Need maybe recommend: "Make your home server the always-on endpoint. Have her NAS initiate an outbound WireGuard tunnel to your home server. No port forwarding on her side. Then restic to her NAS over the tunnel. If your home side also cannot accept inbound, use an outbound reverse SSH from her NAS to a reachable machine, or fall back to offline drive; but if you have any public IPv4/IPv6 at home, WireGuard home-server is the answer." Need concrete.
+
+Need no cloud: WireGuard self-hosted on home server. Need maybe use dynamic DNS if home IP changes. No paid. Free DDNS. Need port forward UDP 51820 on home router to home server. If home has IPv6, even easier: no port forward, use IPv6 address, firewall allow WG. If home ISP also CGNAT, then this fails; need alternative.
+
+Need maybe think of CGNAT details: CGNAT means her public IP is shared, no inbound. But outbound from her NAS to home server's public IP works. WireGuard client on NAS can connect to home server WG endpoint. Once tunnel established, home can initiate SFTP to NAS's WG IP. Good.
+
+Need maybe if her NAS cannot run WireGuard client? Many NAS (Synology/QNAP) can. If not, use SSH reverse tunnel from NAS to home server. SSH is outbound from NAS. Home server listens SSH; NAS runs `autossh -N -R 2222:localhost:22 home`? Actually to expose NAS SFTP to home local port: from NAS: `autossh -M 0 -N -R 127.0.0.1:2222:localhost:22 user@home` with `GatewayPorts no`. Then on home, restic repo `sftp:backup@127.0.0.1:2222:/path`? Restic SFTP URL may not support port? Need check. It might support `sftp:user@host:port:path`? Not sure. Could use SSH local forward from home to NAS: home runs `ssh -L 2222:localhost:22 user@home`? Wait reverse tunnel: NAS connects to home and asks home to listen on local port 2222 forwarding back through tunnel to NAS localhost:22. Then home restic can connect to `sftp:backup@127.0.0.1:2222:/path` if restic supports port. If not, use `ssh -L`? Actually if reverse tunnel already listens on home 2222, restic needs SFTP to port 2222. If restic SFTP backend doesn't allow port, can use `ssh` proxy? Maybe use `sftp` command supports `-P`. Restic URL maybe `sftp:user@host:port/path`? Need not rely. WireGuard avoids port issue.
+
+Could use SSH reverse tunnel plus `ssh -W`? Restic SFTP backend likely uses `sftp` command? It may support `sftp:user@host:/path` and maybe port via `~/.ssh/config` Host alias with Port. Yes, use SSH config alias:
+```
+Host nas-tunnel
+  HostName 127.0.0.1
+  Port 2222
+  User backup
+```
+Then restic repo `sftp:backup@nas-tunnel:/path`? It may parse host as `nas-tunnel` and use ssh config? Probably. Or use `sftp:backup@127.0.0.1:/path` if port 22? No. Better WireGuard.
+
+Need maybe recommend WireGuard with home as server. Provide concrete config.
+
+Need address "she moved and took the NAS" maybe now abroad? Previous context: she moved abroad, now CGNAT. So international + CGNAT. Need rework: home server as endpoint, NAS initiates tunnel. Backups over tunnel. If bandwidth poor, adjust schedule/retention. If tunnel unreliable, local backup primary; offsite is cold. If no home inbound, use offline rotation or free Tailscale? Need maybe concrete: "If your home connection can accept inbound (port forward or IPv6), do this. If not, the no-cloud answer is: keep local restic, and for offsite use an offline drive you physically move, or ask her to run a small always-on endpoint with a public IP? But she has no port forward; could still run WireGuard client to you if you public. If you also no public, no pure self-hosted point-to-point without some rendezvous. You need either a reachable endpoint at one side, a third-party relay, or offline media." Need be honest.
+
+User says "rework the plan around that" likely expects solution with CGNAT. Need not ask clarifying? We can assume home can be reachable? Maybe need state assumption. If home also CGNAT, plan changes. But give concrete recommendation under likely assumption: home has port forwarding/IPv6. If not, fallback.
+
+Need no cloud: self-hosted WireGuard on home server. Use free DDNS if dynamic IP. No port forwarding on her side. She only needs outbound UDP to your home WG port. Her ISP CGNAT allows outbound. Good.
+
+Need maybe mention if her NAS is behind CGNAT but can make outbound UDP, WireGuard client works. If her router blocks outbound UDP? unlikely. If it blocks, use SSH reverse tunnel over TCP 443? Home server can listen on 443? But need home inbound. Could use SSH to home. If home public. If home not public, harder.
+
+Need maybe mention "do not try to port forward on her side; don't use UPnP; don't expose SFTP to internet." Good.
+
+Need maybe rework 3-2-1: original home server, local old laptop/USB, offsite sister NAS via outbound tunnel. Same. But offsite may be slower. Use local as fast restore. Offsite as cold. If tunnel drops, restic job fails; use retry and alert.
+
+Need maybe concrete steps:
+1. On home server: install WireGuard, create server config, assign IP 10.200.0.1/24, AllowedIPs for sister 10.200.0.2/32. Port forward UDP 51820 to home server (or use IPv6). Use DDNS if dynamic.
+2. On sister NAS: install WireGuard client, public endpoint = home's public IP/DDNS:51820, AssignIP 10.200.0.2/24, AllowedIPs 10.200.0.0/24 (or 10.200.0.1/32? For client to reach home and maybe other? Use 10.200.0.0/24). Keep client always connected; set to auto-start/reconnect.
+3. Test ping 10.200.0.1 from NAS, ping 10.200.0.2 from home.
+4. On NAS: enable SFTP, dedicated backup user, path.
+5. On home: restic repo `sftp:backup@10.200.0.2:/volume1/restic-offsite` over WG. Key external. Local repo unchanged.
+6. Schedule. Because WAN, maybe daily if bandwidth okay; else weekly. First backup large; run during off-peak. Use restic incremental. Maybe `--compress`? Photos already compressed; not much.
+7. Monitoring: if tunnel down, backup fails. Use health check. Maybe keep last local backup. If offsite fails, local still protects.
+
+Need maybe if home IP dynamic: use free DDNS (No-IP/DynDNS) or IPv6. WireGuard endpoint can be DNS name. Need ensure router forwards. If home has IPv6: use IPv6 address as endpoint, no port forward; enable firewall. If home ISP also CGNAT: no inbound. Then what? Need fallback.
+
+Fallback no cloud:
+- If home also cannot be reached, a pure self-hosted direct tunnel requires a reachable endpoint. Without one, you need either:
+  a) a small always-on machine with public IP (not cloud storage; could be a VPS, but that's cloud-ish and likely paid; user refuses)
+  b) free Tailscale/ZeroTier (uses coordination servers; may violate "no cloud" depending on definition)
+  c) offline drive rotation (physical offsite)
+  d) ask sister to get a line without CGNAT or a static IP (maybe not)
+But user wants concrete. Need choose: "If your home side has no inbound either, the no-paid-cloud answer is: keep local restic backup, and replace the sister NAS as continuous offsite with an offline encrypted restic repo on a USB drive you physically store elsewhere (or swap drives). If you will accept free coordination but no paid cloud, Tailscale is the easiest; otherwise offline drive." But they said refuse pay for cloud anything, free Tailscale might be acceptable? Need maybe not recommend as primary because "cloud anything" could include. But can mention as "if 'no cloud' means no paid storage, Tailscale is free and not storage; if it means no third-party cloud at all, skip it." But user asked concrete, not options. Maybe choose one: "Use WireGuard with your home as the server. If your home also can't accept inbound, then the only fully no-cloud continuous option is not available; use offline drive rotation." That's honest.
+
+Need maybe think if there is a way with both CGNAT and no cloud using outbound connections to each other? Two NATed endpoints cannot initiate direct connection without rendezvous. Could use hole punching? WireGuard doesn't do NAT traversal without server. SSH can do reverse if one reachable. If both unreachable, no. Could use her NAS outbound to home via a free public SSH server? That's cloud. Could use Tor? Not reliable, cloud-ish. Could use I2P? No. So need reachable endpoint or third-party.
+
+Need maybe mention "CGNAT on her side is not a problem if your side is reachable; the tunnel direction is her NAS -> your home." Good.
+
+Need maybe consider "she took the NAS" maybe she no longer has it? "moved and took the NAS" means she has it with her abroad. Good.
+
+Need maybe mention "If she is abroad, latency + CGNAT means offsite is cold. Do not make it the only offsite if you need reliable recovery." But 3-2-1 still.
+
+Need maybe include exact WireGuard config examples.
+
+Home server WG config:
+```
+[Interface]
+PrivateKey = <home private>
+Address = 10.200.0.1/24
+# maybe PostUp for firewall
+[Peer]
+# Sister NAS
+PublicKey = <nas public>
+PresharedKey = <psk>
+AllowedIPs = 10.200.0.2/32
+```
+Sister NAS client:
+```
+[Interface]
+PrivateKey = <nas private>
+Address = 10.200.0.2/24
+DNS = 1.1.1.1 # optional
+
+[Peer]
+PublicKey = <home public>
+PresharedKey = <psk>
+Endpoint = home.example.ddns:51820
+AllowedIPs = 10.200.0.0/24
+PersistentKeepalive = 25
+```
+Need note: If using IPv6 endpoint, `Endpoint = [2001:db8::1]:51820`.
+
+Need maybe mention `PersistentKeepalive = 25` on client behind NAT to keep mapping. Good.
+
+Need maybe mention firewall: allow WireGuard interface traffic; restrict SFTP to WG IP only. On NAS, firewall allow SFTP from 10.200.0.1 only. On home, restic connects to 10.200.0.2. Good.
+
+Need maybe mention if her NAS OS uses `wg-quick`, set service to start on boot. If Synology, WireGuard package? It may only support server? Synology WireGuard package can be server or client? I think Synology has WireGuard package, can configure client? Maybe. QNAP too. If not, install via Community/SSH or use `wg` if Linux. If NAS cannot run WireGuard client, use SSH reverse tunnel. Need include fallback within concrete plan: "If her NAS cannot run WireGuard client, use an outbound SSH reverse tunnel from the NAS to your home server." Provide command.
+
+SSH reverse tunnel details:
+- Home server runs SSH server, listens public (port forward TCP 22 or 2222) or IPv6.
+- Sister NAS runs autossh outbound to home:
+```
+autossh -M 0 -N -o "ServerAliveInterval=30" -o "ServerAliveCountMax=3" \
+  -R 127.0.0.1:2222:127.0.0.1:22 backup@home.example.ddns
+```
+But this reverse tunnel forwards home local 2222 to NAS local 22. Need home SSH config? Actually `-R 127.0.0.1:2222:127.0.0.1:22` means on home (remote) listen on 127.0.0.1:2222 and forward to local (NAS) 127.0.0.1:22. Yes.
+- Then on home, use SSH alias:
+```
+Host nas-offsite
+  HostName 127.0.0.1
+  Port 2222
+  User backup
+```
+- Restic repo: `sftp:backup@nas-offsite:/volume1/restic-offsite`? Need ensure restic can use ssh config. It likely invokes sftp which uses ssh config. If not, use `sftp:backup@127.0.0.1:/volume1/restic-offsite` with port? Hmm. Could instead use `ssh -L` from home to home? Wait reverse tunnel already. If restic doesn't support port, maybe use `sftp` command? Restic SFTP backend uses `sftp` binary? It may parse URL and run `sftp -b -` with `-P`? Need not guarantee. Could use `ssh` config alias and hope. Or use `sftp:backup@localhost:/path` and set up local port forward to remote? Another way: On home, run a local SSH port forward to the reverse tunnel? Not needed. Could use `netcat`? No.
+
+Maybe better: Use SSH reverse tunnel to expose NAS SFTP on home's standard port 22? Not safe. Could use `GatewayPorts` and bind to WG? No.
+
+WireGuard is cleaner. SSH fallback can be described conceptually, not exact restic URL. But user wants concrete. Could say "If restic's SFTP URL does not accept the tunnel port on your version, use an SSH config alias or a local `ssh -L` wrapper; the point is the NAS initiates the connection." But maybe too fuzzy.
+
+Could use `restic` with `sftp` backend and `~/.ssh/config` definitely? Let's recall restic SFTP backend implementation: It uses `sftp` command? It may construct command: `sftp -b - user@host` and send commands. It may not use port. It might support `sftp:user@host:port/path`? Quick memory: Restic docs: SFTP backend: `sftp:user@host:/path` or `sftp:user@host:port:/path`? I think maybe yes: "sftp:user@host:port:/path" where port is optional. Let's assume. Could include `sftp:backup@127.0.0.1:2222:/volume1/restic-offsite`. If wrong, not ideal. Maybe use `sftp:backup@nas-tunnel:/volume1/restic-offsite` with ssh config. I can phrase: "use an SSH config alias (or the port in the SFTP URL if your restic version supports it)." But concrete? Hmm.
+
+Maybe avoid SSH fallback details; just say if NAS can't run WG client, use an outbound SSH reverse tunnel, but the recommended is WG.
+
+Need maybe mention "CGNAT does not block outbound UDP, so her NAS can call home. If her ISP blocks outbound UDP, use SSH over TCP to your home." Good.
+
+Need maybe mention "No port forwarding on her side, no UPnP, no DMZ." Good.
+
+Need maybe mention "Do not expose SFTP directly to the internet just because she has no port forwarding. The tunnel is the firewall." Good.
+
+Need maybe rework plan around "she moved and took NAS" maybe she might not want to keep running tunnel? Need mention social/availability: she must keep NAS powered and tunnel running. If she won't, offsite copy is unreliable. Then use offline drive. But assume she does.
+
+Need maybe answer in decisive tone: "Rework: invert the tunnel. Your home server becomes the WireGuard server; her NAS becomes a client that initiates outbound to you. Then restic as before." Good.
+
+Need maybe include "If your home side is also CGNAT" section. Since user only says her ISP CGNAT, but maybe home could be. Need be clear:
+- If home has public IPv4 or usable IPv6: do WG home server.
+- If home also CGNAT/no inbound: no pure self-hosted no-cloud continuous tunnel. Use offline encrypted restic drive rotation, or accept a free tunneling service if your 'no cloud' rule allows it. But since user refuses cloud anything, concrete no-cloud fallback: offline drive.
+
+Need maybe think if "cloud anything" includes using sister's NAS? No, it's their hardware. Good.
+
+Need maybe mention "free dynamic DNS is not cloud storage; it's fine." Good.
+
+Need maybe mention "If home IP changes, DDNS; if IPv6, use IPv6." Good.
+
+Need maybe mention "First backup over international link: do local first, then offsite; maybe use `restic backup` with `--ignore-unknown`? Not needed. Could use `--exclude`? No.
+
+Need maybe mention "Because photos are already compressed, don't expect compression to save bandwidth. Expect roughly the amount of new/changed data to traverse the link." Good.
+
+Need maybe mention "Use `restic forget` retention to limit offsite growth; prune monthly." Good.
+
+Need maybe mention "If bandwidth is capped, schedule offsite backup during cheap/unlimited window, or reduce frequency." Good.
+
+Need maybe mention "If tunnel is down, local backup still runs; offsite job can retry. Don't let offsite failure block local backup." In script, run local first, then offsite; if offsite fails, local done. Good.
+
+Need maybe provide updated script? Could. Maybe concise.
+
+Need maybe final structure:
+- Short answer: invert tunnel; home server = WireGuard server, sister NAS = client; restic unchanged.
+- Why CGNAT is okay: outbound from her side works.
+- Concrete setup steps with configs.
+- Restic repo command.
+- If home side also unreachable: no-cloud fallback.
+- What changes operationally: offsite is cold, slower, monitor.
+- Bottom line.
+
+Need ensure not too many options. But must address edge case. Keep fallback minimal.
+
+Let's draft final.
+
+Potential final:
+
+"Rework: don't try to reach her NAS from your side. Make her NAS call you."
+
+Assumption: your home connection can accept one inbound UDP port (or has IPv6). If not, see last section.
+
+1. Home server runs WireGuard server.
+   - port forward UDP 51820 or use IPv6
+   - IP 10.200.0.1/24
+2. Sister NAS runs WireGuard client.
+   - Endpoint = your home public IP/DDNS:51820
+   - IP 10.200.0.2/24
+   - PersistentKeepalive=25
+   - auto-start
+No port forwarding on her side. CGNAT only blocks inbound; outbound client works.
+3. Restrict NAS SFTP to 10.200.0.1.
+4. Restic from home:
+```
+restic backup /photos --repo sftp:backup@10.200.0.2:/volume1/restic-offsite ...
+```
+Local repo same.
+5. Schedule: local daily, offsite daily if link good else weekly. First full backup big.
+6. Monitoring.
+
+If her NAS can't run WG client: outbound SSH reverse tunnel to home server. But prefer WG.
+
+If your home side also CGNAT/no inbound:
+- A direct self-hosted tunnel needs one reachable endpoint. If neither side is reachable and you won't use any cloud/relay, continuous offsite to her NAS is not possible.
+- No-cloud rework: keep local restic backup; for offsite, use an encrypted restic repo on a USB drive you physically store/rotate elsewhere. Or if you will accept free non-storage coordination, Tailscale, but if "no cloud anything" is absolute, skip.
+
+Need maybe be more concrete for home also CGNAT: "Use offline drive as third copy. The plan becomes original + local laptop/SSD + offline encrypted drive stored offsite. You manually copy drive monthly." That is concrete. But user asked rework around CGNAT, likely home reachable. Include as caveat.
+
+Need maybe mention "If she moved abroad, add latency; treat offsite as cold." Good.
+
+Need maybe mention "key management unchanged." Good.
+
+Need maybe mention "Do not put key on NAS." Good.
+
+Need maybe final with exact configs.
+
+Let's ensure WireGuard client behind CGNAT: Need `Endpoint` to home public. If home dynamic, DDNS. `PersistentKeepalive` helps. If home router NAT, inbound UDP from her NAS to forwarded port works. Once tunnel up, home can initiate packets to 10.200.0.2; they go out to her public CGNAT address? WireGuard keeps peer endpoint learned. Yes.
+
+Need maybe mention if her NAS is behind CGNAT, its public endpoint changes? WireGuard client will send packets with source port; home learns endpoint. If her NAT mapping changes, client keepalive refreshes. Good.
+
+Need maybe mention if her ISP blocks UDP, use TCP? WireGuard only UDP. Could use SSH reverse tunnel over TCP. Good.
+
+Need maybe mention "Use a non-standard WG port if 51820 blocked, e.g. 137. But if home port forward, choose." Not necessary.
+
+Need maybe mention "Firewall on home: allow established from wg0; do not expose SFTP publicly." Good.
+
+Need maybe mention "If using IPv6 at home, no port forward; but ensure router/firewall allows inbound UDP to home server IPv6." Good.
+
+Need maybe final answer not too long but detailed. Desired oververbosity 9. User likely appreciates concrete.
+
+Let's produce final. Ensure no analysis. final only.
+
+
+ANSWER:
+Rework the plan by **inverting the tunnel direction**.
+
+Do **not** try to port-forward into your sister’s CGNAT connection.  
+Instead, make **her NAS initiate an outbound connection to your home server**.
+
+That is the key change.
+
+## New concrete plan
+
+Assuming your home connection can accept one inbound connection — port-forwarded IPv4 or usable IPv6 — do this:
+
+```text
+[Sister NAS behind CGNAT]
+        |
+        | outbound-only WireGuard client
+        v
+[Your home server = WireGuard server]
+        |
+        | restic over private WireGuard IP
+        v
+[Sister NAS SFTP repo]
+```
+
+Your backup topology stays the same:
+
+```text
+[Home server /photos]
+   ├── local restic backup on old laptop / USB SSD
+   └── offsite restic backup on sister’s NAS
+```
+
+But now the offsite link works despite her CGNAT because **she calls you**, not the other way around.
+
+---
+
+# 1. Make your home server the WireGuard endpoint
+
+On your home server:
+
+- install WireGuard
+- assign it a private tunnel IP, e.g. `10.200.0.1/24`
+- expose one UDP port to the internet, e.g. `51820`
+- if your home IP changes, use free DDNS
+- if you have IPv6, you may not need port forwarding at all
+
+Example home/server side concept:
+
+```ini
+[Interface]
+PrivateKey = <home-server-private-key>
+Address = 10.200.0.1/24
+
+[Peer]
+# Sister’s NAS
+PublicKey = <nas-public-key>
+PresharedKey = <psk>
+AllowedIPs = 10.200.0.2/32
+```
+
+On your home router:
+
+- forward UDP `51820` to your home server  
+  **or**
+- if using IPv6, allow inbound UDP to the home server’s IPv6 address
+
+That is the only inbound piece you need.
+
+---
+
+# 2. Make her NAS a WireGuard client
+
+On her NAS:
+
+- install/enable WireGuard client mode
+- set the endpoint to your home server’s public IP or DDNS name
+- assign it a private tunnel IP, e.g. `10.200.0.2/24`
+- set it to start automatically and keep reconnecting
+
+Example NAS/client side concept:
+
+```ini
+[Interface]
+PrivateKey = <nas-private-key>
+Address = 10.200.0.2/24
+
+[Peer]
+PublicKey = <home-server-public-key>
+PresharedKey = <psk>
+Endpoint = your-home.ddns.example:51820
+AllowedIPs = 10.200.0.0/24
+PersistentKeepalive = 25
+```
+
+That `PersistentKeepalive = 25` is useful because she is behind NAT/CGNAT.
+
+### Why this works with CGNAT
+
+CGNAT blocks inbound connections to her side.  
+It does **not** block outbound connections from her side.
+
+So this works:
+
+- her NAS → your home server
+
+And once the tunnel is up, this also works:
+
+- your home server → her NAS over `10.200.0.2`
+
+No port forwarding on her side.  
+No UPnP.  
+No DMZ.  
+No exposed SFTP port.
+
+---
+
+# 3. Keep SFTP private to the tunnel
+
+On her NAS:
+
+- enable SFTP
+- create a dedicated `backup` user
+- give it write access only to the backup path
+- firewall it so SFTP is accepted **only from `10.200.0.1`**
+
+That last part matters.  
+You do not want SFTP reachable from the public internet just because the tunnel exists.
+
+---
+
+# 4. Restic stays almost exactly the same
+
+On your home server, your offsite repo now looks like this:
+
+```bash
+restic backup /photos \
+  --repo sftp:backup@10.200.0.2:/volume1/restic-offsite \
+  --key-file /etc/restic/offsite.key \
+  --password-file /etc/restic/offsite.password \
+  --tag photos
+```
+
+Your local repo stays the same:
+
+```bash
+restic backup /photos \
+  --repo sftp:backup@192.168.1.50:/backup/restic-local \
+  --key-file /etc/restic/local.key \
+  --password-file /etc/restic/local.password \
+  --tag photos
+```
+
+or, if you use a USB SSD locally:
+
+```bash
+restic backup /photos \
+  --repo /mnt/usb-ssd/restic-local \
+  --key-file /etc/restic/local.key \
+  --password-file /etc/restic/local.password \
+  --tag photos
+```
+
+Everything else from the previous plan still applies:
+
+- encrypted repos
+- external key files
+- versioning
+- retention policy
+- restore tests
+
+---
+
+# 5. Adjust expectations for the offsite copy
+
+Because she is now abroad and behind CGNAT, the offsite copy is still valid, but it is now a **cold offsite copy**, not a fast local-ish one.
+
+That means:
+
+- first full backup may be slow
+- restores from her NAS may be slow
+- the backup job is now dependent on:
+  - her NAS being powered on
+  - her internet working
+  - the WireGuard tunnel staying connected
+  - her bandwidth not being capped or terrible
+
+So operationally:
+
+- keep your **local backup** as the fast, reliable restore source
+- treat the sister NAS as the **offsite safety copy**
+- if the tunnel is down, the local backup should still succeed
+
+A sane schedule is:
+
+- local backup: daily
+- offsite backup: daily if the link is good, otherwise weekly
+
+If her connection is bad, do not force a huge daily offsite backup.  
+Make the offsite copy less frequent but still real.
+
+---
+
+# 6. If her NAS cannot run WireGuard client
+
+Some NAS boxes are easier than others.
+
+If her NAS can run a WireGuard client, use that.
+
+If it cannot, the next-best no-cloud option is an **outbound SSH reverse tunnel** from her NAS to your home server.
+
+The idea is the same:
+
+- her NAS initiates SSH to your home server
+- that SSH session creates a private tunnel back to her NAS
+- your home server then talks to her NAS through that tunnel
+
+This also requires your home side to be reachable, but it avoids needing WireGuard on the NAS.
+
+I would still prefer WireGuard if the NAS supports it, because it is cleaner and more robust.
+
+---
+
+# 7. What if your home side also cannot accept inbound?
+
+This is the important caveat.
+
+The plan above assumes **your home side is reachable** in at least one of these ways:
+
+- port-forwarded IPv4
+- usable IPv6
+
+If your home ISP is also CGNAT and you cannot accept inbound connections either, then a purely self-hosted, no-cloud, always-on tunnel between the two sites gets much harder.
+
+In that case, the honest answer is:
+
+- you still keep the local `restic` backup
+- but a continuous offsite backup to her NAS without some reachable endpoint or relay is not really feasible
+
+If you absolutely refuse any cloud/relay service, then the no-cloud rework becomes:
+
+```text
+[Home server /photos]
+   ├── local restic backup on old laptop / USB SSD
+   └── offline encrypted restic backup on a USB drive you physically store elsewhere
+```
+
+That is the boring, reliable, no-cloud fallback.
+
+You would:
+
+- keep one encrypted restic repo on a USB drive
+- store that drive in another physical location
+- rotate/refresh it periodically
+
+It is less automatic than a network offsite copy, but it still satisfies the core goal:
+
+- encrypted
+- offsite
+- no cloud
+- no paid service
+
+---
+
+# Bottom line
+
+With her CGNAT, the reworked plan is:
+
+1. **Your home server becomes the WireGuard server.**
+2. **Her NAS becomes an outbound WireGuard client to your home server.**
+3. **Restic runs from your home server to her NAS over the private tunnel IP.**
+4. **Local backup stays local.**
+5. **Her NAS becomes a slower, colder offsite copy.**
+
+If your home side is reachable, that is the clean answer.
+
+If your home side is **also** unreachable and you will not use any relay/cloud service at all, then replace the network offsite copy with an **offline encrypted restic drive** you physically store somewhere else.
+
+======================================================================
+TURN4 low  : reasoning_chars=   367 content_chars=  302 completion_tokens=153 prompt_tokens=26123 finish=stop
+
+USER: so which of the two ends initiates the tunnel then, mine or hers?
+
+REASONING:
+User asks which end initiates tunnel. Need answer direct: hers (sister's NAS) initiates outbound WireGuard connection to your home server, because her side CGNAT no inbound. Your side is server/listener. Once established, either can send over tunnel, but initial initiation is hers. Keep concise. Maybe mention if using SSH reverse tunnel also hers. Need final only.
+
+
+ANSWER:
+**Hers.**
+
+Your sister’s NAS initiates the outbound WireGuard connection to **your home server**.
+
+Your end is the listener/server.  
+Her end is the client that calls out through CGNAT.
+
+Once the tunnel is up, both sides can talk over it — but the initial connection is started from **her NAS to you**.
+
+======================================================================
+TURN5 xhigh: reasoning_chars= 40937 content_chars=12245 completion_tokens=15412 prompt_tokens=26392 finish=stop
+
+USER: new wrinkle: my upload is 5 Mbps and the photo library is 800GB and growing about 20GB a year. give me a realistic migration plan with actual numbers, how long the initial seed takes, whether I should seed the first copy onto a disk and mail it to her, all of it.
+
+REASONING:
+User asks: new wrinkle: upload 5 Mbps, photo library 800GB growing 20GB/year. Give realistic migration plan with actual numbers, how long initial seed takes, whether seed first copy onto disk and mail it to her, all of it.
+
+Need answer concrete. Need calculate times. 5 Mbps upload = megabits per second. 800 GB = gibibytes? Need use decimal? Let's calculate. 800 GB * 8 = 6400 Gbit. At 5 Mbps ideal = 6400/5 = 1280 hours = 53.3 days. But real throughput maybe 70-85% due overhead, TCP, SFTP, restic, compression, WAN. Photos JPEG already compressed, restic compression minimal. SFTP overhead maybe 10-20%. So effective 3.5-4.5 Mbps. Time 800GB at 4 Mbps = 6400/4=1600h=66.7 days. At 3.5=1828h=76 days. At 5 ideal 53 days. So initial online seed ~2-3 months continuous, likely 2.5 months if good, 3+ if poor. Need include restic incremental after first: 20GB/year = ~1.7GB/month, ~0.055GB/day. At 4 Mbps, 20GB = 160 Gbit /4=40h = 1.67 days per year? Wait 20GB/year total, not per month? 20GB/year = 1.67GB/month. At 4Mbps, 1.67GB=13.36Gbit/4=3.34h/month. Daily average 0.055GB=0.44Gbit/4=0.11h=6.6 min/day. But new photos may be batched; monthly backup maybe few hours. Good.
+
+Need consider 800GB first backup over 5Mbps upload is painful. Should seed via physical disk? Yes, strongly. Need plan: create encrypted restic repository on external disk locally, then mail disk to sister, she imports into NAS, then switch to online incremental over WireGuard. Need discuss security: disk encrypted with restic (and maybe full-disk encryption/LUKS) before shipping; key not shipped? Need careful: If restic repo on disk and key not on disk, she can't read, but to import she just copies files. Need include key separately? She doesn't need key to store/copy. But if disk fails? You have key. If you want her to be able to restore? Not necessary. Could include a sealed key envelope? But privacy from sister? They don't want sister seeing memes. If you give her key, she can read. So don't. Ship only encrypted repo. Maybe include a note with exact path and commands for her to copy to NAS. She doesn't need key. But if restic repo requires key to add? No, copying files to existing repo is fine; restic client with key can later use it. Need ensure repo path ownership/permissions. She can copy as backup user. Need maybe use `restic copy`? There is `restic copy` to copy snapshots from one repo to another. But if she doesn't have key, cannot run restic copy. Simpler: physically copy the repo directory to NAS path. Restic repos are just files; can be copied. Need ensure no concurrent writes. Stop backup, sync/copy, verify maybe `restic check` after import? You can later run check from home over tunnel. Or she can run `restic check` if she has key? She doesn't. You can run from home once tunnel up. Need maybe use `rsync` to copy to disk, then mail.
+
+Need plan details:
+- Choose disk size: 800GB repo initial plus overhead. Restic dedup/compression; photos not compress much. Need maybe 1TB or 2TB? If repo is 800GB, plus future, and if using local disk also for local backup? Need separate? For seed disk, 1TB minimum if exact 800GB, but file system overhead and restic packs maybe ~800-900GB. A 1TB disk may be too tight if 800GiB? 800GB decimal = 745GiB. 1TB decimal = 931GiB, enough maybe. But to be safe, 2TB external USB SSD/HDD. If photos are 800 GiB, 1TB (931GiB) might barely fit with overhead; 2TB safer. Cost maybe $100-200. Need recommend 2TB USB SSD or HDD. If mailing, rugged/protected. Use USB SSD for speed? HDD cheaper. Need maybe use a disk she can read: exFAT? But for encryption/LUKS, ext4. If she just copies files, file system matters. If using restic repo files, can be on ext4. If she needs to copy from disk to NAS, NAS must read file system. Synology/QNAP can read ext4? Maybe read-only? exFAT easier cross-platform. But restic repo on exFAT? Restic local repo can be on any filesystem, but exFAT lacks permissions? It may work but not ideal. Could create repo on ext4 and she mounts? NAS may mount ext4 read-only? Some can. Alternatively, don't create restic repo directly on shipped disk? Could create a tar/encrypted container? Let's think.
+
+Goal: seed first copy onto disk and mail. Need practical. Options:
+1. Create restic repo on external disk (ext4). Mail. She mounts/copies to NAS. If NAS can't mount ext4, problem. Many NAS can mount ext4? Synology supports ext2/3/4 read/write? I think Synology can mount ext4? Maybe. QNAP too. But not guaranteed.
+2. Use exFAT disk, create restic repo on exFAT. Restic may work but local backend on exFAT? It might have issues with file permissions/atomic renames? Restic docs recommend POSIX filesystem; exFAT may not support hard links? It might work but not ideal. Could use `restic` with local repo on exFAT? Maybe okay but not recommended.
+3. Create a full-disk encrypted image (LUKS) containing ext4 restic repo. Mail image file on exFAT disk. She copies image to NAS and imports? More complex.
+4. Use `restic` repo on your local machine, then use `rsync`/`tar` to copy repo files to an exFAT disk as a tar archive or directory. She extracts to NAS. If repo files are many small packs, tar reduces file count. But extracting 800GB takes time. Could use `tar` with checksums. But she can just untar. Need preserve file names. This may be most compatible: put a tar file (or split tar) on exFAT disk. But 800GB tar file on 2TB exFAT okay (exFAT supports large files). She extracts to NAS path. However, a single 800GB tar file is hard to verify/copy; but okay. Could use `tar` with `--checkpoint`. Or use `rsync` over local? Hmm.
+
+Maybe simpler: Use a 2TB USB drive formatted exFAT, copy the restic repository directory onto it (not as tar). Most NAS can read exFAT easily. Restic repo on exFAT may be okay for transfer only; after copied to NAS, the repo resides on NAS's native filesystem. You don't need to run restic on the exFAT disk after seeding, except maybe initial creation. But you need create repo on disk? You can create repo on local disk (ext4) then copy files to exFAT shipping disk. Or initialize repo directly on exFAT? To avoid issues, create the seed repo on a local ext4 disk/partition, then copy the repo directory to an exFAT shipping disk. But that requires extra 800GB local space. You may have home server with space? Could use the same external disk formatted ext4 if NAS can read; or use two disks. Need realistic.
+
+Alternative: Use `restic` to back up to a local repo on home server (maybe existing storage) then copy to USB. But if home server has 800GB photos, maybe has space? Not sure.
+
+Maybe recommend: buy a 2TB USB drive, format ext4 if her NAS can mount ext4; otherwise format exFAT and use a tar archive. But user wants concrete, not options. Need choose one. What is most robust? I'd choose: **Use a 2TB USB SSD formatted ext4, create the restic repo directly on it, encrypt with restic, then mail it. Have her copy the repo directory to the NAS. If her NAS can't mount ext4, use exFAT + tar.** But that's conditional. Need maybe pick: "Use a 2TB exFAT drive containing a tar archive of the restic repo" for maximum compatibility. But creating tar of 800GB takes time and disk space? You can stream tar from repo to USB drive if USB drive has 800GB free; no extra space beyond repo source. If repo is on home server, `tar -C /path/to/repo . | pv > /mnt/seed/repo.tar`. Then she `tar -xf` to NAS. This is compatible. But a single 800GB tar file on exFAT is okay. Verification: use `sha256sum` of tar? Computing 800GB hash takes time but can. Or use `tar -tf` to verify list. Maybe use split tar into 99GB volumes? exFAT max file size large, but some filesystems? 800GB single file okay on exFAT, NTFS, ext4. But if copying over network? She local. Single file easier? If copy fails, restart? Could use `rsync` directory instead. Hmm.
+
+Maybe better: Use `restic`'s `copy` command? If she has key? But she shouldn't. Could give her a separate key? If she has key, privacy gone. But maybe she is trusted to host but not view? If she has key, she could view. Not acceptable. So no.
+
+Could use `restic` repo on disk with LUKS full-disk encryption. Then ship disk. She doesn't need to open LUKS; just copies encrypted container? If disk is LUKS, she can't read files without key. But she needs to copy data to NAS. If she can't decrypt, she can copy the raw encrypted disk image? That would require dd image of entire disk, then she stores image? Not useful as restic repo unless you later import? You could create a LUKS container file on exFAT disk, put restic repo inside. Ship the container file. She copies container file to NAS. Your restic can use it? Restic local backend can use a file? It can use a filesystem path, not a loop device? You could loop mount on home, but not practical over network. Better not.
+
+Need think: If shipping physical disk, security in transit. Restic encrypts repo contents, so if disk stolen, data safe without key. But if repo is on ext4, file system metadata (file names of packs) not encrypted, but not meaningful. Restic pack file names are hashes, no photo names. Good. If you want hide even repo existence, use LUKS, but not necessary. Could mention optional LUKS if paranoid, but it complicates her copying. Since restic already encrypts data and names, shipping restic repo is fine.
+
+Need maybe include exact numbers for seeding disk:
+- Local backup to disk at USB 3 speed: 800GB at ~300MB/s = 2667s = 44 min; at 100MB/s = 2.2h; at 50MB/s = 4.5h. Restic first backup from photos to local disk: reading 800GB and hashing/packing. CPU maybe 100-300MB/s? Could take several hours to overnight. Need estimate: restic first backup of 800GB photos maybe 2-8 hours depending CPU/disk. Let's give realistic: 3-8 hours on a modern home server, maybe overnight. If old laptop, longer. Use USB SSD: 2-4h; HDD: 4-8h. Need not overpromise.
+- Mailing: 2-7 days depending domestic/international. If sister abroad, international shipping 1-3 weeks, customs? A hard drive with encrypted data may be subject to border inspection? Need mention: encrypted drive may raise questions; use a normal external drive, no obvious secrets? If crossing borders, encrypted data can be problematic. Since she moved abroad, mailing internationally. Need consider customs/border. A 2TB drive with encrypted data might be inspected; if you cannot provide key, could be seized? Laws vary. Need advise: check local laws, use a low-profile drive, maybe avoid full-disk encryption that looks suspicious? But restic repo files look random. Could be flagged. If high privacy, physical media across borders has legal risks. Need mention but not too much. User asked all of it. Include: if mailing internationally, be aware of border/customs; encryption can draw attention; consult local rules. Maybe use a standard consumer SSD, not military-grade. But don't give illegal advice. Just note.
+
+Need compare online seed vs physical seed:
+Online at 5Mbps:
+- Ideal: 800GB = 6.4Tbit? Wait 800GB*8=6400Gbit = 6.4Tbit. /5Mbps = 1280h = 53.3 days.
+- Real 70%: 3.5Mbps effective -> 1828h = 76.2 days.
+- Real 80%: 4Mbps -> 1600h = 66.7 days.
+- With interruptions, maybe 3 months.
+Need maybe table:
+Effective upload | Time for 800GB
+5.0 Mbps | 53 days
+4.5 Mbps | 59 days
+4.0 Mbps | 67 days
+3.5 Mbps | 76 days
+3.0 Mbps | 89 days
+Add 10-20% overhead => plan 2.5-3.5 months.
+
+Need maybe calculate if using restic dedup/compression: photos JPEG already compressed; expect little reduction. Maybe 5-15% if some PNG/raw? If RAW, compression maybe 10-20%. But use 800GB as repo size. If dedup of similar? Photos not much. So no major reduction.
+
+Need incremental after seed:
+- 20GB/year = 1.67GB/month.
+- At 4Mbps effective: 1.67GB = 13.36Gbit /4 = 3.34h/month.
+- Daily average: 0.0548GB/day = 0.438Gbit /4 = 0.11h = 6.6min/day.
+- If monthly batch: ~3-4 hours.
+- If yearly 20GB in one go: 20GB=160Gbit/4=40h = 1.7 days. But you won't wait a year; monthly.
+- Need account for failed runs/retries: budget 5-6h/month offsite.
+
+Need maybe local backup numbers:
+- Local 800GB seed to old laptop/USB: at 100-300MB/s, 45min-2.5h; restic processing maybe 2-6h. Monthly 1.7GB local trivial.
+
+Need migration plan step-by-step with timeline:
+Week 0:
+- Decide disk: 2TB USB SSD (or HDD) for seed. Maybe use one disk for local backup? Could use same? Need separate? If you use the seed disk as local backup after mailing? You mail it to sister, so not local. Need local backup separate: old laptop or another USB SSD. If budget, buy two 2TB drives: one local, one seed? But seed disk goes to sister; she imports to NAS, then you keep disk? She might return? You could keep the disk as local backup after she imports? If you mail it, you don't have it. Could ask her to return after import, but international return shipping. Better buy one disposable seed disk or use old laptop for local. If old laptop has space, use it. If not, buy a 2TB USB SSD for local and another for seed? Maybe too much. Could use the same disk: create seed, mail to her, she imports, then returns disk to you to use as local backup. But return shipping time/cost. Or keep local backup on old laptop. User has old laptop. Use old laptop as local. Seed disk can be a 2TB external drive you may keep? If you mail it, she has it; after import she could keep it as an extra copy? But then it's offsite too? Maybe not. You could ask her to keep the drive as a second offsite copy? But if it's at her place, same risk as NAS. Could be good: NAS + drive at her place? But 3-2-1? It would be two copies offsite same location, not better. Better return drive for local. But if local old laptop insufficient, return.
+
+Concrete: Use old laptop as local backup. Buy a 2TB USB SSD as seed/transport. After she imports, ask her to return it if you want it as local; otherwise keep local on old laptop. But user wants no cloud, not no hardware. Need maybe recommend: "Buy one 2TB USB SSD for the seed. If your old laptop can hold the local repo, use it; if not, have the seed drive returned and use it as the local repo." That's practical.
+
+Need maybe plan:
+1. Prepare local restic repo on old laptop or USB SSD. Run normal local backups until current.
+2. Create seed repo on 2TB external drive:
+   - Format ext4/exFAT? Need choose. Let's decide: Use ext4 if her NAS can mount it; otherwise exFAT + tar. To be concrete, maybe choose **2TB USB SSD formatted exFAT with a tar archive** for compatibility. But is tar necessary? If exFAT can hold directory, she can copy directory. NAS can read exFAT directory easily. Restic repo on exFAT for creation might be okay? To avoid restic on exFAT, create repo on local ext4 then tar to exFAT. But if you don't have extra space, you can create repo directly on exFAT? Need know if restic supports exFAT. Restic local repository backend requires a directory; it may work on any filesystem that supports standard file ops. exFAT supports renames? It may not support POSIX permissions, but restic may not need. However, restic uses file locking? It may use `flock`? exFAT may not support locks? Could be issue. Better not run restic repo on exFAT. Use ext4 for repo, then copy/tar to exFAT for shipping. But requires source repo space. Could create seed repo on the 2TB drive formatted ext4, then if her NAS can't mount ext4, you need another step. Hmm.
+
+Maybe choose **2TB USB drive formatted ext4** and assume her NAS can mount ext4. Most NAS can? Synology supports ext4? Let's verify: Synology File Station can mount ext2/ext3/ext4? I think yes, Linux-based. QNAP also. But some NAS may only read. She can copy. If not, fallback. But user wants concrete; we can state "Use ext4; if her NAS cannot mount ext4, use the tar fallback." That's one fallback.
+
+Could use **Btrfs/ZFS send/receive**? Restic repo not. No.
+
+Maybe use `restic` repository on a **single file** using `restic` local? Restic doesn't support file backend, but you can use `restic` with `--repo /dev/...`? No. Could use `sftp`? No.
+
+Physical seed could be done by shipping the **old laptop** with local repo? If old laptop has repo, she can copy? But mailing a laptop is more expensive/attention. External drive better.
+
+Need maybe include commands for seed:
+- Initialize repo on seed drive:
+```
+sudo mkfs.ext4 /dev/sdb1
+sudo mkdir /mnt/seed
+sudo mount /dev/sdb1 /mnt/seed
+restic init --repo /mnt/seed/restic-seed --key-file /etc/restic/offsite.key --password-file /etc/restic/offsite.password
+restic backup /photos --repo /mnt/seed/restic-seed --key-file ... --password-file ... --tag seed
+restic forget --keep-daily 7 --keep-weekly 4 --keep-monthly 12 --repo ...
+```
+But if using same key as future offsite repo, good. The seed repo will become the offsite repo after copied to NAS. Need ensure path on NAS matches? Restic repo doesn't care path. Use same key. Good.
+- Verify locally:
+```
+restic check --repo /mnt/seed/restic-seed ...
+restic restore latest /tmp/seed-restore-test ...
+```
+- Unmount safely.
+- Optional: compute checksum of a manifest? Maybe `find /mnt/seed/restic-seed -type f -exec sha256sum {} + > /mnt/seed/restic-seed.sha256` but 800GB hash takes hours. Could do `restic check` enough. For transfer, she can use `rsync -c`? Checksumming 800GB on NAS takes time. Maybe use `rsync --size-only --modify-window` or `cp -a` then you run `restic check` over tunnel. Since restic check reads data and verifies, good. But after she copies, you can run `restic check` from home over WireGuard to NAS repo. That verifies.
+
+- Shipping note to sister:
+```
+Copy the entire restic-seed directory to /volume1/restic-offsite on the NAS, preserving ownership/permissions for backup user. Do not run restic. Do not modify files. After copy, tell me.
+```
+If using tar:
+```
+tar -C /mnt/seed -cf /mnt/seed-transport/restic-seed.tar restic-seed
+sha256sum restic-seed.tar > restic-seed.tar.sha256
+```
+She:
+```
+mkdir -p /volume1/restic-offsite
+tar -C /volume1/restic-offsite -xf /path/to/restic-seed.tar
+```
+But if tar file contains directory restic-seed, path becomes /volume1/restic-offsite/restic-seed. Need set repo path accordingly. Better:
+```
+tar -C /mnt/seed/restic-seed -cf /mnt/transport/restic-seed.tar .
+```
+She:
+```
+mkdir -p /volume1/restic-offsite
+tar -C /volume1/restic-offsite -xf /volume1/tmp/restic-seed.tar
+```
+Then repo path is /volume1/restic-offsite. Good.
+
+Need decide whether to recommend tar. For compatibility, yes. But if using ext4 drive, she can copy directory. Which is simpler? Directory copy on ext4 if NAS mounts ext4. Tar on exFAT more compatible but extra time. Need maybe recommend: "Use a 2TB USB SSD formatted exFAT and put a tar archive on it. This is the most compatible for NAS import." That is concrete. But creating tar of 800GB takes time: at 200MB/s write + read, ~1.5-2h. Fine. Need disk size: 2TB enough for 800GB tar + maybe checksum. Good.
+
+But if restic repo is 800GB, tar file 800GB (not compressed). Use `tar` without compression because photos already compressed and CPU/time. Could use `tar` with `--checkpoint=100000`. Need maybe use `gzip`? No, not worth. Could use `zstd`? Maybe 5-10% reduction for some, but CPU and time; not needed. If disk capacity tight, maybe `zstd -T0` but 2TB no need.
+
+Need maybe include transfer time for her importing from USB to NAS:
+- USB 3 to NAS: 100-300MB/s. 800GB: 45min-2.5h. If NAS HDD slower 100MB/s: 2.2h. If extracting tar, read+write maybe 2-5h. If USB 2, 30MB/s: 7.4h. Recommend USB 3 drive and USB 3 port.
+
+Need online incremental after seed:
+- Set repo path to `sftp:backup@10.200.0.2:/volume1/restic-offsite`
+- Use same key. Since repo already has data, restic will see existing snapshots? If same key and repo copied, yes. It will add new snapshots. Need maybe `restic snapshots` to verify.
+- Run first online backup after import: it should only upload new changes since seed, not full 800GB, if source unchanged. But if photos added during seed, maybe few GB. Need calculate: if seed takes 1 week, new data maybe 0.3GB. Good.
+- If source changed a lot or repo not recognized, it may upload more. Use tags.
+
+Need maybe mention if you create seed repo with a different key than future? Use same key to avoid re-uploading. But if key is external and same, good. If you use separate keys, restic cannot understand existing repo? It can if key provided. Use same offsite key for seed and NAS. Good.
+
+Need maybe mention local backup key separate? Could be same or separate. For simplicity, use one offsite key for seed/NAS, one local key for local. Or one key for all. But earlier we used separate. Keep separate.
+
+Need maybe mention disk encryption in transit: restic repo is encrypted. But the tar file contains encrypted repo files; file names are pack hashes, no photo names. Good. If you want extra, put the tar inside a LUKS container or use `age` encrypted archive? But that adds complexity. Maybe optional: if mailing internationally and you're paranoid, encrypt the tar with `age` or put it in a LUKS file. But then she needs to decrypt to import, requiring key, which defeats privacy? She would need key only to import, but then she has key? Could give her a one-time decryption key? That allows her to decrypt and thus read if she keeps it. Not good. Could use a key she deletes? Risk. Better rely on restic encryption. If border concern, full-disk LUKS without giving key may prevent her import. So not.
+
+Need maybe mention customs: A drive full of random-looking files may be less suspicious than labeled "encrypted photos"? Don't label. But don't advise evasion. Just say know the laws; encrypted media can be treated differently at borders.
+
+Need maybe calculate cost/time tradeoff:
+- Online seed: free but 2.5-3.5 months, ties up upload, may hit caps, risk interruptions.
+- Physical seed: drive cost ~$80-200, shipping ~$20-100, total days-weeks, then online increments small. Recommend physical seed.
+
+Need maybe answer "whether I should seed the first copy onto a disk and mail it to her" -> Yes, strongly. Unless 800GB is smaller or upload faster. At 5Mbps, physical is the realistic choice.
+
+Need maybe include a timeline:
+- Day 0: buy drive, setup.
+- Day 1-2: local restic seed to drive (3-8h), verify, tar (2-4h), mail.
+- Day 3-14: transit.
+- Day 14-17: she imports (2-6h), tunnel setup, you verify (restic check maybe reads 800GB over 5Mbps? Wait! Important: If you run `restic check --read-data` over the tunnel after import, it will read 800GB from NAS over the WireGuard tunnel. What is download speed from her NAS? Her upload? You are downloading from her NAS, so limited by her upload, not your upload. Unknown. Could be slow. But you don't need full check immediately; can do subset or trust copy. Need mention: full `restic check --read-data` from abroad may take as long as her upload allows. If her upload is also slow, do a subset check or local restore test of a few files. Restic check without `--read-data` only checks metadata? By default `restic check` checks metadata and maybe data? I think `restic check` checks metadata and optionally reads data with `--read-data`. Default may not read all data? It checks index/config, maybe not all data. Use `restic restore` a sample. For full verification, schedule later during low usage, or use `--read-data-subset=1%`.
+- Day 17+: switch to incremental offsite backups. Monthly ~3-4h upload.
+
+Need maybe calculate verification over 5Mbps? Your upload not relevant for check reading from NAS; her upload. If her upload 5Mbps too, 800GB read = 53 days. So don't do full check online immediately. Do metadata check + sample restore. Or have her run `restic check` locally if she has key? She doesn't. Could give her a separate verification key? No. Could have her run `restic check` with key? That gives her key. Not okay. Could you remotely run `restic check` from home; it downloads data. If her upload slow, bad. Use `restic check` without full data? Need know default. Restic `check` by default checks metadata and reads data? Let's recall: `restic check` "checks the repository for errors. This command performs a check of the repository and verifies the content of all files." Hmm maybe it reads all data by default? There is `--read-data-subset` and `--read-data`? I think default checks metadata only? Let's check memory: restic check command: "By default, the check command only checks the metadata of the repository. Use --read-data to also read all data." Or maybe `--read-data-subset` implies read data. I think default is metadata only. There is `--read-data` flag. So safe: run `restic check` (metadata) and `restic restore latest /tmp/test` sample. For full data verification, do subset 1% or monthly.
+
+Need maybe mention if she can run a simple file count/size check without key: compare directory size/file counts. You can provide manifest of file sizes/hashes? Restic pack file hashes? Could create `find ... -printf '%s %p\n' | sha256sum` but not content. She can compare total size. But restic metadata check from you is enough after tunnel.
+
+Need maybe mention if using tar, she can verify tar integrity with `tar -tf` (lists) and maybe `sha256sum` if you provide. But sha256 of 800GB on her side takes time; optional. Use `tar -tzf`? No compression. `tar -tf` reads whole archive to list, verifies structure. Good.
+
+Need maybe include exact numbers table for online seed and incremental.
+
+Let's calculate more precisely:
+800 GB decimal = 800,000,000,000 bytes? *8 = 6,400,000,000,000 bits = 6,400 Gbit. Mbps = megabits per second. Hours = 6400/5 = 1280 h = 53.33 days. If 800 GiB = 858,993,459,200 bytes *8 = 6,871,947,673,600 bits = 6872 Gbit. /5 = 1374.4 h = 57.3 days. Need choose. User says 800GB likely decimal. Use 800GB decimal. Maybe note if you mean 800GiB, add ~8%.
+
+Effective throughput: SFTP over WireGuard maybe 70-85% of raw. 5Mbps raw -> 3.5-4.25Mbps. Use 4Mbps planning. 800GB at 4Mbps = 1600h = 66.7 days. At 3.5 = 1828.6h = 76.2 days. Add overhead/interruptions: 70-90 days. So 2.5-3 months.
+
+If upload is 5 Mbps but symmetric? Only upload matters for backup. Download from her for restore depends her upload.
+
+Physical seed local times:
+- Restic backup to local USB SSD: Suppose average 150MB/s (1.2Gbps) due CPU/disk. 800GB /150MB/s = 5333s = 1.48h. At 100MB/s = 2.2h. At 50MB/s = 4.4h. Add overhead, 2-6h. If old CPU, 8-12h. Use overnight.
+- Tar to second USB? If creating repo on one drive and tar to transport, maybe read+write 800GB at 150MB/s = 1.5h. If same drive? Need not.
+- If using 2TB drive as both repo and transport ext4, no tar. If exFAT tar, need source repo elsewhere. Maybe simplify: Use 2TB USB SSD formatted ext4, create repo directly, mail ext4 drive. If her NAS can't mount ext4, then plan B. But to avoid conditional, maybe use ext4 and say "most NAS can mount ext4; if hers cannot, use tar/exFAT." The user asked concrete, but one fallback okay.
+
+Which physical method is best? Let's decide final recommendation: **Yes, seed with a 2TB USB SSD. Format it ext4. Create the restic repo directly on it. Mail the drive. Have her copy the repo directory to the NAS. If her NAS cannot mount ext4, use the exFAT+tarp fallback.** This is concrete and simpler/faster than tar. Most NAS are Linux and can mount ext4. But if she is not technical, mounting ext4 may be harder. Synology has external storage? It can mount? Maybe. QNAP can. If she is not technical, exFAT directory copy is easier: plug in, File Station copies folder. But restic repo on exFAT? Could create repo on home server local ext4, then copy directory to exFAT drive (not run restic on exFAT). That requires home server has 800GB free for repo. Maybe it does? Photo library 800GB, server may have more. If not, use ext4 drive.
+
+Maybe recommend based on sister's technical ability:
+- If she can use NAS GUI and mount ext4: ext4 drive, copy folder.
+- If she is non-technical: exFAT drive with a single tar file; she just copies/extracts? Extracting tar may also be technical. Copying folder from exFAT is easier. Could put repo directory on exFAT (created elsewhere) and she copies folder. That works: create repo on home server or ext4 temp, copy files to exFAT drive. She plugs in, copies folder to NAS. No tar. Restic repo files on exFAT are just for transfer; after copy, repo is on NAS native fs. This is best compatibility. Need extra space to create repo then copy? You can create repo directly on exFAT? Maybe not ideal. But you can create repo on the same exFAT drive? If restic works, then no extra space. If not, need temp.
+
+Can restic local repo work on exFAT? Let's investigate from memory: Restic uses a local backend that stores files in a directory. It may use `os.Rename`, `os.Remove`, file locking via `flock`? On Windows/exFAT, file locking may not work. Restic supports Windows, so it must work on NTFS. exFAT maybe lacks POSIX but Go os works. It might be fine. But not officially recommended? I don't know. To be safe, don't rely.
+
+Maybe use a **2TB USB HDD/SSD formatted NTFS/exFAT** and store a **restic repository** there. Restic on Windows supports NTFS; on Linux exFAT likely okay. But if file locking issue, backups may fail if concurrent. For one-time seed, okay. But I'd rather not recommend unsupported.
+
+Alternative physical seed without restic repo on shipping drive: Use `restic` to back up to a **local repo on home server**, then use `rsync` to copy repo to shipping drive formatted exFAT. If home server lacks space, use an old laptop with space? Hmm.
+
+Could use `restic` to back up directly to an **SFTP server on a local USB drive**? No.
+
+Maybe use `restic` with **local repo on a loop file** on a large disk? Then ship the file? Not easier.
+
+Maybe use `borg` with **BorgBase?** No.
+
+Physical seed could be done by shipping the **old laptop** after creating local restic repo on it. She can copy the repo from laptop to NAS if she can access laptop. But mailing laptop is cost and attention. External drive better.
+
+Let's choose a practical plan: Buy a 2TB USB SSD. Use it as the **local seed/transport drive** formatted ext4. Create the offsite restic repo directly on it. Verify. Mail it. Ask her to copy the `restic-offsite` directory to the NAS. If her NAS cannot mount ext4, then before mailing, copy the repo directory to an exFAT drive or create a tar; but that's fallback.
+
+Need maybe mention if she is not comfortable mounting ext4, the tar/exFAT fallback is better. But final recommendation can be: "Use ext4 if she can; otherwise exFAT tar." Since user wants all of it, include both but mark primary.
+
+Need maybe include actual commands for ext4 primary:
+```
+# identify drive, e.g. /dev/sdb
+sudo mkfs.ext4 -L seed /dev/sdb1
+sudo mkdir /mnt/seed
+sudo mount /dev/sdb1 /mnt/seed
+sudo mkdir /mnt/seed/restic-offsite
+
+restic init --repo /mnt/seed/restic-offsite \
+  --key-file /etc/restic/offsite.key \
+  --password-file /etc/restic/offsite.password
+
+restic backup /photos --repo /mnt/seed/restic-offsite \
+  --key-file /etc/restic/offsite.key \
+  --password-file /etc/restic/offsite.password \
+  --tag seed
+
+restic check --repo /mnt/seed/restic-offsite ...
+restic restore latest /tmp/seed-test --repo ... ...
+sudo umount /mnt/seed
+```
+Need maybe `restic forget` to set retention? For seed, maybe keep one snapshot. `restic forget --keep-last 1`? If you want only current, but retention policy later. Could run `restic forget --keep-daily 7 --keep-weekly 4 --keep-monthly 12` but with one snapshot keeps one. Fine.
+
+Shipping instructions to sister:
+```
+Plug in drive. It is ext4, label seed.
+Mount it read/write.
+Copy the folder /restic-offsite to /volume1/restic-offsite on the NAS.
+Make sure the NAS backup user owns it or can read/write.
+Do not run restic. Do not change file names.
+Tell me when done.
+```
+If using Synology: maybe External Storage > mount, File Station copy. If QNAP: similar.
+
+After she imports:
+- Set up WireGuard as previous.
+- On home, set offsite repo to `sftp:backup@10.200.0.2:/volume1/restic-offsite`.
+- Run `restic snapshots` to see seed snapshot.
+- Run `restic backup /photos` again; it should upload only changes.
+- Run `restic check` metadata and sample restore.
+- Schedule.
+
+Need maybe calculate first online backup after seed:
+- If no new photos: near zero, just metadata.
+- If 20GB/year and seed took 2 weeks: ~0.65GB new. At 4Mbps: 0.65GB=5.2Gbit/4=1.3h.
+- If seed took 1 month: ~1.7GB new, ~3.3h.
+Good.
+
+Need maybe mention if you make major changes during seed (re-import, rename), restic treats renames as delete+add? Restic uses content addressing; moving files may not reupload if content same? It may still upload new file paths metadata but data chunks reused if same files exist in repo. If you modify many photos, more upload. Keep source stable during seed.
+
+Need maybe mention if photo library is 800GB and growing 20GB/year, local disk sizes:
+- Local repo retention: if keep 12 months daily/weekly/monthly, for 20GB/year growth, maybe <50GB of new data plus full base? Restic repo contains full base plus changes. Local repo will be ~800GB + growth/retention. Need disk size 2TB for local too if using USB. Old laptop may need 1TB+; if only 512GB, not enough. Need mention: local backup target needs at least 1TB, preferably 2TB, because repo starts near 800GB. If old laptop has less, use 2TB USB SSD. Good point.
+
+Need maybe calculate local repo growth: 20GB/year, retention 12 months, maybe 20-40GB extra. So 1TB enough for 800GB? If 800GB decimal = 745GiB, 1TB=931GiB, leaves 186GiB, enough for a few years. But overhead and packs maybe. 2TB safer. If 800GiB, 1TB too tight. Recommend 2TB for local and seed if possible.
+
+Need maybe mention if using old laptop with 1TB, it may fit but tight; monitor. Use `restic stats` to see repo size.
+
+Need maybe include "do not use the same physical disk for local and offsite seed if you mail it; you need local copy after mailing." Good.
+
+Need maybe discuss "mail it to her" international: shipping a drive with 800GB encrypted data. Need packaging, tracking, insurance. Cost maybe $30-100. Time 1-3 weeks. If she is abroad, customs. Use a standard drive, no labels. Keep tracking. Maybe ship via tracked parcel. If drive is stolen, restic encryption protects. If customs asks, laws vary; don't provide key. But if they demand, legal risk. Need maybe say "if you are moving sensitive data across borders, get advice; I can't give legal advice." Good.
+
+Need maybe compare to online seed in a table:
+Method | Cost | Time | Notes
+Physical seed | $100-250 + shipping | 1-3 weeks + hours local | best
+Online seed | $0 | 2.5-3.5 months continuous | painful, upload cap risk
+Hybrid | seed physical, then online increments | recommended
+
+Need maybe mention "Do not try to seed by syncing over the tunnel while also using upload for other things; it will take longer."
+
+Need maybe mention "If your 5Mbps upload is capped, online seed may be impossible; physical seed avoids cap." Good.
+
+Need maybe mention "If her download/upload for future restores is slow, local copy is your fast restore. Offsite is for disaster." Good.
+
+Need maybe include exact monthly incremental numbers table:
+Growth | Data per month | At 4Mbps effective | At 3.5Mbps
+20GB/year | 1.67GB | 3.3h | 3.8h
+If 100GB one-time addition | 100GB=800Gbit/4=200h=8.3 days; at 3.5=229h=9.5 days. So large imports should be physical or done over long period. Good maybe include.
+
+Need maybe mention "20GB/year is small after seed; the migration problem is only the initial 800GB." Good.
+
+Need maybe final answer with headings:
+- Short answer: Yes, mail a disk.
+- Numbers for online seed
+- Recommended migration plan
+- Physical seed steps
+- What sister does
+- Post-import switch
+- Ongoing numbers
+- Edge cases / border / disk size
+
+Need keep concrete but thorough.
+
+Let's ensure calculations:
+Effective throughput table:
+Raw 5 Mbps. Assume 80% = 4 Mbps. 800GB = 6400Gb. 6400/4=1600h=66.7d. 70%=3.5 -> 1828.6h=76.2d. 90%=4.5 -> 1422.2h=59.3d. 100%=5 -> 1280h=53.3d. Add interruptions: +10-20%. So 60-90 days.
+
+If restic compression reduces 10%: 720GB at 4Mbps = 57.6 days. But photos likely no. Use 800.
+
+Local restic seed time: Need maybe calculate based on restic throughput. Restic can do ~100-500MB/s depending CPU. For 800GB:
+- 100MB/s: 800,000MB/100=8000s=2.22h
+- 200MB/s: 4000s=1.11h
+- 50MB/s: 16000s=4.44h
+But first backup includes reading, hashing, packing, writing. Use 2-6h. If old laptop 8-12h.
+
+Tar time if fallback: reading repo and writing tar at 150MB/s: 800,000/150=5333s=1.48h. At 100MB/s=2.22h. Add.
+
+Her import time:
+- Copy 800GB at 100MB/s=2.22h; 200MB/s=1.11h; 50MB/s=4.44h. If tar extract, read+write maybe 2-6h.
+
+Mailing: domestic 2-5 days, international 1-3 weeks.
+
+Need maybe mention "Use USB 3; if she has only USB 2, import takes ~7-10h." Good.
+
+Need maybe mention "Don't use a 1TB drive for 800GB repo; use 2TB." Good.
+
+Need maybe mention "If the repo is smaller due compression/dedup, 1TB might fit, but don't plan on it." Good.
+
+Need maybe mention "After seed, the drive can be returned for local use or kept by her as an extra copy, but not a substitute for local." Good.
+
+Need maybe mention "If you want to keep the seed drive after import, have her return it; otherwise buy another local drive." Good.
+
+Need maybe mention "Use the same offsite key for seed and NAS so restic recognizes the repo." Good.
+
+Need maybe mention "Do not initialize a new repo on the NAS after seeding; that would orphan the seed." Actually if she copies repo to path, don't init. If path empty and you init, new repo. So instructions: do not run `restic init` on NAS; just copy files. On home, use existing repo. Good.
+
+Need maybe mention "If she copies to /volume1/restic-offsite and the repo files are inside a subfolder, set repo path to that subfolder." Good.
+
+Need maybe mention "Permissions: restic needs write access to repo directory and files. On NAS, set ownership to backup user or permissions 700/750." Good.
+
+Need maybe mention "If using SFTP, restic will create new pack files; SFTP user must be able to create/delete in repo." Good.
+
+Need maybe mention "If the seed drive is ext4 and she copies via GUI, ownership may become root; fix with `chown -R backup:backup /volume1/restic-offsite` or set permissions." Good.
+
+Need maybe mention "After import, run `restic snapshots` from home; if it lists the seed snapshot, success." Good.
+
+Need maybe mention "If `restic snapshots` says no snapshots, path/key wrong." Good.
+
+Need maybe mention "Full `restic check --read-data` over international link is expensive; do metadata check + sample restore first; schedule full check during a window you accept." Good.
+
+Need maybe mention "If her upload is also 5Mbps, a full 800GB read check takes ~53 days ideal; don't do it casually." Good point.
+
+Need maybe final bottom line: Yes, mail a 2TB encrypted restic seed. Online seed at 5Mbps is 2.5-3.5 months. After seed, 20GB/year is only ~3-4 hours/month upload.
+
+Need ensure answer doesn't over-option. But user asked all of it, so detailed okay.
+
+Let's draft final.
+
+Potential final:
+
+"Short answer: yes, seed physically. At 5Mbps, 800GB online is ~53 days ideal, ~2.5-3.5 months real. Do not do that as your migration plan."
+
+Then numbers.
+
+Need maybe use "GB" decimal. Add note: if 800GiB, add ~8%.
+
+Let's write with tables.
+
+Detailed plan:
+1. Buy drives: 2TB USB SSD for seed; local backup target 2TB or old laptop if >=1TB.
+2. Create offsite seed repo on 2TB drive ext4. Commands.
+3. Verify locally.
+4. Ship. Instructions.
+5. She imports.
+6. You connect WireGuard and switch repo URL.
+7. Run incremental.
+8. Ongoing schedule.
+
+Fallback if NAS can't mount ext4: exFAT + tar. Provide commands.
+
+Need maybe choose primary: ext4. But if sister non-technical, maybe exFAT directory copy. Hmm. Let's phrase: "Primary: 2TB USB drive, ext4, repo directory. If she is not comfortable mounting ext4, use the compatibility variant: exFAT drive with the repo directory copied onto it (or a tar archive)." But that's options. Maybe okay.
+
+Could make primary **exFAT directory copy** because most NAS and users can handle exFAT. How to create repo without extra space? You can create repo directly on exFAT for seed; if restic works, fine. Is it safe? I need avoid recommending unsupported. Maybe say "format the transport drive exFAT and copy the finished repo directory onto it; do not run restic on exFAT." But requires repo elsewhere. If you have home server space, okay. If not, ext4 primary.
+
+Maybe user has home server with photo library 800GB; likely has at least 1TB disk? Could have RAID with space. But not guaranteed. The old laptop maybe. Hmm.
+
+Could use the seed drive as local repo on ext4, then after mailing, use old laptop for local. That's fine. Primary ext4.
+
+Need maybe mention if her NAS cannot mount ext4, you can still have her use a small Linux machine? No. Tar fallback.
+
+Let's include fallback but not dwell.
+
+Need maybe legal/border section brief.
+
+Need final answer in English.
+
+Let's produce final. Ensure no analysis.
+
+
+ANSWER:
+Short answer: **yes, seed the first copy onto a disk and mail it.**  
+At **5 Mbps upload**, an 800GB initial online backup is painful enough that physical seeding is the realistic migration plan.
+
+Below are the actual numbers and the plan I would use.
+
+---
+
+# 1. How long the initial online seed would take
+
+Your upload speed is the bottleneck.
+
+Assume:
+
+- photo library: **800GB**
+- upload: **5 Mbps**
+- `restic` over SFTP/WireGuard
+- photos are mostly JPEGs, so do **not** expect much compression savings
+
+## Idealized math
+
+800GB = 6400Gbit
+
+At a perfect 5Mbps:
+
+```text
+6400Gbit / 5Mbps = 1280 hours
+1280 hours / 24 = 53.3 days
+```
+
+So even in fantasy-land, the first backup is **about 53 days**.
+
+## Real-world math
+
+Real throughput will be lower because of:
+
+- TCP/SFTP overhead
+- WireGuard overhead
+- WAN latency
+- retries
+- router/NAS limitations
+- incomplete pipe utilization
+
+A reasonable planning number is **70–85%** of raw upload.
+
+| Effective upload | Time for 800GB |
+|---:|---:|
+| 5.0 Mbps | ~53 days |
+| 4.5 Mbps | ~59 days |
+| 4.0 Mbps | ~67 days |
+| 3.5 Mbps | ~76 days |
+| 3.0 Mbps | ~89 days |
+
+Then add real life:
+
+- overnight scheduling
+- dropped connections
+- ISP shaping
+- her side being slow or unstable
+
+## Practical expectation
+
+Plan on **2.5 to 3.5 months** for the first online seed.
+
+That is not impossible, but it is a bad migration strategy.
+
+---
+
+# 2. What happens after the first seed
+
+This part is much more reasonable.
+
+You said the library grows by:
+
+```text
+20GB/year
+```
+
+That is:
+
+```text
+20GB / 12 = 1.67GB/month
+1.67GB / 30 = ~0.055GB/day
+```
+
+At a realistic **4Mbps effective upload**:
+
+## Monthly increment
+
+```text
+1.67GB = ~13.4Gbit
+13.4Gbit / 4Mbps = ~3.35 hours
+```
+
+So a normal month is only about **3–4 hours of upload**.
+
+## Daily average
+
+```text
+0.055GB = ~0.44Gbit
+0.44Gbit / 4Mbps = ~0.11 hours
+```
+
+That is about **6–7 minutes per day** on average.
+
+In practice you will probably run it daily or weekly and it will be fine.
+
+## If you add 100GB at once
+
+For reference:
+
+```text
+100GB = 800Gbit
+800Gbit / 4Mbps = 200 hours
+```
+
+That is about **8 days** of continuous upload.
+
+So:
+
+- normal yearly growth: fine
+- one-off huge import: painful
+
+---
+
+# 3. Should you seed onto a disk and mail it?
+
+**Yes.**
+
+For your numbers, this is clearly the better plan.
+
+## Why physical seeding wins
+
+### Online seed
+- cost: ~$0
+- time: **2.5–3.5 months**
+- risk: long tail of failures, caps, instability
+
+### Physical seed
+- cost: one external drive + shipping
+- time: **days to a couple of weeks**
+- risk: much lower
+- after that, online backups are small
+
+A **2TB external USB SSD** is the right tool.
+
+Why 2TB?
+
+Because your repo will start near **800GB**, and you do not want to be one bad estimate away from running out of space.
+
+A 1TB drive *might* fit depending on whether you mean 800GB vs 800GiB and how much overhead you have, but I would not plan around it.
+
+**Use 2TB.**
+
+---
+
+# 4. Recommended migration plan
+
+## High-level plan
+
+```text
+1. Create an encrypted restic seed repo on a 2TB USB drive locally
+2. Verify it locally
+3. Mail the drive to your sister
+4. She copies the repo onto her NAS
+5. You connect over WireGuard
+6. You switch the offsite repo URL to the NAS
+7. From then on, only incremental backups go online
+```
+
+This gives you:
+
+- fast initial migration
+- no 3-month upload marathon
+- encrypted data in transit and at rest
+- normal small incremental backups afterward
+
+---
+
+# 5. Exact local seeding steps
+
+Assume:
+
+- photos are in `/photos`
+- USB drive is `/dev/sdb`
+- you will use an ext4 partition on the drive
+- the repo directory on the drive will be `/restic-offsite`
+
+## Format the drive
+
+```bash
+sudo mkfs.ext4 -L seed /dev/sdb1
+sudo mkdir -p /mnt/seed
+sudo mount /dev/sdb1 /mnt/seed
+sudo mkdir -p /mnt/seed/restic-offsite
+```
+
+## Initialize the seed repo
+
+Use the **same offsite key** you will later use for the NAS repo.
+
+```bash
+restic init \
+  --repo /mnt/seed/restic-offsite \
+  --key-file /etc/restic/offsite.key \
+  --password-file /etc/restic/offsite.password
+```
+
+## Run the seed backup
+
+```bash
+restic backup /photos \
+  --repo /mnt/seed/restic-offsite \
+  --key-file /etc/restic/offsite.key \
+  --password-file /etc/restic/offsite.password \
+  --tag seed
+```
+
+## Set your retention policy
+
+For example:
+
+```bash
+restic forget \
+  --repo /mnt/seed/restic-offsite \
+  --key-file /etc/restic/offsite.key \
+  --password-file /etc/restic/offsite.password \
+  --keep-daily 7 \
+  --keep-weekly 4 \
+  --keep-monthly 12
+```
+
+## Verify locally before shipping
+
+At minimum:
+
+```bash
+restic check \
+  --repo /mnt/seed/restic-offsite \
+  --key-file /etc/restic/offsite.key \
+  --password-file /etc/restic/offsite.password
+```
+
+And do a small restore test:
+
+```bash
+restic restore latest \
+  --repo /mnt/seed/restic-offsite \
+  --key-file /etc/restic/offsite.key \
+  --password-file /etc/restic/offsite.password \
+  /tmp/seed-restore-test
+```
+
+If that works, unmount cleanly:
+
+```bash
+sudo umount /mnt/seed
+```
+
+---
+
+# 6. How long the local seed takes
+
+This depends on your CPU and disks, but realistic numbers:
+
+| Local throughput | Time for 800GB |
+|---:|---:|
+| 50MB/s | ~4.5 hours |
+| 100MB/s | ~2.2 hours |
+| 150MB/s | ~1.5 hours |
+| 250MB/s | ~55 minutes |
+
+But `restic` is not just copying bytes. It is:
+
+- reading files
+- hashing
+- packing
+- writing
+
+So a realistic estimate is:
+
+- modern home server + USB SSD: **2–5 hours**
+- older machine or slower disk: **6–12 hours**
+
+Run it overnight.
+
+---
+
+# 7. What your sister needs to do
+
+This is where simplicity matters.
+
+## If she is comfortable with NAS storage
+
+Give her a drive like this:
+
+- ext4
+- one folder: `restic-offsite`
+
+Her job:
+
+1. plug the drive in
+2. mount it
+3. copy the `restic-offsite` folder to the NAS
+4. make sure the NAS backup user can read/write it
+5. tell you when done
+
+Example target path on her NAS:
+
+```text
+/volume1/restic-offsite
+```
+
+Important:
+
+- **do not run `restic init` on the NAS**
+- **do not rename the repo files**
+- **just copy the existing repo directory**
+
+The repo is already initialized. You are moving the repo, not creating a new one.
+
+## Permissions note
+
+After she copies it, the NAS backup user needs write access to the repo directory.
+
+On many NAS boxes that means something like:
+
+```bash
+chown -R backup:backup /volume1/restic-offsite
+chmod -R u+rwX,g+rwX,o-rwx /volume1/restic-offsite
+```
+
+Exact commands depend on the NAS OS.
+
+---
+
+# 8. Compatibility fallback for the physical drive
+
+The cleanest method is ext4, but if her NAS makes ext4 annoying, use this fallback:
+
+## Use an exFAT drive and a tar archive
+
+On your side:
+
+```bash
+tar -C /mnt/seed/restic-offsite -cf /mnt/transport/restic-seed.tar .
+```
+
+Then ship the exFAT drive with `restic-seed.tar` on it.
+
+She does:
+
+```bash
+mkdir -p /volume1/restic-offsite
+tar -C /volume1/restic-offsite -xf /path/to/restic-seed.tar
+```
+
+This is more compatible, but slower and a little more work.
+
+If I were choosing one default:
+
+- **ext4 drive with the repo folder** if she can handle it
+- **exFAT + tar** if she cannot
+
+---
+
+# 9. How long her import takes
+
+Assuming USB 3 and a normal NAS:
+
+| Transfer speed | Time for 800GB |
+|---:|---:|
+| 50MB/s | ~4.5 hours |
+| 100MB/s | ~2.2 hours |
+| 200MB/s | ~1.1 hours |
+| 300MB/s | ~45 minutes |
+
+If she is using USB 2, expect much longer:
+
+- around **7–10 hours**
+
+So tell her:
+
+- use a USB 3 port
+- do not do other heavy NAS work at the same time
+- let the copy finish before touching the folder
+
+---
+
+# 10. Shipping the drive
+
+Yes, mail it.
+
+## Practical details
+
+Use:
+
+- tracked shipping
+- insurance
+- normal consumer external drive
+- good packaging
+
+## Security
+
+The drive contains a `restic` repo, so:
+
+- file contents are encrypted
+- file names are encrypted
+- the key is not on the drive
+
+So if the drive is lost or stolen, that is not a direct data breach.
+
+## Border / customs caveat
+
+If this is an international shipment, be aware that encrypted media can sometimes attract extra attention at borders. Laws vary a lot by country.
+
+I’m not giving legal advice, but the practical points are:
+
+- know the rules in both countries
+- do not label the drive in a way that invites scrutiny
+- understand that refusing to provide a key can have legal consequences in some jurisdictions
+
+For most people, a normal encrypted backup drive is fine, but you should be aware of the risk.
+
+---
+
+# 11. After she has imported the repo
+
+Now you switch from the physical seed to the network repo.
+
+Your offsite repo URL becomes:
+
+```bash
+sftp:backup@10.200.0.2:/volume1/restic-offsite
+```
+
+assuming:
+
+- WireGuard IP for her NAS is `10.200.0.2`
+- SFTP user is `backup`
+- repo path is `/volume1/restic-offsite`
+
+## Confirm restic sees the seeded snapshots
+
+From your home server:
+
+```bash
+restic snapshots \
+  --repo sftp:backup@10.200.0.2:/volume1/restic-offsite \
+  --key-file /etc/restic/offsite.key \
+  --password-file /etc/restic/offsite.password
+```
+
+If you see your seed snapshot, the migration worked.
+
+## Run the next backup
+
+```bash
+restic backup /photos \
+  --repo sftp:backup@10.200.0.2:/volume1/restic-offsite \
+  --key-file /etc/restic/offsite.key \
+  --password-file /etc/restic/offsite.password \
+  --tag photos
+```
+
+This should now upload only:
+
+- new files
+- changed files
+- new metadata
+
+not the whole 800GB again.
+
+---
+
+# 12. Verification after import
+
+Do not immediately run a full data-reading `restic check` over the international link if her upload is also slow.
+
+A full 800GB read from her side could take a very long time.
+
+## Do this first
+
+1. `restic snapshots`
+2. normal `restic check` for metadata
+3. restore a sample:
+
+```bash
+restic restore latest \
+  --repo sftp:backup@10.200.0.2:/volume1/restic-offsite \
+  --key-file /etc/restic/offsite.key \
+  --password-file /etc/restic/offsite.password \
+  /tmp/offsite-restore-test
+```
+
+## Then later, if you want deeper verification
+
+Use a subset check rather than a full read every time:
+
+```bash
+restic check --read-data-subset=1%
+```
+
+A full `--read-data` check is possible, but schedule it deliberately.
+
+---
+
+# 13. What the steady-state schedule should look like
+
+After seeding, your normal operation becomes easy.
+
+## Local backup
+- target: old laptop or local USB SSD
+- frequency: daily
+- expected size: small after first local backup
+
+## Offsite backup
+- target: sister’s NAS over WireGuard
+- frequency: daily or weekly
+- expected monthly upload: **~3–4 hours** at 4Mbps effective
+
+## Retention
+Example:
+
+```text
+keep 7 daily
+keep 4 weekly
+keep 12 monthly
+```
+
+## Prune
+Weekly is usually enough.
+
+---
+
+# 14. One important sizing note
+
+Your **local** backup target also needs to be big enough.
+
+The local repo will also start near **800GB**.
+
+So:
+
+- if your old laptop has only 512GB, it is not enough
+- 1TB may be tight
+- 2TB is the comfortable choice
+
+If your old laptop cannot hold the local repo, then the clean setup is:
+
+- 2TB USB SSD for local backup
+- 2TB USB SSD for physical seed / transport
+
+or:
+
+- seed drive gets mailed
+- she returns it after import
+- you use it as the local backup drive
+
+---
+
+# 15. The realistic timeline
+
+Here is a sane end-to-end timeline.
+
+## Days 0–2
+- buy drive
+- create seed repo
+- verify locally
+- package and ship
+
+## Days 3–14
+- transit time
+- if international, possibly 1–3 weeks
+
+## Day 14–17
+- she imports drive to NAS
+- you verify over WireGuard
+- switch offsite repo to NAS
+
+## Day 17+
+- normal incremental backups begin
+
+So total migration time is usually:
+
+**1 to 3 weeks**, not 3 months.
+
+---
+
+# 16. Bottom line
+
+For your numbers:
+
+- **800GB initial library**
+- **5Mbps upload**
+- **20GB/year growth**
+
+the answer is:
+
+## Do not seed 800GB online.
+## Seed it physically.
+
+### Best plan
+1. Create an encrypted `restic` repo on a **2TB USB SSD**
+2. Verify it locally
+3. Mail it to her
+4. She copies it to the NAS
+5. You connect over WireGuard
+6. Future backups go online as small increments
+
+### Expected numbers
+- online initial seed: **~2.5–3.5 months**
+- physical seed: **hours locally + shipping time**
+- future monthly offsite backup: **~3–4 hours at 4Mbps effective**
+
+If you want the one-line recommendation:
+
+**Buy a 2TB USB SSD, seed an encrypted restic repo onto it, mail it to her, then switch to small incremental backups over the tunnel.**
+
+======================================================================
+TURN6 low  : reasoning_chars=   510 content_chars=  742 completion_tokens=309 prompt_tokens=41852 finish=stop
+
+USER: summarize the final setup in five bullet points.
+
+REASONING:
+User wants final setup summarized in five bullet points. Need be concise. Need incorporate latest: home server WireGuard server, sister NAS client behind CGNAT, restic encrypted versioned backups, local backup old laptop/USB, physical seed 2TB drive then incremental. Five bullets exactly? "in five bullet points" likely exactly 5. Need final only. Ensure no extra text. Bullet 1: topology/connectivity. 2: backup tool/repos. 3: local copy. 4: offsite seed/migration. 5: operations/retention/keys. Keep clear.
+
+
+ANSWER:
+- Use **WireGuard with your home server as the server** and your sister’s NAS as the **outbound client**, so her CGNAT connection does not need port forwarding.
+
+- Run **restic** from your home server to create **encrypted, versioned, incremental photo backups**, with the key stored only on your side and offline.
+
+- Keep a **local restic backup** on your old laptop or a 2TB USB SSD as the fast, reliable restore copy.
+
+- Seed the initial 800GB offsite copy by creating a restic repo on a **2TB USB drive**, mailing it to her, and having her copy it to her NAS.
+
+- After seeding, back up to her NAS over the WireGuard tunnel as normal increments, using a retention policy like **7 daily / 4 weekly / 12 monthly** and periodic restore tests.
+

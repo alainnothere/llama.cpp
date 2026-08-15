@@ -1,0 +1,32 @@
+{
+  "description": "6-turn backup-planning conversation alternating xhigh/low reasoning effort. Coherence is testable: turns 3-6 only make sense if the model carries forward decisions from earlier turns (restic/WireGuard choice, CGNAT inversion, 5 Mbps math).",
+  "chat_template_kwargs": {"per_message_reasoning_effort": true},
+  "temperature": 0.6,
+  "max_tokens": {"xhigh": 16384, "medium": 8192, "low": 4096},
+  "turns": [
+    {
+      "effort": "xhigh",
+      "question": "ok so here is the thing, I have a home server, well actually two if you count the old laptop, and I want to back up my photos, but ALSO I do not want to pay for cloud storage because reasons, and my sister has a NAS at her place across town, and I was thinking maybe syncthing? or maybe rsync over a VPN? or wireguard something something... but then what happens when her NAS dies, do I need a third copy? people say 3-2-1 backup but honestly who has the time, and should the backups be encrypted before they leave my machine because I do not want my sister seeing my memes folder... anyway WHAT should I actually set up, give me a concrete recommendation, not seventeen options."
+    },
+    {
+      "effort": "low",
+      "question": "and what if my sister moves abroad, does anything change?"
+    },
+    {
+      "effort": "xhigh",
+      "question": "ok she moved and took the NAS, but her new ISP is doing CGNAT so no port forwarding on her side at all. rework the plan around that, and remember I still refuse to pay for cloud anything."
+    },
+    {
+      "effort": "low",
+      "question": "so which of the two ends initiates the tunnel then, mine or hers?"
+    },
+    {
+      "effort": "xhigh",
+      "question": "new wrinkle: my upload is 5 Mbps and the photo library is 800GB and growing about 20GB a year. give me a realistic migration plan with actual numbers, how long the initial seed takes, whether I should seed the first copy onto a disk and mail it to her, all of it."
+    },
+    {
+      "effort": "low",
+      "question": "summarize the final setup in five bullet points."
+    }
+  ]
+}

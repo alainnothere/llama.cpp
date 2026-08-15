@@ -1,0 +1,7 @@
+TURN1 xhigh: reasoning_chars= 54713 content_chars= 8992 completion_tokens=16384 prompt_tokens=202 finish=length
+TURN2 low  : reasoning_chars=  3060 content_chars= 3674 completion_tokens=1535 prompt_tokens=16636 finish=stop
+TURN3 xhigh: reasoning_chars= 22086 content_chars= 7085 completion_tokens=7805 prompt_tokens=18265 finish=stop
+TURN4 low  : reasoning_chars=   367 content_chars=  302 completion_tokens=153 prompt_tokens=26123 finish=stop
+TURN5 xhigh: reasoning_chars= 40937 content_chars=12245 completion_tokens=15412 prompt_tokens=26392 finish=stop
+TURN6 low  : reasoning_chars=   510 content_chars=  742 completion_tokens=309 prompt_tokens=41852 finish=stop
+transcript: /tmp/effort_6turn_transcript.txt
