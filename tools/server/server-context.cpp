@@ -2453,6 +2453,24 @@ private:
                     // free when prompt_load() runs inside get_available_slot().  Doing this
                     // after launch (the old location) meant the load could fail with "no
                     // available cells" because a prior conversation still occupied the pool.
+                    //
+                    // Why the clear here is unconditional, unlike the launch-time flush below
+                    // that clears only with kv_unified: a restore must not hold the incoming
+                    // state and the old slot state alive at the same time, or the memory
+                    // spike can OOM the box (the original bug this block fixed).
+                    //
+                    // The tradeoff: upstream keeps idle slot KV in place and truncates it to
+                    // the common prefix on the next request, so partial prompt matches are
+                    // free.  Here every turn instead pays a save + restore round-trip through
+                    // the RAM cache, and load() rejects candidates that would keep less than
+                    // 25% of a cached entry ([TAG_CACHE_SELECT_SIM]), so a request sharing
+                    // only a short prefix with the slot's previous state re-prefills from
+                    // scratch.  mtmd states take this path too (RAM tier only, never disk),
+                    // so they survive within a session but not across restarts.  Known
+                    // fallout: test_slot_save.py and
+                    // test_kv_keep_only_active.py::test_clear_and_restore fail on this
+                    // branch (pre-dates the 2026-08-13 master merge, verified against
+                    // clean-master and pre-merge control builds).
                     if (params_base.cache_idle_slots) {
                         for (auto & s : slots) {
                             if (!s.is_processing()) {
