@@ -784,6 +784,59 @@ common_chat_templates_ptr common_chat_templates_init(const struct llama_model * 
         }
     }
 
+    // Stock Qwen3.8 templates only read a conversation-level reasoning_effort
+    // kwarg. Patch per-message support in at load time so any Qwen3.8 GGUF works
+    // without --chat-template-file: render message.reasoning_effort inside each
+    // user block, and honor the per_message_reasoning_effort kwarg that
+    // suppresses the system-level instruction. Applied to the stock template
+    // this is byte-identical to models/templates/Qwen3.8-27B-per-msg-effort.jinja,
+    // and a request carrying no efforts and no kwarg renders exactly as stock,
+    // so existing cached prefixes from other clients stay valid.
+    {
+        const std::string fingerprint = "reasoning_effort|default('xhigh')";
+        const std::string capable     = "message.reasoning_effort";
+
+        const std::string sys_anchor = R"TMPL({%- endif %}
+{%- if tools and tools is iterable and tools is not mapping %})TMPL";
+        const std::string sys_patched = R"TMPL({%- endif %}
+{%- if per_message_reasoning_effort is defined and per_message_reasoning_effort is true %}
+    {%- set reasoning_instructions = '' %}
+{%- endif %}
+{%- if tools and tools is iterable and tools is not mapping %})TMPL";
+
+        const std::string user_anchor = R"TMPL(    {%- elif message.role == "user" %}
+        {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }})TMPL";
+        const std::string user_patched = R"TMPL(    {%- elif message.role == "user" %}
+        {%- set effort_note = '' %}
+        {%- if message.reasoning_effort is defined and message.reasoning_effort is string and message.reasoning_effort != '' and (enable_thinking is undefined or enable_thinking is true) %}
+            {%- if message.reasoning_effort not in ('xhigh', 'medium', 'low') %}
+                {{- raise_exception('Unexpected per-message reasoning effort ' ~ message.reasoning_effort ~ '. Supported types are xhigh, medium, and low.') }}
+            {%- endif %}
+            {%- if message.reasoning_effort == 'xhigh' %}
+                {%- set effort_note = '\n\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.' %}
+            {%- elif message.reasoning_effort == 'low' %}
+                {%- set effort_note = '\n\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.' %}
+            {%- endif %}
+        {%- endif %}
+        {{- '<|im_start|>' + message.role + '\n' + content + effort_note + '<|im_end|>' + '\n' }})TMPL";
+
+        auto patch_per_msg_effort = [&](std::string & src, const char * which) {
+            if (src.find(fingerprint) == std::string::npos || src.find(capable) != std::string::npos) {
+                return; // not a Qwen3.8-style template, or already per-message capable
+            }
+            if (src.find(sys_anchor) == std::string::npos || src.find(user_anchor) == std::string::npos) {
+                LOG_WRN("%s: Qwen3.8-style %s template detected but per-message effort anchors not found; leaving it unpatched\n",
+                        __func__, which);
+                return;
+            }
+            string_replace_all(src, sys_anchor, sys_patched);
+            string_replace_all(src, user_anchor, user_patched);
+            LOG_INF("%s: patched %s chat template for per-message reasoning_effort\n", __func__, which);
+        };
+        patch_per_msg_effort(default_template_src, "default");
+        patch_per_msg_effort(template_tool_use_src, "tool_use");
+    }
+
     std::string token_bos = bos_token_override;
     std::string token_eos = eos_token_override;
     bool        add_bos   = false;

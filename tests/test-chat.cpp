@@ -6989,6 +6989,27 @@ static void test_reasoning_budget_message_per_request() {
     }
 }
 
+static void test_qwen38_per_msg_effort_autopatch() {
+    LOG_DBG("%s\n", __func__);
+
+    // Init applies all template patches (the reasoning-strip gate rewrite fires
+    // on Qwen3.8 too), so the right property is convergence: a stock Qwen3.8
+    // template (as embedded in the GGUFs) and the hand-modified per-message
+    // template must come out of init byte-identical.
+    auto stock_tmpls = common_chat_templates_init(
+        /* model= */ nullptr, read_file("models/templates/Qwen3.8-27B-stock.jinja"));
+    auto capable_tmpls = common_chat_templates_init(
+        /* model= */ nullptr, read_file("models/templates/Qwen3.8-27B-per-msg-effort.jinja"));
+    const std::string from_stock   = common_chat_templates_source(stock_tmpls.get());
+    const std::string from_capable = common_chat_templates_source(capable_tmpls.get());
+    assert_equals(from_capable, from_stock);
+
+    // And the autopatch actually took: the per-message rendering is present.
+    if (from_stock.find("message.reasoning_effort") == std::string::npos) {
+        throw std::runtime_error("autopatch did not apply per-message effort rendering");
+    }
+}
+
 static void test_msg_diffs_compute() {
     LOG_DBG("%s\n", __func__);
     {
@@ -7150,6 +7171,7 @@ int main(int argc, char ** argv) {
         test_template_generation_prompt();
         test_reasoning_budget_tokens_per_request();
         test_reasoning_budget_message_per_request();
+        test_qwen38_per_msg_effort_autopatch();
         test_template_output_peg_parsers(detailed_debug);
         std::cout << "\n[chat] All tests passed!" << '\n';
     }
