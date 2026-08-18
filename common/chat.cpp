@@ -1323,7 +1323,16 @@ static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_
             auto tool_call_first = p.rule("tool-call-first", p.optional(p.literal("<tool_call>\n")) + tool_call_body);
             auto tool_call       = p.rule("tool-call", "<tool_call>\n" + tool_call_body);
 
-            auto calls      = inputs.parallel_tool_calls ? tool_call_first + p.zero_or_more(tool_call) : tool_call_first;
+            // Repetition-loop guard: with max_tool_calls set, the grammar simply
+            // has no production for block K+1, so a looping model is forced to
+            // stop instead of knocking on the same door for minutes (observed:
+            // 120 identical bash calls in one turn).
+            auto calls      = tool_call_first;
+            if (inputs.parallel_tool_calls) {
+                calls = inputs.max_tool_calls > 0
+                    ? tool_call_first + p.repeat(tool_call, 0, inputs.max_tool_calls - 1)
+                    : tool_call_first + p.zero_or_more(tool_call);
+            }
             auto tool_calls = p.trigger_rule("tool-call-root", p.repeat(calls, min_calls, 1));
 
             return generation_prompt +
@@ -3525,6 +3534,7 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
     }
 
     params.parallel_tool_calls = inputs.parallel_tool_calls;
+    params.max_tool_calls      = inputs.max_tool_calls;
 
     if (params.tools.is_array()) {
         if (params.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE && !params.grammar.empty()) {

@@ -1248,6 +1248,7 @@ json oaicompat_chat_params_parse(
     inputs.grammar                = grammar;
     inputs.use_jinja              = opt.use_jinja;
     inputs.parallel_tool_calls    = json_value(body, "parallel_tool_calls", caps["supports_parallel_tool_calls"]);
+    inputs.max_tool_calls         = json_value(body, "max_tool_calls", -1);
     inputs.add_generation_prompt  = json_value(body, "add_generation_prompt", true);
     inputs.continue_final_message = body.contains("continue_final_message") ?
         common_chat_continuation_parse(body.at("continue_final_message")) :

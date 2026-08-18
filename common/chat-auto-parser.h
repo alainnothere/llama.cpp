@@ -57,6 +57,9 @@ struct generation_params {
     common_chat_tool_choice               tool_choice = COMMON_CHAT_TOOL_CHOICE_AUTO;
     json                                  json_schema;
     bool                                  parallel_tool_calls = true;
+    // Upper bound on tool_call blocks per assistant turn, enforced by the
+    // generation grammar (the model cannot emit block K+1). <= 0: unbounded.
+    int                                   max_tool_calls      = -1;
     common_reasoning_format               reasoning_format    = COMMON_REASONING_FORMAT_AUTO;
     bool                                  stream              = true;
     std::string                           grammar;

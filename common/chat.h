@@ -263,6 +263,7 @@ struct common_chat_templates_inputs {
     std::vector<common_chat_tool>         tools;
     common_chat_tool_choice               tool_choice         = COMMON_CHAT_TOOL_CHOICE_AUTO;
     bool                                  parallel_tool_calls = false;
+    int                                   max_tool_calls      = -1;  // <= 0: unbounded (see autoparser::generation_params)
     common_reasoning_format               reasoning_format    = COMMON_REASONING_FORMAT_NONE; // TODO: refactor this to "bool enable_thinking"
     bool                                  enable_thinking     = true;
     std::chrono::system_clock::time_point now                 = std::chrono::system_clock::now();

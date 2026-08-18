@@ -7010,6 +7010,60 @@ static void test_qwen38_per_msg_effort_autopatch() {
     }
 }
 
+static void test_qwen3_coder_max_tool_calls() {
+    LOG_DBG("%s\n", __func__);
+
+    auto tmpls = read_templates("models/templates/Qwen3-Coder.jinja");
+
+    const std::string call_block =
+        "<tool_call>\n"
+        "<function=special_function>\n"
+        "<parameter=arg1>\n"
+        "1\n"
+        "</parameter>\n"
+        "</function>\n"
+        "</tool_call>";
+
+    auto make_inputs = [&](int max_calls) {
+        common_chat_templates_inputs inputs;
+        inputs.messages            = { message_user };
+        inputs.tools               = { special_function_tool };
+        inputs.parallel_tool_calls = true;
+        inputs.max_tool_calls      = max_calls;
+        return inputs;
+    };
+
+    const std::string two_calls   = call_block + "\n" + call_block;
+    const std::string three_calls = call_block + "\n" + call_block + "\n" + call_block;
+
+    {
+        // Unbounded default keeps accepting any number of calls.
+        auto parser = make_peg_parser(tmpls.get(), make_inputs(-1));
+        auto msg    = parser.parse(three_calls, /* is_partial= */ false);
+        assert_equals<size_t>(3, msg.tool_calls.size());
+    }
+    {
+        // The bound permits up to the cap...
+        auto parser = make_peg_parser(tmpls.get(), make_inputs(2));
+        auto msg    = parser.parse(two_calls, /* is_partial= */ false);
+        assert_equals<size_t>(2, msg.tool_calls.size());
+    }
+    {
+        // ...and has no production for block K+1: a third block cannot parse.
+        // Generation-side the same grammar masks the logits, so a looping
+        // model is forced to stop at the cap instead of repeating for minutes.
+        auto parser   = make_peg_parser(tmpls.get(), make_inputs(2));
+        bool rejected = false;
+        try {
+            auto msg = parser.parse(three_calls, /* is_partial= */ false);
+            rejected = msg.tool_calls.size() <= 2;
+        } catch (const std::exception &) {
+            rejected = true;
+        }
+        assert_equals(true, rejected);
+    }
+}
+
 static void test_msg_diffs_compute() {
     LOG_DBG("%s\n", __func__);
     {
@@ -7172,6 +7226,7 @@ int main(int argc, char ** argv) {
         test_reasoning_budget_tokens_per_request();
         test_reasoning_budget_message_per_request();
         test_qwen38_per_msg_effort_autopatch();
+        test_qwen3_coder_max_tool_calls();
         test_template_output_peg_parsers(detailed_debug);
         std::cout << "\n[chat] All tests passed!" << '\n';
     }
