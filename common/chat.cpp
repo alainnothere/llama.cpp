@@ -814,6 +814,8 @@ common_chat_templates_ptr common_chat_templates_init(const struct llama_model * 
             {%- endif %}
             {%- if message.reasoning_effort == 'xhigh' %}
                 {%- set effort_note = '\n\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.' %}
+            {%- elif message.reasoning_effort == 'medium' %}
+                {%- set effort_note = '\n\nReasoning effort is set to medium. Think through the main considerations and verify the key steps, but do not be exhaustive: once the essentials check out, commit to the answer.' %}
             {%- elif message.reasoning_effort == 'low' %}
                 {%- set effort_note = '\n\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.' %}
             {%- endif %}
