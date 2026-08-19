@@ -50,12 +50,11 @@
     {%- endif %}
     {%- if resolved_reasoning_effort == 'xhigh' %}
         {%- set reasoning_instructions = 'Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.' %}
+    {%- elif resolved_reasoning_effort == 'medium' %}
+        {%- set reasoning_instructions = 'Reasoning effort is set to medium. Think through the main considerations and verify the key steps, but do not be exhaustive: once the essentials check out, commit to the answer.' %}
     {%- elif resolved_reasoning_effort == 'low' %}
         {%- set reasoning_instructions = 'Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.' %}
     {%- endif %}
-{%- endif %}
-{%- if per_message_reasoning_effort is defined and per_message_reasoning_effort is true %}
-    {%- set reasoning_instructions = '' %}
 {%- endif %}
 {%- if tools and tools is iterable and tools is not mapping %}
     {{- '<|im_start|>system\n' }}
@@ -109,20 +108,7 @@
             {{- raise_exception('System message must be at the beginning.') }}
         {%- endif %}
     {%- elif message.role == "user" %}
-        {%- set effort_note = '' %}
-        {%- if message.reasoning_effort is defined and message.reasoning_effort is string and message.reasoning_effort != '' and (enable_thinking is undefined or enable_thinking is true) %}
-            {%- if message.reasoning_effort not in ('xhigh', 'medium', 'low') %}
-                {{- raise_exception('Unexpected per-message reasoning effort ' ~ message.reasoning_effort ~ '. Supported types are xhigh, medium, and low.') }}
-            {%- endif %}
-            {%- if message.reasoning_effort == 'xhigh' %}
-                {%- set effort_note = '\n\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.' %}
-            {%- elif message.reasoning_effort == 'medium' %}
-                {%- set effort_note = '\n\nReasoning effort is set to medium. Think through the main considerations and verify the key steps, but do not be exhaustive: once the essentials check out, commit to the answer.' %}
-            {%- elif message.reasoning_effort == 'low' %}
-                {%- set effort_note = '\n\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.' %}
-            {%- endif %}
-        {%- endif %}
-        {{- '<|im_start|>' + message.role + '\n' + content + effort_note + '<|im_end|>' + '\n' }}
+        {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }}
     {%- elif message.role == "assistant" %}
         {%- set reasoning_content = '' %}
         {%- if message.reasoning_content is string %}
