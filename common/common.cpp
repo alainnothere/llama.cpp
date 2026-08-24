@@ -1284,6 +1284,53 @@ struct common_init_result::impl {
     std::vector<llama_sampler_seq_config> samplers_seq_config;
 };
 
+void common_ctx_apply_yarn_ext(llama_context_params & cparams, const common_params & params, const llama_model * model) {
+    const int32_t n_ctx_train = llama_model_n_ctx_train(model);
+
+    // if the user did not specify a context size, default to the maximum YaRN extension
+    if (cparams.n_ctx == 0 && n_ctx_train > 0) {
+        cparams.n_ctx = common_n_ctx_seq_yarn_max(n_ctx_train);
+
+        if (cparams.n_ctx > (uint32_t) n_ctx_train) {
+            COM_WRN("no context size specified, defaulting to the +30%% YaRN extension of the training context: %u\n", cparams.n_ctx);
+        }
+    }
+
+    // same as llama_context: pad n_ctx, then split it over the sequences if the KV cache is not unified
+    auto n_ctx_seq_of = [&](uint32_t n_ctx) {
+        n_ctx = GGML_PAD(n_ctx == 0 ? (uint32_t) n_ctx_train : n_ctx, 256);
+
+        return cparams.kv_unified ? n_ctx : GGML_PAD(n_ctx / std::max(1u, cparams.n_seq_max), 256);
+    };
+
+    uint32_t n_ctx_seq = n_ctx_seq_of(cparams.n_ctx);
+
+    // compare against the padded training context so that the 256-token padding alone never triggers the extension
+    if (n_ctx_train > 0 && n_ctx_seq > (uint32_t) GGML_PAD(n_ctx_train, 256)) {
+        const uint32_t n_ctx_seq_max = common_n_ctx_seq_yarn_max(n_ctx_train);
+
+        if (n_ctx_seq > n_ctx_seq_max) {
+            n_ctx_seq = n_ctx_seq_max;
+
+            cparams.n_ctx = cparams.kv_unified ? n_ctx_seq : n_ctx_seq*std::max(1u, cparams.n_seq_max);
+
+            COM_WRN("n_ctx_seq capped to %u - the +30%% YaRN extension limit of the training context (%d)\n", n_ctx_seq, n_ctx_train);
+        }
+
+        // do not override a user-provided RoPE scaling
+        if (params.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED && params.rope_freq_scale == 0.0f) {
+            cparams.rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_YARN;
+            cparams.rope_freq_scale   = (float) n_ctx_train / (float) n_ctx_seq;
+
+            if (cparams.yarn_orig_ctx == 0) {
+                cparams.yarn_orig_ctx = n_ctx_train;
+            }
+
+            COM_WRN("auto-YaRN enabled: n_ctx_seq (%u) > n_ctx_train (%d) - rope_freq_scale = %g\n", n_ctx_seq, n_ctx_train, cparams.rope_freq_scale);
+        }
+    }
+}
+
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
@@ -1311,53 +1358,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         return;
     }
 
-    // extend the context over the training context with YaRN
-    {
-        const int32_t n_ctx_train = llama_model_n_ctx_train(model);
-
-        // if the user did not specify a context size, default to the maximum YaRN extension
-        if (cparams.n_ctx == 0 && n_ctx_train > 0) {
-            cparams.n_ctx = common_n_ctx_seq_yarn_max(n_ctx_train);
-
-            if (cparams.n_ctx > (uint32_t) n_ctx_train) {
-                COM_WRN("no context size specified, defaulting to the +30%% YaRN extension of the training context: %u\n", cparams.n_ctx);
-            }
-        }
-
-        // same as llama_context: pad n_ctx, then split it over the sequences if the KV cache is not unified
-        auto n_ctx_seq_of = [&](uint32_t n_ctx) {
-            n_ctx = GGML_PAD(n_ctx == 0 ? (uint32_t) n_ctx_train : n_ctx, 256);
-
-            return cparams.kv_unified ? n_ctx : GGML_PAD(n_ctx / std::max(1u, cparams.n_seq_max), 256);
-        };
-
-        uint32_t n_ctx_seq = n_ctx_seq_of(cparams.n_ctx);
-
-        // compare against the padded training context so that the 256-token padding alone never triggers the extension
-        if (n_ctx_train > 0 && n_ctx_seq > (uint32_t) GGML_PAD(n_ctx_train, 256)) {
-            const uint32_t n_ctx_seq_max = common_n_ctx_seq_yarn_max(n_ctx_train);
-
-            if (n_ctx_seq > n_ctx_seq_max) {
-                n_ctx_seq = n_ctx_seq_max;
-
-                cparams.n_ctx = cparams.kv_unified ? n_ctx_seq : n_ctx_seq*std::max(1u, cparams.n_seq_max);
-
-                COM_WRN("n_ctx_seq capped to %u - the +30%% YaRN extension limit of the training context (%d)\n", n_ctx_seq, n_ctx_train);
-            }
-
-            // do not override a user-provided RoPE scaling
-            if (params.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED && params.rope_freq_scale == 0.0f) {
-                cparams.rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_YARN;
-                cparams.rope_freq_scale   = (float) n_ctx_train / (float) n_ctx_seq;
-
-                if (cparams.yarn_orig_ctx == 0) {
-                    cparams.yarn_orig_ctx = n_ctx_train;
-                }
-
-                COM_WRN("auto-YaRN enabled: n_ctx_seq (%u) > n_ctx_train (%d) - rope_freq_scale = %g\n", n_ctx_seq, n_ctx_train, cparams.rope_freq_scale);
-            }
-        }
-    }
+    common_ctx_apply_yarn_ext(cparams, params, model);
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
 

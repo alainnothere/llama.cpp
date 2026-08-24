@@ -1104,6 +1104,15 @@ private:
                         params_dft.model.path.c_str(), &mparams_dft, &cparams_dft,
                         devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
 
+                    // the draft context is extended with YaRN like the target one - measure it again at the extended size
+                    if (cparams_dft.n_ctx == 0 && hp_nct > 0 && common_n_ctx_seq_yarn_max(hp_nct) > (int32_t) hp_nct) {
+                        cparams_dft.n_ctx = common_n_ctx_seq_yarn_max(hp_nct);
+
+                        dmd = common_get_device_memory_data(
+                            params_dft.model.path.c_str(), &mparams_dft, &cparams_dft,
+                            devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
+                    }
+
                     GGML_ASSERT(!params_base.fit_params_target.empty());
                     size_t total = 0;
 

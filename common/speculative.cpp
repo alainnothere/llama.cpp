@@ -2396,6 +2396,12 @@ common_speculative_init_result::common_speculative_init_result(
 
         pimpl->model.reset(model_dft);
 
+        // the draft context must be extended like the target one, its training context can be different
+        common_ctx_apply_yarn_ext(cparams, params, model_dft);
+
+        SPC_INF("draft context: n_ctx = %u, n_ctx_train = %d, rope_freq_scale = %g\n",
+                cparams.n_ctx, llama_model_n_ctx_train(model_dft), cparams.rope_freq_scale);
+
         llama_context * ctx_dft = llama_init_from_model(model_dft, cparams);
         if (ctx_dft == nullptr) {
             LOG_ERR("%s: failed to create MTP context\n", __func__);
@@ -2407,6 +2413,11 @@ common_speculative_init_result::common_speculative_init_result(
         model_path = params.model.path;
 
         LOG_INF("%s: creating MTP draft context against the target model '%s'\n", __func__, model_path.c_str());
+
+        common_ctx_apply_yarn_ext(cparams, params, model_tgt);
+
+        SPC_INF("MTP context: n_ctx = %u, n_ctx_train = %d, rope_freq_scale = %g\n",
+                cparams.n_ctx, llama_model_n_ctx_train(model_tgt), cparams.rope_freq_scale);
 
         llama_context * ctx_dft = llama_init_from_model(model_tgt, cparams);
         if (ctx_dft == nullptr) {

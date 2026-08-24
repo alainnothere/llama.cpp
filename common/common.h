@@ -946,6 +946,10 @@ inline int32_t common_n_ctx_seq_yarn_max(int32_t n_ctx_train) {
     return std::max(n_ctx_train, (n_ctx_train + n_ctx_train*3/10) & ~255);
 }
 
+// extend the context over the training context of the model with YaRN:
+// default n_ctx to the maximum extension, cap it there and enable the matching RoPE scaling
+void common_ctx_apply_yarn_ext(struct llama_context_params & cparams, const common_params & params, const struct llama_model * model);
+
 // clear LoRA adapters from context, then apply new list of adapters
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora);
 
