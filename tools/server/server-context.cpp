@@ -1250,10 +1250,12 @@ private:
 
         const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
 
+        const int n_ctx_slot_max = common_n_ctx_seq_yarn_max(n_ctx_train);
+
         int n_ctx_slot = llama_n_ctx_seq(ctx_tgt);
-        if (n_ctx_slot > n_ctx_train) {
-            SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - capping\n", n_ctx_slot, n_ctx_train);
-            n_ctx_slot = n_ctx_train;
+        if (n_ctx_slot > n_ctx_slot_max) {
+            SRV_WRN("the slot context (%d) exceeds the +30%% YaRN extension limit of the training context (%d) - capping to %d\n", n_ctx_slot, n_ctx_train, n_ctx_slot_max);
+            n_ctx_slot = n_ctx_slot_max;
         }
 
         slots.clear();

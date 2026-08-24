@@ -939,6 +939,13 @@ struct llama_model_params     common_model_params_to_llama  (      common_params
 struct llama_context_params   common_context_params_to_llama(const common_params & params);
 struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const common_cpu_params & params);
 
+// max context per sequence that the automatic YaRN extension allows: +30% of the training context,
+// rounded down to a multiple of 256 so the llama_context padding cannot push past it
+// (falls back to the training context itself when it is too small to extend)
+inline int32_t common_n_ctx_seq_yarn_max(int32_t n_ctx_train) {
+    return std::max(n_ctx_train, (n_ctx_train + n_ctx_train*3/10) & ~255);
+}
+
 // clear LoRA adapters from context, then apply new list of adapters
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora);
 
