@@ -75,6 +75,14 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
+    // the indexer cache must round-trip with the attention cells it mirrors:
+    // full state and APPEND range blobs carry it, PARTIAL_ONLY (recurrent
+    // checkpoints) does not
+    void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
+    void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0)       override;
+
+    void state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_state_seq_flags flags = 0) const override;
+
     //
     // llama_memory_hybrid_idx specific API
     //
