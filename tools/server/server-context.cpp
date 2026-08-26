@@ -3377,8 +3377,22 @@ private:
                             // ref: https://github.com/ggml-org/llama.cpp/pull/24110
                             const bool has_new_tokens = (n_past < slot.task->n_tokens());
 
+                            // #24110's "no rewind needed when new tokens follow" shortcut holds for a
+                            // SWA window, whose pos_min is the oldest cell still present. a recurrent
+                            // state lives only at the tail, so pos_min == pos_next means the tail IS the
+                            // first token to drop: the rewind is mandatory unless the per-token rollback
+                            // budget (n_rs_seq) covers it. without this the checkpoint search is skipped,
+                            // seq_rm refuses, and the whole prompt is re-processed on every follow-up
+                            // turn whose divergence sits exactly at the previous stop token.
+                            bool needs_tail_rewind = false;
+                            if (n_past > 0 && (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt))) {
+                                const llama_pos pos_tail = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                                const llama_pos rollback = pos_tail - pos_next + 1;
+                                needs_tail_rewind = rollback > (llama_pos) llama_n_rs_seq(ctx_tgt);
+                            }
+
                             // the largest pos_min required for a checkpoint to be useful
-                            const auto pos_min_thold = std::max(0, pos_next - n_swa - (has_new_tokens ? 0 : 1));
+                            const auto pos_min_thold = std::max(0, pos_next - n_swa - ((has_new_tokens && !needs_tail_rewind) ? 0 : 1));
 
                             // Only enter checkpoint recovery when there is an actual divergence
                             // (n_past < slot tokens). When n_past == slot.n_tokens() the new
