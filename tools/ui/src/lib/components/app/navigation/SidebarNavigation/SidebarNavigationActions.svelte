@@ -12,8 +12,8 @@
 		SIDEBAR_ACTIONS_ITEMS,
 		SIDEBAR_FILES_ITEM
 	} from '$lib/constants';
-	import { TooltipSide } from '$lib/enums';
-	import { isMobile, serverStore } from '$lib/stores';
+	import { SidebarAction, TooltipSide } from '$lib/enums';
+	import { conversationsStore, deviceStore, serverStore } from '$lib/stores';
 	import type { Component } from 'svelte';
 	import { onMount } from 'svelte';
 	import { circIn } from 'svelte/easing';
@@ -48,7 +48,7 @@
 			? [...SIDEBAR_ACTIONS_ITEMS, SIDEBAR_FILES_ITEM]
 			: SIDEBAR_ACTIONS_ITEMS
 	);
-	const isOnMobile = $derived(isMobile.current);
+	const isOnMobile = $derived(deviceStore.isMobile);
 
 	$effect(() => {
 		if (isSearchModeActive && searchInputRef) {
@@ -98,8 +98,8 @@
 {#if isSearchModeActive}
 	<div class="px-4 my-2">
 		<SearchInput
-			bind:value={searchQuery}
 			bind:ref={searchInputRef}
+			bind:value={searchQuery}
 			onClose={handleSearchModeDeactivate}
 			onKeyDown={(e) => e.key === 'Escape' && handleSearchModeDeactivate()}
 			placeholder="Search conversations..."
@@ -113,18 +113,23 @@
 	>
 		{#each actionItems as item, i (item.tooltip)}
 			{@const isActive = isItemActive(item)}
-			{@const isSearchOnMobile = item.icon === Search && isMobile.current}
+			{@const isSearchOnMobile = item.icon === Search && deviceStore.isMobile}
 			{@const itemHref = item.externalHref ?? (isSearchOnMobile ? ROUTES.SEARCH : item.route)}
 			{@const itemOnClick = item.externalHref
 				? undefined
-				: item.route
+				: item.action === SidebarAction.NEW_CHAT
 					? () => {
 							onNewChat?.();
-							goto(item.route!);
+							void conversationsStore.openNewChat();
 						}
-					: isSearchOnMobile
-						? undefined
-						: onSearchClick}
+					: item.route
+						? () => {
+								onNewChat?.();
+								goto(item.route!);
+							}
+						: isSearchOnMobile
+							? undefined
+							: onSearchClick}
 			{@const itemTransition = {
 				delay: !initialized ? i * ICON_STRIP_TRANSITION_DELAY_MULTIPLIER : 0,
 				duration: ICON_STRIP_TRANSITION_DURATION,
@@ -141,8 +146,8 @@
 						onclick={itemOnClick}
 						target={item.externalHref ? '_blank' : undefined}
 						data-sveltekit-reload={item.externalHref ? true : undefined}
-						variant="ghost"
 						size="default"
+						variant="ghost"
 					>
 						<span class="flex min-w-0 items-center px-0.5 gap-2">
 							{@render itemIcon(item.icon)}
@@ -166,17 +171,22 @@
 	<div class="{className} flex-col gap-1 hidden md:flex">
 		{#each actionItems as item, i (item.tooltip)}
 			{@const isActive = isItemActive(item)}
-			{@const isSearchOnMobile = item.icon === Search && isMobile.current}
+			{@const isSearchOnMobile = item.icon === Search && deviceStore.isMobile}
 			{@const itemOnClick = item.externalHref
 				? undefined
-				: item.route
+				: item.action === SidebarAction.NEW_CHAT
 					? () => {
 							onNewChat?.();
-							goto(item.route!);
+							void conversationsStore.openNewChat();
 						}
-					: isSearchOnMobile
-						? undefined
-						: onSearchClick}
+					: item.route
+						? () => {
+								onNewChat?.();
+								goto(item.route!);
+							}
+						: isSearchOnMobile
+							? undefined
+							: onSearchClick}
 			{@const itemTransition = {
 				delay: !initialized ? i * ICON_STRIP_TRANSITION_DELAY_MULTIPLIER : 0,
 				duration: ICON_STRIP_TRANSITION_DURATION,
@@ -186,17 +196,17 @@
 			{#if showIcons}
 				<div transition:fade={itemTransition}>
 					<ActionIcon
-						icon={item.icon}
-						tooltip={item.tooltip}
-						tooltipSide={TooltipSide.RIGHT}
-						size="lg"
-						iconSize={ICON_CLASS_DEFAULT}
 						class="h-9 w-9 rounded-full hover:bg-accent! {isActive
 							? 'bg-accent text-accent-foreground'
 							: ''}"
 						href={item.externalHref}
 						external={!!item.externalHref}
+						icon={item.icon}
+						iconSize={ICON_CLASS_DEFAULT}
 						onclick={itemOnClick}
+						size="lg"
+						tooltip={item.tooltip}
+						tooltipSide={TooltipSide.RIGHT}
 					/>
 				</div>
 			{/if}

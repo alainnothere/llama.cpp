@@ -507,6 +507,23 @@ void server_tokens::push_back(const mtmd_input_chunk * chunk) {
     }
 }
 
+void server_tokens::push_back_placeholder(const mtmd_input_chunk * chunk) {
+    auto type = mtmd_input_chunk_get_type(chunk);
+    if (type == MTMD_INPUT_CHUNK_TYPE_IMAGE || type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+        GGML_ASSERT(has_mtmd);
+        mtmd::input_chunk_ptr new_chunk(mtmd_input_chunk_get_placeholder(chunk));
+        GGML_ASSERT(new_chunk != nullptr && "failed to create placeholder chunk");
+        const size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
+        size_t start_idx = tokens.size();
+        for (size_t i = 0; i < n_tokens; ++i) {
+            tokens.emplace_back(LLAMA_TOKEN_NULL);
+        }
+        map_idx_to_media[start_idx] = std::move(new_chunk);
+    } else {
+        push_back(chunk);
+    }
+}
+
 void server_tokens::push_back(server_tokens & tokens) {
     size_t start_idx = size();
     for (size_t i = 0; i < tokens.size(); i++) {
@@ -1264,6 +1281,12 @@ json oaicompat_chat_params_parse(
     if (inputs.continue_final_message != COMMON_CHAT_CONTINUATION_NONE && inputs.add_generation_prompt) {
         throw std::invalid_argument("Cannot set both add_generation_prompt and continue_final_message to true.");
     }
+    if (inputs.continue_final_message != COMMON_CHAT_CONTINUATION_NONE
+        && !inputs.messages.empty()
+        && inputs.messages.back().role == "assistant"
+        && !inputs.messages.back().tool_calls.empty()) {
+        throw std::invalid_argument("Cannot continue an assistant message that contains tool calls.");
+    }
     inputs.reasoning_format = opt.reasoning_format;
     if (body.contains("reasoning_format")) {
         inputs.reasoning_format = common_reasoning_format_from_name(body.at("reasoning_format").get<std::string>());
@@ -1293,12 +1316,15 @@ json oaicompat_chat_params_parse(
         throw std::invalid_argument("invalid type for \"enable_thinking\" (expected boolean, got string)");
     }
 
-    // Parse also the OAI "reasoning_effort": "none" specific value
+    // Parse the OAI "reasoning_effort" field; "none" disables reasoning.
     if (body.contains("reasoning_effort")) {
         auto reasoning_effort = json_value(body, "reasoning_effort", std::string(""));
         if (reasoning_effort == "none") {
             inputs.enable_thinking = false;
-        } // other reasoning_effort values are model-specific and not yet handled
+            inputs.chat_template_kwargs.erase("reasoning_effort");
+        } else if (!reasoning_effort.empty()) {
+            inputs.chat_template_kwargs["reasoning_effort"] = json(reasoning_effort).dump();
+        }
     }
 
     inputs.force_pure_content = opt.force_pure_content;
@@ -1521,7 +1547,7 @@ std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int i
 }
 
 std::string safe_json_to_str(const json & data) {
-    return data.dump(-1, ' ', false, json::error_handler_t::replace);
+    return data.dump_safe();
 }
 
 // TODO: reuse llama_detokenize
