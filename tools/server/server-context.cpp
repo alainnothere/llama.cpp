@@ -212,6 +212,9 @@ struct server_slot {
     common_draft_dists spec_draft_dists;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
+    // copies of --spec-draft-n-max / --spec-draft-ctx-step, set at slot init
+    int32_t spec_n_max    = 0;
+    int32_t spec_ctx_step = 0;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
 
@@ -462,6 +465,18 @@ struct server_slot {
 
         if (n_remaining() > 0) {
             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
+        }
+
+        if (spec_ctx_step > 0) {
+            // at long context the verify batch is dominated by KV reads, which grow with the draft
+            // length - so start deep and shorten the draft as the context grows
+            const int n_sched = std::max(1, spec_n_max - prompt.n_tokens()/spec_ctx_step);
+
+            n_draft_max = std::min(n_draft_max, n_sched);
+
+            SLT_DBG(*this, "max possible draft: %d (ctx schedule: %d at %d tokens)\n", n_draft_max, n_sched, prompt.n_tokens());
+
+            return n_draft_max;
         }
 
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
@@ -1281,6 +1296,9 @@ private:
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot;
+
+            slot.spec_n_max    = params_base.speculative.draft.n_max;
+            slot.spec_ctx_step = params_base.speculative.draft.ctx_step;
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;

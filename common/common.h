@@ -347,6 +347,10 @@ struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
 
+    // shorten the draft by one token for every `ctx_step` tokens of context, never below 1 (0 = disabled)
+    // long drafts stop paying off once the verify batch is dominated by KV reads
+    int32_t ctx_step = 0;
+
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 

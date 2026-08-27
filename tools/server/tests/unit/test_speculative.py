@@ -132,6 +132,24 @@ def test_stochastic_acceptance():
     assert res.body["timings"]["draft_n"] > 0
 
 
+def test_draft_ctx_step():
+    global server
+    # --spec-draft-ctx-step shortens the draft as the context grows, so the run must still produce
+    # tokens with a draft attached at every length
+    server.spec_draft_n_max = 8
+    server.spec_draft_ctx_step = 16
+    server.start()
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.0,
+        "top_k": 1,
+        "n_predict": 64,
+        "speculative.p_min": 0.0,
+    })
+    assert res.status_code == 200
+    assert res.body["timings"]["draft_n"] > 0
+
+
 def test_stochastic_acceptance_is_reproducible():
     global server
     # both the acceptance rng (seeded from the request's sampling seed) and the draft's proposal rng

@@ -276,6 +276,10 @@ both rules coincide, so `stochastic` is only worth enabling for `temperature > 0
 --spec-draft-n-min                      N
                                         minimum number of draft tokens to use for speculative decoding (default: 0)
                                         (env: LLAMA_ARG_SPEC_DRAFT_N_MIN)
+--spec-draft-ctx-step                   N
+                                        reduce the draft length by one for every N tokens of context, never below 1 (default: 0, 0 = disabled)
+                                        useful with a large --spec-draft-n-max: long drafts pay off at short context and stop paying off once the verify batch is dominated by KV reads
+                                        (env: LLAMA_ARG_SPEC_DRAFT_CTX_STEP)
 --spec-draft-p-split, --draft-p-split   P
                                         speculative decoding split probability (default: 0.10)
                                         (env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT)
@@ -289,6 +293,14 @@ both rules coincide, so `stochastic` is only worth enabling for `temperature > 0
                                         comma-separated list of devices to use for offloading the draft model
                                         (use --list-devices to see available devices)
 ```
+
+`--spec-draft-n-max` is a fixed cap for the whole run, but the best draft length is not: the target's
+verify batch reads the KV cache for every drafted token, so a draft that wins at 1k tokens of context
+can cost more than it saves at 32k. `--spec-draft-ctx-step N` makes the cap follow the context - the
+effective per-step limit is `max(1, n_max - n_tokens_in_context/N)`, evaluated per slot on every
+generation step. For example, `--spec-draft-n-max 16 --spec-draft-ctx-step 2048` drafts 16 tokens on a
+short prompt, 8 tokens at 16k of context, and 1 token past 30k. The default `0` disables the schedule
+and keeps `n_max` constant.
 
 ### Draft Model CPU Scheduling Parameters
 
