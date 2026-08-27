@@ -17,6 +17,7 @@
 #include <cstring>
 #include <iomanip>
 #include <map>
+#include <random>
 #include <cinttypes>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -157,7 +158,20 @@ struct common_speculative_impl {
     int64_t t_draft_us  = 0; // total time spent in generating drafts in this implementation in microseconds.
     int64_t t_accept_us = 0; // total time spent in accumulation of this implementation in microseconds.
 
-    common_speculative_impl(common_speculative_type type, uint32_t n_seq) : type(type), n_seq(n_seq) {}
+    // used only when the consumer asks for the proposal distributions (stochastic verification):
+    // sampling the drafted token from the post-chain candidates. it is deliberately *not* the
+    // sampler chain's own rng, which common_sampler_reset() restarts at the beginning of every
+    // draft() call - restarting would make the drafted token a fixed quantile of the distribution
+    // instead of a sample from it, which is exactly what the acceptance math must not assume
+    std::vector<std::mt19937> rngs_draft;
+
+    common_speculative_impl(common_speculative_type type, uint32_t n_seq) : type(type), n_seq(n_seq) {
+        rngs_draft.reserve(n_seq);
+        for (uint32_t i = 0; i < n_seq; ++i) {
+            // fixed seeds - a run with a fixed sampling seed stays reproducible
+            rngs_draft.emplace_back(0x5eed0000u + i);
+        }
+    }
 
     virtual ~common_speculative_impl() = default;
 
@@ -173,6 +187,43 @@ struct common_speculative_impl {
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
 };
+
+// pick the token to draft at this position
+//
+// by default the most likely candidate is drafted - a deterministic proposal, which gives the target
+// nothing to work with beyond the usual exact-match check. if the consumer asked for the proposal
+// distribution (dp.result_dists != nullptr), the token is instead *sampled* from the post-chain
+// candidates and that distribution is recorded, which is what makes exact rejection sampling on the
+// target side (common_spec_verify_token()) worthwhile
+//
+// cur_p: the post-chain candidates, with normalized probabilities
+static llama_token common_speculative_pick(
+        const llama_token_data_array * cur_p,
+        common_speculative_draft_params & dp,
+        std::mt19937 & rng) {
+    if (!dp.result_dists) {
+        return cur_p->data[0].id;
+    }
+
+    // pad for tokens that were drafted by another implementation without a distribution
+    dp.result_dists->resize(dp.result->size());
+    dp.result_dists->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+
+    std::uniform_real_distribution<float> u(0.0f, 1.0f);
+
+    const float r = u(rng);
+
+    float sum_run = 0.0f;
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        sum_run += cur_p->data[i].p;
+
+        if (r < sum_run) {
+            return cur_p->data[i].id;
+        }
+    }
+
+    return cur_p->data[cur_p->size - 1].id;
+}
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
     common_params_speculative_draft params;
@@ -328,9 +379,6 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
                             common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
                 }
 
-                // add drafted token for each sequence
-                const llama_token id = cur_p->data[0].id;
-
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
                     drafting[seq_id] = false;
@@ -339,9 +387,13 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
                     continue;
                 }
 
+                auto & dp = dparams.at(seq_id);
+
+                // add drafted token for each sequence
+                const llama_token id = common_speculative_pick(cur_p, dp, rngs_draft[seq_id]);
+
                 common_sampler_accept(smpl, id, true);
 
-                auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
 
                 result.push_back(id);
@@ -790,8 +842,6 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                             common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
                 }
 
-                const llama_token id = cur_p->data[0].id;
-
                 // only collect very high-confidence draft tokens
                 // (configurable via --spec-draft-p-min, set to 0.0 to disable early-stop)
                 if (cur_p->data[0].p < params.p_min) {
@@ -801,9 +851,12 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                     continue;
                 }
 
+                auto & dp = dparams.at(seq_id);
+
+                const llama_token id = common_speculative_pick(cur_p, dp, rngs_draft[seq_id]);
+
                 common_sampler_accept(smpl, id, true);
 
-                auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
 
                 result.push_back(id);
@@ -1236,7 +1289,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                                 common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
                     }
 
-                    const llama_token id = cur_p->data[0].id;
+                    const llama_token id = common_speculative_pick(cur_p, dp, rngs_draft[seq_id]);
 
                     common_sampler_accept(smpl, id, true);
 
@@ -1255,11 +1308,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                                 common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
                     }
 
-                    const llama_token id = cur_p->data[0].id;
-
                     if (cur_p->data[0].p < params.p_min) {
                         break;
                     }
+
+                    const llama_token id = common_speculative_pick(cur_p, dp, rngs_draft[seq_id]);
 
                     common_sampler_accept(smpl, id, true);
 
@@ -1629,9 +1682,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                             common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
                 }
 
-                // add drafted token for each sequence
-                const llama_token id = cur_p->data[0].id;
-
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
                     drafting[seq_id] = false;
@@ -1640,9 +1690,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
+                auto & dp = dparams.at(seq_id);
+
+                // add drafted token for each sequence
+                const llama_token id = common_speculative_pick(cur_p, dp, rngs_draft[seq_id]);
+
                 common_sampler_accept(smpl, id, true);
 
-                auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
 
                 result.push_back(id);
@@ -2650,6 +2704,14 @@ void common_speculative_draft(common_speculative * spec) {
             impl->n_call_draft++;
         }
 
+        // an implementation can discard its own draft (e.g. n_min) after having recorded the
+        // distributions - drop those so that the next implementation in the chain starts aligned
+        for (auto & dp : dparams) {
+            if (dp.result_dists && dp.result_dists->size() > dp.result->size()) {
+                dp.result_dists->resize(dp.result->size());
+            }
+        }
+
         int n_drafting = 0;
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
@@ -2701,6 +2763,14 @@ void common_speculative_draft(common_speculative * spec) {
 
         if (dp.drafting) {
             dp.drafting = false;
+        }
+    }
+
+    // keep the recorded proposal distributions aligned with the draft - implementations can drop or
+    // truncate their result after having recorded a distribution (n_min, dp.n_max, ...)
+    for (auto & dp : dparams) {
+        if (dp.result_dists && dp.result_dists->size() > dp.result->size()) {
+            dp.result_dists->resize(dp.result->size());
         }
     }
 }

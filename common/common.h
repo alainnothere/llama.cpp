@@ -58,6 +58,15 @@ struct common_adapter_lora_info {
 
 using llama_tokens = std::vector<llama_token>;
 
+// the sampling distribution that a speculative draft actually sampled a token from, as (token, p) pairs
+// it is usually truncated (top-k) and renormalized - that is fine, because it *is* the proposal
+// distribution, which is all that the rejection sampling in common_spec_verify_token() needs
+//
+// note: purely transient - it is only filled when the consumer explicitly asks for it and it is never
+//       serialized as part of any speculative/prompt state
+using common_draft_dist  = std::vector<llama_token_data>;
+using common_draft_dists = std::vector<common_draft_dist>;
+
 struct common_control_vector_load_info;
 
 //
@@ -180,6 +189,19 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
+};
+
+// how the target model verifies the drafted tokens
+enum common_speculative_accept {
+    // accept a draft token only if it is equal to the token sampled from the target - conservative,
+    // and the only option when the proposal distribution is unknown
+    COMMON_SPECULATIVE_ACCEPT_GREEDY,
+
+    // rejection sampling (Leviathan et al., arXiv:2211.17192): accept with prob min(1, p_tgt/p_dft),
+    // on rejection resample from the normalized residual max(0, p_tgt - p_dft)
+    // both rules produce samples from p_tgt; this one accepts more often, but only when the draft
+    // exposes a non-degenerate proposal distribution (see common_draft_dists)
+    COMMON_SPECULATIVE_ACCEPT_STOCHASTIC,
 };
 
 // Grammar type enumeration
@@ -368,6 +390,9 @@ struct common_params_speculative_ngram_cache {
 
 struct common_params_speculative {
     std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
+
+    // draft verification rule (--spec-accept)
+    enum common_speculative_accept accept = COMMON_SPECULATIVE_ACCEPT_GREEDY;
 
     // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;

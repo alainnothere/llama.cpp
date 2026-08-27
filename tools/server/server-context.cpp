@@ -207,6 +207,9 @@ struct server_slot {
     common_speculative * spec;
 
     llama_tokens spec_draft;
+    // the distributions the draft sampled `spec_draft` from - only filled with --spec-accept stochastic
+    // and only by the implementations that can provide them (transient, never persisted)
+    common_draft_dists spec_draft_dists;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
@@ -345,6 +348,7 @@ struct server_slot {
 
         if (can_speculate()) {
             spec_draft.clear();
+            spec_draft_dists.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
@@ -3112,13 +3116,17 @@ private:
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
+                        slot.spec_draft_dists.clear();
+
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
-                            /* .drafting = */ true,
-                            /* .n_max    = */ n_draft_max,
-                            /* .n_past   = */ slot.prompt.n_tokens(),
-                            /* .id_last  = */ slot.sampled,
-                            /* .prompt   = */ &slot.spec_prompt,
-                            /* .result   = */ &slot.spec_draft,
+                            /* .drafting     = */ true,
+                            /* .n_max        = */ n_draft_max,
+                            /* .n_past       = */ slot.prompt.n_tokens(),
+                            /* .id_last      = */ slot.sampled,
+                            /* .prompt       = */ &slot.spec_prompt,
+                            /* .result       = */ &slot.spec_draft,
+                            /* .result_dists = */ params_base.speculative.accept == COMMON_SPECULATIVE_ACCEPT_STOCHASTIC
+                                                    ? &slot.spec_draft_dists : nullptr,
                         };
 
                         drafting.push_back(&slot);
@@ -4075,8 +4083,15 @@ private:
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+
+                // the returned vector has the same meaning in both cases: the accepted prefix of the
+                // draft, plus one token sampled from the target - everything below is unaffected
+                auto accepted = params_base.speculative.accept == COMMON_SPECULATIVE_ACCEPT_STOCHASTIC
+                    ? common_sampler_sample_and_accept_n_stochastic(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_dists)
+                    : common_sampler_sample_and_accept_n           (slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+
                 slot.spec_i_batch.clear();
+                slot.spec_draft_dists.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
 

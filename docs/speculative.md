@@ -221,7 +221,34 @@ Unsupported samplers and device layouts fall back to CPU sampling. Tensor split 
                                         (env: LLAMA_ARG_SPEC_TYPE)
 --spec-default                          use default speculative decoding config
                                         (enables ngram-mod)
+--spec-accept                           {greedy,stochastic}
+                                        how the target model verifies the drafted tokens (default: greedy)
+                                        (env: LLAMA_ARG_SPEC_ACCEPT)
 ```
+
+#### Draft Acceptance (`--spec-accept`)
+
+Both modes return samples from the *target* model's distribution - they differ only in how often a
+drafted token survives verification.
+
+- `greedy` (default): the target samples a token at each drafted position and the draft token is
+  accepted only if the two are equal.
+- `stochastic`: rejection sampling (Leviathan et al., [arXiv:2211.17192](https://arxiv.org/abs/2211.17192)).
+  The drafted token `d` is accepted with probability `min(1, p_tgt(d)/p_dft(d))`; on rejection the
+  continuation is drawn from the normalized residual `max(0, p_tgt - p_dft)`.
+
+`stochastic` requires the draft implementation to expose the distribution it sampled from. The
+draft-model implementations (`draft-simple`, `draft-eagle3`, `draft-mtp`, `draft-dflash`,
+`draft-dspark`) switch from drafting the most likely token to drafting a sample from their top-k
+distribution and report it. The `ngram-*` implementations propose deterministically: for a
+point-mass proposal the acceptance probability is `p_tgt(d)` either way, so they are unaffected and
+keep the exact-match rule. Positions with a grammar also keep the exact-match rule, since the
+residual is not grammar-constrained.
+
+The gain comes from diffuse target distributions: with a point-mass proposal the expected acceptance
+is `p_tgt(argmax p_dft)`, while sampled proposals accept with probability `sum_x min(p_tgt, p_dft)`,
+which is much larger when both models agree but neither is confident. With a near-zero temperature
+both rules coincide, so `stochastic` is only worth enabling for `temperature > 0` workloads.
 
 ### Draft Model Parameters
 

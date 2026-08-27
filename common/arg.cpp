@@ -4139,6 +4139,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE"));
 
     add_opt(common_arg(
+        {"--spec-accept"}, "{greedy,stochastic}",
+        string_format("how the target model verifies the drafted tokens (default: %s)\n"
+                      "greedy:     accept a draft token only if it equals the token sampled from the target\n"
+                      "stochastic: rejection sampling, accept with probability min(1, p_tgt/p_dft) and resample\n"
+                      "            from the residual otherwise - both preserve the target distribution, but this\n"
+                      "            one accepts more often for draft implementations that sample their proposals\n"
+                      "            (draft-simple, draft-eagle3, draft-mtp, draft-dflash, draft-dspark);\n"
+                      "            the ngram-* implementations propose deterministically and are unaffected",
+            params.speculative.accept == COMMON_SPECULATIVE_ACCEPT_STOCHASTIC ? "stochastic" : "greedy"),
+        [](common_params & params, const std::string & value) {
+            if (value == "greedy") {
+                params.speculative.accept = COMMON_SPECULATIVE_ACCEPT_GREEDY;
+            } else if (value == "stochastic") {
+                params.speculative.accept = COMMON_SPECULATIVE_ACCEPT_STOCHASTIC;
+            } else {
+                throw std::invalid_argument("invalid value, must be one of: greedy, stochastic");
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_ACCEPT"));
+
+    add_opt(common_arg(
         {"--spec-draft-n-max"}, "N",
         string_format("number of tokens to draft for speculative decoding (default: %d)", params.speculative.draft.n_max),
         [](common_params & params, int value) {

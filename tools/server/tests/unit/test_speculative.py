@@ -112,6 +112,82 @@ def test_with_ctx_shift():
     assert res.body["truncated"] == True
 
 
+def test_stochastic_acceptance():
+    global server
+    # with --spec-accept stochastic the draft samples from its top-k distribution and the target
+    # accepts with probability min(1, p_tgt/p_dft) instead of requiring an exact match
+    server.spec_accept = "stochastic"
+    server.start()
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.8,
+        "top_k": 40,
+        "seed": 4242,
+        "n_predict": 32,
+        "speculative.p_min": 0.0,
+        "return_tokens": True,
+    })
+    assert res.status_code == 200
+    assert len(res.body["tokens"]) == 32
+    assert res.body["timings"]["draft_n"] > 0
+
+
+def test_stochastic_acceptance_is_reproducible():
+    global server
+    # both the acceptance rng (seeded from the request's sampling seed) and the draft's proposal rng
+    # are deterministic, so an identical run produces identical tokens
+    request = {
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.8,
+        "top_k": 40,
+        "seed": 1234,
+        "n_predict": 24,
+        "speculative.p_min": 0.0,
+        "return_tokens": True,
+    }
+
+    server.spec_accept = "stochastic"
+    server.start()
+    res = server.make_request("POST", "/completion", data=request)
+    assert res.status_code == 200
+    tokens_a = res.body["tokens"]
+    server.stop()
+
+    create_server()
+    server.spec_accept = "stochastic"
+    server.start()
+    res = server.make_request("POST", "/completion", data=request)
+    assert res.status_code == 200
+    assert res.body["tokens"] == tokens_a
+
+
+def test_stochastic_acceptance_greedy_sampling():
+    global server
+    # at temperature 0 both target and draft collapse to a point mass, so the stochastic rule must
+    # reduce to the exact-match rule and produce the very same tokens
+    request = {
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.0,
+        "top_k": 1,
+        "n_predict": 16,
+        "speculative.p_min": 0.0,
+        "return_tokens": True,
+    }
+
+    server.start()
+    res = server.make_request("POST", "/completion", data=request)
+    assert res.status_code == 200
+    tokens_greedy = res.body["tokens"]
+    server.stop()
+
+    create_server()
+    server.spec_accept = "stochastic"
+    server.start()
+    res = server.make_request("POST", "/completion", data=request)
+    assert res.status_code == 200
+    assert res.body["tokens"] == tokens_greedy
+
+
 @pytest.mark.parametrize("n_slots,n_requests", [
     (1, 2),
     (2, 2),

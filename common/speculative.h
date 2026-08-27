@@ -60,6 +60,17 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // optional: when set, implementations that can do so will sample the draft tokens from their
+    // post-chain distribution (instead of taking the argmax) and append that distribution here, one
+    // entry per token in `result` - this is what enables stochastic (rejection sampling) verification
+    // on the target side (see common_spec_verify_token())
+    //
+    // implementations that cannot provide it simply leave `result_dists` shorter than `result`; the
+    // missing positions are then verified with the usual exact-match rule
+    //
+    // note: transient - never serialized into the speculative state blobs
+    common_draft_dists * result_dists = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
