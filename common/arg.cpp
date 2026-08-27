@@ -1627,7 +1627,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-lcd", "--lookup-cache-dynamic"}, "FNAME",
-        "path to dynamic lookup cache to use for lookup decoding (updated by generation)",
+        "path to dynamic lookup cache to use for lookup decoding (updated by generation, written back on graceful shutdown)",
         [](common_params & params, const std::string & value) {
             params.speculative.ngram_cache.lookup_cache_dynamic = value;
         }

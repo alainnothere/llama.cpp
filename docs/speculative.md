@@ -119,6 +119,17 @@ See:
 An n-gram is a sequence of n tokens. The n-gram cache implementation maintains statistics about short n-gram sequences.
 A draft is computed using probabilities derived from these statistics. External statistics can also be loaded from files for improved accuracy.
 
+Two such files can be supplied:
+
+- `-lcs`, `--lookup-cache-static FNAME`: a prebuilt corpus, used read-only for validation. It is never written back, and a missing file is a hard error.
+- `-lcd`, `--lookup-cache-dynamic FNAME`: statistics accumulated from generation. It is written back when the server shuts down gracefully (SIGINT/SIGTERM, and when the server goes to sleep), so lookup statistics survive a restart. Pointing it at a file that does not exist yet is the normal way to start a fresh cache - the server warns and begins with an empty one.
+
+The write-back merges what was generated since startup into the statistics that were loaded, and replaces the file atomically (write to `FNAME.tmp`, then rename), so an interrupted write cannot destroy the cache already on disk. A process killed outright (`SIGKILL`) never reaches the write-back and loses the statistics of that run.
+
+```
+llama-server [...] --spec-type ngram-cache -lcd /var/lib/llama/lookup.bin
+```
+
 See:
 
 - #5479, #6828, #6848

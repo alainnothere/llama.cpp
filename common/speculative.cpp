@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <filesystem>
 #include <iomanip>
 #include <map>
 #include <random>
@@ -2102,8 +2103,11 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
 
     uint16_t n_draft;
 
+    // the dynamic cache is written back on destruction (graceful shutdown / sleep) when a path was given.
+    // the static cache is a prebuilt corpus, read-only by definition - it is never written back
+    std::string path_dynamic;
+
     bool save_dynamic;
-    bool save_static;
 
     struct seq_info {
         size_t cache_size = 0; // number of tokens in n-gram cache
@@ -2121,13 +2125,12 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
             uint16_t n_draft,
             const std::string & path_static,
             const std::string & path_dynamic,
-            bool save_dynamic,
-            bool save_static)
+            bool save_dynamic)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_CACHE, n_seq)
         , params(params.ngram_cache)
         , n_draft(n_draft)
+        , path_dynamic(path_dynamic)
         , save_dynamic(save_dynamic)
-        , save_static(save_static)
     {
         SPC_TRC("%s", "adding speculative implementation 'ngram-cache'\n");
         SPC_TRC("- n_draft=%d, cache_static=%s, cache_dynamic=%s\n",
@@ -2158,9 +2161,59 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
                     sinfo.ngram_cache_dynamic = ngram_cache_dynamic;
                 }
             } catch (...) {
-                SPC_ERR("failed to open dynamic lookup cache: %s", path_dynamic.c_str());
-                GGML_ABORT("Couldn't read dynamic lookup cache");
+                // a missing or unreadable dynamic cache is not fatal - it is the normal fresh-start case.
+                // begin with an empty cache; it is written back on shutdown when save_dynamic is set
+                SPC_WRN("could not read dynamic lookup cache '%s' - starting with an empty one\n",
+                        path_dynamic.c_str());
             }
+        }
+    }
+
+    // the destructor persists the dynamic cache, so copying an instance would save it more than once
+    common_speculative_impl_ngram_cache(const common_speculative_impl_ngram_cache &) = delete;
+    common_speculative_impl_ngram_cache & operator=(const common_speculative_impl_ngram_cache &) = delete;
+
+    ~common_speculative_impl_ngram_cache() override {
+        save_dynamic_cache();
+    }
+
+    // write the dynamic lookup cache back to path_dynamic. called from the destructor - must never throw
+    void save_dynamic_cache() noexcept {
+        if (!save_dynamic || path_dynamic.empty()) {
+            return;
+        }
+
+        try {
+            // every seq loaded the same dynamic cache and nothing mutates it at runtime, so seq 0's copy
+            // is the base - merging all of them would multiply the counts by n_seq on every restart.
+            // the per-seq context caches hold what generation actually produced since startup
+            common_ngram_cache merged = sinfos.empty() ? common_ngram_cache() : sinfos[0].ngram_cache_dynamic;
+
+            for (auto & sinfo : sinfos) {
+                common_ngram_cache_merge(merged, sinfo.ngram_cache_context);
+            }
+
+            size_t n_counts = 0;
+            for (const auto & entry : merged) {
+                n_counts += entry.second.size();
+            }
+
+            // write a temporary and rename it over the target, so that an interrupted write cannot
+            // destroy the cache that is already on disk
+            const std::string path_tmp = path_dynamic + ".tmp";
+
+            common_ngram_cache_save(merged, path_tmp);
+
+            std::filesystem::rename(path_tmp, path_dynamic);
+
+            SPC_INF("saved dynamic lookup cache to '%s' (%zu ngrams, %zu token counts)\n",
+                    path_dynamic.c_str(), merged.size(), n_counts);
+        } catch (const std::exception & e) {
+            SPC_WRN("failed to save dynamic lookup cache '%s': %s - the file on disk is left untouched\n",
+                    path_dynamic.c_str(), e.what());
+        } catch (...) {
+            SPC_WRN("failed to save dynamic lookup cache '%s' - the file on disk is left untouched\n",
+                    path_dynamic.c_str());
         }
     }
 
@@ -2257,20 +2310,19 @@ static common_ngram_map get_common_ngram_map(
     return common_ngram_map(size_key, size_value, key_only, min_hits);
 }
 
-static common_speculative_impl_ngram_cache create_state_ngram_cache(
+static std::unique_ptr<common_speculative_impl_ngram_cache> create_state_ngram_cache(
         const common_speculative_config & config,
         uint32_t n_seq,
         const std::string & path_static,
         const std::string & path_dynamic) {
     uint16_t n_draft = 8; // TODO get from config?
 
-    // TODO bool param in common/common.h to set save_static/save_dynamic?
-    bool save_static = false;
-    bool save_dynamic = false;
+    // passing a dynamic cache path implies writing it back on shutdown - that is what -lcd promises
+    // ("updated by generation"). the static cache is read-only by definition and is never written back
+    const bool save_dynamic = !path_dynamic.empty();
 
-    common_speculative_impl_ngram_cache state(config.params, n_seq, n_draft, path_static, path_dynamic, save_static, save_dynamic);
-
-    return state;
+    return std::make_unique<common_speculative_impl_ngram_cache>(
+            config.params, n_seq, n_draft, path_static, path_dynamic, save_dynamic);
 }
 
 std::string common_speculative_type_name_str(const std::vector<common_speculative_type> & types) {
@@ -2657,11 +2709,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE: {
-                auto state = create_state_ngram_cache(
+                impls.push_back(create_state_ngram_cache(
                         config, n_seq,
                         params.ngram_cache.lookup_cache_static,
-                        params.ngram_cache.lookup_cache_dynamic);
-                impls.push_back(std::make_unique<common_speculative_impl_ngram_cache>(state));
+                        params.ngram_cache.lookup_cache_dynamic));
                 break;
             }
             default:

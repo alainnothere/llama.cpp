@@ -100,6 +100,7 @@ class ServerProcess:
     spec_draft_n_min: int | None = None
     spec_draft_n_max: int | None = None
     spec_accept: str | None = None
+    lookup_cache_dynamic: str | None = None
     no_ui: bool | None = None
     jinja: bool | None = None
     reasoning_format: Literal['deepseek', 'none', 'nothink'] | None = None
@@ -254,6 +255,8 @@ class ServerProcess:
             server_args.extend(["--spec-draft-n-min", self.spec_draft_n_min])
         if self.spec_accept:
             server_args.extend(["--spec-accept", self.spec_accept])
+        if self.lookup_cache_dynamic:
+            server_args.extend(["--lookup-cache-dynamic", self.lookup_cache_dynamic])
         if self.no_ui:
             server_args.append("--no-ui")
         if self.no_models_autoload:
