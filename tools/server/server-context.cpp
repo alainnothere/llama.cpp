@@ -275,7 +275,14 @@ struct server_spec_autotune {
         return res;
     }
 
-    int choose() {
+    // n_seed: where to start before anything has been observed - the middle of the range, or the
+    //         --spec-draft-ctx-step estimate when one is configured. starting at the ceiling means
+    //         paying for the deepest drafts exactly where they are most likely to be wrong
+    int choose(int n_seed) {
+        if (n_obs == 0 && n_step == 0) {
+            n_cur = clamp(n_seed);
+        }
+
         ++n_step;
 
         // exploration: until every cap has been tried a few times, probe every other step and
@@ -3330,7 +3337,11 @@ private:
 
                             const int n_prev = spec_auto.n_chosen;
 
-                            n_draft_cur = std::min(n_draft_cur, spec_auto.choose());
+                            const int n_seed = slot.spec_ctx_step > 0
+                                ? std::max(1, slot.spec_n_max - slot.prompt.n_tokens()/slot.spec_ctx_step)
+                                : (slot.spec_n_max + 1)/2;
+
+                            n_draft_cur = std::min(n_draft_cur, spec_auto.choose(n_seed));
 
                             // the ctx/n_remaining clamps above can shorten the draft - charge the step to the cap really used
                             spec_auto.n_chosen = n_draft_cur;
