@@ -216,16 +216,24 @@ static llama_token common_speculative_pick(
 
     const float r = u(rng);
 
+    llama_token id = cur_p->data[cur_p->size - 1].id;
+    float       p  = cur_p->data[cur_p->size - 1].p;
+
     float sum_run = 0.0f;
     for (size_t i = 0; i < cur_p->size; ++i) {
         sum_run += cur_p->data[i].p;
 
         if (r < sum_run) {
-            return cur_p->data[i].id;
+            id = cur_p->data[i].id;
+            p  = cur_p->data[i].p;
+            break;
         }
     }
 
-    return cur_p->data[cur_p->size - 1].id;
+    SPC_DBG("sampled proposal %6d (p=%.4f) from %zu candidates, argmax %6d (p=%.4f), r=%.4f%s\n",
+            id, p, cur_p->size, cur_p->data[0].id, cur_p->data[0].p, r, id != cur_p->data[0].id ? " [non-argmax]" : "");
+
+    return id;
 }
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -2721,7 +2729,12 @@ common_speculative * common_speculative_init(common_params_speculative & params,
     }
 
     if (impls.empty()) {
-        SPC_TRC("%s", "no implementations specified for speculative decoding\n");
+        if (params.draft.ctx_dft || params.accept != COMMON_SPECULATIVE_ACCEPT_GREEDY) {
+            // a draft model or a verification rule was configured, but nothing will ever use it
+            SPC_WRN("%s", "no implementations specified for speculative decoding - nothing will be drafted, pass --spec-type (e.g. draft-simple)\n");
+        } else {
+            SPC_TRC("%s", "no implementations specified for speculative decoding\n");
+        }
         return nullptr;
     }
 

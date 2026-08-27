@@ -646,6 +646,12 @@ struct server_slot {
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
             SLT_TRC(*this,
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
+
+            if (stats.n_spec_pos_stoch + stats.n_spec_pos_exact + stats.n_spec_fallback > 0) {
+                SLT_INF(*this,
+                        "spec verify rule = stochastic %5" PRIu64 " pos (%5" PRIu64 " accepted), exact-match fallback %5" PRIu64 " pos (%5" PRIu64 " accepted), %5" PRIu64 " steps fully greedy\n",
+                        stats.n_spec_pos_stoch, stats.n_spec_acc_stoch, stats.n_spec_pos_exact, stats.n_spec_acc_exact, stats.n_spec_fallback);
+            }
         }
 
         common_speculative_print_stats(spec);
@@ -1254,6 +1260,11 @@ private:
         }
 
         if (spec) {
+            SRV_INF("speculative draft verification: %s\n",
+                    params_base.speculative.accept == COMMON_SPECULATIVE_ACCEPT_STOCHASTIC
+                        ? "stochastic (rejection sampling) - draft-model implementations sample their proposals; ngram-* and grammar-constrained positions stay exact-match"
+                        : "greedy (exact match)");
+
             SRV_TRC("%s", "speculative decoding context initialized\n");
         } else {
             spec_init.reset();
@@ -4032,9 +4043,30 @@ private:
 
             // the returned vector has the same meaning in both cases: the accepted prefix of the
             // draft, plus one token sampled from the target - everything below is unaffected
-            auto accepted = params_base.speculative.accept == COMMON_SPECULATIVE_ACCEPT_STOCHASTIC
-                ? common_sampler_sample_and_accept_n_stochastic(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_dists)
+            const bool stochastic = params_base.speculative.accept == COMMON_SPECULATIVE_ACCEPT_STOCHASTIC;
+
+            common_spec_verify_stats vstats;
+
+            auto accepted = stochastic
+                ? common_sampler_sample_and_accept_n_stochastic(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_dists, false, &vstats)
                 : common_sampler_sample_and_accept_n           (slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+
+            if (stochastic) {
+                size_t n_dists = 0;
+                for (const auto & d : slot.spec_draft_dists) {
+                    n_dists += d.empty() ? 0 : 1;
+                }
+
+                SLT_DBG(slot, "spec verify: n_draft=%zu, dists=%zu, stochastic=%u/%u accepted, exact=%u/%u accepted%s\n",
+                        (size_t) n_draft, n_dists, vstats.n_acc_stoch, vstats.n_pos_stoch, vstats.n_acc_exact, vstats.n_pos_exact,
+                        vstats.n_fallback ? " [whole step fell back to greedy]" : "");
+
+                slot.stats.n_spec_pos_stoch += vstats.n_pos_stoch;
+                slot.stats.n_spec_acc_stoch += vstats.n_acc_stoch;
+                slot.stats.n_spec_pos_exact += vstats.n_pos_exact;
+                slot.stats.n_spec_acc_exact += vstats.n_acc_exact;
+                slot.stats.n_spec_fallback  += vstats.n_fallback;
+            }
 
             GGML_ASSERT(accepted.size() >= 1);
 

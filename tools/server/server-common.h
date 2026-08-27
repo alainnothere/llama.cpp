@@ -353,6 +353,13 @@ struct server_slot_stats {
     uint64_t n_draft_accepted    = 0;
     uint64_t n_draft_verif_steps = 0;
 
+    // --spec-accept stochastic only: which verification rule each drafted position went through
+    uint64_t n_spec_pos_stoch = 0; // positions verified by rejection sampling
+    uint64_t n_spec_acc_stoch = 0; // ... accepted
+    uint64_t n_spec_pos_exact = 0; // positions that fell back to exact match
+    uint64_t n_spec_acc_exact = 0; // ... accepted
+    uint64_t n_spec_fallback  = 0; // verification steps forwarded wholesale to the greedy rule
+
     // these are absolute timestamps (in us)
     // note: must be signed - they are subtracted before the later ones are set
     int64_t t_start       = 0;

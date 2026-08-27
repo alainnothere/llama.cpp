@@ -820,7 +820,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_stochastic(
         const std::vector<int> & idxs,
         const llama_tokens     & draft,
         const common_draft_dists & dists,
-        bool grammar_first) {
+        bool grammar_first,
+        common_spec_verify_stats * stats) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
 
     const bool has_dists = std::any_of(dists.begin(), dists.end(),
@@ -829,7 +830,18 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_stochastic(
     // without a proposal distribution there is nothing to gain (see common_spec_verify_token), and with
     // a grammar the residual is not grammar-constrained - in both cases use the exact-match path
     if (!has_dists || gsmpl->grmr) {
-        return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
+        LOG_DBG("%s: falling back to exact-match verification for all %zu drafted tokens (%s)\n", __func__, draft.size(),
+                gsmpl->grmr ? "grammar in use" : dists.empty() ? "draft reported no proposal distributions" : "all proposal distributions empty");
+
+        auto res = common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
+
+        if (stats) {
+            stats->n_fallback  += 1;
+            stats->n_pos_exact += (uint32_t) std::min(res.size(), draft.size());
+            stats->n_acc_exact += (uint32_t) (res.size() - 1);
+        }
+
+        return res;
     }
 
     static const common_draft_dist dist_empty;
@@ -859,8 +871,38 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_stochastic(
             const float r_accept   = gsmpl->rand_uniform();
             const float r_resample = gsmpl->rand_uniform();
 
+            float p_dft = 0.0f;
+            float p_tgt = 0.0f;
+            if (common_log_get_verbosity_thold() >= LOG_LEVEL_DEBUG) {
+                for (const auto & d : dist) {
+                    if (d.id == draft[i]) { p_dft = d.p; break; }
+                }
+                for (size_t k = 0; k < gsmpl->cur_p.size; ++k) {
+                    if (gsmpl->cur_p.data[k].id == draft[i]) { p_tgt = gsmpl->cur_p.data[k].p; break; }
+                }
+            }
+
             id = common_spec_verify_token(&gsmpl->cur_p, dist.data(), dist.size(), draft[i],
                     r_accept, r_resample, &accepted);
+
+            LOG_DBG("%s: pos %2zu stochastic: draft %6d p_dft=%.4f p_tgt=%.4f (n_dft=%zu, n_tgt=%zu) r=%.4f -> %s%s\n",
+                    __func__, i, draft[i], p_dft, p_tgt, dist.size(), gsmpl->cur_p.size, r_accept,
+                    accepted ? "ACCEPT" : "reject, resampled ",
+                    accepted ? "" : std::to_string(id).c_str());
+
+            if (stats) {
+                stats->n_pos_stoch += 1;
+                stats->n_acc_stoch += accepted ? 1 : 0;
+            }
+        } else {
+            LOG_DBG("%s: pos %2zu exact-match: draft %6d vs sampled %6d -> %s (%s)\n",
+                    __func__, i, draft[i], id_smpl, accepted ? "ACCEPT" : "reject",
+                    dist.empty() ? "no proposal distribution for this position" : "target has no probabilities (backend sampler)");
+
+            if (stats) {
+                stats->n_pos_exact += 1;
+                stats->n_acc_exact += accepted ? 1 : 0;
+            }
         }
 
         common_sampler_accept(gsmpl, id, true);

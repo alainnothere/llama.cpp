@@ -98,6 +98,16 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 // reduces to anyway. if no position has a distribution, or if a grammar is in use (the residual is not
 // grammar-constrained), this simply forwards to the greedy version
 //
+// per-call accounting of which verification rule each drafted position actually went through -
+// this is the only way to tell from the outside whether the stochastic path is doing anything
+struct common_spec_verify_stats {
+    uint32_t n_pos_stoch = 0; // positions verified by rejection sampling
+    uint32_t n_acc_stoch = 0; // ... of which accepted
+    uint32_t n_pos_exact = 0; // positions verified by exact match (no proposal distribution / grammar / no probs)
+    uint32_t n_acc_exact = 0; // ... of which accepted
+    uint32_t n_fallback  = 0; // 1 if the whole call was forwarded to the greedy version
+};
+
 // requires: idxs.size() == draft.size() + 1
 std::vector<llama_token> common_sampler_sample_and_accept_n_stochastic(
         struct common_sampler * gsmpl,
@@ -105,7 +115,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_stochastic(
         const std::vector<int> & idxs,
         const llama_tokens     & draft,
         const common_draft_dists & dists,
-        bool grammar_first = false);
+        bool grammar_first = false,
+        common_spec_verify_stats * stats = nullptr);
 
 // verify a single drafted token against the target distribution using rejection sampling
 // (Leviathan et al., arXiv:2211.17192):
