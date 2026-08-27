@@ -25,9 +25,9 @@ server = ServerPreset.tinygemma3()
 
 _disk_dir: str = ""
 
-# header of a cp_ spill file: magic, version, arch hash, vocab hash,
+# header of a cp_ spill file: magic, version, arch hash, vocab hash, state hash,
 # pos_min, pos_max, n_tokens, token_prefix_hash
-CP_HEADER = "<IIIIiiqQ"
+CP_HEADER = "<IIIIIiiqQ"
 
 DELIMITERS = [
     {"role": "user",      "delimiter": "<start_of_turn>user\n"},
@@ -96,7 +96,7 @@ def _cp_files():
     for path in glob.glob(os.path.join(_disk_dir, "cp_*.bin")):
         with open(path, "rb") as f:
             header = f.read(struct.calcsize(CP_HEADER))
-        _, _, _, _, pos_min, pos_max, n_tokens, _ = struct.unpack(CP_HEADER, header)
+        _, _, _, _, _, pos_min, pos_max, n_tokens, _ = struct.unpack(CP_HEADER, header)
         out.append((pos_min, pos_max, n_tokens, path))
     return out
 
@@ -110,7 +110,7 @@ def _cp_headers():
             header = f.read(struct.calcsize(CP_HEADER))
         if len(header) < struct.calcsize(CP_HEADER):
             continue
-        _, _, _, _, pos_min, _, n_tokens, tok_hash = struct.unpack(CP_HEADER, header)
+        _, _, _, _, _, pos_min, _, n_tokens, tok_hash = struct.unpack(CP_HEADER, header)
         out[path] = (pos_min, n_tokens, tok_hash)
     return out
 

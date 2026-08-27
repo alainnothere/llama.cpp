@@ -1362,11 +1362,37 @@ private:
                 vocab_hash = h;
             }
 
+            // KV state identity: cache types + coarse model geometry. Same arch string
+            // and vocab (two sizes of one family) still produce mutually unreadable
+            // state blobs when any of these differ.
+            uint32_t state_hash = 0;
+            if (!params_base.cache_disk_path.empty() && model_tgt != nullptr) {
+                constexpr uint32_t FNV_OFFSET = 2166136261u;
+                constexpr uint32_t FNV_PRIME  = 16777619u;
+
+                const uint32_t vals[] = {
+                    (uint32_t) params_base.cache_type_k,
+                    (uint32_t) params_base.cache_type_v,
+                    (uint32_t) llama_model_n_layer  (model_tgt),
+                    (uint32_t) llama_model_n_embd   (model_tgt),
+                    (uint32_t) llama_model_n_head   (model_tgt),
+                    (uint32_t) llama_model_n_head_kv(model_tgt),
+                };
+                uint32_t h = FNV_OFFSET;
+                for (uint32_t v : vals) {
+                    for (int b = 0; b < 4; ++b) {
+                        h ^= (v >> (8*b)) & 0xff;
+                        h *= FNV_PRIME;
+                    }
+                }
+                state_hash = h;
+            }
+
             prompt_cache = std::make_unique<server_prompt_cache>(
                 params_base.cache_ram_mib, n_ctx,
                 params_base.cache_disk_path, params_base.cache_disk_queue_depth,
                 params_base.checkpoint_spill_max,
-                arch_hash, vocab_hash);
+                arch_hash, vocab_hash, state_hash);
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }

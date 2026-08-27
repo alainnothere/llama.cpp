@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -35,14 +36,14 @@ static int g_failures = 0;
     } while (0)
 
 // header layout written by spill_checkpoint():
-//   magic u32 | version u32 | arch u32 | vocab u32 | pos_min i32 | pos_max i32
+//   magic u32 | version u32 | arch u32 | vocab u32 | state u32 | pos_min i32 | pos_max i32
 //   | n_tokens i64 | token_prefix_hash u64 | tgt_sz u64 | <tgt bytes> | dft_sz u64 | <dft bytes>
-// => tgt blob starts at byte 48; dft blob starts at byte 56 + sz_tgt.
-static constexpr uint64_t HEADER_BEFORE_TGT = 48;
+// => tgt blob starts at byte 52; dft blob starts at byte 60 + sz_tgt.
+static constexpr uint64_t HEADER_BEFORE_TGT = 52;
 
 // mirrors of the file-local constants in server-task.cpp
 static constexpr uint32_t CP_MAGIC   = 0x43504B44; // 'CPKD'
-static constexpr uint32_t CP_VERSION = 2;
+static constexpr uint32_t CP_VERSION = 3;
 
 static int g_dir_counter = 0;
 
@@ -164,8 +165,8 @@ static void test_lazy_registration_roundtrip() {
     CHECK(got.sz_dft == 512);
 
     // exact offsets for the fixed on-disk layout
-    CHECK(got.off_tgt == HEADER_BEFORE_TGT);                       // 48
-    CHECK(got.off_dft == HEADER_BEFORE_TGT + got.sz_tgt + 8);      // 56 + sz_tgt
+    CHECK(got.off_tgt == HEADER_BEFORE_TGT);
+    CHECK(got.off_dft == HEADER_BEFORE_TGT + got.sz_tgt + 8);
 
     // the recorded offsets point at the original bytes (what load_tgt/load_dft read)
     CHECK(read_file_range(got.src_path, got.off_tgt, got.sz_tgt) == cp.data_tgt);
@@ -189,6 +190,103 @@ static void test_hash_mismatch_rejected() {
     bind_prompt(prompt, 512);
     reader.merge_checkpoint_spills(prompt);
     CHECK(prompt.checkpoints.empty());
+    fs::remove_all(dir);
+}
+
+// a checkpoint written under a different KV-state identity (cache types / model
+// geometry) must be skipped even when arch and vocab match - two sizes of the
+// same model family, or the same model with a different -ctk, share both
+static void test_state_hash_mismatch_rejected() {
+    std::printf("test_state_hash_mismatch_rejected\n");
+    const std::string dir = make_temp_dir("state_mm");
+    {
+        server_prompt_cache writer(64, 0, dir, 16, -1, 0x11111111u, 0x22222222u, 0xAAAA0001u);
+        writer.spill_checkpoint(make_ckpt(10, 20, 21, 256, 64, 1), "conv_state_mm");
+    }
+    {
+        // same arch and vocab, different state identity: rejected
+        server_prompt_cache reader(64, 0, dir, 16, -1, 0x11111111u, 0x22222222u, 0xAAAA0002u);
+        server_prompt prompt;
+        prompt.conversation_id = "conv_state_mm";
+        bind_prompt(prompt, 512);
+        reader.merge_checkpoint_spills(prompt);
+        CHECK(prompt.checkpoints.empty());
+    }
+    {
+        // matching state identity: accepted
+        server_prompt_cache reader(64, 0, dir, 16, -1, 0x11111111u, 0x22222222u, 0xAAAA0001u);
+        server_prompt prompt;
+        prompt.conversation_id = "conv_state_mm";
+        bind_prompt(prompt, 512);
+        reader.merge_checkpoint_spills(prompt);
+        CHECK(prompt.checkpoints.size() == 1);
+    }
+    fs::remove_all(dir);
+}
+
+// a .hdr written under a different KV-state identity is ignored wholesale, so the
+// next flush rewrites the entry instead of appending unreadable segments to it
+static void test_hdr_state_mismatch_rejected() {
+    std::printf("test_hdr_state_mismatch_rejected\n");
+    const std::string dir = make_temp_dir("hdr_state");
+
+    // hand-craft a v-current .hdr + .kv pair the way process_disk writes them
+    const uint32_t arch = 0x33333333u, vocab = 0x44444444u, state = 0xBBBB0001u;
+    {
+        std::vector<uint8_t> hdr;
+        auto put32 = [&hdr](uint32_t v) {
+            const uint8_t * p = reinterpret_cast<const uint8_t *>(&v);
+            hdr.insert(hdr.end(), p, p + sizeof(v));
+        };
+        auto put64 = [&hdr](uint64_t v) {
+            const uint8_t * p = reinterpret_cast<const uint8_t *>(&v);
+            hdr.insert(hdr.end(), p, p + sizeof(v));
+        };
+        put32(0x53504344u);  // DISK_CACHE_MAGIC 'SPCD'
+        put32(6);            // DISK_CACHE_VERSION
+        put32(arch);
+        put32(vocab);
+        put32(state);
+        put32(0);            // limit_tokens (informational)
+        put32(4);            // n_tok
+        put32(1);            // n_segs
+        put64(16);           // kv_size
+        put64(0);            // drft_size
+        put64(0);            // rec_size
+        put64(0);            // seg.kv_off
+        put64(16);           // seg.kv_size
+        put64(0);            // seg.drft_off
+        put64(0);            // seg.drft_size
+        put32((uint32_t) 0); // seg.p0 (i32)
+        put32((uint32_t) 4); // seg.p1 (i32)
+        // trailing checksum: XOR of 8-byte words (mirror of disk_hdr_checksum)
+        uint64_t sum = 0;
+        for (size_t i = 0; i < hdr.size(); i += 8) {
+            uint64_t word = 0;
+            memcpy(&word, hdr.data() + i, std::min<size_t>(8, hdr.size() - i));
+            sum ^= word;
+        }
+        put64(sum);
+
+        std::ofstream f(dir + "/conv_hdr.hdr", std::ios::binary | std::ios::trunc);
+        f.write(reinterpret_cast<const char *>(hdr.data()), (std::streamsize) hdr.size());
+        std::ofstream k(dir + "/conv_hdr.kv", std::ios::binary | std::ios::trunc);
+        const char zeros[16] = {};
+        k.write(zeros, sizeof(zeros));
+    }
+
+    {
+        // matching identity reads back
+        server_prompt_cache cache(64, 0, dir, 16, -1, arch, vocab, state);
+        server_prompt_cache::disk_conv_state st;
+        CHECK(cache.read_disk_state("conv_hdr", st));
+    }
+    {
+        // same arch and vocab, different KV-state identity: entry is invisible
+        server_prompt_cache cache(64, 0, dir, 16, -1, arch, vocab, 0xBBBB0002u);
+        server_prompt_cache::disk_conv_state st;
+        CHECK(!cache.read_disk_state("conv_hdr", st));
+    }
     fs::remove_all(dir);
 }
 
@@ -635,6 +733,8 @@ static void test_spill_all_noop_without_disk() {
 int main() {
     test_lazy_registration_roundtrip();
     test_hash_mismatch_rejected();
+    test_state_hash_mismatch_rejected();
+    test_hdr_state_mismatch_rejected();
     test_dup_pos_min_skipped();
     test_conversation_filter();
     test_corrupt_file_skipped();

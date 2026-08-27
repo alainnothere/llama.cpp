@@ -651,7 +651,7 @@ struct server_prompt_cache_state {
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens,
                         std::string disk_path, int32_t queue_depth, int32_t checkpoint_spill_max,
-                        uint32_t arch_hash, uint32_t vocab_hash);
+                        uint32_t arch_hash, uint32_t vocab_hash, uint32_t state_hash = 0);
     ~server_prompt_cache();
 
     server_prompt_cache(const server_prompt_cache &)             = delete;
@@ -671,6 +671,10 @@ struct server_prompt_cache {
     int32_t     checkpoint_spill_max = -1; // -1 = no limit
     uint32_t    arch_hash            = 0;
     uint32_t    vocab_hash           = 0;
+    // KV state identity: cache types + model geometry. Two models can share arch
+    // string and vocab (e.g. two sizes of the same family) yet produce mutually
+    // unreadable state blobs; this is what tells them apart.
+    uint32_t    state_hash           = 0;
 
     size_t size();
     size_t n_tokens();

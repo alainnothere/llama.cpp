@@ -41,7 +41,7 @@ constexpr uint32_t DISK_CACHE_MAGIC   = 0x53504344; // 'SPCD' - Server Prompt Ca
 //                             the recurrent state is a running state valid only at the latest
 //                             position, so overwrite is its only correct mode (and it is small)
 // checkpoints live in their own write-once cp_{conv}_{pos_min}.bin files (see below)
-constexpr uint32_t DISK_CACHE_VERSION = 5;
+constexpr uint32_t DISK_CACHE_VERSION = 6;
 
 // number of tokens covered by one .kv segment when writing a large state from scratch
 // (bounds RAM on both save and load - the peak is one segment, ~500 MiB at ~60 KB/token)
@@ -52,17 +52,17 @@ constexpr uint32_t DISK_SEGMENT_TOKENS = 8192;
 constexpr size_t DISK_QUEUE_MAX_BYTES = 1ull << 30; // 1 GiB
 
 // checkpoint files - written by spill_checkpoint() the moment create_checkpoint() captures a
-// checkpoint. format: magic, version, arch_hash, vocab_hash,
+// checkpoint. format: magic, version, arch_hash, vocab_hash, state_hash,
 // pos_min (i32), pos_max (i32), n_tokens (i64), token_prefix_hash (u64),
 // data_tgt_size (u64), data_tgt, data_dft_size (u64), data_dft.
 // checkpoint files are named cp_{conversation_id}_{pos_min}.bin and live in disk_path
 // v2: added token_prefix_hash. v1 files fail the version check and are ignored until evicted.
 constexpr uint32_t CHECKPOINT_SPILL_MAGIC   = 0x43504B44; // 'CPKD'
-constexpr uint32_t CHECKPOINT_SPILL_VERSION = 2;
+constexpr uint32_t CHECKPOINT_SPILL_VERSION = 3;
 
 // byte offsets inside a cp_ file (see format above) - used to register disk-backed checkpoints
 // without reading the blobs: off_tgt = header, off_dft = header + tgt blob + its size field
-constexpr uint64_t CHECKPOINT_FILE_HEADER_BYTES = 4*sizeof(uint32_t) + 2*sizeof(int32_t) + sizeof(int64_t) + 2*sizeof(uint64_t);
+constexpr uint64_t CHECKPOINT_FILE_HEADER_BYTES = 5*sizeof(uint32_t) + 2*sizeof(int32_t) + sizeof(int64_t) + 2*sizeof(uint64_t);
 
 
 static bool read_disk_u32(std::ifstream & f, uint32_t & v)
@@ -2104,7 +2104,7 @@ void server_prompt_cache::spill_all_to_disk() {
 server_prompt_cache::server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens_in,
                                           std::string disk_path_in, int32_t queue_depth_in,
                                           int32_t checkpoint_spill_max_in,
-                                          uint32_t arch_hash_in, uint32_t vocab_hash_in) {
+                                          uint32_t arch_hash_in, uint32_t vocab_hash_in, uint32_t state_hash_in) {
     this->limit_size            = 1024ull * 1024ull * (limit_size_mib < 0 ? 0 : limit_size_mib);
     this->limit_tokens          = limit_tokens_in;
     this->disk_path             = std::move(disk_path_in);
@@ -2112,6 +2112,7 @@ server_prompt_cache::server_prompt_cache(int32_t limit_size_mib, size_t limit_to
     this->checkpoint_spill_max  = checkpoint_spill_max_in;
     this->arch_hash             = arch_hash_in;
     this->vocab_hash            = vocab_hash_in;
+    this->state_hash            = state_hash_in;
 
     if (!this->disk_path.empty()) {
         std::error_code ec;
@@ -2121,9 +2122,9 @@ server_prompt_cache::server_prompt_cache(int32_t limit_size_mib, size_t limit_to
                     this->disk_path.c_str(), ec.message().c_str());
             this->disk_path.clear();
         } else {
-            SRV_WRN("disk cache: enabled at '%s' (queue depth %d, checkpoint spill max %d, arch=0x%08x, vocab=0x%08x)\n",
+            SRV_WRN("disk cache: enabled at '%s' (queue depth %d, checkpoint spill max %d, arch=0x%08x, vocab=0x%08x, state=0x%08x)\n",
                     this->disk_path.c_str(), this->queue_depth, this->checkpoint_spill_max,
-                    this->arch_hash, this->vocab_hash);
+                    this->arch_hash, this->vocab_hash, this->state_hash);
             start_writer_if_needed();
         }
     }
@@ -2468,6 +2469,7 @@ void server_prompt_cache::process_disk_job(const disk_job & job) {
     put(DISK_CACHE_VERSION);
     put(arch_hash);
     put(vocab_hash);
+    put(state_hash);
     put((uint32_t) limit_tokens);
     put(st.n_tok);
     put((uint32_t) st.segments.size());
@@ -2524,7 +2526,7 @@ bool server_prompt_cache::read_disk_state(const std::string & conversation_id, d
     }
 
     // fixed part: 7 x u32 + 3 x u64, then the segment table, then a u64 checksum
-    constexpr size_t fixed_bytes = 7*sizeof(uint32_t) + 3*sizeof(uint64_t);
+    constexpr size_t fixed_bytes = 8*sizeof(uint32_t) + 3*sizeof(uint64_t);
     constexpr size_t seg_bytes   = 4*sizeof(uint64_t) + 2*sizeof(int32_t);
     if (hdr.size() < fixed_bytes + sizeof(uint64_t)) {
         return false;
@@ -2543,12 +2545,13 @@ bool server_prompt_cache::read_disk_state(const std::string & conversation_id, d
         off += sizeof(v);
     };
 
-    uint32_t magic = 0, version = 0, fa = 0, fv = 0, lt = 0, n_tok = 0, n_segs = 0;
+    uint32_t magic = 0, version = 0, fa = 0, fv = 0, fs = 0, lt = 0, n_tok = 0, n_segs = 0;
     uint64_t kv_size = 0, drft_size = 0, rec_size = 0;
     get(magic);
     get(version);
     get(fa);
     get(fv);
+    get(fs);
     get(lt);
     get(n_tok);
     get(n_segs);
@@ -2563,6 +2566,14 @@ bool server_prompt_cache::read_disk_state(const std::string & conversation_id, d
     }
     if (fa != arch_hash || fv != vocab_hash) {
         SRV_INF("disk cache: '%s.hdr' arch/vocab mismatch\n", conversation_id.c_str());
+        return false;
+    }
+    // same arch and vocab does not mean readable state: KV cache types and model
+    // geometry must match too, or state_read aborts mid-restore on the first
+    // typed tensor (observed: two qwen35-family models sharing one cache dir)
+    if (fs != state_hash) {
+        SRV_INF("disk cache: '%s.hdr' kv-state identity mismatch (0x%08x != 0x%08x) - ignoring\n",
+                conversation_id.c_str(), fs, state_hash);
         return false;
     }
     if (n_tok == 0 || hdr.size() != fixed_bytes + (size_t) n_segs * seg_bytes + sizeof(uint64_t)) {
@@ -2725,6 +2736,7 @@ bool server_prompt_cache::write_checkpoint_file(const common_prompt_checkpoint &
         put_u32(CHECKPOINT_SPILL_VERSION);
         put_u32(arch_hash);
         put_u32(vocab_hash);
+        put_u32(state_hash);
 
         const int32_t pos_min_v  = cp.pos_min;
         const int32_t pos_max_v  = cp.pos_max;
@@ -2912,10 +2924,12 @@ void server_prompt_cache::merge_checkpoint_spills(server_prompt & prompt) {
             continue;
         }
 
+        uint32_t fs = 0;
         f.read(reinterpret_cast<char *>(&fa), sizeof(fa));
         f.read(reinterpret_cast<char *>(&fv), sizeof(fv));
+        f.read(reinterpret_cast<char *>(&fs), sizeof(fs));
 
-        if (fa != arch_hash || fv != vocab_hash) {
+        if (fa != arch_hash || fv != vocab_hash || fs != state_hash) {
             ++n_skip_hash;
             continue;
         }
@@ -3047,13 +3061,14 @@ void server_prompt_cache::drop_stale_checkpoint_spills(const server_prompt & pro
                 continue;
             }
 
-            uint32_t magic = 0, version = 0, fa = 0, fv = 0;
+            uint32_t magic = 0, version = 0, fa = 0, fv = 0, fs = 0;
             int32_t  pos_max_v  = 0;
             uint64_t tok_hash_v = 0;
             f.read(reinterpret_cast<char *>(&magic),      sizeof(magic));
             f.read(reinterpret_cast<char *>(&version),    sizeof(version));
             f.read(reinterpret_cast<char *>(&fa),         sizeof(fa));
             f.read(reinterpret_cast<char *>(&fv),         sizeof(fv));
+            f.read(reinterpret_cast<char *>(&fs),         sizeof(fs));
             f.read(reinterpret_cast<char *>(&pos_min_v),  sizeof(pos_min_v));
             f.read(reinterpret_cast<char *>(&pos_max_v),  sizeof(pos_max_v));
             f.read(reinterpret_cast<char *>(&n_tokens_v), sizeof(n_tokens_v));
