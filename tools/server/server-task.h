@@ -756,7 +756,9 @@ private:
         }
     };
 
+public:
     // per-conversation mirror of the on-disk .hdr plus what has been scheduled into the queue
+    // (public: tests hand-craft .hdr files and validate them through read_disk_state)
     struct disk_conv_state {
         struct seg_entry {
             uint64_t kv_off    = 0;
@@ -782,6 +784,7 @@ private:
         bool broken = false;
     };
 
+private:
     std::deque<disk_job>    queue;
     std::mutex              mtx;     // protects queue, queue_bytes, disk_convs, writer_active_conv
     std::condition_variable cv;
@@ -801,6 +804,7 @@ private:
     void process_disk_job(const disk_job & job);
     bool write_checkpoint_file(const common_prompt_checkpoint & cp, const std::string & conversation_id);
 
+public:
     // seed a disk_conv_state's committed fields from an existing .hdr (server restart case)
     bool read_disk_state(const std::string & conversation_id, disk_conv_state & st);
 

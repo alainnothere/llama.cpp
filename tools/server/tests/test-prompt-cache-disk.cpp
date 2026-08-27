@@ -273,6 +273,11 @@ static void test_hdr_state_mismatch_rejected() {
         std::ofstream k(dir + "/conv_hdr.kv", std::ios::binary | std::ios::trunc);
         const char zeros[16] = {};
         k.write(zeros, sizeof(zeros));
+
+        // read_disk_state also loads the token list: n_tok entries from .tok
+        std::ofstream t(dir + "/conv_hdr.tok", std::ios::binary | std::ios::trunc);
+        const int32_t toks[4] = {1, 2, 3, 4};
+        t.write(reinterpret_cast<const char *>(toks), sizeof(toks));
     }
 
     {
