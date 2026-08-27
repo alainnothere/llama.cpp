@@ -79,7 +79,12 @@ common_speculative_draft_params & common_speculative_get_draft_params(common_spe
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 
 // process the batch and update the internal state of the speculative context
-bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
+//
+// `keep`, when non-empty, has one entry per batch row and marks the rows that the target model has
+// committed to: a 0 entry is a drafted token that the target has just rejected and whose KV is about
+// to be dropped from the target memory, so there is no point in mirroring it into the draft state.
+// implementations that can skip such rows do so, the rest simply replay the whole batch
+bool common_speculative_process(common_speculative * spec, const llama_batch & batch, const std::vector<int8_t> & keep = {});
 
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);

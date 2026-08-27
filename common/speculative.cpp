@@ -177,7 +177,9 @@ struct common_speculative_impl {
 
     virtual void begin(llama_seq_id seq_id, const llama_tokens & prompt) = 0;
 
-    virtual bool process(const llama_batch & batch) = 0;
+    // `keep` is either empty (replay the whole batch) or has one entry per batch row - see
+    // common_speculative_process() in speculative.h
+    virtual bool process(const llama_batch & batch, const std::vector<int8_t> & keep) = 0;
 
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
@@ -231,6 +233,12 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
     llama_batch batch;
 
     std::vector<common_sampler_ptr> smpls;
+
+    // scratch for the row-filtered replay batch built in process()
+    std::vector<llama_token>    proc_token;
+    std::vector<llama_pos>      proc_pos;
+    std::vector<int32_t>        proc_n_seq_id;
+    std::vector<llama_seq_id *> proc_seq_id;
 
     common_speculative_impl_draft_simple(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE, n_seq)
@@ -308,11 +316,46 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
         // noop
     }
 
-    bool process(const llama_batch & batch) override {
+    bool process(const llama_batch & batch, const std::vector<int8_t> & keep) override {
         auto * ctx_dft = params.ctx_dft;
 
         llama_batch batch_dft = batch;
         batch_dft.logits = nullptr;
+
+        // drop the rows that the target model has already rejected: mirroring them into the draft
+        // context only to trim them again on the next iteration is pure waste [TAG_SPEC_AVOID_DRAFT_REEVAL]
+        //
+        // the rejected rows are always a suffix of a sequence's rows, so what is left is still a
+        // contiguous, in-order run of positions per sequence
+        if (!keep.empty() && batch.token != nullptr && batch.embd == nullptr) {
+            GGML_ASSERT((int32_t) keep.size() == batch.n_tokens);
+
+            proc_token   .clear();
+            proc_pos     .clear();
+            proc_n_seq_id.clear();
+            proc_seq_id  .clear();
+
+            for (int32_t i = 0; i < batch.n_tokens; ++i) {
+                if (!keep[i]) {
+                    continue;
+                }
+
+                proc_token   .push_back(batch.token   [i]);
+                proc_pos     .push_back(batch.pos     [i]);
+                proc_n_seq_id.push_back(batch.n_seq_id[i]);
+                proc_seq_id  .push_back(batch.seq_id  [i]);
+            }
+
+            batch_dft.n_tokens = (int32_t) proc_token.size();
+            batch_dft.token    = proc_token   .data();
+            batch_dft.pos      = proc_pos     .data();
+            batch_dft.n_seq_id = proc_n_seq_id.data();
+            batch_dft.seq_id   = proc_seq_id  .data();
+        }
+
+        if (batch_dft.n_tokens <= 0) {
+            return true;
+        }
 
         const int ret = llama_decode(ctx_dft, batch_dft);
 
@@ -469,6 +512,11 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 //   process() runs encoder + decoder on the *full* verify batch including rows for
 //   rejected drafts. The KV at those positions is then dropped.
 //
+// The `keep` mask that lets draft-simple skip the rejected rows [TAG_SPEC_AVOID_DRAFT_REEVAL] is
+// deliberately ignored here: the target features are read row-by-row out of ctx_tgt's embedding
+// buffers, which are indexed by *full* batch row, and accept() replays verify_g by n_accepted to
+// recover the deferred boundary. Filtering would have to renumber both, so it is left for later.
+//
 // TODO: Not sure if we need optimization for this waste?
 // If so we may need hybrid stash:
 //      in verify mode, have process() only stash features and let draft() seed run
@@ -619,7 +667,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         }
     }
 
-    bool process(const llama_batch & batch_in) override {
+    bool process(const llama_batch & batch_in, const std::vector<int8_t> & /*keep*/) override {
         if (batch_in.n_tokens <= 0) {
             return true;
         }
@@ -1109,7 +1157,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
     }
 
-    bool process(const llama_batch & batch_in) override {
+    // note: `keep` is ignored - the target features are read row-by-row out of ctx_tgt's embedding
+    //       buffers, which are indexed by full batch row [TAG_SPEC_AVOID_DRAFT_REEVAL]
+    bool process(const llama_batch & batch_in, const std::vector<int8_t> & /*keep*/) override {
         if (batch_in.n_tokens <= 0) {
             return true;
         }
@@ -1484,7 +1534,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
-    bool process(const llama_batch & batch_in) override {
+    // note: `keep` is ignored - the target features are read row-by-row out of ctx_tgt's embedding
+    //       buffers, which are indexed by full batch row [TAG_SPEC_AVOID_DRAFT_REEVAL]
+    bool process(const llama_batch & batch_in, const std::vector<int8_t> & /*keep*/) override {
         if (batch_in.n_tokens <= 0) {
             return true;
         }
@@ -1793,7 +1845,7 @@ struct common_speculative_impl_ngram_simple : public common_speculative_impl {
         // noop
     }
 
-    bool process(const llama_batch & /*batch*/) override {
+    bool process(const llama_batch & /*batch*/, const std::vector<int8_t> & /*keep*/) override {
         // TODO: implement
         return true;
     }
@@ -1841,7 +1893,7 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
         common_ngram_map_begin(config[seq_id], prompt);
     }
 
-    bool process(const llama_batch & /*batch*/) override {
+    bool process(const llama_batch & /*batch*/, const std::vector<int8_t> & /*keep*/) override {
         // TODO: implement
         return true;
     }
@@ -1999,7 +2051,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         sinfo.n_draft_last = result.size();
     }
 
-    bool process(const llama_batch & /*batch*/) override {
+    bool process(const llama_batch & /*batch*/, const std::vector<int8_t> & /*keep*/) override {
         // TODO: implement
         return true;
     }
@@ -2161,7 +2213,7 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
         }
     }
 
-    bool process(const llama_batch & /*batch*/) override {
+    bool process(const llama_batch & /*batch*/, const std::vector<int8_t> & /*keep*/) override {
         // TODO: implement
         return true;
     }
@@ -2660,7 +2712,7 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
     }
 }
 
-bool common_speculative_process(common_speculative * spec, const llama_batch & batch) {
+bool common_speculative_process(common_speculative * spec, const llama_batch & batch, const std::vector<int8_t> & keep) {
     bool result = true;
 
     if (spec == nullptr) {
@@ -2668,7 +2720,7 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
     }
 
     for (auto & impl : spec->impls) {
-        result = result && impl->process(batch);
+        result = result && impl->process(batch, keep);
     }
 
     return result;

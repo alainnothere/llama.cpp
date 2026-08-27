@@ -3149,7 +3149,10 @@ private:
 
             slot.stats.n_draft_tokens += draft.size();
 
-            // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
+            // the draft context is only fed the rows the target accepted [TAG_SPEC_AVOID_DRAFT_REEVAL],
+            // so this rewind is normally a no-op - it still has to run for the implementations that
+            // replay the full verify batch (eagle3/mtp/dflash) and for the tokens that draft() itself
+            // wrote into ctx_dft while generating the previous draft
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
             if (ctx_dft) {
@@ -3910,22 +3913,9 @@ private:
             metrics_post_decode(off, batch_view.n_tokens, has_output);
         }
 
-        // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
-        //       for now, always re-evaluate for simplicity
+        // note: the draft context is updated at the top of post_decode(), once the target model has
+        //       told us which of the drafted tokens it actually accepted [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        if (spec) {
-            bool ok = true;
-            queue_tasks.yield_to_queue([&]() {
-                ok = common_speculative_process(spec.get(), batch_view);
-            });
-
-            if (!ok) {
-                SRV_ERR("%s", "failed to process speculative batch\n");
-
-                // TODO: handle error
-                throw std::runtime_error("failed to process speculative batch");
-            }
-        }
 
         // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
         for (auto & slot : slots) {
@@ -3968,6 +3958,93 @@ private:
                 }
             }
         });
+
+        // speculative decoding - verify the drafts first
+        //
+        // this has to happen before the draft context is updated with the batch we have just decoded:
+        // knowing how much of each draft the target accepted lets us skip the rejected rows instead of
+        // mirroring them into the draft state only to trim them again [TAG_SPEC_AVOID_DRAFT_REEVAL]
+        //
+        // everything that mutates state (the checkpoint rollback, common_speculative_accept(), the
+        // token emission) stays below, in the same order as before
+        struct spec_verify_result {
+            int    id_slot;
+            size_t n_draft;
+            size_t n_accepted;
+            bool   restore; // partial acceptance not supported by the context -> rollback to the checkpoint
+            common_sampler_ptr smpl_save;
+        };
+
+        std::vector<spec_verify_result> spec_verified;
+
+        // per batch-view row: 0 marks a drafted token that the target has just rejected
+        // empty means "nothing was rejected", i.e. replay the whole batch
+        std::vector<int8_t> spec_keep;
+
+        iterate(slots, [&](server_slot & slot) {
+            if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() ||
+                    slot.spec_draft.empty() || slot.spec_i_batch.empty()) {
+                return;
+            }
+
+            // save the original draft size
+            const size_t n_draft = slot.spec_draft.size();
+
+            GGML_ASSERT(n_draft > 0);
+            GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
+
+            common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+
+            // the returned vector has the same meaning in both cases: the accepted prefix of the
+            // draft, plus one token sampled from the target - everything below is unaffected
+            auto accepted = params_base.speculative.accept == COMMON_SPECULATIVE_ACCEPT_STOCHASTIC
+                ? common_sampler_sample_and_accept_n_stochastic(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_dists)
+                : common_sampler_sample_and_accept_n           (slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+
+            GGML_ASSERT(accepted.size() >= 1);
+
+            const uint32_t n_rollback = n_draft + 1 - accepted.size();
+
+            const bool use_ckpt_tgt =
+                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt));
+
+            const bool restore = n_rollback > 0 && use_ckpt_tgt;
+
+            // note: on the rollback path the whole draft state is restored from the checkpoint right
+            //       below, so the rows are left in - dropping them would only change which of two
+            //       equivalent ways we get back to the checkpointed state
+            if (n_rollback > 0 && !restore) {
+                if (spec_keep.empty()) {
+                    spec_keep.assign(n_batch_tokens, 1);
+                }
+
+                for (size_t i = accepted.size(); i < slot.spec_i_batch.size(); ++i) {
+                    spec_keep[slot.spec_i_batch[i] - off] = 0;
+                }
+            }
+
+            spec_verified.push_back({ slot.id, n_draft, accepted.size() - 1, restore, std::move(smpl_save) });
+
+            slot.spec_i_batch.clear();
+            slot.spec_draft_dists.clear();
+            slot.spec_draft = std::move(accepted);
+        });
+
+        // update the draft context/state with the batch that was just decoded by the target
+        if (spec) {
+            bool ok = true;
+            queue_tasks.yield_to_queue([&]() {
+                ok = common_speculative_process(spec.get(), batch_view, spec_keep);
+            });
+
+            if (!ok) {
+                SRV_ERR("%s", "failed to process speculative batch\n");
+
+                // TODO: handle error
+                throw std::runtime_error("failed to process speculative batch");
+            }
+        }
 
         auto accept_special_token = [&](server_slot & slot, llama_token token) {
             return params_base.special ||
@@ -4066,78 +4143,51 @@ private:
             slot.print_timings_tg();
         });
 
-        // speculative decoding - main model sample and accept
+        // speculative decoding - apply the verification result computed above
         iterate(slots, [&](server_slot & slot) {
-            if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() ||
-                    slot.spec_draft.empty() || slot.spec_i_batch.empty()) {
+            const auto it = std::find_if(spec_verified.begin(), spec_verified.end(),
+                    [&](const spec_verify_result & v) { return v.id_slot == slot.id; });
+
+            if (it == spec_verified.end() || slot.state != SLOT_STATE_GENERATING) {
                 return;
             }
 
-            // save the original draft size
-            const size_t n_draft = slot.spec_draft.size();
+            // the original draft size
+            const size_t n_draft = it->n_draft;
 
-            GGML_ASSERT(n_draft > 0);
-
-            // verify and try to accept the draft
             {
-                common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
-
-                GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-
-                // the returned vector has the same meaning in both cases: the accepted prefix of the
-                // draft, plus one token sampled from the target - everything below is unaffected
-                auto accepted = params_base.speculative.accept == COMMON_SPECULATIVE_ACCEPT_STOCHASTIC
-                    ? common_sampler_sample_and_accept_n_stochastic(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_dists)
-                    : common_sampler_sample_and_accept_n           (slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
-
-                slot.spec_i_batch.clear();
-                slot.spec_draft_dists.clear();
-
-                GGML_ASSERT(accepted.size() >= 1);
-
-                const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
-
-                const bool use_ckpt_tgt =
-                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt));
-
                 // check for partial draft acceptance
-                if (n_rollback > 0) {
-                    if (use_ckpt_tgt) {
-                        if (trace > 0) {
-                            SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
-                        }
-
-                        // partial acceptance is not supported by the context -> truncate the draft and restore the state
-                        slot.spec_is_replay = true;
-                        slot.spec_draft = std::move(accepted);
-
-                        const auto & ckpt = slot.spec_ckpt;
-
-                        SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
-
-                        ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-
-                        if (slot.ctx_dft) {
-                            ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                        }
-
-                        slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
-
-                        slot.prompt.tokens.keep_first(ckpt.n_tokens);
-                        common_sampler_copy(smpl_save.get(), slot.smpl.get());
-
-                        return;
+                if (it->restore) {
+                    if (trace > 0) {
+                        SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", it->n_accepted, n_draft);
                     }
+
+                    // partial acceptance is not supported by the context -> truncate the draft and restore the state
+                    slot.spec_is_replay = true;
+
+                    const auto & ckpt = slot.spec_ckpt;
+
+                    SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
+
+                    ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+                    if (slot.ctx_dft) {
+                        ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    }
+
+                    slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
+
+                    slot.prompt.tokens.keep_first(ckpt.n_tokens);
+                    common_sampler_copy(it->smpl_save.get(), slot.smpl.get());
+
+                    return;
                 }
 
                 if (trace > 0) {
-                    SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
+                    SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", it->n_accepted, n_draft);
                 }
 
-                common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
-
-                slot.spec_draft = std::move(accepted);
+                common_speculative_accept(spec.get(), slot.id, it->n_accepted);
             }
 
             const auto ids = std::move(slot.spec_draft);
