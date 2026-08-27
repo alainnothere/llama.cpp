@@ -1465,6 +1465,11 @@ extern "C" {
                const llama_token * trigger_tokens,
                             size_t num_trigger_tokens);
 
+    /// @details Whether a grammar sampler is currently constraining the output. false for a lazy grammar
+    ///          that has not seen its trigger yet, and for a grammar sampler with no grammar loaded.
+    ///          Returns true for any sampler that is not a grammar sampler.
+    LLAMA_API bool llama_sampler_grammar_is_active(const struct llama_sampler * smpl);
+
 
     /// NOTE: Avoid using on the full vocabulary as searching for repeated tokens can become slow. For example, apply top-k or top-p sampling first.
     LLAMA_API struct llama_sampler * llama_sampler_init_penalties(

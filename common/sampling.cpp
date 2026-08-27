@@ -828,10 +828,17 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_stochastic(
             [](const common_draft_dist & d) { return !d.empty(); });
 
     // without a proposal distribution there is nothing to gain (see common_spec_verify_token), and with
-    // a grammar the residual is not grammar-constrained - in both cases use the exact-match path
-    if (!has_dists || gsmpl->grmr) {
+    // an active grammar the residual is not grammar-constrained - in both cases use the exact-match path
+    //
+    // a lazy grammar (tool calls) that has not seen its trigger yet is not constraining anything, so it
+    // does not force the fallback. the grammar can only become active by accepting the trigger token,
+    // and every accepted token below goes through common_sampler_accept() - so the check is repeated
+    // per position, and the step switches to exact match the moment the grammar wakes up
+    const bool grammar_active = gsmpl->grmr && grammar_should_apply(gsmpl) && llama_sampler_grammar_is_active(gsmpl->grmr);
+
+    if (!has_dists || grammar_active) {
         LOG_DBG("%s: falling back to exact-match verification for all %zu drafted tokens (%s)\n", __func__, draft.size(),
-                gsmpl->grmr ? "grammar in use" : dists.empty() ? "draft reported no proposal distributions" : "all proposal distributions empty");
+                grammar_active ? "grammar active" : dists.empty() ? "draft reported no proposal distributions" : "all proposal distributions empty");
 
         auto res = common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
 
@@ -863,7 +870,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_stochastic(
         // by a backend sampler that did not report them, in which case exact-match is the only option
         const bool has_probs = gsmpl->cur_p.selected >= 0 && gsmpl->cur_p.data[gsmpl->cur_p.selected].p > 0.0f;
 
-        if (!dist.empty() && has_probs) {
+        // the previous accept may have triggered a lazy grammar - from here on only exact match is safe
+        const bool grammar_now = gsmpl->grmr && grammar_should_apply(gsmpl) && llama_sampler_grammar_is_active(gsmpl->grmr);
+
+        if (!dist.empty() && has_probs && !grammar_now) {
             const auto tm = gsmpl->tm();
 
             // note: the token sampled by the chain above is discarded - the verification below draws
@@ -897,7 +907,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_stochastic(
         } else {
             LOG_DBG("%s: pos %2zu exact-match: draft %6d vs sampled %6d -> %s (%s)\n",
                     __func__, i, draft[i], id_smpl, accepted ? "ACCEPT" : "reject",
-                    dist.empty() ? "no proposal distribution for this position" : "target has no probabilities (backend sampler)");
+                    grammar_now ? "grammar became active" : dist.empty() ? "no proposal distribution for this position" : "target has no probabilities (backend sampler)");
 
             if (stats) {
                 stats->n_pos_exact += 1;

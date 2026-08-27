@@ -2822,6 +2822,16 @@ static struct llama_sampler * llama_sampler_init_grammar_impl(
     );
 }
 
+bool llama_sampler_grammar_is_active(const struct llama_sampler * smpl) {
+    if (!smpl || smpl->iface != &llama_sampler_grammar_i) {
+        return true;
+    }
+
+    const auto * ctx = (const llama_sampler_grammar *) smpl->ctx;
+
+    return ctx->grammar && !ctx->grammar->awaiting_trigger;
+}
+
 struct llama_sampler * llama_sampler_init_grammar(
         const struct llama_vocab * vocab,
                       const char * grammar_str,
