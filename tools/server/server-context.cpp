@@ -3111,6 +3111,10 @@ private:
                                 llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
 
                         if (use_ckpt_dft) {
+                            // note: reads draft state, so it synchronizes ctx_dft and closes the
+                            //       overlap window opened by the previous iteration's
+                            //       common_speculative_process() [TAG_SPEC_OVERLAP]. only recurrent
+                            //       draft models take this path
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
@@ -3136,6 +3140,9 @@ private:
         });
 
         // generate the actual drafts (if any)
+        // note: this is where the draft batch submitted by the previous iteration's
+        //       common_speculative_process() is finally waited on - the draft loop reads ctx_dft
+        //       logits on its first step [TAG_SPEC_OVERLAP]
         if (!drafting.empty()) {
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
@@ -3852,6 +3859,17 @@ private:
 
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
+        //
+        // [TAG_SPEC_OVERLAP] do not move this sync out of the yield to "let it happen lazily in
+        // the first llama_get_logits_ith()". two things depend on it being here:
+        //   - /metrics and /slots stay answerable for the whole duration of the wait, because the
+        //     wait runs on the worker thread while the main thread drains the queue (#27041, #27133)
+        //   - metrics_post_decode() below flushes the queued prompt timings only when has_output is
+        //     set, on the promise that the context is synchronized by then. deferring the sync would
+        //     make t_prompt measure submission, not compute
+        // when has_output is false (mid-prompt chunk) there is deliberately no sync: the target
+        // batch stays in flight across post_decode(), where common_speculative_process() submits the
+        // same chunk to ctx_dft, so target and draft prefill overlap
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
             ret = llama_decode(ctx_tgt, batch_view);
@@ -3981,6 +3999,15 @@ private:
         // empty means "nothing was rejected", i.e. replay the whole batch
         std::vector<int8_t> spec_keep;
 
+        // whether the rollback path below can ever be taken for this target context. it needs a
+        // checkpoint restore, which is only used when the context cannot drop the rejected rows in
+        // place - see `use_ckpt_tgt` in the verification pass. for a plain range-truncatable context
+        // (the common transformer case) `restore` is false on every step, so the sampler snapshot
+        // that feeds it is dead work
+        const bool may_restore =
+            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS;
+
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() ||
                     slot.spec_draft.empty() || slot.spec_i_batch.empty()) {
@@ -3993,7 +4020,15 @@ private:
             GGML_ASSERT(n_draft > 0);
             GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
 
-            common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+            // [TAG_SPEC_OVERLAP] this snapshot has to be taken before the sampler is advanced, so it
+            // sits on the critical path between the target sync and the ctx_dft submission below, and
+            // it is not cheap: common_sampler_clone() clones the grammar and copies an n_vocab-sized
+            // candidate array (~1.8 MiB for a 151k vocab) on every verification step. only take it
+            // when the rollback path that consumes it can actually be reached
+            common_sampler_ptr smpl_save;
+            if (may_restore) {
+                smpl_save.reset(common_sampler_clone(slot.smpl.get()));
+            }
 
             // the returned vector has the same meaning in both cases: the accepted prefix of the
             // draft, plus one token sampled from the target - everything below is unaffected
@@ -4032,6 +4067,27 @@ private:
         });
 
         // update the draft context/state with the batch that was just decoded by the target
+        //
+        // [TAG_SPEC_OVERLAP] for the draft-model implementations this is a *submission only*: it
+        // calls llama_decode(ctx_dft, ...) and returns without touching any draft output, and
+        // llama_decode() does not synchronize. the draft batch therefore stays in flight across
+        // everything below - the per-slot sampling, detokenization, JSON building and the streamed
+        // partial responses - and, when several sub-batches are in flight, across the next
+        // llama_decode(ctx_tgt, ...) as well. on a `-devd`-split setup that is real concurrency
+        // between the two devices out of a single thread.
+        //
+        // the window closes at the *first* read of draft output or draft state, which is normally
+        // the next update_slots() iteration inside common_speculative_draft(). do not introduce a
+        // ctx_dft sync in between: llama_get_logits*/llama_get_embeddings* on ctx_dft, any
+        // llama_state_seq_{get,set}_data*(ctx_dft, ...) (that is what server_spec_ckpt::update_dft()
+        // and ::load_dft() do) and llama_synchronize(ctx_dft) all close it. llama_memory_seq_*() on
+        // the draft memory does not - it only touches host-side cell metadata.
+        //
+        // two places legitimately close it early and are known:
+        //   - the checkpoint-restore branch in the second speculative pass below calls load_dft()
+        //     for contexts that cannot roll back by range (the same ones `may_restore` covers)
+        //   - a recurrent draft model (ctx_dft_seq_rm_type == FULL) snapshots the draft state with
+        //     update_dft() at the start of every new draft cycle in pre_decode()
         if (spec) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
@@ -4172,12 +4228,19 @@ private:
                     ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                     if (slot.ctx_dft) {
+                        // note: this waits for the draft batch submitted by common_speculative_process()
+                        //       above and then throws its rows away [TAG_SPEC_OVERLAP]. it is the one
+                        //       step that does not get the draft decode for free, and it is reachable
+                        //       only for contexts that cannot roll back by range
                         ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                     }
 
                     slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
 
                     slot.prompt.tokens.keep_first(ckpt.n_tokens);
+
+                    // taken only when `may_restore` was true in the verification pass
+                    GGML_ASSERT(it->smpl_save);
                     common_sampler_copy(it->smpl_save.get(), slot.smpl.get());
 
                     return;
