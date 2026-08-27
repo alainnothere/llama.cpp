@@ -132,6 +132,23 @@ def test_stochastic_acceptance():
     assert res.body["timings"]["draft_n"] > 0
 
 
+def test_draft_auto():
+    global server
+    # --spec-draft-auto tunes the draft length online, the run must still produce drafted tokens
+    server.spec_draft_n_max = 8
+    server.spec_draft_auto = True
+    server.start()
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.0,
+        "top_k": 1,
+        "n_predict": 96,
+        "speculative.p_min": 0.0,
+    })
+    assert res.status_code == 200
+    assert res.body["timings"]["draft_n"] > 0
+
+
 def test_draft_ctx_step():
     global server
     # --spec-draft-ctx-step shortens the draft as the context grows, so the run must still produce

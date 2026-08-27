@@ -351,6 +351,9 @@ struct common_params_speculative_draft {
     // long drafts stop paying off once the verify batch is dominated by KV reads
     int32_t ctx_step = 0;
 
+    // tune the draft length online, per slot, using `n_max` as the ceiling
+    bool auto_n = false;
+
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 

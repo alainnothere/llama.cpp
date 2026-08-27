@@ -280,6 +280,9 @@ both rules coincide, so `stochastic` is only worth enabling for `temperature > 0
                                         reduce the draft length by one for every N tokens of context, never below 1 (default: 0, 0 = disabled)
                                         useful with a large --spec-draft-n-max: long drafts pay off at short context and stop paying off once the verify batch is dominated by KV reads
                                         (env: LLAMA_ARG_SPEC_DRAFT_CTX_STEP)
+--spec-draft-auto
+                                        automatically tune the draft length per slot, using --spec-draft-n-max as the ceiling: keeps a running estimate of tokens landed per unit of wall time for every draft length tried, uses the best one and periodically probes its neighbours (default: disabled)
+                                        (env: LLAMA_ARG_SPEC_DRAFT_AUTO)
 --spec-draft-p-split, --draft-p-split   P
                                         speculative decoding split probability (default: 0.10)
                                         (env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT)
@@ -301,6 +304,14 @@ effective per-step limit is `max(1, n_max - n_tokens_in_context/N)`, evaluated p
 generation step. For example, `--spec-draft-n-max 16 --spec-draft-ctx-step 2048` drafts 16 tokens on a
 short prompt, 8 tokens at 16k of context, and 1 token past 30k. The default `0` disables the schedule
 and keeps `n_max` constant.
+
+`--spec-draft-ctx-step` needs you to know the shape of the curve up front. `--spec-draft-auto` measures
+it instead: for every draft length it tries, each slot keeps a running estimate of how many tokens the
+step landed and how long the step took, then runs on the length with the best tokens per second and
+probes a neighbour every 8 steps to follow the curve as the context grows or the acceptance rate
+changes. `--spec-draft-n-max` stays the ceiling (and `--spec-draft-ctx-step`, if set, still applies on
+top of it). The estimates live per slot and carry across requests. Server logs print the table as
+`draft auto = n=6 | 4:98.1 t/s 5:104.3 t/s ...` at the end of each request.
 
 ### Draft Model CPU Scheduling Parameters
 

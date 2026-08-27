@@ -191,6 +191,167 @@ struct server_batch {
     }
 };
 
+// online tuner for the draft length (--spec-draft-auto)
+// keeps a throughput estimate (tokens landed per unit of wall time) for every cap that was tried,
+// runs on the best one and probes its neighbours from time to time
+struct server_spec_autotune {
+    static constexpr int    N_PERIOD = 8;   // probe every N_PERIOD steps
+    static constexpr double ALPHA    = 0.1; // EMA weight of a new observation once a bucket is warm
+    static constexpr int    N_WARM   = 4;   // observations before a bucket can be picked as best
+
+    int n_ceiling = 0;
+    int n_cur     = 0;
+
+    // per-cap EMAs, indexed by the cap value 1..n_ceiling, negative means never observed
+    std::vector<double> t_step_us;
+    std::vector<double> n_landed;
+    std::vector<int>    n_count;  // observations per cap - running mean until 1/ALPHA, EMA after
+
+    uint64_t n_obs = 0;
+
+    int probe_dir = +1;
+
+    int64_t t_start_us = 0; // stopwatch of the step in flight
+
+    int  n_chosen  = 0;     // cap used by the step in flight
+    int  n_step    = 0;
+    bool is_probe  = false; // last choose() was a probe
+
+    void init(int n_max) {
+        n_ceiling = std::max(1, n_max);
+        n_cur     = n_ceiling;
+
+        t_step_us.assign(n_ceiling + 1, -1.0);
+        n_landed .assign(n_ceiling + 1, -1.0);
+        n_count  .assign(n_ceiling + 1, 0);
+
+        n_obs      = 0;
+        probe_dir  = +1;
+        t_start_us = 0;
+        n_chosen   = 0;
+        n_step     = 0;
+        is_probe   = false;
+    }
+
+    bool has(int n) const {
+        return n >= 1 && n <= n_ceiling && t_step_us[n] > 0.0;
+    }
+
+    // a bucket with a single lucky step must not be able to win - require a few observations
+    bool warm(int n) const {
+        return has(n) && n_count[n] >= N_WARM;
+    }
+
+    double tps(int n) const {
+        return n_landed[n]/t_step_us[n];
+    }
+
+    int best() const {
+        int    res     = n_cur;
+        double res_tps = warm(n_cur) ? tps(n_cur) : -1.0;
+
+        for (int n = 1; n <= n_ceiling; ++n) {
+            if (warm(n) && tps(n) > res_tps) {
+                res     = n;
+                res_tps = tps(n);
+            }
+        }
+
+        return res;
+    }
+
+    int clamp(int n) const {
+        return std::min(n_ceiling, std::max(1, n));
+    }
+
+    // the cap with the fewest observations that is not warm yet, 0 if all are
+    int coldest() const {
+        int res = 0;
+        for (int n = 1; n <= n_ceiling; ++n) {
+            if (!warm(n) && (res == 0 || n_count[n] < n_count[res])) {
+                res = n;
+            }
+        }
+        return res;
+    }
+
+    int choose() {
+        ++n_step;
+
+        // exploration: until every cap has been tried a few times, probe every other step and
+        // sweep the whole range - a neighbour walk alone cannot cross a flat, noisy stretch
+        const int cold = coldest();
+
+        is_probe = cold ? (n_step % 2) == 0 : (n_step % N_PERIOD) == 0;
+
+        if (is_probe && cold) {
+            n_chosen = cold;
+        } else if (is_probe) {
+            n_chosen = clamp(n_cur + probe_dir);
+
+            if (n_chosen == n_cur) {
+                // at a boundary - try the other side
+                probe_dir = -probe_dir;
+                n_chosen  = clamp(n_cur + probe_dir);
+            }
+
+            probe_dir = -probe_dir;
+        } else {
+            n_chosen = best();
+        }
+
+        return n_chosen;
+    }
+
+    void begin() {
+        t_start_us = ggml_time_us();
+    }
+
+    void observe(int n_landed_step) {
+        if (t_start_us == 0) {
+            return;
+        }
+
+        const double dt_us = ggml_time_us() - t_start_us;
+
+        t_start_us = 0;
+
+        if (n_chosen < 1 || n_chosen > n_ceiling) {
+            return;
+        }
+
+        if (!has(n_chosen)) {
+            t_step_us[n_chosen] = dt_us;
+            n_landed [n_chosen] = n_landed_step;
+        } else {
+            // running mean for the first 1/ALPHA observations, EMA afterwards - so that no single
+            // step anchors a bucket, but the estimate still tracks the context and the task
+            const double a = std::max(ALPHA, 1.0/(n_count[n_chosen] + 1));
+
+            t_step_us[n_chosen] += a*(dt_us          - t_step_us[n_chosen]);
+            n_landed [n_chosen] += a*(n_landed_step  - n_landed [n_chosen]);
+        }
+
+        n_count[n_chosen]++;
+
+        n_obs++;
+
+        n_cur = best();
+    }
+
+    std::string summary() const {
+        std::string res = string_format("n=%d | ", n_cur);
+
+        for (int n = 1; n <= n_ceiling; ++n) {
+            if (has(n)) {
+                res += string_format("%d:%.1f t/s (%d%s) ", n, tps(n)*1e6, n_count[n], warm(n) ? "" : ", warming");
+            }
+        }
+
+        return res;
+    }
+};
+
 struct server_slot {
     int id;
 
@@ -215,6 +376,10 @@ struct server_slot {
     // copies of --spec-draft-n-max / --spec-draft-ctx-step, set at slot init
     int32_t spec_n_max    = 0;
     int32_t spec_ctx_step = 0;
+
+    // --spec-draft-auto, the state carries across tasks
+    bool spec_auto_enabled = false;
+    server_spec_autotune spec_auto;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
 
@@ -661,6 +826,10 @@ struct server_slot {
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
             SLT_TRC(*this,
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
+
+            if (spec_auto_enabled) {
+                SLT_INF(*this, "draft auto = %s\n", spec_auto.summary().c_str());
+            }
 
             if (stats.n_spec_pos_stoch + stats.n_spec_pos_exact + stats.n_spec_fallback > 0) {
                 SLT_INF(*this,
@@ -1299,6 +1468,9 @@ private:
 
             slot.spec_n_max    = params_base.speculative.draft.n_max;
             slot.spec_ctx_step = params_base.speculative.draft.ctx_step;
+
+            slot.spec_auto_enabled = params_base.speculative.draft.auto_n;
+            slot.spec_auto.init(slot.spec_n_max);
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
@@ -3151,9 +3323,28 @@ private:
 
                         slot.spec_draft_dists.clear();
 
+                        int n_draft_cur = n_draft_max;
+
+                        if (slot.spec_auto_enabled) {
+                            auto & spec_auto = slot.spec_auto;
+
+                            const int n_prev = spec_auto.n_chosen;
+
+                            n_draft_cur = std::min(n_draft_cur, spec_auto.choose());
+
+                            // the ctx/n_remaining clamps above can shorten the draft - charge the step to the cap really used
+                            spec_auto.n_chosen = n_draft_cur;
+
+                            if (n_draft_cur != n_prev) {
+                                SLT_DBG(slot, "draft auto: cap %d -> %d (%s)\n", n_prev, n_draft_cur, spec_auto.is_probe ? "probe" : "best");
+                            }
+
+                            spec_auto.begin();
+                        }
+
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting     = */ true,
-                            /* .n_max        = */ n_draft_max,
+                            /* .n_max        = */ n_draft_cur,
                             /* .n_past       = */ slot.prompt.n_tokens(),
                             /* .id_last      = */ slot.sampled,
                             /* .prompt       = */ &slot.spec_prompt,
@@ -4228,6 +4419,12 @@ private:
 
             slot.stats.update_gen_last();
 
+            if (slot.spec_auto_enabled) {
+                // the draft was empty (for example dropped by --spec-draft-n-min), but the cap that
+                // produced it still paid for this step
+                slot.spec_auto.observe(1);
+            }
+
             completion_token_output result;
             result.tok          = id;
             result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
@@ -4316,6 +4513,10 @@ private:
             // update how many tokens out of those tested were accepted
             slot.stats.n_draft_accepted += n_accepted;
             slot.stats.n_draft_verif_steps += 1;
+
+            if (slot.spec_auto_enabled) {
+                slot.spec_auto.observe((int) n_accepted + 1);
+            }
 
             auto & n_accepted_per_pos = slot.n_accepted_per_pos;
             if (n_accepted_per_pos.empty()) {
