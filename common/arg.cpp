@@ -3407,6 +3407,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_UI_FILES_PATH"));
     add_opt(common_arg(
+        {"--path-to-upload-from-ui"}, "PATH",
+        "directory where the files uploaded from the web UI /files page are stored,\n"
+        "must be an existing directory (default: uploads disabled)",
+        [](common_params & params, const std::string & value) {
+            params.ui_upload_path = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_UI_UPLOAD_PATH"));
+    add_opt(common_arg(
         {"--cors-origins"}, "ORIGINS",
         string_format(
             "comma-separated list of allowed origins for CORS (default: %s)\n"

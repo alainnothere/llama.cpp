@@ -670,6 +670,7 @@ struct common_params {
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
     std::vector<std::string> ui_files_paths; // directories and/or single files served for download at /files
+    std::string ui_upload_path; // empty = disabled. directory receiving the files uploaded from the /files page
     std::string api_prefix    = "";                                                                         // NOLINT
     std::string chat_template = "";                                                                         // NOLINT
     bool use_jinja = true;                                                                                  // NOLINT

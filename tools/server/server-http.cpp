@@ -348,7 +348,8 @@ bool server_http_context::init(const common_params & params) {
     //
 
     // registered before the web UI, so that these routes win over a potential `--path` root mount
-    if (!params.ui_files_paths.empty()) {
+    // an upload-only configuration still gets the listing page and the upload route
+    if (!params.ui_files_paths.empty() || !params.ui_upload_path.empty()) {
         for (const auto & entry : params.ui_files_paths) {
             std::error_code ec;
             // symlinks are deliberately followed here and everywhere below
@@ -358,7 +359,15 @@ bool server_http_context::init(const common_params & params) {
             }
         }
 
-        auto handle_files_listing = [entries = params.ui_files_paths](const httplib::Request & req, httplib::Response & res) {
+        if (!params.ui_upload_path.empty()) {
+            std::error_code ec;
+            if (!std::filesystem::is_directory(params.ui_upload_path, ec)) {
+                SRV_ERR("upload path is not a directory: %s\n", params.ui_upload_path.c_str());
+                return false;
+            }
+        }
+
+        auto handle_files_listing = [entries = params.ui_files_paths, upload_path = params.ui_upload_path](const httplib::Request & req, httplib::Response & res) {
             auto html_escape = [](const std::string & str) {
                 std::string out;
                 for (const char c : str) {
@@ -434,7 +443,16 @@ bool server_http_context::init(const common_params & params) {
             for (const auto & [name, size] : files) {
                 html += "<li><a href=\"" + href_prefix + percent_encode(name) + "\">" + html_escape(name) + "</a> (" + human_size(size) + ")</li>\n";
             }
-            html += "</ul>\n</body></html>\n";
+            html += "</ul>\n";
+            if (!upload_path.empty()) {
+                // an empty action posts to the current URL, which works for both "/files" and "/files/"
+                html +=
+                    "<h2>Upload</h2>\n"
+                    "<form method=\"post\" enctype=\"multipart/form-data\" action=\"\">"
+                    "<input type=\"file\" name=\"file\" required> <input type=\"submit\" value=\"Upload\">"
+                    "</form>\n";
+            }
+            html += "</body></html>\n";
 
             res.set_content(html, "text/html");
         };
@@ -497,7 +515,68 @@ bool server_http_context::init(const common_params & params) {
                 res.set_content("Error: file not found", "text/plain");
             });
 
-        SRV_INF("serving %zu path(s) for download at %s/files\n", params.ui_files_paths.size(), params.api_prefix.c_str());
+        if (!params.ui_upload_path.empty()) {
+            auto handle_files_upload = [upload_path = params.ui_upload_path](const httplib::Request & req, httplib::Response & res) {
+                auto fail = [&res](const int status, const std::string & message) {
+                    res.status = status;
+                    res.set_content("<!DOCTYPE html>\n<html><body><p>" + message + "</p></body></html>\n", "text/html");
+                };
+
+                if (!req.is_multipart_form_data() || req.form.files.empty()) {
+                    fail(400, "Error: expected a multipart form with a file part");
+                    return;
+                }
+
+                // the first file part wins, whatever its field name is
+                const httplib::FormData & file = req.form.files.begin()->second;
+
+                // the client-supplied filename is untrusted: keep the last path component only
+                std::string name = file.filename;
+                if (const auto pos = name.find_last_of("/\\"); pos != std::string::npos) {
+                    name.erase(0, pos + 1);
+                }
+                const bool has_control_char = std::any_of(name.begin(), name.end(),
+                    [](const unsigned char c) { return c < 0x20 || c == 0x7F; });
+                if (name.empty() || name == "." || name == ".." || has_control_char) {
+                    fail(400, "Error: invalid file name");
+                    return;
+                }
+
+                const std::filesystem::path path = std::filesystem::path(upload_path) / name;
+                std::error_code ec;
+                if (std::filesystem::exists(path, ec)) {
+                    fail(409, "Error: file already exists");
+                    return;
+                }
+
+                std::ofstream out(path, std::ios::binary);
+                out.write(file.content.data(), static_cast<std::streamsize>(file.content.size()));
+                out.close();
+                if (!out) {
+                    SRV_ERR("failed to write the uploaded file: %s\n", path.string().c_str());
+                    std::filesystem::remove(path, ec);
+                    fail(500, "Error: failed to write the uploaded file");
+                    return;
+                }
+
+                SRV_INF("uploaded %zu bytes to %s\n", file.content.size(), path.string().c_str());
+
+                // relative location, so that the redirect keeps working behind a reverse proxy or an api prefix
+                res.status = 303;
+                res.set_header("Location", !req.path.empty() && req.path.back() == '/' ? "./" : "files");
+            };
+
+            // both spellings of the listing page post to themselves
+            srv->Post(params.api_prefix + "/files",  handle_files_upload);
+            srv->Post(params.api_prefix + "/files/", handle_files_upload);
+        }
+
+        if (!params.ui_files_paths.empty()) {
+            SRV_INF("serving %zu path(s) for download at %s/files\n", params.ui_files_paths.size(), params.api_prefix.c_str());
+        }
+        if (!params.ui_upload_path.empty()) {
+            SRV_INF("accepting uploads at %s/files -> %s\n", params.api_prefix.c_str(), params.ui_upload_path.c_str());
+        }
     }
 
     //
