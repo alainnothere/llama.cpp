@@ -103,6 +103,8 @@ class ServerProcess:
     spec_draft_ctx_step: int | None = None
     spec_draft_auto: bool | None = None
     lookup_cache_dynamic: str | None = None
+    spec_synth_len: float | None = None
+    spec_synth_rates: List[float] | None = None
     no_ui: bool | None = None
     jinja: bool | None = None
     reasoning_format: Literal['deepseek', 'none', 'nothink'] | None = None
@@ -263,6 +265,11 @@ class ServerProcess:
             server_args.append("--spec-draft-auto")
         if self.lookup_cache_dynamic:
             server_args.extend(["--lookup-cache-dynamic", self.lookup_cache_dynamic])
+        if self.spec_synth_len is not None:
+            server_args.extend(["--spec-synth-len", self.spec_synth_len])
+        if self.spec_synth_rates is not None:
+            rates = ",".join(str(rate) for rate in self.spec_synth_rates)
+            server_args.extend(["--spec-synth-rates", rates])
         if self.no_ui:
             server_args.append("--no-ui")
         if self.no_models_autoload:

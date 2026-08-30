@@ -27,6 +27,7 @@
 		onSearchDeactivated?: () => void;
 		onSearchClick?: () => void;
 		onNewChat?: () => void;
+		onSettingsClick?: () => void;
 	}
 
 	let {
@@ -36,6 +37,7 @@
 		onNewChat,
 		onSearchClick,
 		onSearchDeactivated,
+		onSettingsClick,
 		searchQuery = $bindable('')
 	}: Props = $props();
 
@@ -122,14 +124,16 @@
 							onNewChat?.();
 							void conversationsStore.openNewChat();
 						}
-					: item.route
-						? () => {
-								onNewChat?.();
-								goto(item.route!);
-							}
-						: isSearchOnMobile
-							? undefined
-							: onSearchClick}
+					: item.action === SidebarAction.SETTINGS
+						? () => onSettingsClick?.()
+						: item.route
+							? () => {
+									onNewChat?.();
+									goto(item.route!);
+								}
+							: isSearchOnMobile
+								? undefined
+								: onSearchClick}
 			{@const itemTransition = {
 				delay: !initialized ? i * ICON_STRIP_TRANSITION_DELAY_MULTIPLIER : 0,
 				duration: ICON_STRIP_TRANSITION_DURATION,
@@ -179,14 +183,16 @@
 							onNewChat?.();
 							void conversationsStore.openNewChat();
 						}
-					: item.route
-						? () => {
-								onNewChat?.();
-								goto(item.route!);
-							}
-						: isSearchOnMobile
-							? undefined
-							: onSearchClick}
+					: item.action === SidebarAction.SETTINGS
+						? () => onSettingsClick?.()
+						: item.route
+							? () => {
+									onNewChat?.();
+									goto(item.route!);
+								}
+							: isSearchOnMobile
+								? undefined
+								: onSearchClick}
 			{@const itemTransition = {
 				delay: !initialized ? i * ICON_STRIP_TRANSITION_DELAY_MULTIPLIER : 0,
 				duration: ICON_STRIP_TRANSITION_DURATION,
