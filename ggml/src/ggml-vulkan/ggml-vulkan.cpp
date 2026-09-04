@@ -67,10 +67,12 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include <future>
 #include <condition_variable>
 #include <thread>
+#include <atomic>
 
 #if defined(_MSC_VER)
 # define NOMINMAX 1
 # include <windows.h>
+# include <malloc.h> // _aligned_malloc / _aligned_free
 # define YIELD() YieldProcessor()
 #elif defined(__clang__) || defined(__GNUC__)
 # if defined(__x86_64__) ||defined(__i386__)
@@ -802,6 +804,9 @@ struct vk_device_struct {
     uint64_t suballocation_block_size;
     uint64_t min_imported_host_pointer_alignment;
     bool external_memory_host {};
+    bool external_semaphore {};
+    bool external_memory_dma_buf {};
+    bool external_semaphore_fd {};
     bool fp16;
     bool bf16;
     bool pipeline_robustness;
@@ -1129,35 +1134,7 @@ struct vk_device_struct {
 
     std::unique_ptr<vk_memory_logger> memory_logger;
 
-    ~vk_device_struct() {
-        VK_LOG_DEBUG("destroy device " << name);
-
-        device.destroyFence(fence);
-
-        ggml_vk_destroy_buffer(sync_staging);
-
-        if (compute_queue) compute_queue->cmd_pool.destroy(device);
-        if (transfer_queue) transfer_queue->cmd_pool.destroy(device);
-
-        // Explicitly clear to ensure queues drop their shared_ptrs to handles
-        // before the Vulkan logical device instance is destroyed
-        compute_queue.reset();
-        transfer_queue.reset();
-
-        for (auto& pipeline : all_pipelines) {
-            if (pipeline.expired()) {
-                continue;
-            }
-
-            vk_pipeline pl = pipeline.lock();
-            ggml_vk_destroy_pipeline(device, pl);
-        }
-        all_pipelines.clear();
-
-        device.destroyDescriptorSetLayout(dsl);
-
-        device.destroy();
-    }
+    ~vk_device_struct();
 };
 
 void vk_command_pool::init(vk_device& device, vk_queue *q_) {
@@ -1243,10 +1220,72 @@ struct vk_buffer_struct {
         }
         VK_LOG_DEBUG("~vk_buffer_struct(" << buffer << ", " << size << ")");
 
-        device->device.freeMemory(device_memory);
         device->device.destroyBuffer(buffer);
+        device->device.freeMemory(device_memory);
     }
 };
+
+#ifdef __linux__
+enum vk_d2d_method {
+    D2D_UNTESTED,
+    D2D_DMABUF_P2P,
+    D2D_DMABUF_GTT,
+    D2D_SHARED_STAGING,
+    D2D_STAGING,
+};
+
+enum vk_d2d_sync_method {
+    D2D_SYNC_NONE,
+    D2D_SYNC_TIMELINE,
+    D2D_SYNC_SYNCFD,
+};
+
+struct vk_d2d_path {
+    vk_d2d_method method = D2D_UNTESTED;
+    bool reverse_direction = false;
+    size_t size = 0;
+
+    static constexpr size_t POOL_SIZE = 2;
+
+    struct slot {
+        vk_buffer buf_a;
+        vk_buffer buf_b;
+        void * host_ptr = nullptr;
+        uint64_t hop2_done = 0;
+        // sync_fd back-edge: hop2 signals a per-copy semaphore (stored here),
+        // exported via sync_fd into a per-copy semaphore on src for next hop1
+        vk::Semaphore last_back_sem = VK_NULL_HANDLE;
+        bool back_edge_ready = false;
+    };
+
+    slot slots[POOL_SIZE];
+    size_t num_slots = 0;
+    size_t pool_idx = 0;
+
+    vk_d2d_sync_method sync_method = D2D_SYNC_NONE;
+    vk::Semaphore sem_src = VK_NULL_HANDLE;
+    vk::Semaphore sem_dst = VK_NULL_HANDLE;
+    uint64_t sem_value = 0;
+    vk_device_struct * sem_src_device = nullptr;
+    vk_device_struct * sem_dst_device = nullptr;
+
+    vk_command_pool hop1_cmd_pool;
+    vk_device_struct * hop1_device = nullptr;
+
+    vk_command_pool hop2_cmd_pool;
+    vk_device_struct * hop2_device = nullptr;
+
+    // Syncfd bump sub-allocator: each copy claims alloc_offset space,
+    // reset between evaluations. high_water_mark drives buffer resizing.
+    size_t alloc_offset = 0;
+    size_t high_water_mark = 0;
+
+    // Semi-async: tracks whether a deferred hop2 is pending in the dst
+    // compute context, so back-to-back copies flush before overwriting
+    // the shared buffer.
+    bool semi_async_pending = false;
+};
+#endif
 
 struct vk_subbuffer {
     vk_buffer buffer;
@@ -2386,6 +2425,10 @@ struct ggml_backend_vk_context {
 
     vk_device device;
 
+    bool         comm_active = false;
+    vk::Semaphore comm_prog_sem = VK_NULL_HANDLE;
+    uint64_t     comm_prog_val  = 0;
+
     size_t semaphore_idx, event_idx;
     ggml_vk_garbage_collector gc;
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset;
@@ -2611,10 +2654,113 @@ struct vk_instance_t {
     std::vector<size_t> device_indices;
     std::vector<bool>   device_supports_membudget;
     vk_device devices[GGML_VK_MAX_DEVICES];
+
+    ~vk_instance_t();
 };
+
+#ifdef __linux__
+static std::mutex vk_d2d_cache_mutex;
+static std::map<std::pair<vk_device_struct*, vk_device_struct*>, vk_d2d_path> vk_d2d_cache;
+#endif
 
 static bool vk_instance_initialized = false;
 static vk_instance_t vk_instance;
+
+#ifdef __linux__
+static void ggml_vk_d2d_destroy_sync(vk_d2d_path& path);
+static bool ggml_vk_d2d_grow_slot(vk_d2d_path& path, vk_device& src_dev, vk_device& dst_dev,
+                                   size_t needed, vk_d2d_path::slot& s);
+#endif
+
+vk_instance_t::~vk_instance_t() {
+#ifdef __linux__
+    {
+        std::lock_guard<std::mutex> guard(vk_d2d_cache_mutex);
+        for (auto& entry : vk_d2d_cache) {
+            // Neutralize entries without Vulkan API calls — device.destroy()
+            // in each device's destructor will implicitly free associated resources.
+            // Explicit Vulkan calls here are unsafe because the validation layer's
+            // static data may already be destroyed.
+            entry.second.sync_method = D2D_SYNC_NONE;
+            entry.second.sem_src = VK_NULL_HANDLE;
+            entry.second.sem_dst = VK_NULL_HANDLE;
+            entry.second.hop1_cmd_pool.pool = nullptr;
+            entry.second.hop2_cmd_pool.pool = nullptr;
+            for (auto& s : entry.second.slots) {
+                if (s.host_ptr) {
+                    free(s.host_ptr);
+                    s.host_ptr = nullptr;
+                }
+                if (s.buf_a) {
+                    s.buf_a->size = 0;
+                }
+                if (s.buf_b) {
+                    s.buf_b->size = 0;
+                }
+                s.last_back_sem = VK_NULL_HANDLE;
+                s.back_edge_ready = false;
+            }
+        }
+        vk_d2d_cache.clear();
+    }
+#endif
+}
+
+vk_device_struct::~vk_device_struct() {
+    VK_LOG_DEBUG("destroy device " << name);
+
+#ifdef __linux__
+    {
+        std::lock_guard<std::mutex> guard(vk_d2d_cache_mutex);
+        for (auto it = vk_d2d_cache.begin(); it != vk_d2d_cache.end(); ) {
+            if (it->first.first == this || it->first.second == this) {
+                ggml_vk_d2d_destroy_sync(it->second);
+                for (auto& s : it->second.slots) {
+                    if (s.host_ptr) {
+                        free(s.host_ptr);
+                        s.host_ptr = nullptr;
+                    }
+                    if (s.buf_a) {
+                        s.buf_a->size = 0;
+                    }
+                    if (s.buf_b) {
+                        s.buf_b->size = 0;
+                    }
+                }
+                it = vk_d2d_cache.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+#endif
+
+    device.destroyFence(fence);
+
+    ggml_vk_destroy_buffer(sync_staging);
+
+    if (compute_queue) compute_queue->cmd_pool.destroy(device);
+    if (transfer_queue) transfer_queue->cmd_pool.destroy(device);
+
+    // Explicitly clear to ensure queues drop their shared_ptrs to handles
+    // before the Vulkan logical device instance is destroyed
+    compute_queue.reset();
+    transfer_queue.reset();
+
+    for (auto& pipeline : all_pipelines) {
+        if (pipeline.expired()) {
+            continue;
+        }
+
+        vk_pipeline pl = pipeline.lock();
+        ggml_vk_destroy_pipeline(device, pl);
+    }
+    all_pipelines.clear();
+
+    device.destroyDescriptorSetLayout(dsl);
+
+    device.destroy();
+}
 
 #ifdef GGML_VULKAN_CHECK_RESULTS
 static size_t vk_skip_checks;
@@ -3386,9 +3532,17 @@ static vk_context ggml_vk_create_temporary_context(vk_command_pool& p) {
     return result;
 }
 
-static vk_semaphore * ggml_vk_create_binary_semaphore(ggml_backend_vk_context * ctx) {
-    VK_LOG_DEBUG("ggml_vk_create_timeline_semaphore()");
+static vk_semaphore * ggml_vk_create_binary_semaphore(ggml_backend_vk_context * ctx,
+        vk::ExternalSemaphoreHandleTypeFlags export_handle_types = {}) {
+    VK_LOG_DEBUG("ggml_vk_create_binary_semaphore()");
+    vk::ExportSemaphoreCreateInfo export_ci;
+    export_ci.handleTypes = export_handle_types;
+
     vk::SemaphoreTypeCreateInfo tci{ vk::SemaphoreType::eBinary, 0 };
+    if (export_handle_types) {
+        tci.pNext = &export_ci;
+    }
+
     vk::SemaphoreCreateInfo ci{};
     ci.setPNext(&tci);
     vk::Semaphore semaphore = ctx->device->device.createSemaphore(ci);
@@ -3672,6 +3826,531 @@ static void ggml_vk_destroy_buffer(vk_buffer& buf) {
 
     buf.reset();
 }
+
+#ifdef __linux__
+#include <unistd.h>
+
+static vk_buffer ggml_vk_create_buffer_dma_buf_export(vk_device& device, size_t size, bool device_local) {
+    vk_buffer buf = std::make_shared<vk_buffer_struct>();
+
+    vk::BufferUsageFlags usage_flags = vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst;
+
+    vk::ExternalMemoryBufferCreateInfo external_memory_bci;
+    external_memory_bci.handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT;
+
+    vk::BufferCreateInfo buffer_create_info{
+        vk::BufferCreateFlags(),
+        size,
+        usage_flags,
+        vk::SharingMode::eExclusive,
+        0,
+        nullptr,
+    };
+    buffer_create_info.setPNext(&external_memory_bci);
+
+    try {
+        buf->buffer = device->device.createBuffer(buffer_create_info);
+    } catch (const vk::SystemError& e) {
+        VK_LOG_DEBUG("ggml_vk_create_buffer_dma_buf_export: createBuffer failed: " << e.what());
+        return {};
+    }
+
+    vk::MemoryRequirements mem_req = device->device.getBufferMemoryRequirements(buf->buffer);
+    vk::PhysicalDeviceMemoryProperties mem_props = device->physical_device.getMemoryProperties();
+
+    vk::MemoryPropertyFlags req_flags;
+    if (device_local) {
+        req_flags = vk::MemoryPropertyFlagBits::eDeviceLocal;
+    } else {
+        req_flags = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent;
+    }
+
+    const std::vector<uint32_t> memory_type_indices = ggml_vk_find_memory_properties(&mem_props, &mem_req, req_flags);
+    if (memory_type_indices.empty()) {
+        VK_LOG_DEBUG("ggml_vk_create_buffer_dma_buf_export: no suitable memory type");
+        device->device.destroyBuffer(buf->buffer);
+        return {};
+    }
+
+    // For GTT, prefer non-device-local host-visible memory
+    uint32_t chosen_idx = memory_type_indices[0];
+    if (!device_local) {
+        for (uint32_t idx : memory_type_indices) {
+            if (!(mem_props.memoryTypes[idx].propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal)) {
+                chosen_idx = idx;
+                break;
+            }
+        }
+    }
+
+    vk::ExportMemoryAllocateInfo export_info;
+    export_info.handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT;
+
+    vk::MemoryAllocateInfo alloc_info;
+    alloc_info.allocationSize = mem_req.size;
+    alloc_info.memoryTypeIndex = chosen_idx;
+    alloc_info.setPNext(&export_info);
+
+    try {
+        buf->device_memory = device->device.allocateMemory(alloc_info);
+    } catch (const vk::SystemError& e) {
+        VK_LOG_DEBUG("ggml_vk_create_buffer_dma_buf_export: allocateMemory failed: " << e.what());
+        device->device.destroyBuffer(buf->buffer);
+        return {};
+    }
+
+    buf->memory_property_flags = mem_props.memoryTypes[chosen_idx].propertyFlags;
+    buf->ptr = nullptr;
+
+    device->device.bindBufferMemory(buf->buffer, buf->device_memory, 0);
+    buf->device = device;
+    buf->size = size;
+
+    device->memory_logger->log_allocation(buf, size);
+
+    return buf;
+}
+
+static int ggml_vk_export_dma_buf_fd(vk_device& device, vk_buffer& buf) {
+    vk::MemoryGetFdInfoKHR fd_info;
+    fd_info.memory = buf->device_memory;
+    fd_info.handleType = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT;
+
+    try {
+        return device->device.getMemoryFdKHR(fd_info);
+    } catch (const vk::SystemError& e) {
+        VK_LOG_DEBUG("ggml_vk_export_dma_buf_fd: getMemoryFdKHR failed: " << e.what());
+        return -1;
+    }
+}
+
+static vk_buffer ggml_vk_import_dma_buf_fd(vk_device& device, int fd, size_t size, vk::MemoryPropertyFlags req_flags) {
+    vk_buffer buf = std::make_shared<vk_buffer_struct>();
+
+    vk::ExternalMemoryBufferCreateInfo external_memory_bci;
+    external_memory_bci.handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT;
+
+    vk::BufferCreateInfo buffer_create_info{
+        vk::BufferCreateFlags(),
+        size,
+        vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst,
+        vk::SharingMode::eExclusive,
+        0,
+        nullptr,
+    };
+    buffer_create_info.setPNext(&external_memory_bci);
+
+    try {
+        buf->buffer = device->device.createBuffer(buffer_create_info);
+    } catch (const vk::SystemError& e) {
+        VK_LOG_DEBUG("ggml_vk_import_dma_buf_fd: createBuffer failed: " << e.what());
+        close(fd);
+        return {};
+    }
+
+    vk::MemoryRequirements mem_req = device->device.getBufferMemoryRequirements(buf->buffer);
+    vk::PhysicalDeviceMemoryProperties mem_props = device->physical_device.getMemoryProperties();
+
+    vk::MemoryFdPropertiesKHR fd_props;
+    try {
+        fd_props = device->device.getMemoryFdPropertiesKHR(vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT, fd);
+    } catch (const vk::SystemError& e) {
+        VK_LOG_DEBUG("ggml_vk_import_dma_buf_fd: getMemoryFdPropertiesKHR failed: " << e.what());
+        device->device.destroyBuffer(buf->buffer);
+        close(fd);
+        return {};
+    }
+
+    uint32_t memory_type_idx;
+    for (memory_type_idx = 0; memory_type_idx < mem_props.memoryTypeCount; ++memory_type_idx) {
+        if (!(fd_props.memoryTypeBits & (1u << memory_type_idx))) {
+            continue;
+        }
+        if (!(mem_req.memoryTypeBits & (1u << memory_type_idx))) {
+            continue;
+        }
+        if ((mem_props.memoryTypes[memory_type_idx].propertyFlags & req_flags) == req_flags) {
+            break;
+        }
+    }
+    if (memory_type_idx == mem_props.memoryTypeCount) {
+        VK_LOG_DEBUG("ggml_vk_import_dma_buf_fd: no suitable memory type");
+        device->device.destroyBuffer(buf->buffer);
+        close(fd);
+        return {};
+    }
+
+    vk::ImportMemoryFdInfoKHR import_info;
+    import_info.handleType = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT;
+    import_info.fd = fd;
+
+    vk::MemoryAllocateInfo alloc_info;
+    alloc_info.allocationSize = mem_req.size;
+    alloc_info.memoryTypeIndex = memory_type_idx;
+    alloc_info.setPNext(&import_info);
+
+    try {
+        buf->device_memory = device->device.allocateMemory(alloc_info);
+    } catch (const vk::SystemError& e) {
+        VK_LOG_DEBUG("ggml_vk_import_dma_buf_fd: allocateMemory failed: " << e.what());
+        device->device.destroyBuffer(buf->buffer);
+        close(fd);
+        return {};
+    }
+    // fd is consumed by successful import — do not close
+
+    buf->memory_property_flags = mem_props.memoryTypes[memory_type_idx].propertyFlags;
+    buf->ptr = nullptr;
+
+    device->device.bindBufferMemory(buf->buffer, buf->device_memory, 0);
+    buf->device = device;
+    buf->size = size;
+
+    device->memory_logger->log_allocation(buf, size);
+
+    return buf;
+}
+
+static bool ggml_vk_d2d_try_dma_buf(vk_device& exporter, vk_device& importer, size_t size, bool device_local,
+                                     vk_buffer& out_export_buf, vk_buffer& out_import_buf) {
+    out_export_buf = ggml_vk_create_buffer_dma_buf_export(exporter, size, device_local);
+    if (!out_export_buf) {
+        return false;
+    }
+
+    int fd = ggml_vk_export_dma_buf_fd(exporter, out_export_buf);
+    if (fd < 0) {
+        ggml_vk_destroy_buffer(out_export_buf);
+        return false;
+    }
+
+    vk::MemoryPropertyFlags import_flags = device_local
+        ? vk::MemoryPropertyFlagBits::eDeviceLocal
+        : (vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+
+    out_import_buf = ggml_vk_import_dma_buf_fd(importer, fd, size, import_flags);
+    static const bool any_memtype = getenv("GGML_VK_DMABUF_ANY_MEMTYPE") != nullptr;
+    if (!out_import_buf && device_local && any_memtype) {
+        // amdgpu exposes a foreign dma-buf as an sg-table object typed as GTT on the importer, so RADV never
+        // offers a device-local type for it. The kernel maps the exporter's VRAM over the BAR (P2P), but the
+        // imported object lacks AMDGPU_GEM_CREATE_EXPLICIT_SYNC, so every submission that references it
+        // implicitly syncs to the peer GPU and the two devices serialize. Opt-in only until that is fixed.
+        fd = ggml_vk_export_dma_buf_fd(exporter, out_export_buf);
+        if (fd >= 0) {
+            out_import_buf = ggml_vk_import_dma_buf_fd(importer, fd, size, vk::MemoryPropertyFlags());
+        }
+    }
+    if (!out_import_buf) {
+        ggml_vk_destroy_buffer(out_export_buf);
+        return false;
+    }
+
+    return true;
+}
+
+static bool ggml_vk_d2d_try_shared_staging(vk_device& dev_a, vk_device& dev_b, size_t size,
+                                            vk_buffer& out_buf_a, vk_buffer& out_buf_b, void*& out_host_ptr) {
+    if (!dev_a->external_memory_host || !dev_b->external_memory_host) {
+        return false;
+    }
+
+    uint64_t align = std::max(dev_a->min_imported_host_pointer_alignment, dev_b->min_imported_host_pointer_alignment);
+    size_t alloc_size = (size + align - 1) & ~(align - 1);
+
+    void * ptr = nullptr;
+    if (posix_memalign(&ptr, align, alloc_size) != 0 || ptr == nullptr) {
+        return false;
+    }
+
+    const vk::MemoryPropertyFlags flags = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached;
+
+    try {
+        out_buf_a = ggml_vk_create_buffer(dev_a, alloc_size, {flags}, ptr);
+    } catch (const vk::SystemError&) {
+        out_buf_a = {};
+    }
+    if (!out_buf_a) {
+        free(ptr);
+        return false;
+    }
+
+    try {
+        out_buf_b = ggml_vk_create_buffer(dev_b, alloc_size, {flags}, ptr);
+    } catch (const vk::SystemError&) {
+        out_buf_b = {};
+    }
+    if (!out_buf_b) {
+        ggml_vk_destroy_buffer(out_buf_a);
+        free(ptr);
+        return false;
+    }
+
+    out_host_ptr = ptr;
+    return true;
+}
+
+static void ggml_vk_d2d_destroy_sync(vk_d2d_path& path) {
+    if (path.sync_method == D2D_SYNC_NONE) {
+        return;
+    }
+
+    if (path.sync_method == D2D_SYNC_TIMELINE) {
+        if (path.sem_value > 0 && path.sem_src_device) {
+            try {
+                VkSemaphoreWaitInfo wait_info = {};
+                wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+                VkSemaphore sem = path.sem_src;
+                uint64_t val = path.sem_value;
+                wait_info.semaphoreCount = 1;
+                wait_info.pSemaphores = &sem;
+                wait_info.pValues = &val;
+                vkWaitSemaphores(path.sem_src_device->device, &wait_info, UINT64_MAX);
+            } catch (...) {}
+        }
+    } else if (path.sync_method == D2D_SYNC_SYNCFD) {
+        if (path.hop1_device) {
+            vkDeviceWaitIdle(path.hop1_device->device);
+        }
+        if (path.sem_dst_device) {
+            vkDeviceWaitIdle(path.sem_dst_device->device);
+        }
+    }
+
+    if (path.hop1_cmd_pool.pool) {
+        path.hop1_cmd_pool.destroy(path.hop1_device->device);
+    }
+    if (path.hop2_cmd_pool.pool) {
+        path.hop2_cmd_pool.destroy(path.hop2_device->device);
+    }
+
+    if (path.sem_src) {
+        path.sem_src_device->device.destroySemaphore(path.sem_src);
+        path.sem_src = VK_NULL_HANDLE;
+    }
+    if (path.sem_dst) {
+        path.sem_dst_device->device.destroySemaphore(path.sem_dst);
+        path.sem_dst = VK_NULL_HANDLE;
+    }
+
+    path.sync_method = D2D_SYNC_NONE;
+    path.sem_value = 0;
+    path.alloc_offset = 0;
+    path.high_water_mark = 0;
+    path.sem_src_device = nullptr;
+    path.sem_dst_device = nullptr;
+    path.hop1_device = nullptr;
+    path.hop2_device = nullptr;
+}
+
+static bool ggml_vk_d2d_check_timeline_semaphore_export(vk_device& dev) {
+    vk::SemaphoreTypeCreateInfo sem_type;
+    sem_type.semaphoreType = vk::SemaphoreType::eTimeline;
+
+    vk::PhysicalDeviceExternalSemaphoreInfo ext_sem_info;
+    ext_sem_info.handleType = vk::ExternalSemaphoreHandleTypeFlagBits::eOpaqueFd;
+    ext_sem_info.pNext = &sem_type;
+
+    vk::ExternalSemaphoreProperties props = dev->physical_device.getExternalSemaphoreProperties(ext_sem_info);
+
+    return (props.externalSemaphoreFeatures & vk::ExternalSemaphoreFeatureFlagBits::eExportable) &&
+           (props.externalSemaphoreFeatures & vk::ExternalSemaphoreFeatureFlagBits::eImportable);
+}
+
+static bool ggml_vk_d2d_check_sync_fd_support(vk_device& dev) {
+    if (!dev->external_semaphore_fd) {
+        return false;
+    }
+
+    vk::PhysicalDeviceExternalSemaphoreInfo ext_sem_info;
+    ext_sem_info.handleType = vk::ExternalSemaphoreHandleTypeFlagBits::eSyncFd;
+
+    vk::ExternalSemaphoreProperties props = dev->physical_device.getExternalSemaphoreProperties(ext_sem_info);
+
+    return (props.externalSemaphoreFeatures & vk::ExternalSemaphoreFeatureFlagBits::eExportable) &&
+           (props.externalSemaphoreFeatures & vk::ExternalSemaphoreFeatureFlagBits::eImportable);
+}
+
+static bool ggml_vk_d2d_try_timeline_sync(vk_device& src_dev, vk_device& dst_dev, vk_d2d_path& path) {
+    if (!src_dev->external_semaphore_fd || !dst_dev->external_semaphore_fd) {
+        return false;
+    }
+
+    if (src_dev->driver_id != dst_dev->driver_id) {
+        return false;
+    }
+
+    if (!ggml_vk_d2d_check_timeline_semaphore_export(src_dev) ||
+        !ggml_vk_d2d_check_timeline_semaphore_export(dst_dev)) {
+        VK_LOG_DEBUG("ggml_vk_d2d_try_timeline_sync: timeline semaphore export/import not supported");
+        return false;
+    }
+
+    vk::ExportSemaphoreCreateInfo export_ci;
+    export_ci.handleTypes = vk::ExternalSemaphoreHandleTypeFlagBits::eOpaqueFd;
+
+    vk::SemaphoreTypeCreateInfo type_ci{ vk::SemaphoreType::eTimeline, 0 };
+    type_ci.pNext = &export_ci;
+
+    vk::SemaphoreCreateInfo sem_ci;
+    sem_ci.pNext = &type_ci;
+
+    vk::Semaphore src_sem;
+    try {
+        src_sem = src_dev->device.createSemaphore(sem_ci);
+    } catch (const vk::SystemError& e) {
+        VK_LOG_DEBUG("ggml_vk_d2d_try_timeline_sync: createSemaphore on src failed: " << e.what());
+        return false;
+    }
+
+    vk::SemaphoreGetFdInfoKHR get_fd_info;
+    get_fd_info.semaphore = src_sem;
+    get_fd_info.handleType = vk::ExternalSemaphoreHandleTypeFlagBits::eOpaqueFd;
+
+    int fd = -1;
+    try {
+        fd = src_dev->device.getSemaphoreFdKHR(get_fd_info);
+    } catch (const vk::SystemError& e) {
+        VK_LOG_DEBUG("ggml_vk_d2d_try_timeline_sync: getSemaphoreFdKHR failed: " << e.what());
+        src_dev->device.destroySemaphore(src_sem);
+        return false;
+    }
+    if (fd < 0) {
+        VK_LOG_DEBUG("ggml_vk_d2d_try_timeline_sync: getSemaphoreFdKHR returned invalid fd");
+        src_dev->device.destroySemaphore(src_sem);
+        return false;
+    }
+
+    vk::SemaphoreTypeCreateInfo dst_type_ci{ vk::SemaphoreType::eTimeline, 0 };
+
+    vk::SemaphoreCreateInfo dst_sem_ci{};
+    dst_sem_ci.pNext = &dst_type_ci;
+
+    vk::Semaphore dst_sem;
+    try {
+        dst_sem = dst_dev->device.createSemaphore(dst_sem_ci);
+    } catch (const vk::SystemError& e) {
+        VK_LOG_DEBUG("ggml_vk_d2d_try_timeline_sync: createSemaphore on dst failed: " << e.what());
+        close(fd);
+        src_dev->device.destroySemaphore(src_sem);
+        return false;
+    }
+
+    vk::ImportSemaphoreFdInfoKHR import_info;
+    import_info.semaphore = dst_sem;
+    import_info.handleType = vk::ExternalSemaphoreHandleTypeFlagBits::eOpaqueFd;
+    import_info.fd = fd;
+
+    try {
+        dst_dev->device.importSemaphoreFdKHR(import_info);
+    } catch (const vk::SystemError& e) {
+        VK_LOG_DEBUG("ggml_vk_d2d_try_timeline_sync: importSemaphoreFdKHR failed: " << e.what());
+        close(fd);
+        dst_dev->device.destroySemaphore(dst_sem);
+        src_dev->device.destroySemaphore(src_sem);
+        return false;
+    }
+
+    try {
+        path.hop1_cmd_pool.init(src_dev, src_dev->transfer_queue.get());
+    } catch (const vk::SystemError& e) {
+        VK_LOG_DEBUG("ggml_vk_d2d_try_timeline_sync: cmd pool/fence creation failed: " << e.what());
+        if (path.hop1_cmd_pool.pool) {
+            path.hop1_cmd_pool.destroy(src_dev->device);
+        }
+        dst_dev->device.destroySemaphore(dst_sem);
+        src_dev->device.destroySemaphore(src_sem);
+        return false;
+    }
+
+    path.sem_src = src_sem;
+    path.sem_dst = dst_sem;
+    path.sem_value = 0;
+    path.sem_src_device = src_dev.get();
+    path.sem_dst_device = dst_dev.get();
+    path.hop1_device = src_dev.get();
+    path.sync_method = D2D_SYNC_TIMELINE;
+
+    for (size_t i = path.num_slots; i < vk_d2d_path::POOL_SIZE; i++) {
+        if (!ggml_vk_d2d_grow_slot(path, src_dev, dst_dev, path.size, path.slots[i])) {
+            break;
+        }
+        path.num_slots = i + 1;
+    }
+
+    GGML_LOG_DEBUG("ggml_vulkan: d2d %s -> %s: timeline sync (same driver), %zu pool slots\n",
+                  src_dev->name.c_str(), dst_dev->name.c_str(), path.num_slots);
+    return true;
+}
+
+static bool ggml_vk_d2d_try_syncfd_sync(vk_device& src_dev, vk_device& dst_dev, vk_d2d_path& path) {
+    if (!ggml_vk_d2d_check_sync_fd_support(src_dev) ||
+        !ggml_vk_d2d_check_sync_fd_support(dst_dev)) {
+        VK_LOG_DEBUG("ggml_vk_d2d_try_syncfd_sync: sync_fd not supported on one or both devices");
+        return false;
+    }
+
+    vk::ExportSemaphoreCreateInfo export_ci;
+    export_ci.handleTypes = vk::ExternalSemaphoreHandleTypeFlagBits::eSyncFd;
+
+    vk::SemaphoreCreateInfo src_sem_ci;
+    src_sem_ci.pNext = &export_ci;
+
+    vk::Semaphore src_sem;
+    try {
+        src_sem = src_dev->device.createSemaphore(src_sem_ci);
+    } catch (const vk::SystemError& e) {
+        VK_LOG_DEBUG("ggml_vk_d2d_try_syncfd_sync: createSemaphore on src failed: " << e.what());
+        return false;
+    }
+
+    try {
+        path.hop1_cmd_pool.init(src_dev, src_dev->compute_queue.get());
+    } catch (const vk::SystemError& e) {
+        VK_LOG_DEBUG("ggml_vk_d2d_try_syncfd_sync: cmd pool creation failed: " << e.what());
+        if (path.hop1_cmd_pool.pool) {
+            path.hop1_cmd_pool.destroy(src_dev->device);
+        }
+        src_dev->device.destroySemaphore(src_sem);
+        return false;
+    }
+
+    path.sem_src = src_sem;
+    path.sem_value = 0;
+    path.sem_src_device = src_dev.get();
+    path.sem_dst_device = dst_dev.get();
+    path.hop1_device = src_dev.get();
+    path.sync_method = D2D_SYNC_SYNCFD;
+    path.alloc_offset = 0;
+    path.high_water_mark = 0;
+
+    // Single shared buffer pair for bump sub-allocator
+    if (path.num_slots == 0) {
+        if (!ggml_vk_d2d_grow_slot(path, src_dev, dst_dev, path.size, path.slots[0])) {
+            path.hop1_cmd_pool.destroy(src_dev->device);
+            src_dev->device.destroySemaphore(src_sem);
+            return false;
+        }
+        path.num_slots = 1;
+    }
+
+    GGML_LOG_DEBUG("ggml_vulkan: d2d %s -> %s: sync_fd sync (cross-driver)\n",
+                  src_dev->name.c_str(), dst_dev->name.c_str());
+    return true;
+}
+
+static void ggml_vk_d2d_setup_sync(vk_device& src_dev, vk_device& dst_dev, vk_d2d_path& path) {
+    if (ggml_vk_d2d_try_timeline_sync(src_dev, dst_dev, path)) {
+        return;
+    }
+
+    if (ggml_vk_d2d_try_syncfd_sync(src_dev, dst_dev, path)) {
+        return;
+    }
+
+    GGML_LOG_DEBUG("ggml_vulkan: d2d %s -> %s: no async sync available, using CPU fallback\n",
+                  src_dev->name.c_str(), dst_dev->name.c_str());
+}
+#endif
 
 static vk_subbuffer ggml_vk_subbuffer(const ggml_backend_vk_context* ctx, const vk_buffer& buf, size_t offset = 0) {
     return { buf, offset, ggml_vk_get_max_buffer_range(ctx, buf, offset) };
@@ -6289,6 +6968,12 @@ static vk_device ggml_vk_get_device(size_t idx) {
         bool dot2_f16_support = false;
         bool ocp_microscaling_extension = false;
         bool shader_float8_extension = false;
+#ifdef __linux__
+        bool dma_buf_support = false;
+        bool external_memory_fd_support = false;
+        bool external_semaphore_support = false;
+        bool external_semaphore_fd_support = false;
+#endif
 
         for (const auto& properties : ext_props) {
             if (strcmp("VK_KHR_maintenance4", properties.extensionName) == 0) {
@@ -6349,6 +7034,17 @@ static vk_device ggml_vk_get_device(size_t idx) {
                 device->memory_priority = true;
             } else if (strcmp("VK_EXT_external_memory_host", properties.extensionName) == 0) {
                 device->external_memory_host = true;
+            } else if (strcmp("VK_KHR_external_semaphore_fd", properties.extensionName) == 0) {
+                device->external_semaphore = true;
+#ifdef __linux__
+                external_semaphore_fd_support = true;
+            } else if (strcmp("VK_EXT_external_memory_dma_buf", properties.extensionName) == 0) {
+                dma_buf_support = true;
+            } else if (strcmp("VK_KHR_external_memory_fd", properties.extensionName) == 0) {
+                external_memory_fd_support = true;
+            } else if (strcmp("VK_KHR_external_semaphore", properties.extensionName) == 0) {
+                external_semaphore_support = true;
+#endif
 #if defined(VK_EXT_shader_64bit_indexing)
             } else if (strcmp("VK_EXT_shader_64bit_indexing", properties.extensionName) == 0) {
                 device->shader_64b_indexing = true;
@@ -6528,6 +7224,11 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         device->min_imported_host_pointer_alignment = external_memory_host_props.minImportedHostPointerAlignment;
 
+#ifdef __linux__
+        device->external_memory_dma_buf = dma_buf_support && external_memory_fd_support;
+        device->external_semaphore_fd = external_semaphore_support && external_semaphore_fd_support;
+#endif
+
         device->max_workgroup_size_log2 = uint32_t(log2f(float(device->properties.limits.maxComputeWorkGroupInvocations)));
 
         std::vector<vk::QueueFamilyProperties> queue_family_props = device->physical_device.getQueueFamilyProperties();
@@ -6700,6 +7401,21 @@ static vk_device ggml_vk_get_device(size_t idx) {
         if (device->external_memory_host) {
             device_extensions.push_back("VK_EXT_external_memory_host");
         }
+        if (device->external_semaphore) {
+            device_extensions.push_back("VK_KHR_external_semaphore");
+            device_extensions.push_back("VK_KHR_external_semaphore_fd");
+        }
+
+#ifdef __linux__
+        if (device->external_memory_dma_buf) {
+            device_extensions.push_back("VK_EXT_external_memory_dma_buf");
+            device_extensions.push_back("VK_KHR_external_memory_fd");
+        }
+        if (device->external_semaphore_fd) {
+            device_extensions.push_back("VK_KHR_external_semaphore");
+            device_extensions.push_back("VK_KHR_external_semaphore_fd");
+        }
+#endif
 
 #if defined(VK_EXT_shader_64bit_indexing)
         VkPhysicalDeviceShader64BitIndexingFeaturesEXT shader_64bit_indexing_features {};
@@ -8729,6 +9445,557 @@ static void ggml_vk_buffer_read(vk_buffer& src, size_t offset, void * dst, size_
     ggml_vk_buffer_read_2d(src, offset, dst, size, size, size, 1);
 }
 
+#ifdef __linux__
+static bool ggml_vk_d2d_test_copy(vk_device& device, vk_buffer& shared_buf, size_t size) {
+    vk_buffer tmp;
+    try {
+        tmp = ggml_vk_create_buffer(device, size,
+            {vk::MemoryPropertyFlagBits::eDeviceLocal,
+             vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
+    } catch (...) {
+        return false;
+    }
+    if (!tmp) {
+        return false;
+    }
+
+    std::lock_guard<std::recursive_mutex> guard(device->mutex);
+    vk_context subctx = ggml_vk_create_temporary_context(device->transfer_queue->cmd_pool);
+    ggml_vk_ctx_begin(device, subctx);
+    VkBufferCopy bc{ 0, 0, size };
+    vkCmdCopyBuffer(subctx->s->buffer->buf, (VkBuffer)shared_buf->buffer, (VkBuffer)tmp->buffer, 1, &bc);
+    ggml_vk_ctx_end(subctx);
+    try {
+        ggml_vk_submit(subctx, device->fence);
+        VK_CHECK(device->device.waitForFences({ device->fence }, true, UINT64_MAX), "d2d test copy waitForFences", device);
+        device->device.resetFences({ device->fence });
+        ggml_vk_queue_command_pools_cleanup(device);
+        ggml_vk_destroy_buffer(tmp);
+        return true;
+    } catch (...) {
+        try {
+            device->device.resetFences({ device->fence });
+            ggml_vk_queue_command_pools_cleanup(device);
+        } catch (...) {}
+        ggml_vk_destroy_buffer(tmp);
+        return false;
+    }
+}
+
+static const size_t VK_D2D_PROBE_SIZE = 4096;
+
+static vk_d2d_path ggml_vk_probe_d2d_path(vk_device& src_dev, vk_device& dst_dev) {
+    VK_LOG_DEBUG("ggml_vk_probe_d2d_path(" << src_dev->name << " -> " << dst_dev->name << ")");
+    vk_d2d_path path;
+
+    bool src_nvidia = src_dev->vendor_id == 0x10de;
+    bool dst_nvidia = dst_dev->vendor_id == 0x10de;
+    bool cross_vendor_nvidia = src_nvidia != dst_nvidia;
+
+    // 1. dmabuf_p2p — skip if cross-vendor NVIDIA
+    // Try read direction first: src exports VRAM, dst imports and reads from it.
+    // DMA reads from peer VRAM tend to be faster than writes on AMD GPUs.
+    if (src_dev->external_memory_dma_buf && dst_dev->external_memory_dma_buf && !cross_vendor_nvidia) {
+        vk_buffer exp_buf, imp_buf;
+
+        // Try src exports VRAM, dst imports (read direction)
+        if (ggml_vk_d2d_try_dma_buf(src_dev, dst_dev, VK_D2D_PROBE_SIZE, true, exp_buf, imp_buf)) {
+            if (ggml_vk_d2d_test_copy(dst_dev, imp_buf, VK_D2D_PROBE_SIZE)) {
+                path.method = D2D_DMABUF_P2P;
+                path.reverse_direction = false;
+                path.slots[0].buf_a = exp_buf;
+                path.slots[0].buf_b = imp_buf;
+                path.num_slots = 1;
+                path.size = VK_D2D_PROBE_SIZE;
+                GGML_LOG_DEBUG("ggml_vulkan: d2d %s -> %s: dmabuf_p2p (src exports VRAM)\n",
+                              src_dev->name.c_str(), dst_dev->name.c_str());
+                ggml_vk_d2d_setup_sync(src_dev, dst_dev, path);
+                return path;
+            }
+            ggml_vk_destroy_buffer(exp_buf);
+            ggml_vk_destroy_buffer(imp_buf);
+        }
+
+        // Try dst exports VRAM, src imports (write direction)
+        if (ggml_vk_d2d_try_dma_buf(dst_dev, src_dev, VK_D2D_PROBE_SIZE, true, exp_buf, imp_buf)) {
+            if (ggml_vk_d2d_test_copy(src_dev, imp_buf, VK_D2D_PROBE_SIZE)) {
+                path.method = D2D_DMABUF_P2P;
+                path.reverse_direction = true;
+                path.slots[0].buf_a = exp_buf;
+                path.slots[0].buf_b = imp_buf;
+                path.num_slots = 1;
+                path.size = VK_D2D_PROBE_SIZE;
+                GGML_LOG_DEBUG("ggml_vulkan: d2d %s -> %s: dmabuf_p2p (dst exports VRAM)\n",
+                              src_dev->name.c_str(), dst_dev->name.c_str());
+                ggml_vk_d2d_setup_sync(src_dev, dst_dev, path);
+                return path;
+            }
+            ggml_vk_destroy_buffer(exp_buf);
+            ggml_vk_destroy_buffer(imp_buf);
+        }
+    }
+
+    // 2. dmabuf_gtt
+    if (src_dev->external_memory_dma_buf && dst_dev->external_memory_dma_buf) {
+        vk_buffer exp_buf, imp_buf;
+        // Try src exports GTT
+        if (ggml_vk_d2d_try_dma_buf(src_dev, dst_dev, VK_D2D_PROBE_SIZE, false, exp_buf, imp_buf)) {
+            if (ggml_vk_d2d_test_copy(src_dev, exp_buf, VK_D2D_PROBE_SIZE) &&
+                ggml_vk_d2d_test_copy(dst_dev, imp_buf, VK_D2D_PROBE_SIZE)) {
+                path.method = D2D_DMABUF_GTT;
+                path.reverse_direction = false;
+                path.slots[0].buf_a = exp_buf;
+                path.slots[0].buf_b = imp_buf;
+                path.num_slots = 1;
+                path.size = VK_D2D_PROBE_SIZE;
+                GGML_LOG_DEBUG("ggml_vulkan: d2d %s -> %s: dmabuf_gtt (src exports GTT)\n",
+                              src_dev->name.c_str(), dst_dev->name.c_str());
+                ggml_vk_d2d_setup_sync(src_dev, dst_dev, path);
+                return path;
+            }
+            ggml_vk_destroy_buffer(exp_buf);
+            ggml_vk_destroy_buffer(imp_buf);
+        }
+
+        // Try dst exports GTT
+        if (ggml_vk_d2d_try_dma_buf(dst_dev, src_dev, VK_D2D_PROBE_SIZE, false, exp_buf, imp_buf)) {
+            if (ggml_vk_d2d_test_copy(dst_dev, exp_buf, VK_D2D_PROBE_SIZE) &&
+                ggml_vk_d2d_test_copy(src_dev, imp_buf, VK_D2D_PROBE_SIZE)) {
+                path.method = D2D_DMABUF_GTT;
+                path.reverse_direction = true;
+                path.slots[0].buf_a = exp_buf;
+                path.slots[0].buf_b = imp_buf;
+                path.num_slots = 1;
+                path.size = VK_D2D_PROBE_SIZE;
+                GGML_LOG_DEBUG("ggml_vulkan: d2d %s -> %s: dmabuf_gtt (dst exports GTT)\n",
+                              src_dev->name.c_str(), dst_dev->name.c_str());
+                ggml_vk_d2d_setup_sync(src_dev, dst_dev, path);
+                return path;
+            }
+            ggml_vk_destroy_buffer(exp_buf);
+            ggml_vk_destroy_buffer(imp_buf);
+        }
+    }
+
+    // 3. shared_staging
+    {
+        vk_buffer buf_a, buf_b;
+        void * host_ptr = nullptr;
+        if (ggml_vk_d2d_try_shared_staging(src_dev, dst_dev, VK_D2D_PROBE_SIZE, buf_a, buf_b, host_ptr)) {
+            if (ggml_vk_d2d_test_copy(src_dev, buf_a, VK_D2D_PROBE_SIZE) &&
+                ggml_vk_d2d_test_copy(dst_dev, buf_b, VK_D2D_PROBE_SIZE)) {
+                path.method = D2D_SHARED_STAGING;
+                path.slots[0].buf_a = buf_a;
+                path.slots[0].buf_b = buf_b;
+                path.slots[0].host_ptr = host_ptr;
+                path.num_slots = 1;
+                path.size = VK_D2D_PROBE_SIZE;
+                GGML_LOG_DEBUG("ggml_vulkan: d2d %s -> %s: shared_staging\n",
+                              src_dev->name.c_str(), dst_dev->name.c_str());
+                ggml_vk_d2d_setup_sync(src_dev, dst_dev, path);
+                return path;
+            }
+            ggml_vk_destroy_buffer(buf_a);
+            ggml_vk_destroy_buffer(buf_b);
+            free(host_ptr);
+        }
+    }
+
+    // 4. Fallback
+    path.method = D2D_STAGING;
+    GGML_LOG_DEBUG("ggml_vulkan: d2d %s -> %s: staging (fallback)\n",
+                  src_dev->name.c_str(), dst_dev->name.c_str());
+    return path;
+}
+
+static bool ggml_vk_d2d_grow_slot(vk_d2d_path& path, vk_device& src_dev, vk_device& dst_dev,
+                                   size_t needed, vk_d2d_path::slot& s) {
+    vk_buffer new_buf_a, new_buf_b;
+    void * new_host_ptr = nullptr;
+    bool ok = false;
+
+    switch (path.method) {
+    case D2D_DMABUF_P2P: {
+        vk_device& exporter = path.reverse_direction ? dst_dev : src_dev;
+        vk_device& importer = path.reverse_direction ? src_dev : dst_dev;
+        ok = ggml_vk_d2d_try_dma_buf(exporter, importer, needed, true, new_buf_a, new_buf_b);
+        break;
+    }
+    case D2D_DMABUF_GTT: {
+        vk_device& exporter = path.reverse_direction ? dst_dev : src_dev;
+        vk_device& importer = path.reverse_direction ? src_dev : dst_dev;
+        ok = ggml_vk_d2d_try_dma_buf(exporter, importer, needed, false, new_buf_a, new_buf_b);
+        break;
+    }
+    case D2D_SHARED_STAGING:
+        ok = ggml_vk_d2d_try_shared_staging(src_dev, dst_dev, needed, new_buf_a, new_buf_b, new_host_ptr);
+        break;
+    default:
+        return false;
+    }
+
+    if (!ok) {
+        return false;
+    }
+
+    ggml_vk_destroy_buffer(s.buf_a);
+    ggml_vk_destroy_buffer(s.buf_b);
+    if (s.host_ptr) {
+        free(s.host_ptr);
+    }
+
+    s.buf_a = new_buf_a;
+    s.buf_b = new_buf_b;
+    s.host_ptr = new_host_ptr;
+    return true;
+}
+
+static bool ggml_vk_d2d_grow_path(vk_d2d_path& path, vk_device& src_dev, vk_device& dst_dev, size_t needed) {
+    VK_LOG_DEBUG("ggml_vk_d2d_grow_path(" << needed << ", current=" << path.size << ")");
+
+    // Wait for all in-flight work on both devices, then release all command buffer
+    // references to the shared buffers before destroying them.
+    // The shared buffers may be referenced by: hop1_cmd_pool command buffers,
+    // device queue command buffers (from probe test copies and sync d2d copies),
+    // and compute context command buffers (from hop2).
+    if (path.sync_method == D2D_SYNC_TIMELINE && path.sem_value > 0) {
+        VkSemaphoreWaitInfo wait_info = {};
+        wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+        VkSemaphore sem = path.sem_src;
+        uint64_t val = path.sem_value;
+        wait_info.semaphoreCount = 1;
+        wait_info.pSemaphores = &sem;
+        wait_info.pValues = &val;
+        vkWaitSemaphores(path.sem_src_device->device, &wait_info, UINT64_MAX);
+
+        path.sem_src_device->device.resetCommandPool(path.hop1_cmd_pool.pool);
+        for (auto& cb : path.hop1_cmd_pool.cmd_buffers) {
+            cb.in_use = false;
+        }
+    } else if (path.sync_method == D2D_SYNC_SYNCFD) {
+        // deviceWaitIdle below ensures all work is done.
+    }
+
+    src_dev->device.waitIdle();
+    dst_dev->device.waitIdle();
+
+    for (size_t i = 0; i < path.num_slots; i++) {
+        if (!ggml_vk_d2d_grow_slot(path, src_dev, dst_dev, needed, path.slots[i])) {
+            return false;
+        }
+    }
+
+    if (path.sync_method == D2D_SYNC_SYNCFD) {
+        ggml_vk_command_pool_cleanup(src_dev, path.hop1_cmd_pool);
+        if (path.hop2_cmd_pool.pool) {
+            ggml_vk_command_pool_cleanup(dst_dev, path.hop2_cmd_pool);
+        }
+        path.alloc_offset = 0;
+    }
+
+    path.size = needed;
+    return true;
+}
+
+static vk_d2d_path& ggml_vk_get_d2d_path(vk_device& src_dev, vk_device& dst_dev, size_t size) {
+    std::lock_guard<std::mutex> guard(vk_d2d_cache_mutex);
+    auto key = std::make_pair(src_dev.get(), dst_dev.get());
+    auto it = vk_d2d_cache.find(key);
+
+    if (it == vk_d2d_cache.end()) {
+        vk_d2d_cache[key] = ggml_vk_probe_d2d_path(src_dev, dst_dev);
+        it = vk_d2d_cache.find(key);
+    }
+
+    vk_d2d_path& path = it->second;
+
+    // Grow buffer if a single copy doesn't fit
+    if (path.method != D2D_STAGING && path.size < size) {
+        if (!ggml_vk_d2d_grow_path(path, src_dev, dst_dev, size)) {
+            GGML_LOG_WARN("ggml_vulkan: d2d grow failed for %s -> %s, falling back to staging\n",
+                         src_dev->name.c_str(), dst_dev->name.c_str());
+            for (size_t i = 0; i < path.num_slots; i++) {
+                ggml_vk_destroy_buffer(path.slots[i].buf_a);
+                ggml_vk_destroy_buffer(path.slots[i].buf_b);
+                if (path.slots[i].host_ptr) {
+                    free(path.slots[i].host_ptr);
+                    path.slots[i].host_ptr = nullptr;
+                }
+            }
+            path.num_slots = 0;
+            path.method = D2D_STAGING;
+            path.size = 0;
+        }
+    }
+
+    // Syncfd: grow buffer to high-water mark at start of each evaluation
+    if (path.sync_method == D2D_SYNC_SYNCFD &&
+        path.alloc_offset == 0 && path.high_water_mark > path.size) {
+        if (ggml_vk_d2d_grow_path(path, src_dev, dst_dev, path.high_water_mark)) {
+            path.high_water_mark = 0;
+        }
+    }
+
+    return path;
+}
+
+static bool ggml_vk_d2d_is_async_capable(vk_device& src_dev, vk_device& dst_dev) {
+    std::lock_guard<std::mutex> guard(vk_d2d_cache_mutex);
+    auto key = std::make_pair(src_dev.get(), dst_dev.get());
+    auto it = vk_d2d_cache.find(key);
+    return it != vk_d2d_cache.end() && it->second.method != D2D_STAGING;
+}
+
+static bool ggml_vk_buffer_copy_async_d2d_timeline(
+        vk_context& dst_compute_ctx,
+        vk_buffer& dst, size_t dst_offset,
+        vk_buffer& src, size_t src_offset,
+        size_t size,
+        vk_d2d_path& path) {
+
+    // Periodic command pool cleanup
+    if (path.hop1_cmd_pool.buffers_in_use() >= 8) {
+        VkSemaphoreWaitInfo wait_info = {};
+        wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+        VkSemaphore sem = path.sem_src;
+        uint64_t val = path.sem_value;
+        wait_info.semaphoreCount = 1;
+        wait_info.pSemaphores = &sem;
+        wait_info.pValues = &val;
+        vkWaitSemaphores(path.sem_src_device->device, &wait_info, UINT64_MAX);
+        ggml_vk_command_pool_cleanup(src->device, path.hop1_cmd_pool);
+    }
+
+    // Pick next pool slot (round-robin)
+    size_t slot_idx = path.pool_idx;
+    path.pool_idx = (path.pool_idx + 1) % path.num_slots;
+    vk_d2d_path::slot& slot = path.slots[slot_idx];
+
+    vk_buffer& src_side_buf = path.reverse_direction ? slot.buf_b : slot.buf_a;
+    vk_buffer& dst_side_buf = path.reverse_direction ? slot.buf_a : slot.buf_b;
+
+    uint64_t hop1_signal = path.sem_value + 1;
+    uint64_t hop2_signal = path.sem_value + 2;
+    path.sem_value = hop2_signal;
+
+    // Hop 1: src device copies VRAM -> shared buffer
+    {
+        std::lock_guard<std::recursive_mutex> guard(src->device->mutex);
+        vk_context hop1_ctx = ggml_vk_create_temporary_context(path.hop1_cmd_pool);
+        ggml_vk_ctx_begin(src->device, hop1_ctx);
+
+        if (slot.hop2_done > 0) {
+            hop1_ctx->s->wait_semaphores.push_back({ path.sem_src, slot.hop2_done });
+        }
+
+        VkBufferCopy bc{ src_offset, 0, size };
+        vkCmdCopyBuffer(hop1_ctx->s->buffer->buf, (VkBuffer)src->buffer, (VkBuffer)src_side_buf->buffer, 1, &bc);
+
+        hop1_ctx->s->signal_semaphores.push_back({ path.sem_src, hop1_signal });
+
+        ggml_vk_ctx_end(hop1_ctx);
+        ggml_vk_submit(hop1_ctx, {});
+    }
+
+    // Hop 2: deferred in dst compute context
+    ggml_vk_ctx_begin(dst->device, dst_compute_ctx);
+    dst_compute_ctx->s->wait_semaphores.push_back({ path.sem_dst, hop1_signal });
+
+    VkBufferCopy bc2{ 0, dst_offset, size };
+    vkCmdCopyBuffer(dst_compute_ctx->s->buffer->buf, (VkBuffer)dst_side_buf->buffer, (VkBuffer)dst->buffer, 1, &bc2);
+
+    dst_compute_ctx->s->signal_semaphores.push_back({ path.sem_dst, hop2_signal });
+    slot.hop2_done = hop2_signal;
+
+    return true;
+}
+
+static bool ggml_vk_d2d_syncfd_export_import(vk_device& from_dev, vk::Semaphore from_sem,
+                                              vk_device& to_dev, vk::Semaphore to_sem) {
+    vk::SemaphoreGetFdInfoKHR get_fd_info;
+    get_fd_info.semaphore = from_sem;
+    get_fd_info.handleType = vk::ExternalSemaphoreHandleTypeFlagBits::eSyncFd;
+
+    int fd;
+    try {
+        fd = from_dev->device.getSemaphoreFdKHR(get_fd_info);
+    } catch (const vk::SystemError& e) {
+        VK_LOG_DEBUG("ggml_vk_d2d_syncfd_export_import: getSemaphoreFdKHR failed: " << e.what());
+        return false;
+    }
+
+    vk::ImportSemaphoreFdInfoKHR import_info;
+    import_info.semaphore = to_sem;
+    import_info.handleType = vk::ExternalSemaphoreHandleTypeFlagBits::eSyncFd;
+    import_info.fd = fd;
+    import_info.flags = vk::SemaphoreImportFlagBits::eTemporary;
+
+    try {
+        to_dev->device.importSemaphoreFdKHR(import_info);
+    } catch (const vk::SystemError& e) {
+        VK_LOG_DEBUG("ggml_vk_d2d_syncfd_export_import: importSemaphoreFdKHR failed: " << e.what());
+        close(fd);
+        return false;
+    }
+
+    return true;
+}
+
+static bool ggml_vk_buffer_copy_async_d2d_syncfd(
+        ggml_backend_vk_context * dst_ctx,
+        vk_buffer& dst, size_t dst_offset,
+        vk_buffer& src, size_t src_offset,
+        size_t size,
+        vk_d2d_path& path) {
+
+    static constexpr size_t D2D_BUMP_ALIGN = 256;
+
+    vk_d2d_path::slot& slot = path.slots[0];
+    vk_buffer& src_side_buf = path.reverse_direction ? slot.buf_b : slot.buf_a;
+    vk_buffer& dst_side_buf = path.reverse_direction ? slot.buf_a : slot.buf_b;
+
+    size_t aligned_size = ggml_vk_align_size(size, D2D_BUMP_ALIGN);
+
+    // Periodic hop1 command pool cleanup
+    if (path.hop1_cmd_pool.buffers_in_use() >= 8) {
+        vkDeviceWaitIdle(src->device->device);
+        ggml_vk_command_pool_cleanup(src->device, path.hop1_cmd_pool);
+    }
+
+    // Overflow: flush all deferred hop2s, reset bump allocator
+    if (path.alloc_offset + aligned_size > path.size) {
+        path.high_water_mark = std::max(path.high_water_mark, path.alloc_offset);
+        ggml_vk_synchronize(dst_ctx);
+        vkDeviceWaitIdle(src->device->device);
+        ggml_vk_command_pool_cleanup(src->device, path.hop1_cmd_pool);
+        path.alloc_offset = 0;
+    }
+
+    size_t buf_offset = path.alloc_offset;
+    path.alloc_offset += aligned_size;
+    path.high_water_mark = std::max(path.high_water_mark, path.alloc_offset);
+
+    vk::Semaphore fwd_sem = ggml_vk_create_binary_semaphore(dst_ctx)->s;
+
+    // Hop 1: src device copies VRAM -> shared buffer
+    {
+        std::lock_guard<std::recursive_mutex> guard(src->device->mutex);
+        vk_context hop1_ctx = ggml_vk_create_temporary_context(path.hop1_cmd_pool);
+        ggml_vk_ctx_begin(src->device, hop1_ctx);
+
+        VkBufferCopy bc{ src_offset, buf_offset, size };
+        vkCmdCopyBuffer(hop1_ctx->s->buffer->buf, (VkBuffer)src->buffer, (VkBuffer)src_side_buf->buffer, 1, &bc);
+
+        hop1_ctx->s->signal_semaphores.push_back({ path.sem_src, 0 });
+
+        ggml_vk_ctx_end(hop1_ctx);
+        ggml_vk_submit(hop1_ctx, {});
+    }
+
+    // Forward edge: export sync_fd from sem_src, import into per-copy dst semaphore
+    if (!ggml_vk_d2d_syncfd_export_import(src->device, path.sem_src, dst->device, fwd_sem)) {
+        return false;
+    }
+
+    // Hop 2: deferred into dst compute context
+    vk_context compute_ctx = ggml_vk_get_compute_ctx(dst_ctx);
+    ggml_vk_ctx_begin(dst->device, compute_ctx);
+    compute_ctx->s->wait_semaphores.push_back({ fwd_sem, 0 });
+
+    VkBufferCopy bc2{ buf_offset, dst_offset, size };
+    vkCmdCopyBuffer(compute_ctx->s->buffer->buf, (VkBuffer)dst_side_buf->buffer, (VkBuffer)dst->buffer, 1, &bc2);
+
+    return true;
+}
+
+static constexpr size_t D2D_SEMIASYNC_THRESHOLD = 1 * 1024 * 1024;
+
+// Tier 1: both src and dst have rebar — direct memcpy, 0 GPU submits.
+// CPU rebar reads are ~1-3 GB/s; below this threshold the memcpy is faster
+// than a GPU command buffer submission cycle (~50-100 us).
+static constexpr size_t VK_D2D_DIRECT_MEMCPY_THRESHOLD = 128 * 1024;
+
+// Tier 2: dst has rebar — staging path (1 GPU submit + memcpy via BAR).
+// Below this threshold, staging + memcpy-write beats dmabuf's 2 GPU submits
+// for rebar destinations.
+static constexpr size_t VK_D2D_STAGING_THRESHOLD = 4 * 1024 * 1024;
+
+static bool ggml_vk_buffer_copy_async_d2d_semiasync(
+        ggml_backend_vk_context * dst_ctx,
+        vk_buffer& dst, size_t dst_offset,
+        vk_buffer& src, size_t src_offset,
+        size_t size,
+        vk_d2d_path& path) {
+
+    vk_d2d_path::slot& slot = path.slots[0];
+    vk_buffer& src_side_buf = path.reverse_direction ? slot.buf_b : slot.buf_a;
+    vk_buffer& dst_side_buf = path.reverse_direction ? slot.buf_a : slot.buf_b;
+
+    if (path.semi_async_pending) {
+        ggml_vk_synchronize(dst_ctx);
+        path.semi_async_pending = false;
+    }
+
+    // Hop 1: synchronous copy on src device (VRAM -> shared buffer)
+    {
+        std::lock_guard<std::recursive_mutex> guard(src->device->mutex);
+        vk_context hop1_ctx = ggml_vk_create_temporary_context(src->device->compute_queue->cmd_pool);
+        ggml_vk_ctx_begin(src->device, hop1_ctx);
+
+        VkBufferCopy bc{ src_offset, 0, size };
+        vkCmdCopyBuffer(hop1_ctx->s->buffer->buf, (VkBuffer)src->buffer, (VkBuffer)src_side_buf->buffer, 1, &bc);
+
+        ggml_vk_ctx_end(hop1_ctx);
+        ggml_vk_submit(hop1_ctx, src->device->fence);
+        VK_CHECK(src->device->device.waitForFences({ src->device->fence }, true, UINT64_MAX), "d2d_semiasync hop1 waitForFences", src->device);
+        src->device->device.resetFences({ src->device->fence });
+    }
+
+    // Hop 2: deferred into dst compute context (shared buffer -> dst VRAM)
+    vk_context compute_ctx = ggml_vk_get_compute_ctx(dst_ctx);
+    ggml_vk_ctx_begin(dst->device, compute_ctx);
+
+    VkBufferCopy bc2{ 0, dst_offset, size };
+    vkCmdCopyBuffer(compute_ctx->s->buffer->buf, (VkBuffer)dst_side_buf->buffer, (VkBuffer)dst->buffer, 1, &bc2);
+
+    path.semi_async_pending = true;
+    return true;
+}
+
+static bool ggml_vk_buffer_copy_async_d2d(
+        ggml_backend_vk_context * src_ctx,
+        ggml_backend_vk_context * dst_ctx,
+        vk_buffer& dst, size_t dst_offset,
+        vk_buffer& src, size_t src_offset,
+        size_t size) {
+    VK_LOG_DEBUG("ggml_vk_buffer_copy_async_d2d(" << size << ")");
+
+    vk_d2d_path& path = ggml_vk_get_d2d_path(src->device, dst->device, size);
+
+    if (path.method == D2D_STAGING) {
+        return false;
+    }
+
+    // For small copies to rebar destinations, fall back to sync path
+    // which uses the staging + memcpy-via-BAR optimization
+    bool dst_mapped = dst->ptr && (dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible);
+    if (dst_mapped && size <= VK_D2D_STAGING_THRESHOLD) {
+        return false;
+    }
+
+    if (path.sync_method == D2D_SYNC_TIMELINE) {
+        vk_context compute_ctx = ggml_vk_get_compute_ctx(dst_ctx);
+        return ggml_vk_buffer_copy_async_d2d_timeline(compute_ctx, dst, dst_offset, src, src_offset, size, path);
+    }
+
+    if (path.sync_method == D2D_SYNC_SYNCFD && size >= D2D_SEMIASYNC_THRESHOLD) {
+        return ggml_vk_buffer_copy_async_d2d_syncfd(dst_ctx, dst, dst_offset, src, src_offset, size, path);
+    }
+
+    return ggml_vk_buffer_copy_async_d2d_semiasync(dst_ctx, dst, dst_offset, src, src_offset, size, path);
+}
+#endif
+
 static void ggml_vk_buffer_copy_async(vk_context& ctx, vk_buffer& dst, size_t dst_offset, vk_buffer& src, size_t src_offset, size_t size) {
     VK_LOG_DEBUG("ggml_vk_buffer_copy_async(" << size << ")");
     // Make sure both buffers are on same device
@@ -8754,12 +10021,36 @@ static void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& sr
         ggml_vk_queue_command_pools_cleanup(src->device);
     } else {
         VK_LOG_DEBUG("ggml_vk_buffer_copy(MULTI_DEVICE, " << size << ")");
-        // Copy device to device
-        ggml_vk_ensure_sync_staging_buffer(src->device, size);
 
-        // Copy to src staging buffer
+        bool src_mapped = src->ptr && (src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible);
+        bool dst_mapped = dst->ptr && (dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible);
+
+        // Tier 1: both src and dst have rebar — direct memcpy, no GPU submits
+        if (src_mapped && dst_mapped && size <= VK_D2D_DIRECT_MEMCPY_THRESHOLD) {
+            memcpy((uint8_t *)dst->ptr + dst_offset, (const uint8_t *)src->ptr + src_offset, size);
+            return;
+        }
+
+#ifdef __linux__
+        vk_d2d_path& path = ggml_vk_get_d2d_path(src->device, dst->device, size);
+
+        if (path.method != D2D_STAGING) {
+            // Tier 2: dst rebar, small/medium — fall through to staging path
+            // (1 GPU submit + memcpy via BAR is faster than 2 GPU submits)
+            if (!(dst_mapped && size <= VK_D2D_STAGING_THRESHOLD)) {
+                // Tier 3: dmabuf path — best bandwidth for large transfers
+                vk_buffer& src_side_buf = path.reverse_direction ? path.slots[0].buf_b : path.slots[0].buf_a;
+                vk_buffer& dst_side_buf = path.reverse_direction ? path.slots[0].buf_a : path.slots[0].buf_b;
+
+                ggml_vk_buffer_copy(src_side_buf, 0, src, src_offset, size);
+                ggml_vk_buffer_copy(dst, dst_offset, dst_side_buf, 0, size);
+                return;
+            }
+        }
+#endif
+        // Staging fallback: GPU copy to staging + memcpy (or GPU copy) to dst
+        ggml_vk_ensure_sync_staging_buffer(src->device, size);
         ggml_vk_buffer_copy(src->device->sync_staging, 0, src, src_offset, size);
-        // Copy to dst buffer
         ggml_vk_buffer_write(dst, dst_offset, src->device->sync_staging->ptr, size);
     }
 }
@@ -16084,6 +17375,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     if (submit || last_node) {
         ggml_vk_ctx_end(compute_ctx);
 
+        if (last_node && ctx->comm_active && !compute_ctx->seqs.empty()) {
+            ctx->comm_prog_val++;
+            compute_ctx->seqs.back().back().signal_semaphores.push_back({ ctx->comm_prog_sem, ctx->comm_prog_val });
+        }
+
         // TODO probably it'd be better to pass a exit_node flag to ggml_vk_compute_forward
         if (last_node) {
             compute_ctx->exit_tensor_idx = node_idx_begin;
@@ -16170,6 +17466,28 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
     }
     ctx->gc.semaphores.clear();
 
+#ifdef __linux__
+    {
+        std::lock_guard<std::mutex> guard(vk_d2d_cache_mutex);
+        for (auto& entry : vk_d2d_cache) {
+            vk_d2d_path& path = entry.second;
+            if (path.sync_method != D2D_SYNC_SYNCFD) {
+                continue;
+            }
+            if (path.sem_dst_device == ctx->device.get() || path.sem_src_device == ctx->device.get()) {
+                path.high_water_mark = std::max(path.high_water_mark, path.alloc_offset);
+                path.alloc_offset = 0;
+            }
+            if (path.hop1_device == ctx->device.get() &&
+                path.hop1_cmd_pool.pool &&
+                path.hop1_cmd_pool.buffers_in_use() > 0) {
+                vkDeviceWaitIdle(ctx->device->device);
+                ggml_vk_command_pool_cleanup(ctx->device, path.hop1_cmd_pool);
+            }
+        }
+    }
+#endif
+
     for (size_t i = 0; i < ctx->gc.tl_semaphores.size(); i++) {
         ctx->device->device.destroySemaphore({ ctx->gc.tl_semaphores[i].s });
     }
@@ -16197,6 +17515,22 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ggml_vk_synchronize(ctx);
 
     ggml_vk_graph_cleanup(ctx);
+
+#ifdef __linux__
+    {
+        vkDeviceWaitIdle(ctx->device->device);
+        std::lock_guard<std::mutex> guard(vk_d2d_cache_mutex);
+        for (auto& entry : vk_d2d_cache) {
+            vk_d2d_path& path = entry.second;
+            if (path.hop1_device == ctx->device.get() && path.hop1_cmd_pool.pool) {
+                ggml_vk_command_pool_cleanup(ctx->device, path.hop1_cmd_pool);
+            }
+            if (path.hop2_device == ctx->device.get() && path.hop2_cmd_pool.pool) {
+                ggml_vk_command_pool_cleanup(ctx->device, path.hop2_cmd_pool);
+            }
+        }
+    }
+#endif
 
     ggml_vk_destroy_buffer(ctx->prealloc_x);
     ggml_vk_destroy_buffer(ctx->prealloc_y);
@@ -16675,9 +18009,24 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
     if (ggml_backend_buffer_is_vk(src->buffer)) {
         ggml_backend_vk_buffer_context * src_buf_ctx = (ggml_backend_vk_buffer_context *)src->buffer->context;
 
-        // Async copy only works within the same device
         if (src_buf_ctx->dev_buffer->device != dst_buf->device) {
-            return false;
+#ifdef __linux__
+            if (ggml_vk_d2d_is_async_capable(src_buf_ctx->dev_buffer->device, dst_buf->device)) {
+                ggml_backend_vk_context * src_ctx = (ggml_backend_vk_context *)backend_src->context;
+                if (ggml_vk_buffer_copy_async_d2d(
+                        src_ctx, ctx,
+                        dst_buf, vk_tensor_offset(dst) + dst->view_offs,
+                        src_buf_ctx->dev_buffer, vk_tensor_offset(src) + src->view_offs,
+                        ggml_nbytes(src))) {
+                    return true;
+                }
+            }
+#endif
+            ggml_backend_synchronize(backend_src);
+            ggml_vk_buffer_copy(dst_buf, vk_tensor_offset(dst) + dst->view_offs,
+                                src_buf_ctx->dev_buffer, vk_tensor_offset(src) + src->view_offs,
+                                ggml_nbytes(src));
+            return true;
         }
 
         vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
@@ -17412,6 +18761,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         // initialize partial sums to zero.
         ggml_vk_buffer_memset_async(compute_ctx, ctx->prealloc_add_rms_partials, 0, 0, ctx->prealloc_size_add_rms_partials);
         ggml_vk_sync_buffers(ctx, compute_ctx);
+    }
+
+    if (ctx->comm_active) {
+        compute_ctx = ggml_vk_get_compute_ctx(ctx);
+        compute_ctx->s->wait_semaphores.push_back({ ctx->comm_prog_sem, ctx->comm_prog_val });
     }
 
     // Submit after enough work has accumulated, to overlap CPU cmdbuffer generation with GPU execution.
@@ -19179,11 +20533,964 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+struct ggml_backend_vk_comm_context {
+    std::vector<ggml_backend_t>             backends;
+    std::vector<ggml_backend_vk_context*>   vkctx;
+    std::vector<vk_device>                  device;
+    size_t                                  align = 4096;
+    size_t                                  cap   = 0;
+    bool                                    fast  = false;
+    std::vector<vk::Semaphore>              prog;
+    std::vector<std::vector<vk::Semaphore>> peer_prog;
+    std::vector<uint64_t>                   last_reduce;
+    std::vector<vk_command_pool>            cmd_pool;
+    std::vector<uint64_t>                   pool_max_val;
+    PFN_vkGetSemaphoreFdKHR                 pGetSemFd  = nullptr;
+    PFN_vkImportSemaphoreFdKHR              pImportSemFd = nullptr;
+    std::vector<void*>                      host_ptr;
+    std::vector<std::vector<vk_buffer>>     host_buf;
+    std::vector<ggml_backend_buffer_t>      tmp_buffer;
+    std::vector<ggml_tensor*>               tmp_tensor;
+    ggml_context *                          tctx = nullptr;
+    bool                                    ring_ok = false;
+    std::vector<vk::Semaphore>              up;
+    std::vector<std::vector<vk::Semaphore>> peer_up;
+    std::vector<uint64_t>                   up_val;
+    std::vector<vk_command_pool>            cmd_pool_xfer;
+    std::vector<uint64_t>                   xfer_pool_max_val;
+    uint64_t                                ring_round = 0;
+    std::vector<ggml_tensor*>               ring_view;
+    std::vector<ggml_backend_buffer_t>      up16_buffer;
+    std::vector<ggml_backend_buffer_t>      dn16_buffer;
+    std::vector<ggml_tensor*>               up16_tensor;
+    std::vector<ggml_tensor*>               dn16_tensor;
+#ifdef __linux__
+    // dmabuf P2P: p2p_recv[i] is the export buffer in VRAM of device (i+1)%n, p2p_send[i] is the import
+    // on device i that maps the same VRAM (sender pushes, receiver reads locally). When p2p_ok[i] is set, the ring hop
+    // from i to (i+1)%n bypasses host memory entirely.
+    std::vector<bool>                       p2p_ok;
+    std::vector<vk_buffer>                  p2p_send;
+    std::vector<vk_buffer>                  p2p_recv;
+#endif
+    bool                                    proxy = false;
+    std::vector<vk::Semaphore>              pxy;
+    std::vector<uint64_t>                   pxy_val;
+    struct bridge_task { vk::Device wdev; vk::Semaphore wsem; uint64_t wval; vk::Device sdev; vk::Semaphore ssem; uint64_t sval; };
+    std::vector<std::deque<bridge_task>>    bridge_q;
+    std::mutex                              bridge_mtx;
+    std::thread                             proxy_thread;
+    std::atomic<bool>                       proxy_stop{false};
+};
+
+static void ggml_vk_comm_proxy_loop(ggml_backend_vk_comm_context * comm) {
+    while (!comm->proxy_stop.load(std::memory_order_relaxed)) {
+        bool progress = false;
+        for (size_t q = 0; q < comm->bridge_q.size(); q++) {
+            for (;;) {
+                ggml_backend_vk_comm_context::bridge_task t;
+                {
+                    std::lock_guard<std::mutex> lk(comm->bridge_mtx);
+                    if (comm->bridge_q[q].empty()) { break; }
+                    t = comm->bridge_q[q].front();
+                    if (t.wdev.getSemaphoreCounterValue(t.wsem) < t.wval) { break; }
+                    comm->bridge_q[q].pop_front();
+                }
+                vk::SemaphoreSignalInfo si{ t.ssem, t.sval };
+                t.sdev.signalSemaphore(si);
+                progress = true;
+            }
+        }
+        if (!progress) { std::this_thread::yield(); }
+    }
+}
+
+static vk::Semaphore ggml_vk_create_export_timeline(vk_device & device) {
+    vk::ExportSemaphoreCreateInfo esci{ vk::ExternalSemaphoreHandleTypeFlagBits::eOpaqueFd };
+    vk::SemaphoreTypeCreateInfo   stci{ vk::SemaphoreType::eTimeline, 0 };
+    stci.pNext = &esci;
+    vk::SemaphoreCreateInfo sci{};
+    sci.pNext = &stci;
+    return device->device.createSemaphore(sci);
+}
+
+static vk::Semaphore ggml_vk_create_plain_timeline(vk_device & device) {
+    vk::SemaphoreTypeCreateInfo stci{ vk::SemaphoreType::eTimeline, 0 };
+    vk::SemaphoreCreateInfo sci{};
+    sci.pNext = &stci;
+    return device->device.createSemaphore(sci);
+}
+
+static vk::Semaphore ggml_vk_import_timeline(ggml_backend_vk_comm_context * comm, vk_device & dst_dev,
+                                             vk_device & src_dev, vk::Semaphore src_sem) {
+    int fd = -1;
+    VkSemaphoreGetFdInfoKHR gi{};
+    gi.sType      = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR;
+    gi.semaphore  = src_sem;
+    gi.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+    comm->pGetSemFd((VkDevice) src_dev->device, &gi, &fd);
+
+    vk::SemaphoreTypeCreateInfo stci{ vk::SemaphoreType::eTimeline, 0 };
+    vk::SemaphoreCreateInfo sci{};
+    sci.pNext = &stci;
+    vk::Semaphore dst = dst_dev->device.createSemaphore(sci);
+
+    VkImportSemaphoreFdInfoKHR isi{};
+    isi.sType      = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR;
+    isi.semaphore  = dst;
+    isi.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+    isi.fd         = fd;
+    comm->pImportSemFd((VkDevice) dst_dev->device, &isi);
+    return dst;
+}
+
+static bool ggml_vk_comm_opaque_fd_supported(ggml_backend_vk_comm_context * comm) {
+    const size_t n = comm->device.size();
+    uint8_t driver_uuid[VK_UUID_SIZE];
+    for (size_t i = 0; i < n; i++) {
+        vk::PhysicalDeviceIDProperties id;
+        vk::PhysicalDeviceProperties2  p2;
+        p2.pNext = &id;
+        comm->device[i]->physical_device.getProperties2(&p2);
+        if (i == 0) {
+            memcpy(driver_uuid, id.driverUUID.data(), VK_UUID_SIZE);
+        } else if (memcmp(driver_uuid, id.driverUUID.data(), VK_UUID_SIZE) != 0) {
+            return false;
+        }
+
+        vk::SemaphoreTypeCreateInfo               stci{ vk::SemaphoreType::eTimeline, 0 };
+        vk::PhysicalDeviceExternalSemaphoreInfo   esi{ vk::ExternalSemaphoreHandleTypeFlagBits::eOpaqueFd };
+        esi.pNext = &stci;
+        vk::ExternalSemaphoreProperties esp = comm->device[i]->physical_device.getExternalSemaphoreProperties(esi);
+        const vk::ExternalSemaphoreFeatureFlags need =
+            vk::ExternalSemaphoreFeatureFlagBits::eExportable | vk::ExternalSemaphoreFeatureFlagBits::eImportable;
+        if ((esp.externalSemaphoreFeatures & need) != need) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void * ggml_backend_vk_comm_init(ggml_backend_t * backends, size_t n_backends) {
+    ggml_backend_vk_comm_context * comm = new ggml_backend_vk_comm_context;
+    comm->backends.assign(backends, backends + n_backends);
+    comm->vkctx.resize(n_backends);
+    comm->device.resize(n_backends);
+    bool ok = (n_backends >= 2);
+    for (size_t i = 0; i < n_backends; i++) {
+        comm->vkctx[i]  = (ggml_backend_vk_context *) backends[i]->context;
+        comm->device[i] = comm->vkctx[i]->device;
+        ok = ok && comm->device[i]->external_memory_host && comm->device[i]->external_semaphore;
+        comm->align = std::max(comm->align, (size_t) comm->device[i]->min_imported_host_pointer_alignment);
+    }
+    comm->fast = ok;
+   
+    comm->host_ptr.resize(n_backends, nullptr);
+    comm->host_buf.resize(n_backends);
+    comm->tmp_buffer.resize(n_backends, nullptr);
+    comm->tmp_tensor.resize(n_backends, nullptr);
+    for (size_t k = 0; k < n_backends; k++) {
+        comm->host_buf[k].resize(n_backends);
+    }
+    comm->up16_buffer.resize(n_backends, nullptr);
+    comm->dn16_buffer.resize(n_backends, nullptr);
+    comm->up16_tensor.resize(n_backends, nullptr);
+    comm->dn16_tensor.resize(n_backends, nullptr);
+    comm->ring_view.resize(n_backends, nullptr);
+    const ggml_init_params ip = { ggml_tensor_overhead() * (4 * n_backends + 8), nullptr, true };
+    comm->tctx = ggml_init(ip);
+
+    if (comm->fast) {
+        comm->pGetSemFd    = (PFN_vkGetSemaphoreFdKHR)    comm->device[0]->device.getProcAddr("vkGetSemaphoreFdKHR");
+        comm->pImportSemFd = (PFN_vkImportSemaphoreFdKHR) comm->device[0]->device.getProcAddr("vkImportSemaphoreFdKHR");
+        comm->fast = comm->pGetSemFd && comm->pImportSemFd;
+    }
+    if (comm->fast) {
+        comm->prog.resize(n_backends);
+        comm->peer_prog.assign(n_backends, std::vector<vk::Semaphore>(n_backends));
+        comm->last_reduce.assign(n_backends, 0);
+        comm->cmd_pool.resize(n_backends);
+        comm->pool_max_val.assign(n_backends, 0);
+        comm->up.resize(n_backends);
+        comm->peer_up.assign(n_backends, std::vector<vk::Semaphore>(n_backends));
+        comm->up_val.assign(n_backends, 0);
+        comm->cmd_pool_xfer.resize(n_backends);
+        comm->xfer_pool_max_val.assign(n_backends, 0);
+        comm->ring_ok = true;
+        for (size_t i = 0; i < n_backends; i++) {
+            comm->cmd_pool[i].init(comm->device[i], comm->device[i]->compute_queue.get());
+            comm->cmd_pool_xfer[i].init(comm->device[i], comm->device[i]->transfer_queue.get());
+            if (comm->device[i]->single_queue ||
+                comm->device[i]->transfer_queue->handle->queue == comm->device[i]->compute_queue->handle->queue) {
+                comm->ring_ok = false;
+            }
+        }
+        // Decide proxy vs native cross-device sync before creating the progress timelines: the proxy path only
+        // signals/reads them locally, so it must not request exportable handles. Some devices (e.g. llvmpipe, or
+        // RADV on older Mesa) cannot create exportable timeline semaphores at all, which would otherwise abort
+        // init here instead of falling back to the proxy.
+        comm->proxy = getenv("GGML_VK_COMM_PROXY") != nullptr;
+        if (!comm->proxy && !ggml_vk_comm_opaque_fd_supported(comm)) {
+            comm->proxy = true;
+            GGML_LOG_INFO("ggml_vulkan: cross-device OPAQUE_FD timeline import unsupported; using portable CPU-proxy sync\n");
+        }
+        for (size_t i = 0; i < n_backends; i++) {
+            comm->prog[i] = comm->proxy ? ggml_vk_create_plain_timeline(comm->device[i])
+                                        : ggml_vk_create_export_timeline(comm->device[i]);
+            comm->up[i]   = comm->proxy ? ggml_vk_create_plain_timeline(comm->device[i])
+                                        : ggml_vk_create_export_timeline(comm->device[i]);
+        }
+        if (!comm->proxy) {
+            try {
+                for (size_t j = 0; j < n_backends; j++) {
+                    for (size_t i = 0; i < n_backends; i++) {
+                        if (i == j) { continue; }
+                        comm->peer_prog[i][j] = ggml_vk_import_timeline(comm, comm->device[i], comm->device[j], comm->prog[j]);
+                        comm->peer_up[i][j]   = ggml_vk_import_timeline(comm, comm->device[i], comm->device[j], comm->up[j]);
+                    }
+                }
+            } catch (const vk::SystemError &) {
+                comm->proxy = true;
+                GGML_LOG_INFO("ggml_vulkan: comm OPAQUE_FD timeline import failed; using portable CPU-proxy sync\n");
+            }
+        }
+        if (comm->proxy) {
+            comm->pxy.resize(n_backends);
+            comm->pxy_val.assign(n_backends, 0);
+            comm->bridge_q.resize(n_backends);
+            for (size_t i = 0; i < n_backends; i++) {
+                vk::SemaphoreTypeCreateInfo stci{ vk::SemaphoreType::eTimeline, 0 };
+                vk::SemaphoreCreateInfo sci{};
+                sci.pNext = &stci;
+                comm->pxy[i] = comm->device[i]->device.createSemaphore(sci);
+            }
+            comm->proxy_thread = std::thread(ggml_vk_comm_proxy_loop, comm);
+        }
+#ifdef __linux__
+        comm->p2p_ok.assign(n_backends, false);
+        comm->p2p_send.resize(n_backends);
+        comm->p2p_recv.resize(n_backends);
+        if (getenv("GGML_VK_COMM_NO_P2P") == nullptr) {
+            for (size_t i = 0; i < n_backends; i++) {
+                const size_t nextd = (i + 1) % n_backends;
+                if (!comm->device[i]->external_memory_dma_buf || !comm->device[nextd]->external_memory_dma_buf) {
+                    continue;
+                }
+                bool src_nvidia = comm->device[i]->vendor_id == 0x10de;
+                bool dst_nvidia = comm->device[nextd]->vendor_id == 0x10de;
+                if (src_nvidia != dst_nvidia) {
+                    continue;
+                }
+                // push model: the receiver (nextd) exports VRAM, the sender (i) imports it and writes into it.
+                // PCIe posted writes across a root complex are fast, peer reads are not.
+                vk_buffer exp_buf, imp_buf;
+                if (ggml_vk_d2d_try_dma_buf(comm->device[nextd], comm->device[i], VK_D2D_PROBE_SIZE, true, exp_buf, imp_buf) &&
+                    ggml_vk_d2d_test_copy(comm->device[i], imp_buf, VK_D2D_PROBE_SIZE)) {
+                    comm->p2p_ok[i] = true;
+                    comm->p2p_send[i] = imp_buf;
+                    comm->p2p_recv[i] = exp_buf;
+                    GGML_LOG_INFO("ggml_vulkan: comm P2P dmabuf %s -> %s enabled\n",
+                                  comm->device[i]->name.c_str(), comm->device[nextd]->name.c_str());
+                   
+                } else {
+                   
+                    ggml_vk_destroy_buffer(exp_buf);
+                    ggml_vk_destroy_buffer(imp_buf);
+                }
+            }
+        }
+#endif
+       
+        for (size_t i = 0; i < n_backends; i++) {
+            comm->vkctx[i]->comm_prog_sem = comm->prog[i];
+            comm->vkctx[i]->comm_prog_val = 0;
+            comm->vkctx[i]->comm_active   = true;
+        }
+    }
+    return comm;
+}
+
+static void * ggml_vk_comm_aligned_alloc(size_t alignment, size_t size) {
+#if defined(_MSC_VER) || defined(__MINGW32__)
+    return _aligned_malloc(size, alignment);
+#else
+    return std::aligned_alloc(alignment, size);
+#endif
+}
+
+static void ggml_vk_comm_aligned_free(void * ptr) {
+#if defined(_MSC_VER) || defined(__MINGW32__)
+    _aligned_free(ptr);
+#else
+    std::free(ptr);
+#endif
+}
+
+static void ggml_backend_vk_comm_free(void * comm_ctx) {
+    ggml_backend_vk_comm_context * comm = static_cast<ggml_backend_vk_comm_context *>(comm_ctx);
+    for (size_t i = 0; i < comm->vkctx.size(); i++) {
+        ggml_backend_synchronize(comm->backends[i]);
+        comm->vkctx[i]->comm_active   = false;
+        comm->vkctx[i]->comm_prog_sem = VK_NULL_HANDLE;
+    }
+    if (comm->proxy_thread.joinable()) {
+        comm->proxy_stop.store(true, std::memory_order_relaxed);
+        comm->proxy_thread.join();
+    }
+    for (size_t i = 0; i < comm->pxy.size(); i++) {
+        if (comm->pxy[i]) {
+            comm->device[i]->device.destroySemaphore(comm->pxy[i]);
+        }
+    }
+    for (size_t i = 0; i < comm->prog.size(); i++) {
+        if (comm->prog[i]) {
+            comm->device[i]->device.destroySemaphore(comm->prog[i]);
+        }
+        if (i < comm->up.size() && comm->up[i]) {
+            comm->device[i]->device.destroySemaphore(comm->up[i]);
+        }
+        for (size_t j = 0; j < comm->peer_prog[i].size(); j++) {
+            if (comm->peer_prog[i][j]) {
+                comm->device[i]->device.destroySemaphore(comm->peer_prog[i][j]);
+            }
+            if (i < comm->peer_up.size() && j < comm->peer_up[i].size() && comm->peer_up[i][j]) {
+                comm->device[i]->device.destroySemaphore(comm->peer_up[i][j]);
+            }
+        }
+    }
+    for (size_t i = 0; i < comm->cmd_pool.size(); i++) {
+        comm->cmd_pool[i].destroy(comm->device[i]->device);
+    }
+    for (size_t i = 0; i < comm->cmd_pool_xfer.size(); i++) {
+        comm->cmd_pool_xfer[i].destroy(comm->device[i]->device);
+    }
+    for (auto & row : comm->host_buf) {
+        for (auto & b : row) {
+            b.reset();
+        }
+    }
+#ifdef __linux__
+    for (auto & b : comm->p2p_send) { b.reset(); }
+    for (auto & b : comm->p2p_recv) { b.reset(); }
+#endif
+    for (void * p : comm->host_ptr) {
+        ggml_vk_comm_aligned_free(p);
+    }
+    for (ggml_backend_buffer_t b : comm->tmp_buffer) {
+        if (b) {
+            ggml_backend_buffer_free(b);
+        }
+    }
+    for (ggml_backend_buffer_t b : comm->up16_buffer) {
+        if (b) {
+            ggml_backend_buffer_free(b);
+        }
+    }
+    for (ggml_backend_buffer_t b : comm->dn16_buffer) {
+        if (b) {
+            ggml_backend_buffer_free(b);
+        }
+    }
+    if (comm->tctx) {
+        ggml_free(comm->tctx);
+    }
+    delete comm;
+}
+
+static bool ggml_backend_vk_comm_ensure(ggml_backend_vk_comm_context * comm, size_t nbytes) {
+    // Reuse the current buffers when they fit and are not grossly oversized. We deliberately SHRINK when the
+    // request is much smaller than the current cap (e.g. the prefill->decode transition): the imported external
+    // host buffers are made visible across devices on every timeline-semaphore signal, so an oversized `cap`
+    // left over from a large prefill stalls every small (decode) all-reduce in proportion to its size.
+    constexpr size_t shrink_slack = 4;
+    if (nbytes <= comm->cap && comm->cap <= nbytes * shrink_slack) {
+        return true;
+    }
+    const size_t n      = comm->backends.size();
+    const size_t newcap = (nbytes + comm->align - 1) & ~(comm->align - 1);
+
+    // Buffers may still be referenced by the previous (async) all-reduce; wait for it before freeing them.
+    for (size_t i = 0; i < n; i++) {
+        if (comm->last_reduce[i] == 0) {
+            continue;
+        }
+        vk::SemaphoreWaitInfo wi;
+        wi.semaphoreCount = 1;
+        wi.pSemaphores    = &comm->prog[i];
+        wi.pValues        = &comm->last_reduce[i];
+        (void) comm->device[i]->device.waitSemaphores(wi, UINT64_MAX);
+    }
+
+    for (size_t k = 0; k < n; k++) {
+        for (size_t i = 0; i < n; i++) {
+            comm->host_buf[k][i].reset();
+        }
+        ggml_vk_comm_aligned_free(comm->host_ptr[k]);
+        comm->host_ptr[k] = nullptr;
+    }
+#ifdef __linux__
+    for (size_t i = 0; i < n; i++) {
+        comm->p2p_send[i].reset();
+        comm->p2p_recv[i].reset();
+    }
+#endif
+    for (size_t i = 0; i < n; i++) {
+        if (comm->tmp_buffer[i]) {
+            ggml_backend_buffer_free(comm->tmp_buffer[i]);
+            comm->tmp_buffer[i] = nullptr;
+        }
+        if (comm->up16_buffer[i]) {
+            ggml_backend_buffer_free(comm->up16_buffer[i]);
+            comm->up16_buffer[i] = nullptr;
+        }
+        if (comm->dn16_buffer[i]) {
+            ggml_backend_buffer_free(comm->dn16_buffer[i]);
+            comm->dn16_buffer[i] = nullptr;
+        }
+    }
+
+    const size_t slotcap = 4 * newcap;
+    for (size_t k = 0; k < n; k++) {
+        comm->host_ptr[k] = ggml_vk_comm_aligned_alloc(comm->align, slotcap);
+        if (!comm->host_ptr[k]) {
+            return false;
+        }
+        for (size_t i = 0; i < n; i++) {
+            comm->host_buf[k][i] = ggml_vk_buffer_from_host_ptr(comm->device[i], comm->host_ptr[k], slotcap);
+            if (!comm->host_buf[k][i]) {
+                return false;
+            }
+        }
+    }
+#ifdef __linux__
+    for (size_t i = 0; i < n; i++) {
+        if (!comm->p2p_ok[i]) {
+            continue;
+        }
+        const size_t nextd = (i + 1) % n;
+        vk_buffer exp_buf, imp_buf;
+        if (ggml_vk_d2d_try_dma_buf(comm->device[nextd], comm->device[i], slotcap, true, exp_buf, imp_buf)) {
+            comm->p2p_send[i] = imp_buf;
+            comm->p2p_recv[i] = exp_buf;
+        } else {
+            comm->p2p_ok[i] = false;
+            GGML_LOG_WARN("ggml_vulkan: comm P2P dmabuf grow failed for %s -> %s, falling back to host staging\n",
+                          comm->device[i]->name.c_str(), comm->device[nextd]->name.c_str());
+        }
+    }
+#endif
+    for (size_t i = 0; i < n; i++) {
+        ggml_backend_buffer_type_t bt = ggml_backend_get_default_buffer_type(comm->backends[i]);
+        comm->tmp_buffer[i] = ggml_backend_buft_alloc_buffer(bt, newcap);
+        if (!comm->tmp_buffer[i]) {
+            return false;
+        }
+        if (!comm->tmp_tensor[i]) {
+            comm->tmp_tensor[i] = ggml_new_tensor_1d(comm->tctx, GGML_TYPE_F32, 1);
+        }
+        comm->tmp_tensor[i]->buffer = comm->tmp_buffer[i];
+        comm->tmp_tensor[i]->data   = ggml_backend_buffer_get_base(comm->tmp_buffer[i]);
+        comm->up16_buffer[i] = ggml_backend_buft_alloc_buffer(bt, newcap);
+        comm->dn16_buffer[i] = ggml_backend_buft_alloc_buffer(bt, newcap);
+        if (!comm->up16_buffer[i] || !comm->dn16_buffer[i]) {
+            return false;
+        }
+        if (!comm->up16_tensor[i]) {
+            comm->up16_tensor[i] = ggml_new_tensor_1d(comm->tctx, GGML_TYPE_F16, 1);
+        }
+        if (!comm->dn16_tensor[i]) {
+            comm->dn16_tensor[i] = ggml_new_tensor_1d(comm->tctx, GGML_TYPE_F16, 1);
+        }
+        comm->up16_tensor[i]->buffer = comm->up16_buffer[i];
+        comm->up16_tensor[i]->data   = ggml_backend_buffer_get_base(comm->up16_buffer[i]);
+        comm->dn16_tensor[i]->buffer = comm->dn16_buffer[i];
+        comm->dn16_tensor[i]->data   = ggml_backend_buffer_get_base(comm->dn16_buffer[i]);
+        if (!comm->ring_view[i]) {
+            comm->ring_view[i] = ggml_new_tensor_1d(comm->tctx, GGML_TYPE_F32, 1);
+        }
+    }
+    comm->cap = newcap;
+    return true;
+}
+
+static bool ggml_backend_vk_comm_allreduce_ring(ggml_backend_vk_comm_context * comm,
+                                                ggml_tensor ** tensors) {
+    const size_t   n    = comm->backends.size();
+    const size_t   esz  = ggml_type_size(GGML_TYPE_F32);
+    const size_t   xsz  = sizeof(uint16_t);
+    const int64_t  nel  = ggml_nelements(tensors[0]);
+    const int64_t  cels = (nel + (int64_t) n - 1) / (int64_t) n;
+    const uint64_t nsteps = 2 * (uint64_t) (n - 1);
+    const uint64_t nprog  = nsteps + 1;
+
+    const uint64_t round    = comm->ring_round++;
+    const size_t   slot_off = (size_t) (round & 1) * 2 * comm->cap;
+
+    std::vector<uint64_t> compute_val(n), reduce_val(n), prev_reduce(n), up_base(n), pxy_base(n);
+    for (size_t i = 0; i < n; i++) {
+        prev_reduce[i] = comm->last_reduce[i];
+        compute_val[i] = comm->vkctx[i]->comm_prog_val;
+        reduce_val[i]  = compute_val[i] + nprog;
+        comm->vkctx[i]->comm_prog_val = reduce_val[i];
+        comm->last_reduce[i]          = reduce_val[i];
+        up_base[i]      = comm->up_val[i];
+        comm->up_val[i] += nsteps;
+        if (comm->proxy) {
+            pxy_base[i]       = comm->pxy_val[i];
+            comm->pxy_val[i] += nsteps + 1;
+        }
+        uint64_t done = comm->device[i]->device.getSemaphoreCounterValue(comm->prog[i]);
+        if (done >= comm->pool_max_val[i]) { ggml_vk_command_pool_cleanup(comm->device[i], comm->cmd_pool[i]); }
+        comm->pool_max_val[i] = reduce_val[i];
+        uint64_t xdone = comm->device[i]->device.getSemaphoreCounterValue(comm->up[i]);
+        if (xdone >= comm->xfer_pool_max_val[i]) { ggml_vk_command_pool_cleanup(comm->device[i], comm->cmd_pool_xfer[i]); }
+        comm->xfer_pool_max_val[i] = up_base[i] + nsteps;
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        const size_t nextd = (i + 1) % n;
+        const size_t prevd = (i + n - 1) % n;
+        ggml_tensor * rview = comm->ring_view[i];
+        char *        tbase = (char *) tensors[i]->data;
+
+        vk_context cctx = ggml_vk_create_temporary_context(comm->cmd_pool[i]);
+        vk_context tctx = ggml_vk_create_temporary_context(comm->cmd_pool_xfer[i]);
+
+        auto chunk_cels = [&](size_t c) -> int64_t {
+            const int64_t off = (int64_t) c * cels;
+            return off >= nel ? 0 : std::min(cels, nel - off);
+        };
+        auto set_view = [](ggml_tensor * tt, ggml_backend_buffer_t buf, char * data, int64_t ne0, size_t es) {
+            tt->ne[0] = ne0; tt->ne[1] = tt->ne[2] = tt->ne[3] = 1;
+            tt->nb[0] = es;  tt->nb[1] = tt->nb[2] = tt->nb[3] = (size_t) ne0 * es;
+            tt->buffer = buf; tt->data = data; tt->view_offs = 0;
+        };
+
+        {
+            ggml_backend_vk_buffer_context * ubc = (ggml_backend_vk_buffer_context *) comm->up16_buffer[i]->context;
+            ggml_backend_vk_buffer_context * dbc = (ggml_backend_vk_buffer_context *) comm->dn16_buffer[i]->context;
+            ggml_tensor * up16t = comm->up16_tensor[i];
+            ggml_tensor * dn16t = comm->dn16_tensor[i];
+            char *        ubase = (char *) ggml_backend_buffer_get_base(comm->up16_buffer[i]);
+            char *        dbase = (char *) ggml_backend_buffer_get_base(comm->dn16_buffer[i]);
+
+            const int64_t cels0 = chunk_cels(i);
+            ggml_vk_ctx_begin(comm->device[i], cctx);
+            cctx->s->wait_semaphores.push_back({ comm->prog[i], compute_val[i] });
+            cctx->s->wait_semaphores.push_back({ comm->up[i],   up_base[i] });
+            if (cels0) {
+                set_view(rview, tensors[i]->buffer,  tbase + (size_t) i * cels * esz, cels0, esz);
+                set_view(up16t, comm->up16_buffer[i], ubase,                          cels0, xsz);
+                ggml_vk_cpy(comm->vkctx[i], cctx, rview, up16t);
+            }
+            ggml_vk_ctx_end(cctx);
+            cctx->seqs.back().back().signal_semaphores.push_back({ comm->prog[i], compute_val[i] + 1 });
+
+            for (uint64_t t = 0; t < nsteps; t++) {
+                const bool    rs = (t < (uint64_t) (n - 1));
+                const size_t  s  = (size_t) (rs ? t : t - (n - 1));
+                const size_t  c_send = rs ? (i + n - s) % n : (i + n + 1 - s) % n;
+                const size_t  c_recv = rs ? (i + n - s - 1) % n : (i + n - s) % n;
+                const int64_t scels = chunk_cels(c_send), rcels = chunk_cels(c_recv);
+                const size_t  uoff = (size_t) t * (size_t) cels * xsz;
+                const size_t  hoff = slot_off + uoff;
+
+                ggml_vk_ctx_begin(comm->device[i], tctx);
+                if (t == 0) {
+                    tctx->s->wait_semaphores.push_back({ comm->prog[i], compute_val[i] + 1 });
+                    if (round >= 2) {
+                        if (comm->proxy) {
+                            const uint64_t pv = pxy_base[i] + 1;
+                            tctx->s->wait_semaphores.push_back({ comm->pxy[i], pv });
+                            std::lock_guard<std::mutex> lk(comm->bridge_mtx);
+                            comm->bridge_q[i].push_back({ comm->device[nextd]->device, comm->prog[nextd], prev_reduce[nextd],
+                                                          comm->device[i]->device, comm->pxy[i], pv });
+                        } else {
+                            tctx->s->wait_semaphores.push_back({ comm->peer_prog[i][nextd], prev_reduce[nextd] });
+                        }
+                    }
+                } else {
+                    tctx->s->wait_semaphores.push_back({ comm->prog[i], compute_val[i] + t + 1 });
+                }
+                if (scels) {
+#ifdef __linux__
+                    vk_buffer & send_buf = comm->p2p_ok[i] ? comm->p2p_send[i] : comm->host_buf[i][i];
+#else
+                    vk_buffer & send_buf = comm->host_buf[i][i];
+#endif
+                    ggml_vk_buffer_copy_async(tctx, send_buf, hoff, ubc->dev_buffer, uoff, (size_t) scels * xsz);
+                }
+                ggml_vk_ctx_end(tctx);
+                tctx->seqs.back().back().signal_semaphores.push_back({ comm->up[i], up_base[i] + t + 1 });
+
+                ggml_vk_ctx_begin(comm->device[i], cctx);
+                if (comm->proxy) {
+                    const uint64_t pv = pxy_base[i] + 2 + t;
+                    cctx->s->wait_semaphores.push_back({ comm->pxy[i], pv });
+                    std::lock_guard<std::mutex> lk(comm->bridge_mtx);
+                    comm->bridge_q[i].push_back({ comm->device[prevd]->device, comm->up[prevd], up_base[prevd] + t + 1,
+                                                  comm->device[i]->device, comm->pxy[i], pv });
+                } else {
+                    cctx->s->wait_semaphores.push_back({ comm->peer_up[i][prevd], up_base[prevd] + t + 1 });
+                }
+                if (rcels) {
+#ifdef __linux__
+                    vk_buffer & recv_buf = comm->p2p_ok[prevd] ? comm->p2p_recv[prevd] : comm->host_buf[prevd][i];
+#else
+                    vk_buffer & recv_buf = comm->host_buf[prevd][i];
+#endif
+                    ggml_vk_buffer_copy_async(cctx, dbc->dev_buffer, 0, recv_buf, hoff, (size_t) rcels * xsz);
+                    ggml_vk_sync_buffers(comm->vkctx[i], cctx);
+                    set_view(dn16t, comm->dn16_buffer[i], dbase,                                 rcels, xsz);
+                    set_view(rview, tensors[i]->buffer,   tbase + (size_t) c_recv * cels * esz,  rcels, esz);
+                    if (rs) { ggml_vk_add(comm->vkctx[i], cctx, rview, dn16t, rview); }
+                    else    { ggml_vk_cpy(comm->vkctx[i], cctx, dn16t, rview); }
+                    ggml_vk_sync_buffers(comm->vkctx[i], cctx);
+                    if (t + 1 < nsteps) {
+                        set_view(up16t, comm->up16_buffer[i], ubase + (size_t) (t + 1) * cels * xsz, rcels, xsz);
+                        ggml_vk_cpy(comm->vkctx[i], cctx, rview, up16t);
+                        ggml_vk_sync_buffers(comm->vkctx[i], cctx);
+                    }
+                }
+                ggml_vk_ctx_end(cctx);
+                cctx->seqs.back().back().signal_semaphores.push_back({ comm->prog[i], compute_val[i] + t + 2 });
+            }
+        }
+        ggml_vk_submit(tctx, {});
+        ggml_vk_submit(cctx, {});
+    }
+    return true;
+}
+
+// Recursive halving/doubling all-reduce for a power-of-two device count. Bandwidth-optimal like the ring but
+// uses 2*log2(n) cross-device steps instead of 2*(n-1), so its latency scales far better for n>=4. The per-device
+// step schedule (peer, send/recv ranges, reduce-vs-copy) is built exactly as in the reference simulation
+// scratchpad/tree_sim.py; the GPU plumbing (F16 host staging, F32 accumulate, timeline-semaphore / CPU-proxy
+// sync) mirrors ggml_backend_vk_comm_allreduce_ring. Opt-in via GGML_VK_COMM_TREE; the ring stays the default.
+// NOTE: only n=2 (and n=2 with forced proxy) is runnable on a 2-GPU box; the multi-step path is exercised by the
+// reference simulation and the n=2 plumbing test, not directly at n>=4.
+static bool ggml_backend_vk_comm_allreduce_tree(ggml_backend_vk_comm_context * comm, ggml_tensor ** tensors) {
+    const size_t  n   = comm->backends.size();
+    const size_t  esz = ggml_type_size(GGML_TYPE_F32);
+    const size_t  xsz = sizeof(uint16_t);
+    const int64_t nel = ggml_nelements(tensors[0]);
+
+    int logn = 0;
+    while (((size_t) 1 << (logn + 1)) <= n) { logn++; }   // n is a power of two (checked by caller)
+    const uint64_t nsteps = 2u * (uint64_t) logn;
+    const uint64_t nprog  = 2u * nsteps;                  // two compute signals (prep-send, reduce) per step
+
+    // Per-step host stride: the largest single send is ceil(nel/2) F16 elements. A distinct offset per step keeps
+    // a step's staged data alive until the peer has read it. Double-buffered by round like the ring.
+    const size_t   stride   = (size_t) ((nel + 1) / 2) * xsz;
+    const uint64_t round    = comm->ring_round++;
+    const size_t   slot_off = (size_t) (round & 1) * 2 * comm->cap;
+
+    // Build each device's schedule, mirroring tree_sim.py (validated for n=2..8).
+    struct step_t { size_t peer; int64_t soff, slen, roff, rlen; bool add; };
+    std::vector<std::vector<step_t>> sched(n);
+    std::vector<std::vector<size_t>> reuse_peers(n);   // distinct peers that read host[i] (for cross-call reuse wait)
+    {
+        std::vector<int64_t> coff(n, 0), clen(n, nel);
+        for (size_t dist = n / 2; dist >= 1; dist /= 2) {              // reduce-scatter (recursive halving)
+            for (size_t i = 0; i < n; i++) {
+                const size_t  p    = i ^ dist;
+                const int64_t off  = coff[i], len = clen[i];
+                const int64_t half = len / 2;
+                step_t st; st.peer = p; st.add = true;
+                if (i < p) { st.soff = off + half; st.slen = len - half; st.roff = off;        st.rlen = half;        coff[i] = off;        clen[i] = half; }
+                else       { st.soff = off;        st.slen = half;       st.roff = off + half; st.rlen = len - half; coff[i] = off + half; clen[i] = len - half; }
+                sched[i].push_back(st);
+            }
+        }
+        for (size_t dist = 1; dist < n; dist *= 2) {                   // all-gather (recursive doubling)
+            std::vector<int64_t> noff(n), nlen(n);
+            for (size_t i = 0; i < n; i++) {
+                const size_t p = i ^ dist;
+                step_t st; st.peer = p; st.add = false;
+                st.soff = coff[i]; st.slen = clen[i];
+                st.roff = coff[p]; st.rlen = clen[p];
+                sched[i].push_back(st);
+                noff[i] = std::min(coff[i], coff[p]);
+                nlen[i] = std::max(coff[i] + clen[i], coff[p] + clen[p]) - noff[i];
+            }
+            coff = noff; clen = nlen;
+        }
+        for (size_t i = 0; i < n; i++) {
+            for (const auto & st : sched[i]) {
+                if (std::find(reuse_peers[i].begin(), reuse_peers[i].end(), st.peer) == reuse_peers[i].end()) {
+                    reuse_peers[i].push_back(st.peer);
+                }
+            }
+        }
+    }
+
+    std::vector<uint64_t> compute_val(n), reduce_val(n), prev_reduce(n), up_base(n), pxy_base(n);
+    for (size_t i = 0; i < n; i++) {
+        prev_reduce[i] = comm->last_reduce[i];
+        compute_val[i] = comm->vkctx[i]->comm_prog_val;
+        reduce_val[i]  = compute_val[i] + nprog;
+        comm->vkctx[i]->comm_prog_val = reduce_val[i];
+        comm->last_reduce[i]          = reduce_val[i];
+        up_base[i]      = comm->up_val[i];
+        comm->up_val[i] += nsteps;
+        if (comm->proxy) {
+            pxy_base[i]       = comm->pxy_val[i];
+            comm->pxy_val[i] += nsteps + (uint64_t) reuse_peers[i].size();
+        }
+        uint64_t done = comm->device[i]->device.getSemaphoreCounterValue(comm->prog[i]);
+        if (done >= comm->pool_max_val[i]) { ggml_vk_command_pool_cleanup(comm->device[i], comm->cmd_pool[i]); }
+        comm->pool_max_val[i] = reduce_val[i];
+        uint64_t xdone = comm->device[i]->device.getSemaphoreCounterValue(comm->up[i]);
+        if (xdone >= comm->xfer_pool_max_val[i]) { ggml_vk_command_pool_cleanup(comm->device[i], comm->cmd_pool_xfer[i]); }
+        comm->xfer_pool_max_val[i] = up_base[i] + nsteps;
+    }
+
+    auto set_view = [](ggml_tensor * tt, ggml_backend_buffer_t buf, char * data, int64_t ne0, size_t es) {
+        tt->ne[0] = ne0; tt->ne[1] = tt->ne[2] = tt->ne[3] = 1;
+        tt->nb[0] = es;  tt->nb[1] = tt->nb[2] = tt->nb[3] = (size_t) ne0 * es;
+        tt->buffer = buf; tt->data = data; tt->view_offs = 0;
+    };
+
+    for (size_t i = 0; i < n; i++) {
+        ggml_backend_vk_buffer_context * ubc = (ggml_backend_vk_buffer_context *) comm->up16_buffer[i]->context;
+        ggml_backend_vk_buffer_context * dbc = (ggml_backend_vk_buffer_context *) comm->dn16_buffer[i]->context;
+        ggml_tensor * up16t = comm->up16_tensor[i];
+        ggml_tensor * dn16t = comm->dn16_tensor[i];
+        ggml_tensor * rview = comm->ring_view[i];
+        char *        ubase = (char *) ggml_backend_buffer_get_base(comm->up16_buffer[i]);
+        char *        dbase = (char *) ggml_backend_buffer_get_base(comm->dn16_buffer[i]);
+        char *        tbase = (char *) tensors[i]->data;
+
+        vk_context cctx = ggml_vk_create_temporary_context(comm->cmd_pool[i]);
+        vk_context tctx = ggml_vk_create_temporary_context(comm->cmd_pool_xfer[i]);
+
+        for (uint64_t t = 0; t < nsteps; t++) {
+            const step_t & st  = sched[i][t];
+            const size_t   peer = st.peer;
+            const size_t   hoff = slot_off + (size_t) t * stride;
+
+            // compute-A: copy this step's send range to the F16 staging buffer.
+            ggml_vk_ctx_begin(comm->device[i], cctx);
+            cctx->s->wait_semaphores.push_back({ comm->prog[i], compute_val[i] + 2 * t });
+            if (st.slen) {
+                set_view(rview, tensors[i]->buffer,  tbase + (size_t) st.soff * esz, st.slen, esz);
+                set_view(up16t, comm->up16_buffer[i], ubase,                          st.slen, xsz);
+                ggml_vk_cpy(comm->vkctx[i], cctx, rview, up16t);
+            }
+            ggml_vk_ctx_end(cctx);
+            cctx->seqs.back().back().signal_semaphores.push_back({ comm->prog[i], compute_val[i] + 2 * t + 1 });
+
+            // transfer: stage F16 send to this device's host buffer at the step offset.
+            ggml_vk_ctx_begin(comm->device[i], tctx);
+            tctx->s->wait_semaphores.push_back({ comm->prog[i], compute_val[i] + 2 * t + 1 });
+            if (t == 0 && round >= 2) {
+                // The round-1-ago call wrote/read the same host slot; ensure those peer reads are done before reuse.
+                for (size_t pi = 0; pi < reuse_peers[i].size(); pi++) {
+                    const size_t rp = reuse_peers[i][pi];
+                    if (comm->proxy) {
+                        const uint64_t pv = pxy_base[i] + 1 + pi;
+                        tctx->s->wait_semaphores.push_back({ comm->pxy[i], pv });
+                        std::lock_guard<std::mutex> lk(comm->bridge_mtx);
+                        comm->bridge_q[i].push_back({ comm->device[rp]->device, comm->prog[rp], prev_reduce[rp],
+                                                      comm->device[i]->device, comm->pxy[i], pv });
+                    } else {
+                        tctx->s->wait_semaphores.push_back({ comm->peer_prog[i][rp], prev_reduce[rp] });
+                    }
+                }
+            }
+            if (st.slen) {
+                ggml_vk_buffer_copy_async(tctx, comm->host_buf[i][i], hoff, ubc->dev_buffer, 0, (size_t) st.slen * xsz);
+            }
+            ggml_vk_ctx_end(tctx);
+            tctx->seqs.back().back().signal_semaphores.push_back({ comm->up[i], up_base[i] + t + 1 });
+
+            // compute-B: wait our own + the peer's transfer, read the peer's staged data, reduce/copy it in.
+            ggml_vk_ctx_begin(comm->device[i], cctx);
+            cctx->s->wait_semaphores.push_back({ comm->up[i], up_base[i] + t + 1 });
+            if (comm->proxy) {
+                const uint64_t pv = pxy_base[i] + (uint64_t) reuse_peers[i].size() + 1 + t;
+                cctx->s->wait_semaphores.push_back({ comm->pxy[i], pv });
+                std::lock_guard<std::mutex> lk(comm->bridge_mtx);
+                comm->bridge_q[i].push_back({ comm->device[peer]->device, comm->up[peer], up_base[peer] + t + 1,
+                                              comm->device[i]->device, comm->pxy[i], pv });
+            } else {
+                cctx->s->wait_semaphores.push_back({ comm->peer_up[i][peer], up_base[peer] + t + 1 });
+            }
+            if (st.rlen) {
+                ggml_vk_buffer_copy_async(cctx, dbc->dev_buffer, 0, comm->host_buf[peer][i], hoff, (size_t) st.rlen * xsz);
+                ggml_vk_sync_buffers(comm->vkctx[i], cctx);
+                set_view(dn16t, comm->dn16_buffer[i], dbase,                           st.rlen, xsz);
+                set_view(rview, tensors[i]->buffer,   tbase + (size_t) st.roff * esz,  st.rlen, esz);
+                if (st.add) { ggml_vk_add(comm->vkctx[i], cctx, rview, dn16t, rview); }
+                else        { ggml_vk_cpy(comm->vkctx[i], cctx, dn16t, rview); }
+                ggml_vk_sync_buffers(comm->vkctx[i], cctx);
+            }
+            ggml_vk_ctx_end(cctx);
+            cctx->seqs.back().back().signal_semaphores.push_back({ comm->prog[i], compute_val[i] + 2 * t + 2 });
+        }
+        ggml_vk_submit(tctx, {});
+        ggml_vk_submit(cctx, {});
+    }
+    return true;
+}
+
+static bool ggml_backend_vk_comm_allreduce_tensor(void * comm_ctx, ggml_tensor ** tensors) {
+    ggml_backend_vk_comm_context * comm = static_cast<ggml_backend_vk_comm_context *>(comm_ctx);
+    const size_t n = comm->backends.size();
+
+    if (!comm->fast || tensors[0]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const int64_t ne = ggml_nelements(tensors[0]);
+    if (ne == 0) {
+        return true;
+    }
+    const size_t nbytes = ggml_nbytes(tensors[0]);
+    for (size_t i = 0; i < n; i++) {
+        if (tensors[i]->type != GGML_TYPE_F32 || ggml_nelements(tensors[i]) != ne || !ggml_is_contiguous(tensors[i])) {
+            return false;
+        }
+    }
+    if (!ggml_backend_vk_comm_ensure(comm, nbytes)) {
+        return false;
+    }
+
+    constexpr size_t ring_min = 2u << 20;
+    if (comm->ring_ok && n >= 2 && nbytes >= ring_min) {
+        bool all_compute = true;
+        for (size_t i = 0; i < n; i++) {
+            all_compute = all_compute && (tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE);
+        }
+        if (all_compute) {
+            // Opt-in recursive halving/doubling for power-of-two device counts (fewer cross-device steps than the
+            // ring at n>=4); the ring remains the default and handles non-power-of-two counts.
+            static const bool use_tree = getenv("GGML_VK_COMM_TREE") != nullptr;
+            if (use_tree && (n & (n - 1)) == 0) {
+                return ggml_backend_vk_comm_allreduce_tree(comm, tensors);
+            }
+            return ggml_backend_vk_comm_allreduce_ring(comm, tensors);
+        }
+    }
+
+    std::vector<uint64_t> compute_val(n), gather_val(n), reduce_val(n), prev_reduce(n), pxy_base(n);
+    for (size_t i = 0; i < n; i++) {
+        prev_reduce[i] = comm->last_reduce[i];
+        compute_val[i] = comm->vkctx[i]->comm_prog_val;
+        gather_val[i]  = compute_val[i] + 1;
+        reduce_val[i]  = compute_val[i] + 2;
+        comm->vkctx[i]->comm_prog_val = reduce_val[i];
+        comm->last_reduce[i]          = reduce_val[i];
+        if (comm->proxy) {
+            pxy_base[i]       = comm->pxy_val[i];
+            comm->pxy_val[i] += 2 * (uint64_t) (n - 1);
+        }
+        uint64_t done = comm->device[i]->device.getSemaphoreCounterValue(comm->prog[i]);
+        if (done < comm->pool_max_val[i] && comm->cmd_pool[i].buffers_in_use() >= 256) {
+            vk::SemaphoreWaitInfo wi;
+            wi.semaphoreCount = 1;
+            wi.pSemaphores    = &comm->prog[i];
+            wi.pValues        = &comm->pool_max_val[i];
+            (void) comm->device[i]->device.waitSemaphores(wi, UINT64_MAX);
+            done = comm->pool_max_val[i];
+        }
+        if (done >= comm->pool_max_val[i]) {
+            ggml_vk_command_pool_cleanup(comm->device[i], comm->cmd_pool[i]);
+        }
+        comm->pool_max_val[i] = reduce_val[i];
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        ggml_tensor * tmp = comm->tmp_tensor[i];
+        for (int d = 0; d < GGML_MAX_DIMS; d++) {
+            tmp->ne[d] = tensors[i]->ne[d];
+        }
+        tmp->nb[0] = ggml_type_size(GGML_TYPE_F32);
+        for (int d = 1; d < GGML_MAX_DIMS; d++) {
+            tmp->nb[d] = tmp->nb[d - 1] * tmp->ne[d - 1];
+        }
+        ggml_backend_vk_buffer_context * tbc = (ggml_backend_vk_buffer_context *) comm->tmp_buffer[i]->context;
+        vk_context c = ggml_vk_create_temporary_context(comm->cmd_pool[i]);
+
+        ggml_vk_ctx_begin(comm->device[i], c);
+        c->s->wait_semaphores.push_back({ comm->prog[i], compute_val[i] });
+        if (comm->proxy) {
+            c->s->wait_semaphores.push_back({ comm->pxy[i], pxy_base[i] + (uint64_t) (n - 1) });
+        }
+        for (size_t k = 0; k < n; k++) {
+            if (k != i) {
+                const size_t p = (k < i) ? k : k - 1;
+                if (comm->proxy) {
+                    std::lock_guard<std::mutex> lk(comm->bridge_mtx);
+                    comm->bridge_q[i].push_back({ comm->device[k]->device, comm->prog[k], prev_reduce[k],
+                                                  comm->device[i]->device, comm->pxy[i], pxy_base[i] + p + 1 });
+                } else {
+                    c->s->wait_semaphores.push_back({ comm->peer_prog[i][k], prev_reduce[k] });
+                }
+            }
+        }
+        if (tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) {
+            ggml_backend_vk_buffer_context * bc = (ggml_backend_vk_buffer_context *) tensors[i]->buffer->context;
+            ggml_vk_buffer_copy_async(c, comm->host_buf[i][i], 0, bc->dev_buffer,
+                                      vk_tensor_offset(tensors[i]) + tensors[i]->view_offs, nbytes);
+        } else {
+            ggml_vk_buffer_memset_async(c, comm->host_buf[i][i], 0, 0, nbytes);
+        }
+        ggml_vk_ctx_end(c);
+        c->seqs.back().back().signal_semaphores.push_back({ comm->prog[i], gather_val[i] });
+
+        ggml_vk_ctx_begin(comm->device[i], c);
+        c->s->wait_semaphores.push_back({ comm->prog[i], gather_val[i] });
+        if (comm->proxy) {
+            c->s->wait_semaphores.push_back({ comm->pxy[i], pxy_base[i] + 2 * (uint64_t) (n - 1) });
+        }
+        for (size_t k = 0; k < n; k++) {
+            if (k != i) {
+                const size_t p = (k < i) ? k : k - 1;
+                if (comm->proxy) {
+                    std::lock_guard<std::mutex> lk(comm->bridge_mtx);
+                    comm->bridge_q[i].push_back({ comm->device[k]->device, comm->prog[k], gather_val[k],
+                                                  comm->device[i]->device, comm->pxy[i], pxy_base[i] + (uint64_t) (n - 1) + p + 1 });
+                } else {
+                    c->s->wait_semaphores.push_back({ comm->peer_prog[i][k], gather_val[k] });
+                }
+            }
+        }
+        for (size_t k = 0; k < n; k++) {
+            if (k == i) {
+                continue;
+            }
+            ggml_vk_buffer_copy_async(c, tbc->dev_buffer, 0, comm->host_buf[k][i], 0, nbytes);
+            ggml_vk_sync_buffers(comm->vkctx[i], c);
+            ggml_vk_add(comm->vkctx[i], c, tensors[i], tmp, tensors[i]);
+            ggml_vk_sync_buffers(comm->vkctx[i], c);
+        }
+        ggml_vk_ctx_end(c);
+        c->seqs.back().back().signal_semaphores.push_back({ comm->prog[i], reduce_val[i] });
+
+        ggml_vk_submit(c, {});
+    }
+    return true;
+}
+
+static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    UNUSED(reg);
+    if (strcmp(name, "ggml_backend_comm_init") == 0) {
+        return (void *) ggml_backend_vk_comm_init;
+    }
+    if (strcmp(name, "ggml_backend_comm_free") == 0) {
+        return (void *) ggml_backend_vk_comm_free;
+    }
+    if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
+        return (void *) ggml_backend_vk_comm_allreduce_tensor;
+    }
+    return nullptr;
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {
