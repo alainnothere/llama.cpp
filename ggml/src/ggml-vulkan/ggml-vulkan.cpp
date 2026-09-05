@@ -16452,16 +16452,19 @@ static const char * ggml_backend_vk_host_buffer_type_name(ggml_backend_buffer_ty
 
 static void ggml_backend_vk_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     VK_LOG_MEMORY("ggml_backend_vk_host_buffer_free_buffer()");
-    ggml_vk_host_free(vk_instance.devices[0], buffer->context);
+    ggml_backend_vk_buffer_type_context * buft_ctx = (ggml_backend_vk_buffer_type_context *)buffer->buft->context;
+    ggml_vk_host_free(buft_ctx->device, buffer->context);
 }
 
 static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     VK_LOG_MEMORY("ggml_backend_vk_host_buffer_type_alloc_buffer(" << size << ")");
 
+    ggml_backend_vk_buffer_type_context * buft_ctx = (ggml_backend_vk_buffer_type_context *)buft->context;
+
     size += 32;  // Behave like the CPU buffer type
     void * ptr = nullptr;
     try {
-        ptr = ggml_vk_host_malloc(vk_instance.devices[0], size);
+        ptr = ggml_vk_host_malloc(buft_ctx->device, size);
     } catch (vk::SystemError& e) {
         GGML_LOG_WARN("ggml_vulkan: Failed to allocate pinned memory (%s)\n", e.what());
         // fallback to cpu buffer
@@ -16473,43 +16476,55 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
     buffer->iface.free_buffer = ggml_backend_vk_host_buffer_free_buffer;
 
     return buffer;
-
-    UNUSED(buft);
 }
 
 static size_t ggml_backend_vk_host_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
-    return vk_instance.devices[0]->properties.limits.minMemoryMapAlignment;
-
-    UNUSED(buft);
+    ggml_backend_vk_buffer_type_context * buft_ctx = (ggml_backend_vk_buffer_type_context *)buft->context;
+    return buft_ctx->device->properties.limits.minMemoryMapAlignment;
 }
 
 static size_t ggml_backend_vk_host_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
-    return vk_instance.devices[0]->suballocation_block_size;
-
-    UNUSED(buft);
+    ggml_backend_vk_buffer_type_context * buft_ctx = (ggml_backend_vk_buffer_type_context *)buft->context;
+    return buft_ctx->device->suballocation_block_size;
 }
 
-// Should be changed to return device-specific host buffer type
-// but that probably requires changes in llama.cpp
+// Per-device host buffer type
+static ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type_for_device(size_t device_idx) {
+    static struct ggml_backend_buffer_type host_buffer_types[GGML_VK_MAX_DEVICES];
+    static bool initialized[GGML_VK_MAX_DEVICES] = {false};
+    static ggml_backend_vk_buffer_type_context host_buffer_type_contexts[GGML_VK_MAX_DEVICES];
+
+    if (device_idx >= GGML_VK_MAX_DEVICES) {
+        return nullptr;
+    }
+
+    if (!initialized[device_idx]) {
+        ggml_vk_instance_init();
+        ggml_vk_get_device(device_idx);
+
+        host_buffer_type_contexts[device_idx] = { "Vulkan_Host", vk_instance.devices[device_idx] };
+
+        host_buffer_types[device_idx] = {
+            /* .iface    = */ {
+                /* .get_name         = */ ggml_backend_vk_host_buffer_type_name,
+                /* .alloc_buffer     = */ ggml_backend_vk_host_buffer_type_alloc_buffer,
+                /* .get_alignment    = */ ggml_backend_vk_host_buffer_type_get_alignment,
+                /* .get_max_size     = */ ggml_backend_vk_host_buffer_type_get_max_size,
+                /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+                /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
+            },
+            /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), device_idx),
+            /* .context  = */ &host_buffer_type_contexts[device_idx],
+        };
+
+        initialized[device_idx] = true;
+    }
+
+    return &host_buffer_types[device_idx];
+}
+
 ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type() {
-    static struct ggml_backend_buffer_type ggml_backend_vk_buffer_type_host = {
-        /* .iface    = */ {
-            /* .get_name         = */ ggml_backend_vk_host_buffer_type_name,
-            /* .alloc_buffer     = */ ggml_backend_vk_host_buffer_type_alloc_buffer,
-            /* .get_alignment    = */ ggml_backend_vk_host_buffer_type_get_alignment,
-            /* .get_max_size     = */ ggml_backend_vk_host_buffer_type_get_max_size,
-            /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
-            /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
-        },
-        /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), 0),
-        /* .context  = */ nullptr,
-    };
-
-    // Make sure device 0 is initialized
-    ggml_vk_instance_init();
-    ggml_vk_get_device(0);
-
-    return &ggml_backend_vk_buffer_type_host;
+    return ggml_backend_vk_host_buffer_type_for_device(0);
 }
 
 
@@ -16620,6 +16635,27 @@ static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const gg
     bool ret = ggml_vk_buffer_read_2d_async(compute_ctx, buf, src_offset, data, stride_tensor, stride_data, size, n_copies);
 
     if (!ret) {
+        // One-time diagnostic: confirm device mismatch for pinned memory
+        static bool logged_fallback = false;
+        if (!logged_fallback && size > 100000) {  // only log for large copies (logits-sized)
+            logged_fallback = true;
+            std::string pinned_device_name = "not found";
+            for (size_t i = 0; i < GGML_VK_MAX_DEVICES; i++) {
+                if (vk_instance.devices[i]) {
+                    std::shared_lock<std::shared_mutex> guard(vk_instance.devices[i]->pinned_memory_mutex);
+                    for (size_t j = 0; j < vk_instance.devices[i]->pinned_memory.size(); j++) {
+                        const uint8_t* addr = (const uint8_t*) std::get<0>(vk_instance.devices[i]->pinned_memory[j]);
+                        const uint8_t* endr = addr + std::get<1>(vk_instance.devices[i]->pinned_memory[j]);
+                        if (data >= addr && data < endr) {
+                            pinned_device_name = vk_instance.devices[i]->name;
+                            break;
+                        }
+                    }
+                }
+            }
+            fprintf(stderr, "VULKAN FALLBACK: D2H copy %.2f MB from device '%s' but pinned memory on '%s' (device mismatch)\n",
+                    (size * n_copies) / (1024.0 * 1024.0), buf->device->name.c_str(), pinned_device_name.c_str());
+        }
         const size_t staging_size = size * n_copies;
         ggml_vk_ensure_sync_staging_buffer(ctx, staging_size);
         ggml_vk_sync_buffers(nullptr, compute_ctx);
@@ -18303,8 +18339,8 @@ static ggml_backend_buffer_type_t ggml_backend_vk_device_get_buffer_type(ggml_ba
 }
 
 static ggml_backend_buffer_type_t ggml_backend_vk_device_get_host_buffer_type(ggml_backend_dev_t dev) {
-    UNUSED(dev);
-    return ggml_backend_vk_host_buffer_type();
+    ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
+    return ggml_backend_vk_host_buffer_type_for_device(ctx->device);
 }
 
 static enum ggml_backend_dev_type ggml_backend_vk_device_get_type(ggml_backend_dev_t dev) {

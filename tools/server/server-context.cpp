@@ -3157,7 +3157,16 @@ private:
     int64_t n_decode      = 0;
     int64_t n_post_decode = 0;
     int64_t n_sampl       = 0;
-// #define DEBUG_TIMINGS
+    // per-window (last 5s) accumulators, folded into the lifetime totals at print time
+    int64_t w_t_pre_decode  = 0;
+    int64_t w_t_decode      = 0;
+    int64_t w_t_post_decode = 0;
+    int64_t w_t_sampl       = 0;
+    int64_t w_n_pre_decode  = 0;
+    int64_t w_n_decode      = 0;
+    int64_t w_n_post_decode = 0;
+    int64_t w_n_sampl       = 0;
+#define DEBUG_TIMINGS
 #ifdef DEBUG_TIMINGS
     struct scoped_timer {
         int64_t & t;
@@ -3184,11 +3193,41 @@ private:
         int64_t t_start = ggml_time_us();
         if (t_start - t_prev > 5 * 1000 * 1000) { // every 5 seconds
             t_prev = t_start;
-            SRV_INF("n_pre_decode      = %" PRId64 "\n", n_pre_decode);
-            SRV_INF("avg t_pre_decode  = %f ms\n", (double) t_pre_decode / n_pre_decode / 1000.0);
-            SRV_INF("avg t_decode      = %f ms\n", (double) t_decode / n_decode / 1000.0);
-            SRV_INF("avg t_post_decode = %f ms\n", (double) t_post_decode / n_post_decode / 1000.0);
-            SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
+
+            // fold the window into the lifetime totals
+            t_pre_decode  += w_t_pre_decode;  n_pre_decode  += w_n_pre_decode;
+            t_decode      += w_t_decode;      n_decode      += w_n_decode;
+            t_post_decode += w_t_post_decode; n_post_decode += w_n_post_decode;
+            t_sampl       += w_t_sampl;       n_sampl       += w_n_sampl;
+
+            auto print_stats = [](const char * label,
+                                  int64_t t_pre, int64_t n_pre,
+                                  int64_t t_dec, int64_t n_dec,
+                                  int64_t t_post, int64_t n_post,
+                                  int64_t t_sampl, int64_t n_sampl) {
+                if (n_dec == 0) { return; }
+                const double avg_pre   = (double) t_pre   / (double) n_pre   / 1000.0;
+                const double avg_dec   = (double) t_dec   / (double) n_dec   / 1000.0;
+                const double avg_post  = (double) t_post  / (double) n_post  / 1000.0;
+                const double avg_sampl = n_sampl ? (double) t_sampl / (double) n_sampl / 1000.0 : 0.0;
+                const double total     = avg_pre + avg_dec + avg_post;
+                const double overhead  = total > 0.0 ? 100.0 * (avg_pre + avg_post) / total : 0.0;
+                const double dec_share = total > 0.0 ? 100.0 * avg_dec / total : 0.0;
+                SRV_INF("%s n_decode = %" PRId64 "\n", label, n_dec);
+                SRV_INF("%s avg t_pre_decode  = %f ms\n", label, avg_pre);
+                SRV_INF("%s avg t_decode      = %f ms\n", label, avg_dec);
+                SRV_INF("%s avg t_post_decode = %f ms\n", label, avg_post);
+                SRV_INF("%s avg t_sampl       = %f ms\n", label, avg_sampl);
+                SRV_INF("%s total per iter    = %f ms\n", label, total);
+                SRV_INF("%s overhead (pre+post) = %f %%\n", label, overhead);
+                SRV_INF("%s decode share        = %f %%\n", label, dec_share);
+            };
+            print_stats("[window]   ", w_t_pre_decode, w_n_pre_decode, w_t_decode, w_n_decode, w_t_post_decode, w_n_post_decode, w_t_sampl, w_n_sampl);
+            print_stats("[lifetime] ", t_pre_decode, n_pre_decode, t_decode, n_decode, t_post_decode, n_post_decode, t_sampl, n_sampl);
+
+            // reset the window
+            w_t_pre_decode = w_t_decode = w_t_post_decode = w_t_sampl = 0;
+            w_n_pre_decode = w_n_decode = w_n_post_decode = w_n_sampl = 0;
         }
 #endif
 
@@ -3220,7 +3259,7 @@ private:
         }
 
         try {
-            scoped_timer t(t_pre_decode, n_pre_decode);
+            scoped_timer t(w_t_pre_decode, w_n_pre_decode);
             pre_decode();
             batch.render();
         } catch (const std::exception & e) {
@@ -3258,13 +3297,22 @@ private:
         for (int32_t off = 0; off < batch.size(); off = off_next) {
             const int32_t n_tokens = std::min(n_batch, batch.size() - off);
             try {
-                scoped_timer t(t_decode, n_decode);
+                scoped_timer t(w_t_decode, w_n_decode);
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
 
                 batch_view = batch.get_view(off, n_tokens);
                 bool ok = decode(n_batch, off, batch_view);
 #ifdef DEBUG_TIMINGS
-                llama_synchronize(ctx_tgt);
+                // Compute has_output the same way decode() does, to avoid double-sync
+                bool has_output = false;
+                for (int i = off; i < off + batch_view.n_tokens; ++i) {
+                    has_output |= batch.tokens[i].output;
+                }
+                // Only sync here if decode() didn't already sync (i.e., when has_output is false)
+                // When has_output is true, decode() already called llama_synchronize() at line 4236
+                if (!has_output) {
+                    llama_synchronize(ctx_tgt);
+                }
 #endif
 
                 if (ok) {
@@ -3284,7 +3332,7 @@ private:
             }
 
             try {
-                scoped_timer t(t_post_decode, n_post_decode);
+                scoped_timer t(w_t_post_decode, w_n_post_decode);
                 post_decode(n_tokens, off, batch_view);
             } catch (const std::exception & e) {
                 SRV_ERR("post_decode() failed: %s\n", e.what());
@@ -4508,7 +4556,7 @@ private:
 
             llama_token id;
             {
-                scoped_timer timer(t_sampl, n_sampl);
+                scoped_timer timer(w_t_sampl, w_n_sampl);
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
             }
 

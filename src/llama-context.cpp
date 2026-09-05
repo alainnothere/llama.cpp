@@ -23,7 +23,19 @@
 //
 // llama_context
 //
-
+// debug timing helper (see DEBUG_TIMINGS in server-context.cpp)
+struct llama_debug_timer {
+    int64_t & t;
+    int64_t & n;
+    int64_t t_start;
+    llama_debug_timer(int64_t & t_, int64_t & n_) : t(t_), n(n_) {
+        t_start = ggml_time_us();
+    }
+    ~llama_debug_timer() {
+        t += ggml_time_us() - t_start;
+        n++;
+    }
+};
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
         case LLAMA_CONTEXT_TYPE_DEFAULT: return LLM_GRAPH_TYPE_DEFAULT;
@@ -748,7 +760,46 @@ void llama_context::synchronize() {
         t_load_us = ggml_time_us() - t_start_us;
         has_evaluated_once = true;
     }
+    // debug timing breakdown of decode(), every 5 seconds (see DEBUG_TIMINGS in server-context.cpp)
+    {
+        const int64_t t_now = ggml_time_us();
+        if (t_now - t_prev_debug > 5 * 1000 * 1000) {
+            t_prev_debug = t_now;
 
+            const int64_t total = t_build_graph + t_alloc_graph + t_set_inputs + t_compute + t_ubatch_other + t_decode_other + t_sync + t_decode_early + t_mctx_apply;
+            if (total > 0) {
+                const auto pct = [total](int64_t t) { return 100.0 * (double) t / (double) total; };
+                const auto avg = [](int64_t t, int64_t n) { return n ? (double) t / (double) n / 1000.0 : 0.0; };
+                LLAMA_LOG_INFO("decode breakdown (5s window): total = %8.2f ms\n", (double) total / 1000.0);
+                LLAMA_LOG_INFO("  build_graph  = %8.2f ms (%5.1f%%)  avg %8.3f ms x %" PRId64 "\n", (double) t_build_graph / 1000.0, pct(t_build_graph), avg(t_build_graph, n_build_graph), n_build_graph);
+                LLAMA_LOG_INFO("  alloc_graph  = %8.2f ms (%5.1f%%)  avg %8.3f ms x %" PRId64 "\n", (double) t_alloc_graph / 1000.0, pct(t_alloc_graph), avg(t_alloc_graph, n_alloc_graph), n_alloc_graph);
+                LLAMA_LOG_INFO("  set_inputs   = %8.2f ms (%5.1f%%)  avg %8.3f ms x %" PRId64 "\n", (double) t_set_inputs / 1000.0, pct(t_set_inputs), avg(t_set_inputs, n_set_inputs), n_set_inputs);
+                LLAMA_LOG_INFO("  compute      = %8.2f ms (%5.1f%%)  avg %8.3f ms x %" PRId64 "\n", (double) t_compute / 1000.0, pct(t_compute), avg(t_compute, n_compute), n_compute);
+                LLAMA_LOG_INFO("  ubatch_other = %8.2f ms (%5.1f%%)  avg %8.3f ms x %" PRId64 "\n", (double) t_ubatch_other / 1000.0, pct(t_ubatch_other), avg(t_ubatch_other, n_ubatch_other), n_ubatch_other);
+                if (t_ubatch_other > 0) {
+                    const auto pct_u = [](int64_t t, int64_t base) { return base ? 100.0 * (double) t / (double) base : 0.0; };
+                    LLAMA_LOG_INFO("    output extraction (of ubatch_other):\n");
+                    LLAMA_LOG_INFO("      x_logits   = %8.2f ms (%5.1f%%)  avg %8.3f ms x %" PRId64 "  %7.2f MB %7.0f MB/s\n", (double) t_x_logits / 1000.0, pct_u(t_x_logits, t_ubatch_other), avg(t_x_logits, n_x_logits), n_x_logits, (double) bz_x_logits / 1e6, t_x_logits ? (double) bz_x_logits / (double) t_x_logits : 0.0);
+                    LLAMA_LOG_INFO("      x_embd     = %8.2f ms (%5.1f%%)  avg %8.3f ms x %" PRId64 "\n", (double) t_x_embd / 1000.0, pct_u(t_x_embd, t_ubatch_other), avg(t_x_embd, n_x_embd), n_x_embd);
+                    LLAMA_LOG_INFO("      x_layer    = %8.2f ms (%5.1f%%)  avg %8.3f ms x %" PRId64 "\n", (double) t_x_layer / 1000.0, pct_u(t_x_layer, t_ubatch_other), avg(t_x_layer, n_x_layer), n_x_layer);
+                    LLAMA_LOG_INFO("      x_nextn    = %8.2f ms (%5.1f%%)  avg %8.3f ms x %" PRId64 "  %7.2f MB %7.0f MB/s\n", (double) t_x_nextn / 1000.0, pct_u(t_x_nextn, t_ubatch_other), avg(t_x_nextn, n_x_nextn), n_x_nextn, (double) bz_x_nextn / 1e6, t_x_nextn ? (double) bz_x_nextn / (double) t_x_nextn : 0.0);
+                    LLAMA_LOG_INFO("      s_sampled  = %8.2f ms (%5.1f%%)  avg %8.3f ms x %" PRId64 "\n", (double) t_s_sampled / 1000.0, pct_u(t_s_sampled, t_ubatch_other), avg(t_s_sampled, n_s_sampled), n_s_sampled);
+                    LLAMA_LOG_INFO("      s_logits   = %8.2f ms (%5.1f%%)  avg %8.3f ms x %" PRId64 "\n", (double) t_s_logits / 1000.0, pct_u(t_s_logits, t_ubatch_other), avg(t_s_logits, n_s_logits), n_s_logits);
+                    LLAMA_LOG_INFO("      s_probs    = %8.2f ms (%5.1f%%)  avg %8.3f ms x %" PRId64 "\n", (double) t_s_probs / 1000.0, pct_u(t_s_probs, t_ubatch_other), avg(t_s_probs, n_s_probs), n_s_probs);
+                    LLAMA_LOG_INFO("      s_cands    = %8.2f ms (%5.1f%%)  avg %8.3f ms x %" PRId64 "\n", (double) t_s_cands / 1000.0, pct_u(t_s_cands, t_ubatch_other), avg(t_s_cands, n_s_cands), n_s_cands);
+                }
+                LLAMA_LOG_INFO("  decode_other = %8.2f ms (%5.1f%%)  avg %8.3f ms x %" PRId64 "\n", (double) t_decode_other / 1000.0, pct(t_decode_other), avg(t_decode_other, n_decode_other), n_decode_other);
+                LLAMA_LOG_INFO("  sync         = %8.2f ms (%5.1f%%)  avg %8.3f ms x %" PRId64 "\n", (double) t_sync / 1000.0, pct(t_sync), avg(t_sync, n_sync), n_sync);
+                LLAMA_LOG_INFO("  decode_early = %8.2f ms (%5.1f%%)  avg %8.3f ms x %" PRId64 "\n", (double) t_decode_early / 1000.0, pct(t_decode_early), avg(t_decode_early, n_decode_early), n_decode_early);
+                LLAMA_LOG_INFO("  mctx_apply   = %8.2f ms (%5.1f%%)  avg %8.3f ms x %" PRId64 "\n", (double) t_mctx_apply / 1000.0, pct(t_mctx_apply), avg(t_mctx_apply, n_mctx_apply), n_mctx_apply);
+            }
+            t_build_graph = t_alloc_graph = t_set_inputs = t_compute = t_ubatch_other = t_decode_other = t_sync = t_decode_early = t_mctx_apply = 0;
+            t_x_logits = t_x_embd = t_x_layer = t_x_nextn = t_s_sampled = t_s_logits = t_s_probs = t_s_cands = 0;
+            n_build_graph = n_alloc_graph = n_set_inputs = n_compute = n_ubatch_other = n_decode_other = n_sync = n_decode_early = n_mctx_apply = 0;
+            n_x_logits = n_x_embd = n_x_layer = n_x_nextn = n_s_sampled = n_s_logits = n_s_probs = n_s_cands = 0;
+            bz_x_logits = bz_x_nextn = 0;
+        }
+    }
     n_queued_tokens = 0;
     t_compute_start_us = 0;
 }
@@ -1340,10 +1391,13 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
-    if (mctx && !mctx->apply()) {
-        LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
-        ret = GGML_STATUS_FAILED;
-        return nullptr;
+    if (mctx) {
+        llama_debug_timer t(t_mctx_apply, n_mctx_apply);
+        if (!mctx->apply()) {
+            LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
     }
 
     auto * res = gf_res_prev.get();
@@ -1372,7 +1426,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
-        gf = model.build_graph(gparams);
+        {
+            llama_debug_timer t(t_build_graph, n_build_graph);
+            gf = model.build_graph(gparams);
+        }
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -1382,24 +1439,28 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
-            LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
-            ret = GGML_STATUS_ALLOC_FAILED;
-            return nullptr;
+        {
+            llama_debug_timer t(t_alloc_graph, n_alloc_graph);
+            if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+                LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+                ret = GGML_STATUS_ALLOC_FAILED;
+                return nullptr;
+            }
         }
     }
 
     // set the input data for the input tensors
     {
-        //const auto t_start_us = ggml_time_us();
-
+        llama_debug_timer t(t_set_inputs, n_set_inputs);
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
-
-        //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    ggml_status status;
+    {
+        llama_debug_timer t(t_compute, n_compute);
+        status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1750,7 +1811,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
     n_queued_tokens += n_tokens_all;
 
-    output_swaps.clear();
+    const int64_t t_prep_start = ggml_time_us();
+    t_decode_early += t_prep_start - t_decode_early_start;
+    n_decode_early++;
 
     sched_reserve();
 
@@ -1814,7 +1877,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     for (const auto & entry : sampling.samplers) {
         llama_sampler_backend_begin(entry.second);
     }
-
+    t_decode_other += ggml_time_us() - t_prep_start;
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
@@ -1877,6 +1940,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
         //}
 
+        const int64_t t_extract_start = ggml_time_us();
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
@@ -1887,6 +1951,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         // extract logits
         if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+            llama_debug_timer dt(t_x_logits, n_x_logits);
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
@@ -1896,12 +1961,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
+                bz_x_logits += (int64_t) n_outputs * n_vocab * sizeof(float);
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
             }
         }
 
         // extract embeddings
         if (embd.data && t_embd && n_outputs > 0) {
+            llama_debug_timer dt(t_x_embd, n_x_embd);
             ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
             GGML_ASSERT(backend_embd != nullptr);
 
@@ -1960,7 +2027,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
-        extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+        {
+            llama_debug_timer dt(t_x_layer, n_x_layer);
+            extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+        }
 
         // extract nextn embeddings before
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
@@ -1970,6 +2040,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
 
             if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+                llama_debug_timer dt(t_x_nextn, n_x_nextn);
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
 
@@ -1977,6 +2048,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 float * embd_nextn_out = embd_nextn.data + offset*n_embd;
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
+                bz_x_nextn += (int64_t) n_rows * n_embd * sizeof(float);
                 ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
             }
         }
@@ -1985,17 +2057,31 @@ int llama_context::decode(const llama_batch & batch_inp) {
             const auto stride = n_vocab;
 
             // async copy the sampling data from the backend to the host
-            copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, sched.get());
-            copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
-            copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
-            copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
+            {
+                llama_debug_timer dt(t_s_sampled, n_s_sampled);
+                copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, sched.get());
+            }
+            {
+                llama_debug_timer dt(t_s_logits, n_s_logits);
+                copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
+            }
+            {
+                llama_debug_timer dt(t_s_probs, n_s_probs);
+                copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
+            }
+            {
+                llama_debug_timer dt(t_s_cands, n_s_cands);
+                copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
+            }
         }
-
+        t_ubatch_other += ggml_time_us() - t_extract_start;
+        n_ubatch_other++;
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
+    const int64_t t_map_start = ggml_time_us();
     n_outputs = n_outputs_all;
 
     // set output mappings
@@ -2044,7 +2130,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
     }
-
+    t_decode_other += ggml_time_us() - t_map_start;
+    n_decode_other++;
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
