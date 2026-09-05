@@ -490,6 +490,59 @@ backend, traced through the code. This is the working understanding to continue 
 - **`compute` is the irreducible GPU cost.** ~68% of the main-model verify (~33.5 ms). It
   is the actual 27B forward pass; only moved by changing model/quant/backend, not by
   orchestration changes.
+## Possibilities (compute optimization, theoretical)
+
+After the x_logits and double-sync fixes, `compute` is the remaining bottleneck. This is
+a theoretical survey of what could move it - no changes made yet. Grounding facts (from
+the captures):
+
+- Decode is weight-bandwidth-bound. 27B Q8 ~= 28.6 GB of weights read once per verify
+  iteration; 28.6 GB / 38.5 ms ~= 745 GB/s effective. A single 7900 XTX is ~560 GB/s,
+  so the tensor split across the three cards is already contributing aggregate
+  bandwidth (observed: 3-card number exceeds single-card peak).
+- 26k-context run: `compute` ~= 103 ms/iteration (vs 38.5 ms at short context), a ~65 ms
+  delta. The f16 KV cache at 26.4k tokens (8 kv-heads x 128 dim x 65 layers, K+V) is
+  ~= 6.7 GB/step, which at the measured bandwidth is ~= 9 ms. ~56 ms of the delta is
+  unexplained by raw KV bandwidth (UNVERIFIED - see item 1, the sweep that would
+  attribute it).
+
+Levers, in priority order:
+
+1. **Context-length sweep (the deciding experiment).** Run the same decode at
+   4 / 8k / 16k / 26k tokens and plot `compute` ms vs context. A linear slope of ~9 ms
+   per 26k tokens means pure KV streaming (fix: quantize the cache, item 3). A
+   superlinear slope or large intercept means the Vulkan flash-attention kernel or the
+   disk-cache lazification (`lazify_check` checkpoint re-hydration, 149.6 MiB freed in
+   the 26k capture) is costing more than theory says. One afternoon of runs decides
+   which of items 3/6/7 matters.
+2. **Weight quantization, Q8 -> Q5_K or Q4_K_M with imatrix.** Attacks the constant
+   term. Q4_K_M ~= 15.5 GB vs 28.6 GB: short-context iteration ~38.5 -> ~21 ms (~1.7x).
+   At 26k context only the constant shrinks (~103 -> ~85 ms, ~20%) because the context
+   term remains. Risk: MTP draft acceptance (0.70-0.92 in the runs) may dip; measure
+   `mean len` or the gain is a wash. Biggest lever for short contexts, smallest for the
+   long-context workload.
+3. **KV cache quantization (`-ctk`/`-ctv q8_0` or `q4_0`).** Directly attacks the
+   ~6.7 GB/step at 26k: q8_0 halves it (~3.4 GB), q4_0 quarters it (~1.7 GB). Side
+   benefit: halves/quarters the disk-cache segment size (512 MiB per 8192 tokens) - a
+   free synergy with the `disk-cache-eviction` branch. q8_0 quality cost is small for
+   this model size; q4_0 is a bet.
+4. **lm_head.** 5120 x 248320 = 1.27 GB, Q8, read every iteration ~= ~1.7 ms of the
+   38.5 ms. Quantize only the output layer via `--tensor-type` in
+   `convert_hf_to_gguf.py`. Small, free, boring.
+5. **Batching / multi-slot.** Compute per iteration is ~constant for 1-5 tokens (what
+   spec verify already exploits). Two concurrent slots amortize the weight read: same
+   per-stream latency, ~2x aggregate t/s. Beats any kernel micro-optimization if the
+   workload is ever multi-stream.
+6. **Tensor-split efficiency (hidden headroom).** Measured ~745 GB/s vs ~1.65 TB/s
+   theoretical across the three cards - a 2.2x gap. Whether it is allreduce over x8
+   Gen4, unbalanced layer placement (the XT holds middle layers [24,43]), or matmul
+   inefficiency is an open question. Cheap test: run single-card on the XTX only and
+   compare; if it is close to the 3-card number the split is adding bubbles and a
+   rebalance (`-ts`) is worth a day.
+7. **Upstream Vulkan / hardware (long game).** Flash-attention quality on Vulkan lags
+   ROCm. f16 conversion is a no-go on RDNA3: f16 is 2x-FP32, so 2x bytes and 2x FLOPs
+   is a net wash versus Q8. If item 1 points at the attention kernel, the fix is
+   upstream kernel work, not local.
 
 ## What Changed
 
@@ -726,3 +779,38 @@ backend, traced through the code. This is the working understanding to continue 
   
     Built clean (llama-context.cpp recompiled, no warnings). Next: run the server to verify
     the sync count drops to ~76 and measure the throughput improvement.
+- **Possibilities section added (compute optimization survey).** Added a new `##
+  Possibilities (compute optimization, theoretical)` section before `## What Changed`:
+  a theoretical, no-changes-yet survey of what could move the now-dominant `compute`
+  cost. Grounded in the 26k-context capture: decode is weight-bandwidth-bound (~745
+  GB/s effective, above single-card peak, so the tensor split contributes), and the
+  ~65 ms short-to-26k-context `compute` delta is only ~9 ms explainable as f16 KV
+  streaming (~6.7 GB/step) - ~56 ms unattributed (marked UNVERIFIED). Seven levers in
+  priority order: (1) context-length sweep as the deciding experiment (KV streaming vs
+  flash-attn kernel vs disk-cache lazification), (2) weight quantization Q8 ->
+  Q5_K/Q4_K_M imatrix (~1.7x short-context, ~20% at 26k, MTP-acceptance risk), (3) KV
+  cache quantization `-ctk`/`-ctv` q8_0/q4_0 (halves/quarters the 6.7 GB/step, also
+  shrinks disk-cache segments), (4) lm_head output-layer quantization via
+  `--tensor-type` (~1.7 ms/iteration), (5) multi-slot batching (~2x aggregate t/s),
+  (6) tensor-split efficiency (2.2x gap vs theoretical, single-card A/B test), (7)
+  upstream Vulkan flash-attn / hardware (f16 conversion ruled out on RDNA3). No code
+  changes, no questions closed.
+- **Idempotent sync: bool replaced by generation counters, instrumentation now a flag
+  (2026-09-05).** The `synced` bool from the previous entry was wrong: any real sync inside
+  `decode()` before the output copies are enqueued (the `output_reserve()` reallocation
+  barrier, the `embd_seq` drain, a `llama_synchronize()` from `cb_eval`) set it, and the
+  caller's drain then skipped the sync that made the copies visible. Full analysis in
+  `potential-bugs-with-idempotent.md`. Replaced by two counters on `llama_context`:
+  `async_gen` bumps at every graph submission and again after every ubatch's D2H copies,
+  `synced_gen` records what the last real sync covered; `synchronize()` no-ops only when
+  they are equal. The redundant-sync elimination this section wanted (one real sync per
+  decode iteration instead of one per sampler/getter call) is preserved. Regression test:
+  `tests/test-context-sync.cpp`.
+
+  All timing instrumentation described above (the 9 libllama counters, the 5s
+  `decode breakdown` print, the server's `update_slots` window/lifetime stats and its
+  extra sync on mid-prompt chunks) is now OFF by default and enabled with
+  `--performance-instrumentation` (env `LLAMA_ARG_PERF_INSTRUMENTATION`). The server's
+  compile-time `DEBUG_TIMINGS` define is gone. Note the extra mid-prompt sync the flag
+  turns on defeats the target/draft prefill overlap: numbers captured with the flag are
+  honest about `t_decode` but slightly pessimistic about prompt processing.

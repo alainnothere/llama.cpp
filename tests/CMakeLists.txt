@@ -310,6 +310,10 @@ llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 llama_build_and_test(test-state-restore-fragmented.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED test-download-model)
 
+# synchronize() idempotency: generation counters must leave the drain after every decode/encode real
+llama_build_and_test(test-context-sync.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-context-sync PROPERTIES FIXTURES_REQUIRED test-download-model)
+
 if (APPLE)
     llama_build(test-rset-release.cpp)
 endif()

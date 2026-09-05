@@ -3166,32 +3166,29 @@ private:
     int64_t w_n_decode      = 0;
     int64_t w_n_post_decode = 0;
     int64_t w_n_sampl       = 0;
-#define DEBUG_TIMINGS
-#ifdef DEBUG_TIMINGS
+    // runtime-gated by --performance-instrumentation (params_base.perf_instrumentation);
+    // libllama has the matching llama_debug_timer and prints its own 5s breakdown
     struct scoped_timer {
         int64_t & t;
         int64_t & n;
         int64_t t_start;
-        scoped_timer(int64_t & t_, int64_t & n_) : t(t_), n(n_) {
-            t_start = ggml_time_us();
+        bool on;
+        scoped_timer(bool on_, int64_t & t_, int64_t & n_) : t(t_), n(n_), on(on_) {
+            t_start = on ? ggml_time_us() : 0;
         }
         ~scoped_timer() {
-            t += ggml_time_us() - t_start;
-            n++;
+            if (on) {
+                t += ggml_time_us() - t_start;
+                n++;
+            }
         }
     };
-#else
-    struct scoped_timer {
-        scoped_timer(int64_t &, int64_t &) {}
-        ~scoped_timer() {}
-    };
-#endif
 
     void update_slots() {
-#ifdef DEBUG_TIMINGS
+        const bool perf_instr = params_base.perf_instrumentation;
         static int64_t t_prev = 0;
-        int64_t t_start = ggml_time_us();
-        if (t_start - t_prev > 5 * 1000 * 1000) { // every 5 seconds
+        int64_t t_start = perf_instr ? ggml_time_us() : 0;
+        if (perf_instr && t_start - t_prev > 5 * 1000 * 1000) { // every 5 seconds
             t_prev = t_start;
 
             // fold the window into the lifetime totals
@@ -3229,7 +3226,6 @@ private:
             w_t_pre_decode = w_t_decode = w_t_post_decode = w_t_sampl = 0;
             w_n_pre_decode = w_n_decode = w_n_post_decode = w_n_sampl = 0;
         }
-#endif
 
         // check if all slots are idle
         {
@@ -3259,7 +3255,7 @@ private:
         }
 
         try {
-            scoped_timer t(w_t_pre_decode, w_n_pre_decode);
+            scoped_timer t(perf_instr, w_t_pre_decode, w_n_pre_decode);
             pre_decode();
             batch.render();
         } catch (const std::exception & e) {
@@ -3297,23 +3293,23 @@ private:
         for (int32_t off = 0; off < batch.size(); off = off_next) {
             const int32_t n_tokens = std::min(n_batch, batch.size() - off);
             try {
-                scoped_timer t(w_t_decode, w_n_decode);
+                scoped_timer t(perf_instr, w_t_decode, w_n_decode);
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
 
                 batch_view = batch.get_view(off, n_tokens);
                 bool ok = decode(n_batch, off, batch_view);
-#ifdef DEBUG_TIMINGS
-                // Compute has_output the same way decode() does, to avoid double-sync
-                bool has_output = false;
-                for (int i = off; i < off + batch_view.n_tokens; ++i) {
-                    has_output |= batch.tokens[i].output;
+                if (perf_instr) {
+                    // make t_decode measure compute, not submission. decode() already syncs when
+                    // has_output is true (see the [TAG_SPEC_OVERLAP] note there), so only the
+                    // mid-prompt chunks need it - at the cost of the target/draft prefill overlap
+                    bool has_output = false;
+                    for (int i = off; i < off + batch_view.n_tokens; ++i) {
+                        has_output |= batch.tokens[i].output;
+                    }
+                    if (!has_output) {
+                        llama_synchronize(ctx_tgt);
+                    }
                 }
-                // Only sync here if decode() didn't already sync (i.e., when has_output is false)
-                // When has_output is true, decode() already called llama_synchronize() at line 4236
-                if (!has_output) {
-                    llama_synchronize(ctx_tgt);
-                }
-#endif
 
                 if (ok) {
                     // move the head of the batch forward with the number of tokens we just processed
@@ -3332,7 +3328,7 @@ private:
             }
 
             try {
-                scoped_timer t(w_t_post_decode, w_n_post_decode);
+                scoped_timer t(perf_instr, w_t_post_decode, w_n_post_decode);
                 post_decode(n_tokens, off, batch_view);
             } catch (const std::exception & e) {
                 SRV_ERR("post_decode() failed: %s\n", e.what());
@@ -4556,7 +4552,7 @@ private:
 
             llama_token id;
             {
-                scoped_timer timer(w_t_sampl, w_n_sampl);
+                scoped_timer timer(params_base.perf_instrumentation, w_t_sampl, w_n_sampl);
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
             }
 

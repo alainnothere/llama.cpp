@@ -1825,6 +1825,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_PERF"));
     add_opt(common_arg(
+        {"--performance-instrumentation"},
+        {"--no-performance-instrumentation"},
+        string_format("print a 5s timing breakdown of decode()/synchronize() (libllama) and of update_slots() (server) (default: %s)", params.perf_instrumentation ? "true" : "false"),
+        [](common_params & params, bool value) {
+            params.perf_instrumentation = value;
+        }
+    ).set_env("LLAMA_ARG_PERF_INSTRUMENTATION"));
+    add_opt(common_arg(
         {"--show-timings"},
         {"--no-show-timings"},
         string_format("whether to show timing information after each response (default: %s)", params.show_timings ? "true" : "false"),

@@ -49,6 +49,7 @@ struct llama_cparams {
     bool fused_dsv4_hc_post;
     bool auto_fhc;
     bool no_perf;
+    bool perf_instrumentation; // periodic decode()/synchronize() timing breakdown (debug)
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;
     bool kv_unified;

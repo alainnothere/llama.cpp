@@ -374,7 +374,24 @@ private:
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
 
     bool has_evaluated_once = false;
-    bool synced = false; // track whether we've synced since the last decode
+    // synchronize() idempotency: async_gen counts async submission points (every
+    // graph_compute() submission AND every ubatch's batch of D2H output copies),
+    // synced_gen is what the last real sync covered; equal means nothing is in flight.
+    // not a per-decode bool: mid-decode barriers (output_reserve, embd_seq drain,
+    // sched_reserve, a llama_synchronize() from cb_eval) must not cover the output
+    // copies enqueued after them. single-threaded like the rest of llama_context.
+    // regression test: tests/test-context-sync.cpp
+    uint64_t async_gen  = 0;
+    uint64_t synced_gen = 0;
+
+public:
+    // sync bookkeeping, exposed for tests only (not part of the public API)
+    uint64_t sync_async_gen()  const { return async_gen; }
+    uint64_t sync_synced_gen() const { return synced_gen; }
+    int64_t  sync_n_real()     const { return n_sync_total; }
+
+private:
+    int64_t n_sync_total = 0; // lifetime count of real ggml_backend_sched_synchronize() calls
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;

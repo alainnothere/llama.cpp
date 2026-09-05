@@ -23,17 +23,21 @@
 //
 // llama_context
 //
-// debug timing helper (see DEBUG_TIMINGS in server-context.cpp)
+// debug timing helper, active only with llama_context_params.perf_instrumentation
+// (--performance-instrumentation; the server has a matching scoped_timer)
 struct llama_debug_timer {
     int64_t & t;
     int64_t & n;
     int64_t t_start;
-    llama_debug_timer(int64_t & t_, int64_t & n_) : t(t_), n(n_) {
-        t_start = ggml_time_us();
+    bool on;
+    llama_debug_timer(bool on_, int64_t & t_, int64_t & n_) : t(t_), n(n_), on(on_) {
+        t_start = on ? ggml_time_us() : 0;
     }
     ~llama_debug_timer() {
-        t += ggml_time_us() - t_start;
-        n++;
+        if (on) {
+            t += ggml_time_us() - t_start;
+            n++;
+        }
     }
 };
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
@@ -131,6 +135,7 @@ llama_context::llama_context(
     cparams.embeddings_nextn_masked = false;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
+    cparams.perf_instrumentation    = params.perf_instrumentation;
     cparams.warmup                  = false;
 
     // +1: id n_layer() taps the output of the last layer ("input" of the head)
@@ -727,16 +732,22 @@ void llama_context::synchronize() {
         return;
     }
 
-    // skip if already synced since last decode
-    if (synced) {
+    // skip only when every submitted graph has been covered by a sync. a mid-decode
+    // barrier (output_reserve, embd_seq drain, sched_reserve) must not make this a
+    // no-op: the output copies for the current batch are enqueued after it
+    if (synced_gen == async_gen) {
         return;
     }
 
-    const int64_t t_sync_start = ggml_time_us();
+    const bool instr = cparams.perf_instrumentation;
+    const int64_t t_sync_start = instr ? ggml_time_us() : 0;
     ggml_backend_sched_synchronize(sched.get());
-    t_sync += ggml_time_us() - t_sync_start;
-    n_sync++;
-    synced = true;
+    if (instr) {
+        t_sync += ggml_time_us() - t_sync_start;
+        n_sync++;
+    }
+    n_sync_total++;
+    synced_gen = async_gen;
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -760,8 +771,8 @@ void llama_context::synchronize() {
         t_load_us = ggml_time_us() - t_start_us;
         has_evaluated_once = true;
     }
-    // debug timing breakdown of decode(), every 5 seconds (see DEBUG_TIMINGS in server-context.cpp)
-    {
+    // debug timing breakdown of decode(), every 5 seconds (--performance-instrumentation)
+    if (instr) {
         const int64_t t_now = ggml_time_us();
         if (t_now - t_prev_debug > 5 * 1000 * 1000) {
             t_prev_debug = t_now;
@@ -1392,7 +1403,7 @@ bool llama_context::set_adapter_cvec(
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx) {
-        llama_debug_timer t(t_mctx_apply, n_mctx_apply);
+        llama_debug_timer t(cparams.perf_instrumentation, t_mctx_apply, n_mctx_apply);
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
             ret = GGML_STATUS_FAILED;
@@ -1414,7 +1425,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
         // that the previous compute is still reading.
         if (cparams.pipeline_parallel) {
+            // this barrier drains everything submitted so far - record it, else
+            // synchronize() would repeat it needlessly on the next call
             ggml_backend_sched_synchronize(sched.get());
+            synced_gen = async_gen;
         }
 
         n_reused++;
@@ -1427,7 +1441,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         {
-            llama_debug_timer t(t_build_graph, n_build_graph);
+            llama_debug_timer t(cparams.perf_instrumentation, t_build_graph, n_build_graph);
             gf = model.build_graph(gparams);
         }
 
@@ -1440,7 +1454,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         {
-            llama_debug_timer t(t_alloc_graph, n_alloc_graph);
+            llama_debug_timer t(cparams.perf_instrumentation, t_alloc_graph, n_alloc_graph);
             if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
                 LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
                 ret = GGML_STATUS_ALLOC_FAILED;
@@ -1451,14 +1465,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // set the input data for the input tensors
     {
-        llama_debug_timer t(t_set_inputs, n_set_inputs);
+        llama_debug_timer t(cparams.perf_instrumentation, t_set_inputs, n_set_inputs);
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
     }
 
     ggml_status status;
     {
-        llama_debug_timer t(t_compute, n_compute);
+        llama_debug_timer t(cparams.perf_instrumentation, t_compute, n_compute);
         status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     }
     if (status != GGML_STATUS_SUCCESS) {
@@ -1629,6 +1643,9 @@ int llama_context::encode(const llama_batch & batch_inp) {
         ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data, 0, n_tokens*n_embd*sizeof(float));
     }
 
+    // same as decode(): the copies above are async work submitted after the graph
+    async_gen++;
+
     // TODO: hacky solution
     if (model.arch == LLM_ARCH_T5 && t_embd) {
         //cross.t_embd = t_embd;
@@ -1711,15 +1728,18 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
-    const int64_t t_decode_early_start = ggml_time_us();
-    {
+    const bool instr = cparams.perf_instrumentation;
+    const int64_t t_decode_early_start = instr ? ggml_time_us() : 0;
+    if (instr) {
         static bool printed = false;
         if (!printed) {
             LLAMA_LOG_INFO("decode instrumentation active (9 counters, 5s breakdown in synchronize())\n");
             printed = true;
         }
     }
-    synced = false; // reset sync state for new decode
+    // no flag reset here: async_gen keeps counting across decodes, so a batch left
+    // in flight by the previous decode (server mid-prompt chunks) is still drained
+    // by the next real synchronize()
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -1811,9 +1831,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
     n_queued_tokens += n_tokens_all;
 
-    const int64_t t_prep_start = ggml_time_us();
-    t_decode_early += t_prep_start - t_decode_early_start;
-    n_decode_early++;
+    const int64_t t_prep_start = instr ? ggml_time_us() : 0;
+    if (instr) {
+        t_decode_early += t_prep_start - t_decode_early_start;
+        n_decode_early++;
+    }
 
     sched_reserve();
 
@@ -1877,7 +1899,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
     for (const auto & entry : sampling.samplers) {
         llama_sampler_backend_begin(entry.second);
     }
-    t_decode_other += ggml_time_us() - t_prep_start;
+    if (instr) {
+        t_decode_other += ggml_time_us() - t_prep_start;
+    }
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
@@ -1940,7 +1964,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
         //}
 
-        const int64_t t_extract_start = ggml_time_us();
+        const int64_t t_extract_start = instr ? ggml_time_us() : 0;
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
@@ -1951,7 +1975,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         // extract logits
         if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
-            llama_debug_timer dt(t_x_logits, n_x_logits);
+            llama_debug_timer dt(cparams.perf_instrumentation, t_x_logits, n_x_logits);
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
@@ -1968,7 +1992,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         // extract embeddings
         if (embd.data && t_embd && n_outputs > 0) {
-            llama_debug_timer dt(t_x_embd, n_x_embd);
+            llama_debug_timer dt(cparams.perf_instrumentation, t_x_embd, n_x_embd);
             ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
             GGML_ASSERT(backend_embd != nullptr);
 
@@ -2028,7 +2052,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         {
-            llama_debug_timer dt(t_x_layer, n_x_layer);
+            llama_debug_timer dt(cparams.perf_instrumentation, t_x_layer, n_x_layer);
             extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
         }
 
@@ -2040,7 +2064,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
 
             if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
-                llama_debug_timer dt(t_x_nextn, n_x_nextn);
+                llama_debug_timer dt(cparams.perf_instrumentation, t_x_nextn, n_x_nextn);
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
 
@@ -2058,30 +2082,38 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
             // async copy the sampling data from the backend to the host
             {
-                llama_debug_timer dt(t_s_sampled, n_s_sampled);
+                llama_debug_timer dt(cparams.perf_instrumentation, t_s_sampled, n_s_sampled);
                 copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, sched.get());
             }
             {
-                llama_debug_timer dt(t_s_logits, n_s_logits);
+                llama_debug_timer dt(cparams.perf_instrumentation, t_s_logits, n_s_logits);
                 copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
             }
             {
-                llama_debug_timer dt(t_s_probs, n_s_probs);
+                llama_debug_timer dt(cparams.perf_instrumentation, t_s_probs, n_s_probs);
                 copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
             }
             {
-                llama_debug_timer dt(t_s_cands, n_s_cands);
+                llama_debug_timer dt(cparams.perf_instrumentation, t_s_cands, n_s_cands);
                 copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
             }
         }
-        t_ubatch_other += ggml_time_us() - t_extract_start;
-        n_ubatch_other++;
+        if (instr) {
+            t_ubatch_other += ggml_time_us() - t_extract_start;
+            n_ubatch_other++;
+        }
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
+
+        // the D2H output copies above are async work submitted after the graph. a real sync
+        // that landed between the graph submission and here (cb_eval, or a barrier inside
+        // process_ubatch) recorded a gen that does not cover them - bump so the caller's
+        // drain is real. see tests/test-context-sync.cpp
+        async_gen++;
     } while (mctx->next());
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
-    const int64_t t_map_start = ggml_time_us();
+    const int64_t t_map_start = instr ? ggml_time_us() : 0;
     n_outputs = n_outputs_all;
 
     // set output mappings
@@ -2130,8 +2162,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
     }
-    t_decode_other += ggml_time_us() - t_map_start;
-    n_decode_other++;
+    if (instr) {
+        t_decode_other += ggml_time_us() - t_map_start;
+        n_decode_other++;
+    }
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
@@ -2609,6 +2643,10 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
+    // bump before submitting so a synchronize() during compute (e.g. from cb_eval) is
+    // real and drains this graph. the output copies the caller enqueues afterwards are
+    // covered by the second bump at the end of the ubatch loop, not by this one
+    async_gen++;
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
@@ -3734,6 +3772,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.perf_instrumentation        =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
