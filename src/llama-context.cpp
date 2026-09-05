@@ -715,7 +715,16 @@ void llama_context::synchronize() {
         return;
     }
 
+    // skip if already synced since last decode
+    if (synced) {
+        return;
+    }
+
+    const int64_t t_sync_start = ggml_time_us();
     ggml_backend_sched_synchronize(sched.get());
+    t_sync += ggml_time_us() - t_sync_start;
+    n_sync++;
+    synced = true;
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1641,6 +1650,15 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    const int64_t t_decode_early_start = ggml_time_us();
+    {
+        static bool printed = false;
+        if (!printed) {
+            LLAMA_LOG_INFO("decode instrumentation active (9 counters, 5s breakdown in synchronize())\n");
+            printed = true;
+        }
+    }
+    synced = false; // reset sync state for new decode
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);

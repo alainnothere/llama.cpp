@@ -374,6 +374,7 @@ private:
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
 
     bool has_evaluated_once = false;
+    bool synced = false; // track whether we've synced since the last decode
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
@@ -391,4 +392,45 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    // debug timing breakdown of decode() / process_ubatch() (see DEBUG_TIMINGS in server-context.cpp)
+    mutable int64_t t_build_graph  = 0;
+    mutable int64_t t_alloc_graph  = 0;
+    mutable int64_t t_set_inputs   = 0;
+    mutable int64_t t_compute      = 0;
+    mutable int64_t t_ubatch_other = 0; // per-ubatch work outside process_ubatch (output extraction)
+    mutable int64_t t_decode_other = 0; // decode() work outside the ubatch loop (prep + output mapping)
+    mutable int64_t n_build_graph  = 0;
+    mutable int64_t n_alloc_graph  = 0;
+    mutable int64_t n_set_inputs   = 0;
+    mutable int64_t n_compute      = 0;
+    mutable int64_t n_ubatch_other = 0;
+    mutable int64_t n_decode_other = 0;
+    mutable int64_t t_sync         = 0; // ggml_backend_sched_synchronize() wait in synchronize()
+    mutable int64_t n_sync         = 0;
+    mutable int64_t t_decode_early = 0; // decode() work before t_prep_start (validation, balloc->init)
+    mutable int64_t n_decode_early = 0;
+    mutable int64_t t_mctx_apply   = 0; // mctx->apply() in process_ubatch (KV-cache setup per ubatch)
+    mutable int64_t n_mctx_apply   = 0;
+    // breakdown of t_ubatch_other: per-ubatch output extraction (D2H copies)
+    mutable int64_t t_x_logits  = 0; // raw logits extraction
+    mutable int64_t n_x_logits  = 0;
+    mutable int64_t t_x_embd    = 0; // embeddings extraction
+    mutable int64_t n_x_embd    = 0;
+    mutable int64_t t_x_layer   = 0; // extract_layer_inputs
+    mutable int64_t n_x_layer   = 0;
+    mutable int64_t t_x_nextn   = 0; // nextn embeddings extraction
+    mutable int64_t n_x_nextn   = 0;
+    mutable int64_t t_s_sampled = 0; // sampling.sampled copy (1 row)
+    mutable int64_t n_s_sampled = 0;
+    mutable int64_t t_s_logits  = 0; // sampling.logits copy (full vocab)
+    mutable int64_t n_s_logits  = 0;
+    mutable int64_t t_s_probs   = 0; // sampling.probs copy (full vocab)
+    mutable int64_t n_s_probs   = 0;
+    mutable int64_t t_s_cands   = 0; // sampling.candidates copy (full vocab)
+    mutable int64_t n_s_cands   = 0;
+    // bytes moved by the D2H extractions, to compute effective PCIe bandwidth
+    mutable int64_t bz_x_logits = 0;
+    mutable int64_t bz_x_nextn  = 0;
+    mutable int64_t t_prev_debug   = 0; // 5s print cadence for the breakdown
 };
