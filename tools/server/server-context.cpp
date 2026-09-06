@@ -262,6 +262,8 @@ struct server_spec_autotune {
     int  n_step    = 0;
     bool is_probe  = false; // last choose() was a probe
 
+    int  n_landed_last = 0; // landed tokens of the last observed step (read by the perf instrumentation)
+
     void init(int n_max) {
         n_ceiling = std::max(1, n_max);
         n_cur     = n_ceiling;
@@ -386,6 +388,8 @@ struct server_spec_autotune {
 
         n_count[n_chosen]++;
 
+        n_landed_last = n_landed_step;
+
         n_obs++;
 
         n_cur = best();
@@ -396,7 +400,8 @@ struct server_spec_autotune {
 
         for (int n = 1; n <= n_ceiling; ++n) {
             if (has(n)) {
-                res += string_format("%d:%.1f t/s (%d%s) ", n, tps(n)*1e6, n_count[n], warm(n) ? "" : ", warming");
+                // t/s = landed/step; print both factors so a slow bucket can be told from a short one
+                res += string_format("%d:%.1f t/s [%.2f tok / %.1f ms] (%d%s) ", n, tps(n)*1e6, n_landed[n], t_step_us[n]/1000.0, n_count[n], warm(n) ? "" : ", warming");
             }
         }
 
@@ -3166,6 +3171,12 @@ private:
     int64_t w_n_decode      = 0;
     int64_t w_n_post_decode = 0;
     int64_t w_n_sampl       = 0;
+    // per draft-cap breakdown of the window (--performance-instrumentation, single generating slot
+    // with --spec-draft-auto only): index = cap used by the iteration, 0 = no draft
+    struct cap_stats {
+        int64_t n = 0, t_pre = 0, t_dec = 0, t_post = 0, landed = 0;
+    };
+    std::vector<cap_stats> w_cap;
     // runtime-gated by --performance-instrumentation (params_base.perf_instrumentation);
     // libllama has the matching llama_debug_timer and prints its own 5s breakdown
     struct scoped_timer {
@@ -3222,6 +3233,22 @@ private:
             print_stats("[window]   ", w_t_pre_decode, w_n_pre_decode, w_t_decode, w_n_decode, w_t_post_decode, w_n_post_decode, w_t_sampl, w_n_sampl);
             print_stats("[lifetime] ", t_pre_decode, n_pre_decode, t_decode, n_decode, t_post_decode, n_post_decode, t_sampl, n_sampl);
 
+            for (size_t cap = 0; cap < w_cap.size(); ++cap) {
+                const auto & c = w_cap[cap];
+                if (c.n == 0) {
+                    continue;
+                }
+                const double ms  = (double) (c.t_pre + c.t_dec + c.t_post) / (double) c.n / 1000.0;
+                const double tok = (double) c.landed / (double) c.n;
+                SRV_INF("[window]    cap %2zu: %4" PRId64 " steps | pre %6.2f  decode %6.2f  post %6.2f ms | landed %.2f tok/step -> %5.1f t/s\n",
+                        cap, c.n,
+                        (double) c.t_pre  / (double) c.n / 1000.0,
+                        (double) c.t_dec  / (double) c.n / 1000.0,
+                        (double) c.t_post / (double) c.n / 1000.0,
+                        tok, ms > 0.0 ? 1000.0 * tok / ms : 0.0);
+            }
+            w_cap.clear();
+
             // reset the window
             w_t_pre_decode = w_t_decode = w_t_post_decode = w_t_sampl = 0;
             w_n_pre_decode = w_n_decode = w_n_post_decode = w_n_sampl = 0;
@@ -3253,6 +3280,10 @@ private:
                 queue_tasks.post(std::move(task));
             }
         }
+
+        const int64_t it_t_pre0  = w_t_pre_decode;
+        const int64_t it_t_dec0  = w_t_decode;
+        const int64_t it_t_post0 = w_t_post_decode;
 
         try {
             scoped_timer t(perf_instr, w_t_pre_decode, w_n_pre_decode);
@@ -3334,6 +3365,31 @@ private:
                 SRV_ERR("post_decode() failed: %s\n", e.what());
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
+            }
+        }
+
+        if (perf_instr) {
+            // attribute this iteration to the draft cap it ran with - only unambiguous with a
+            // single generating slot
+            const server_slot * gen = nullptr;
+            int n_gen = 0;
+            for (const auto & slot : slots) {
+                if (slot.state == SLOT_STATE_GENERATING) {
+                    gen = &slot;
+                    n_gen++;
+                }
+            }
+            if (n_gen == 1 && gen->spec_auto_enabled) {
+                const size_t cap = (size_t) std::max(0, gen->spec_auto.n_chosen);
+                if (w_cap.size() <= cap) {
+                    w_cap.resize(cap + 1);
+                }
+                auto & c = w_cap[cap];
+                c.n++;
+                c.t_pre  += w_t_pre_decode  - it_t_pre0;
+                c.t_dec  += w_t_decode      - it_t_dec0;
+                c.t_post += w_t_post_decode - it_t_post0;
+                c.landed += gen->spec_auto.n_landed_last;
             }
         }
     }
