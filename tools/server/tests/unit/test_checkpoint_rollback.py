@@ -215,7 +215,10 @@ def test_rollback_falls_back_when_file_missing():
 # checkpoints thinned out of the slot's list are re-registered from disk at rollback time
 def test_rollback_merges_disk_checkpoints():
     # default --checkpoint-min-step (8192): every checkpoint of a finished request is
-    # thinned out of the RAM list by the next request, but its cp_ file stays on disk
+    # thinned out of the RAM list by the next request, but its cp_ file stays on disk.
+    # min-step thinning only runs once the checkpoint list is full (upstream 5d806aa257),
+    # so cap the list low enough that an 11-turn conversation fills it.
+    server.ctx_checkpoints = 4
     server.no_cache_idle_slots = True
     server.start()
     log = LogReader(server.log_path)

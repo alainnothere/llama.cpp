@@ -2955,12 +2955,23 @@ void server_prompt_cache::merge_checkpoint_spills(server_prompt & prompt) {
             continue;
         }
 
-        // skip if this pos_min is already in the checkpoint list
+        // skip if an equivalent checkpoint is already known. pos_min identifies the file
+        // (cp_<conv>_<pos_min>.bin), n_tokens identifies the capture point. create_checkpoint()
+        // supersedes an in-list checkpoint at an equal n_tokens, and when the superseding
+        // capture landed on a different pos_min (SWA: the window start moves after a restore)
+        // the superseded file stays on disk with a still-matching token_prefix_hash. Without
+        // the n_tokens test it would be resurrected here on the next rewind, undoing that.
         bool dup = false;
         for (const auto & cp : prompt.checkpoints) {
-            if (cp.pos_min == pos_min_v) {
+            if (cp.pos_min == pos_min_v || cp.n_tokens == n_tokens_v) {
                 dup = true;
                 break;
+            }
+        }
+        // two files of this conversation can collide on n_tokens with different pos_min too
+        for (auto it = new_ckpts.begin(); !dup && it != new_ckpts.end(); ++it) {
+            if (it->pos_min == pos_min_v || it->n_tokens == n_tokens_v) {
+                dup = true;
             }
         }
         if (dup) {
