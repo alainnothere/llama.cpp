@@ -152,6 +152,9 @@ public:
     const std::vector<uint32_t> & get_rs_idx() const;
     void reset_rs_idx_for_ubatches(const std::vector<llama_ubatch> & ubatches);
 
+    // how far back seq_id may currently be rolled back (see rs_depth)
+    uint32_t get_rs_budget(llama_seq_id seq_id) const;
+
 private:
     llama_hparams hparams_raw;
     llama_hparams hparams_csa;
@@ -162,6 +165,15 @@ private:
     const uint32_t n_rs_seq;
 
     std::vector<uint32_t> rs_idx;
+
+    // per-seq bound on how far back the snapshot planes hold usable states: exactly what the LAST
+    // decode of that seq wrote. a decode of N tokens (re)writes planes [0, N] relative to its own
+    // tail; deeper planes describe positions relative to an older tail and must never be selected,
+    // so the bound is overwritten, not raised, on every decode.
+    // reset to 0 whenever the planes are invalidated wholesale (clear/state_read/seq_cp), since
+    // state_read only restores plane 0 - without this a partial rewind right after a checkpoint
+    // or disk-cache restore would select a plane still holding another prompt's state.
+    std::vector<uint32_t> rs_depth;
 
     std::unique_ptr<llama_kv_cache_iswa> kv_raw;
     std::unique_ptr<llama_kv_cache>      kv_csa;

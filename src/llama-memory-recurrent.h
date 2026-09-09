@@ -76,7 +76,26 @@ public:
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
 
+    // per-seq bound on how far back the snapshot groups hold usable states: exactly what the LAST
+    // decode of that seq wrote. a decode of N tokens (re)writes groups [0, N) relative to its own
+    // tail and leaves deeper groups untouched (see ggml-vulkan gated_delta_net.comp: "older slots
+    // are caller-owned"), so those deeper groups still describe positions relative to an OLDER tail
+    // and must never be selected - the bound is therefore overwritten, not raised, on every decode.
+    // reset to 0 whenever the groups are invalidated wholesale (clear/state_read/full seq_rm), since
+    // state_read only restores group 0 - without this a partial rewind right after a checkpoint or
+    // disk-cache restore would select a group still holding another prompt's state.
+    std::vector<uint32_t> rs_depth;
+
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
+
+    // set the valid rollback depth of seq_id to what the decode that just ran wrote
+    void set_rs_depth(llama_seq_id seq_id, uint32_t depth);
+
+    // reset the valid rollback depth of seq_id (all seqs when seq_id < 0)
+    void reset_rs_depth(llama_seq_id seq_id);
+
+    // how far back seq_id may currently be rolled back
+    uint32_t get_rs_budget(llama_seq_id seq_id) const;
 
     // computed before each graph build
     uint32_t n = 0;

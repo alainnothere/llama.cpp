@@ -1228,7 +1228,8 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     hparams_lid(model.hparams),
     n_seq_max(n_seq_max),
     n_rs_seq(n_rs_seq),
-    rs_idx(n_seq_max, 0) {
+    rs_idx(n_seq_max, 0),
+    rs_depth(n_seq_max, 0) {
 
     const layer_filter_cb filter_raw = [&](int32_t il) {
         if (filter && !filter(il)) {
@@ -1482,19 +1483,20 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
             return false;
         }
 
-        const llama_pos rollback = pos_max - (p0 - 1);
-        if (rollback < 1 || rollback > (llama_pos) n_rs_seq) {
-            return false;
-        }
+        // a pending rollback composes with the new one instead of refusing it: no decode has run
+        // since it was requested, so the snapshot planes have not moved and plane
+        // (pending + rollback) is exactly `rollback` tokens further back than plane `pending`.
+        const llama_pos pending = (llama_pos) rs_idx[seq_id];
+        const llama_pos budget  = (llama_pos) get_rs_budget(seq_id);
 
-        // pending rollback is single-use: stacked partial removals don't compose
-        if (rs_idx[seq_id] != 0) {
+        const llama_pos rollback = pos_max - (p0 - 1);
+        if (rollback < 1 || pending + rollback > budget) {
             return false;
         }
 
         const bool res = kv_raw->seq_rm(seq_id, p0, p1);
         if (res) {
-            rs_idx[seq_id] = (uint32_t) rollback;
+            rs_idx[seq_id] = (uint32_t) (pending + rollback);
         }
 
         return res;
@@ -1522,7 +1524,8 @@ void llama_kv_cache_dsv4::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_ds
     lid_state->seq_cp(seq_id_src, seq_id_dst);
 
     if (seq_id_src != seq_id_dst) {
-        rs_idx[seq_id_dst] = 0;
+        rs_idx[seq_id_dst]   = 0;
+        rs_depth[seq_id_dst] = 0;
     }
 }
 
@@ -1664,11 +1667,15 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     hca_state->state_read(io, seq_id, flags);
     lid_state->state_read(io, seq_id, flags);
 
+    // only plane 0 is restored, planes 1..n_rs_seq still hold whatever this context had before -
+    // refuse rollbacks until decodes have refreshed them
     if (seq_id >= 0) {
         GGML_ASSERT((uint32_t) seq_id < n_seq_max);
-        rs_idx[seq_id] = 0;
+        rs_idx[seq_id]   = 0;
+        rs_depth[seq_id] = 0;
     } else {
         std::fill(rs_idx.begin(), rs_idx.end(), 0);
+        std::fill(rs_depth.begin(), rs_depth.end(), 0);
     }
 }
 
@@ -1713,16 +1720,39 @@ void llama_kv_cache_dsv4::reset_rs_idx_for_ubatches(const std::vector<llama_ubat
         return;
     }
 
+    std::vector<uint32_t> n_tokens_seq(n_seq_max, 0);
+
     for (const llama_ubatch & ubatch : ubatches) {
+        std::fill(n_tokens_seq.begin(), n_tokens_seq.end(), 0);
+
         for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
             for (int32_t s = 0; s < ubatch.n_seq_id[i]; ++s) {
                 const llama_seq_id seq_id = ubatch.seq_id[i][s];
                 if (seq_id >= 0 && (uint32_t) seq_id < n_seq_max) {
                     rs_idx[seq_id] = 0;
+                    n_tokens_seq[seq_id]++;
                 }
             }
         }
+
+        // a decode of N tokens for a seq rewrites its snapshot planes [0, N] relative to the new
+        // tail (plane d >= N saturates to the pre-ubatch state, see the plan builder) and leaves
+        // deeper planes describing positions relative to the OLD tail, so afterwards it can be
+        // rolled back by at most N tokens - the bound is overwritten, never raised (see rs_depth)
+        for (uint32_t seq_id = 0; seq_id < n_seq_max; ++seq_id) {
+            if (n_tokens_seq[seq_id] > 0) {
+                rs_depth[seq_id] = std::min(n_rs_seq, n_tokens_seq[seq_id]);
+            }
+        }
     }
+}
+
+uint32_t llama_kv_cache_dsv4::get_rs_budget(llama_seq_id seq_id) const {
+    if (seq_id < 0 || (size_t) seq_id >= rs_depth.size()) {
+        return 0;
+    }
+
+    return std::min(n_rs_seq, rs_depth[seq_id]);
 }
 
 void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
@@ -1754,9 +1784,11 @@ void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
     lid_state->clear(seq_id, data);
 
     if (seq_id >= 0) {
-        rs_idx[seq_id] = 0;
+        rs_idx[seq_id]   = 0;
+        rs_depth[seq_id] = 0;
     } else {
         std::fill(rs_idx.begin(), rs_idx.end(), 0);
+        std::fill(rs_depth.begin(), rs_depth.end(), 0);
     }
 }
 

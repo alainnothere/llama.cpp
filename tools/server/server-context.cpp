@@ -3844,15 +3844,34 @@ private:
                             // #24110's "no rewind needed when new tokens follow" shortcut holds for a
                             // SWA window, whose pos_min is the oldest cell still present. a recurrent
                             // state lives only at the tail, so pos_min == pos_next means the tail IS the
-                            // first token to drop: the rewind is mandatory unless the per-token rollback
-                            // budget (n_rs_seq) covers it. without this the checkpoint search is skipped,
-                            // seq_rm refuses, and the whole prompt is re-processed on every follow-up
-                            // turn whose divergence sits exactly at the previous stop token.
+                            // first token to drop: the rewind is mandatory. rather than predicting
+                            // whether it can succeed from the per-token rollback budget alone, perform
+                            // it here and let the memory answer - the budget is not the only
+                            // precondition (a rollback may already be pending from a speculative accept
+                            // that stopped on EOG, and a state restored from a checkpoint has no usable
+                            // snapshot groups until decodes refresh them). when it fails, pos_min_thold
+                            // must force the checkpoint search: without that the search is skipped, the
+                            // seq_rm below refuses, and the whole prompt is re-processed on every
+                            // follow-up turn whose divergence sits exactly at the previous stop token.
                             bool needs_tail_rewind = false;
                             if (n_past > 0 && (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt))) {
                                 const llama_pos pos_tail = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
-                                const llama_pos rollback = pos_tail - pos_next + 1;
-                                needs_tail_rewind = rollback > (llama_pos) llama_n_rs_seq(ctx_tgt);
+
+                                if (pos_tail >= pos_next) {
+                                    // [TAG_SERVER_TAIL_REWIND] on success the seq_rm further below is a
+                                    // no-op for this range (its p0 is then > the tail pos), except when
+                                    // [TAG_PROMPT_LOGITS] lowers n_past by one - that extra one-token
+                                    // rewind composes with the one performed here.
+                                    needs_tail_rewind = !llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, pos_next, -1);
+
+                                    if (!needs_tail_rewind && ctx_dft &&
+                                            !llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, pos_next, -1)) {
+                                        // the draft context has n_rs_seq == 0, so a recurrent draft cannot
+                                        // rewind its tail at all - fall back to the checkpoint search
+                                        SLT_WRN(slot, "failed to truncate the draft context at pos %d - forcing checkpoint recovery\n", pos_next);
+                                        needs_tail_rewind = true;
+                                    }
+                                }
                             }
 
                             // the largest pos_min required for a checkpoint to be useful
@@ -4027,6 +4046,8 @@ private:
                     const llama_pos p0 = slot.prompt.tokens.pos_next();
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
+                    // for recurrent/hybrid memory the tail was already rewound at [TAG_SERVER_TAIL_REWIND],
+                    // so this is a no-op there unless [TAG_PROMPT_LOGITS] lowered n_past by one
                     if (!llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, p0, -1)) {
                         SLT_WRN(slot, "failed to truncate tokens with position >= %d - clearing the memory\n", p0);
 
