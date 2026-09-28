@@ -4642,6 +4642,11 @@ private:
 
                 if (slot.can_speculate()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+
+                    // best draft length depends on the task (code vs prose) - estimates from the previous request are stale
+                    if (slot.spec_auto_enabled) {
+                        slot.spec_auto.init(slot.spec_n_max);
+                    }
                 }
             } else if (slot.state != SLOT_STATE_GENERATING) {
                 return;
