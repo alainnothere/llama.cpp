@@ -2169,6 +2169,9 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
         common_ngram_cache ngram_cache_context;
         common_ngram_cache ngram_cache_dynamic;
         common_ngram_cache ngram_cache_static;
+
+        // context caches of finished requests, kept only for the dynamic cache write-back
+        common_ngram_cache ngram_cache_done;
     };
 
     std::vector<seq_info> sinfos;
@@ -2244,6 +2247,7 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
             common_ngram_cache merged = sinfos.empty() ? common_ngram_cache() : sinfos[0].ngram_cache_dynamic;
 
             for (auto & sinfo : sinfos) {
+                common_ngram_cache_merge(merged, sinfo.ngram_cache_done);
                 common_ngram_cache_merge(merged, sinfo.ngram_cache_context);
             }
 
@@ -2271,8 +2275,15 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
         }
     }
 
-    void begin(llama_seq_id /*seq_id*/, const llama_tokens & /*prompt*/) override {
-        // noop
+    void begin(llama_seq_id seq_id, const llama_tokens & /*prompt*/) override {
+        auto & sinfo = sinfos[seq_id];
+
+        // context cache is per-request state - do not carry it over to the next request on this seq
+        if (save_dynamic) {
+            common_ngram_cache_merge(sinfo.ngram_cache_done, sinfo.ngram_cache_context);
+        }
+        sinfo.ngram_cache_context.clear();
+        sinfo.cache_size = 0;
     }
 
     void draft_one(
