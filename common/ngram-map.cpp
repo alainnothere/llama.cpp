@@ -2,6 +2,7 @@
 #include "log.h"
 #include "ngram-map.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
@@ -120,101 +121,22 @@ llama_tokens common_ngram_simple_draft(
 
 void common_ngram_map_begin(
     common_ngram_map & map, const llama_tokens & tokens) {
-    size_t size_begin = tokens.size();
+    const size_t size_begin = tokens.size();
 
     LOG_DBG("%s: begin, idx_last_draft=%zu, new begin=%zu, #keys=%zu\n", __func__,
             map.idx_last_check, size_begin, map.keys.size());
 
-    size_t idx_begin_cleanup = map.size_last_begin;
-    if (idx_begin_cleanup > size_begin) {
-        if (size_begin > (size_t) map.size_key + map.size_value) {
-            idx_begin_cleanup = size_begin - map.size_key - map.size_value;
-        } else {
-            idx_begin_cleanup = 0;
-        }
-        LOG_INF("%s: shrink cleanup begin: %zu -> %zu\n", __func__, map.size_last_begin, idx_begin_cleanup);
-    }
+    // the new prompt may not share any prefix with the previous history, so drop all per-seq state.
+    // draft() then hashes the whole prompt on its first call
+    map.keys.clear();
+    std::fill(map.key_map.begin(), map.key_map.end(), 0);
+    map.key_map_last_idx = 0;
 
-    size_t count_map_entries_upd = 0;
-    if (!map.key_map.empty() && size_begin < map.idx_last_check) {
-        if (map.show_key_map_stats) {
-            // Print statistics of hash map map_key.
-            size_t count_nonzero = 0;
-            uint32_t min_idx = UINT32_MAX;
-            uint32_t max_idx = 0;
-            for (size_t i = 0; i < map.key_map.size(); ++i) {
-                uint32_t key_idx = map.key_map[i];
-                if (key_idx != 0) {
-                    ++count_nonzero;
-                    if (key_idx < min_idx) min_idx = key_idx;
-                    if (key_idx > max_idx) max_idx = key_idx;
-                }
-            }
-            if (count_nonzero == 0) {
-                min_idx = 0;
-            }
-            LOG_INF("%s: key_map stats: entries=%zu, min_idx=%u, max_idx=%u, key_map_last_idx=%u\n",
-                    __func__, count_nonzero, min_idx, max_idx, map.key_map_last_idx);
-        }
+    map.last_draft_created   = false;
+    map.last_draft_key_idx   = 0;
+    map.last_draft_value_idx = 0;
 
-        // Update the map from hash to key index (clear outdated entries).
-        for (size_t i = 0; i < map.key_map.size(); ++i) {
-            uint32_t key_idx = map.key_map[i];
-            if (key_idx != 0 && key_idx >= idx_begin_cleanup) {
-                map.key_map[i] = 0;
-                count_map_entries_upd++;
-            }
-        }
-        map.key_map_last_idx = (idx_begin_cleanup > 0) ? (uint32_t) (idx_begin_cleanup - 1) : 0;
-    }
-
-    if (size_begin < map.idx_last_check && !map.keys.empty()) {
-        size_t count_keys = map.keys.size();
-        size_t count_keys_del = 0;
-        size_t count_values_del = 0;
-        for (int32_t i = map.keys.size() - 1; i >= 0; --i) {
-            common_ngram_map_key & key = map.keys[i];
-            if (key.key_idx >= idx_begin_cleanup) {
-                // Delete the key.
-                LOG_DBG("%s: delete key %d at index %zu (>= idx_begin_cleanup=%zu)\n", __func__, i, key.key_idx, idx_begin_cleanup);
-                map.keys.erase(map.keys.begin() + i);
-                count_keys_del++;
-                continue;
-            }
-            if (map.key_only) {
-                continue;
-            }
-
-            // Check the indices of the values.
-            for (int16_t j = COMMON_NGRAM_MAX_VALUES - 1; j >= 0; --j) {
-                common_ngram_map_value & value = key.values[j];
-                if (value.value_idx != 0 && value.value_idx >= idx_begin_cleanup) {
-                    // Delete the value.
-                    count_values_del++;
-
-                    // Move all values after this value to the left.
-                    for (uint16_t k = j; k < COMMON_NGRAM_MAX_VALUES - 1; ++k) {
-                        key.values[k] = key.values[k + 1];
-                    }
-                    // Clear the last value.
-                    key.values[COMMON_NGRAM_MAX_VALUES - 1].value_idx = 0;
-                    key.values[COMMON_NGRAM_MAX_VALUES - 1].value_num = 0;
-                }
-            }
-            if (key.values[0].value_idx == 0) {
-                // No values left, delete the key.
-                LOG_DBG("%s: delete key %d at index %zu (no values left)\n", __func__, i, key.key_idx);
-                map.keys.erase(map.keys.begin() + i);
-                count_keys_del++;
-            }
-        }
-
-        LOG_INF("%s: refresh map: idx_last_draft=%zu, new begin=%zu, #keys_checked=%zu, #keys_del=%zu, #values_del=%zu, #hashes_upd=%zu\n", __func__,
-                map.idx_last_check, size_begin,
-                count_keys, count_keys_del, count_values_del, count_map_entries_upd);
-    }
-
-    map.idx_last_check = size_begin;
+    map.idx_last_check  = size_begin;
     map.size_last_begin = size_begin;
 }
 
@@ -503,7 +425,7 @@ void common_ngram_map_draft(common_ngram_map & map,
     int n_draft_tokens = std::min((int) m, (int) curr_key.values[slot_max].n_accepted);
 
     for (int i = 0; i < n_draft_tokens; ++i) {
-        draft.push_back(inp[match_pos + n + i]);
+        draft.push_back(inp[curr_key.values[slot_max].value_idx + i]);
     }
 
     LOG_DBG("%s: key_offset = %zu, slot_max = %d, key_num = %d, draft.size = %zu\n", __func__,
