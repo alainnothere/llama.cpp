@@ -254,13 +254,13 @@ common_chat_params common_chat_params_init_gemma4(const common_chat_template &  
 
             auto tool_choice = p.choice();
 
-            foreach_function(inputs.tools, [&](const json & tool) {
+            foreach_function(inputs.tools, [&](size_t tool_index, const json & tool) {
                 const auto & function = tool.at("function");
                 std::string  name     = function.at("name");
                 // TODO @aldehir : need to extend json-schema-to-grammar to produce more than JSON rules
                 // const auto & params   = function.at("parameters");
 
-                tool_choice |= p.rule("tool-" + name, p.tool(p.sequence({
+                tool_choice |= p.rule("tool-" + std::to_string(tool_index), p.tool(p.sequence({
                     p.tool_open(p.tool_name(p.literal(name)) + p.peek(p.literal("{"))),
                     p.tool_args(p.ref("gemma4-dict")),
                 })));
@@ -271,6 +271,10 @@ common_chat_params common_chat_params_init_gemma4(const common_chat_template &  
                 /* min = */ inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ? 1 : 0,
                 /* max = */ inputs.parallel_tool_calls ? -1 : 1
             ));
+
+            if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED) {
+                return start + thought + tool_call;
+            }
 
             auto scan_to_toolcall = p.rule("scan-to-toolcall", p.until("<|tool_call>"));
             auto content = p.rule("content", p.content(p.until_one_of({"<|channel>", "<channel|>", "<|tool_call>"})));
@@ -291,15 +295,6 @@ common_chat_params common_chat_params_init_gemma4(const common_chat_template &  
     if (include_grammar) {
         data.grammar_lazy = !(has_response_format || (has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED));
         data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
-            foreach_function(inputs.tools, [&](const json & tool) {
-                const auto & function = tool.at("function");
-                auto         schema   = function.at("parameters");
-                builder.resolve_refs(schema);
-            });
-            if (has_response_format) {
-                auto schema = inputs.json_schema;
-                builder.resolve_refs(schema);
-            }
             parser.build_grammar(builder, data.grammar_lazy);
         });
 

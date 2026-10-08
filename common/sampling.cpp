@@ -122,22 +122,13 @@ struct common_sampler {
 
     llama_token_data_array cur_p;
 
-    // used by the stochastic draft verification only - seeded from the sampling chain so that runs
-    // with a fixed seed stay reproducible
+    // for rejection sampling; independent of the draft, or the target distribution is not preserved
     std::mt19937 rng;
-
-    float rand_uniform() {
-        std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-
-        return dist(rng);
-    }
 
     void reset() {
         prev.clear();
 
         llama_sampler_reset(chain);
-
-        rng.seed(llama_sampler_get_seed(chain));
     }
 
     void set_logits(struct llama_context * ctx, int idx) {
@@ -227,7 +218,7 @@ struct common_sampler * common_sampler_init(
 #ifdef LLAMA_USE_LLGUIDANCE
         grmr = llama_sampler_init_llg(vocab, "lark", grammar_str.c_str());
 #else
-        GGML_ABORT("llguidance (cmake -DLLAMA_LLGUIDANCE=ON) is not enabled");
+        throw std::runtime_error("failed to parse grammar: llguidance is not enabled");
 #endif // LLAMA_USE_LLGUIDANCE
     } else {
         std::vector<std::string> trigger_patterns;
@@ -408,8 +399,11 @@ struct common_sampler * common_sampler_init(
             // only if user explicitly included adaptive-p sampler
             samplers.push_back(llama_sampler_init_adaptive_p(params.adaptive_target, params.adaptive_decay, params.seed));
         } else {
-            // default: sample from distribution
-            samplers.push_back(llama_sampler_init_dist(params.seed));
+            // Keep distribution sampling when callers request probabilities.
+            const bool greedy = params.n_probs == 0 && !params.samplers.empty() &&
+                ((params.samplers.back() == COMMON_SAMPLER_TYPE_TEMPERATURE && params.temp == 0.0f && params.dynatemp_range == 0.0f) ||
+                 (params.samplers.back() == COMMON_SAMPLER_TYPE_TOP_K && params.top_k == 1));
+            samplers.push_back(greedy ? llama_sampler_init_greedy() : llama_sampler_init_dist(params.seed));
         }
     } else if (params.mirostat == 1) {
         samplers.push_back(llama_sampler_init_temp(params.temp));
@@ -445,7 +439,8 @@ struct common_sampler * common_sampler_init(
         /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
         /* .cur     = */ {},
         /* .cur_p   = */ {},
-        /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain)),
+        // mix it, the chain and the draft are seeded from this one too
+        /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
     };
 
     return result;
@@ -697,6 +692,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     std::vector<llama_token> result;
     result.reserve(idxs.size());
 
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+
     size_t i = 0;
     for (; i < draft.size(); i++) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
@@ -705,7 +702,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
         result.push_back(id);
 
-        if (draft[i] != id) {
+        // do not accept draft tokens after an EOG - they are not output but would stay in the context
+        // on replay the last token is from the target and can be EOG, so a trailing EOG is still accepted
+        if (draft[i] != id || (llama_vocab_is_eog(vocab, id) && i + 1 < draft.size())) {
             break;
         }
     }
@@ -721,207 +720,111 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     return result;
 }
 
-llama_token common_spec_verify_token(
-        llama_token_data_array   * cur_p_tgt,
-        const llama_token_data   * dft,
-        size_t                     n_dft,
-        llama_token                id_dft,
-        float                      r_accept,
-        float                      r_resample,
-        bool                     * accepted) {
-    GGML_ASSERT(cur_p_tgt != nullptr && cur_p_tgt->size > 0);
-
-    if (accepted) {
-        *accepted = false;
-    }
-
-    // p_dft(id_dft) - the probability with which the draft proposed this token
-    float p_dft = 0.0f;
-    for (size_t i = 0; i < n_dft; ++i) {
-        if (dft[i].id == id_dft) {
-            p_dft = dft[i].p;
-            break;
+static float prob_of(const llama_token_data * data, size_t n, llama_token id) {
+    for (size_t k = 0; k < n; ++k) {
+        if (data[k].id == id) {
+            return data[k].p;
         }
     }
+    return 0.0f;
+}
 
-    // p_tgt(id_dft) - 0 if the token did not survive the target's sampler chain
-    float p_tgt = 0.0f;
-    for (size_t i = 0; i < cur_p_tgt->size; ++i) {
-        if (cur_p_tgt->data[i].id == id_dft) {
-            p_tgt = cur_p_tgt->data[i].p;
-            break;
+// Accept a drafted token with probability min(1, p/q), else draw from norm(max(0, p - q)).
+// Preserves the target distribution exactly, and accepts more often than matching does when the
+// draft samples instead of taking its argmax.
+std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first) {
+    GGML_ASSERT(idxs.size()    == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+    GGML_ASSERT(draft_q.size() == draft.size() && "draft_q must have one entry per draft token");
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    // draws come from the sampler's own stream, so they stay independent of what was drafted
+    std::uniform_real_distribution<float> uni(0.0f, 1.0f);
+
+    std::vector<llama_token_data> residual;
+
+    std::vector<llama_token_data> cand; // candidate array masked by the grammar, if there is one
+
+    size_t i = 0;
+    for (; i < draft.size(); i++) {
+        // leaves the target distribution in the candidate array
+        const llama_token id_tgt = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+
+        const auto * cur_p = common_sampler_get_candidates(gsmpl, true);
+        const auto & q     = draft_q[i];
+
+        const bool masked = !grammar_first && grammar_should_apply(gsmpl);
+        if (masked) {
+            cand.assign(cur_p->data, cur_p->data + cur_p->size);
+            llama_token_data_array arr = { cand.data(), cand.size(), -1, false };
+            llama_sampler_apply(gsmpl->grmr, &arr);
         }
-    }
 
-    // accept with probability min(1, p_tgt/p_dft)  <=>  r*p_dft <= p_tgt  (no division, p_dft can be 0)
-    // a token that the target's sampler chain removed (p_tgt == 0) is always rejected
-    if (p_dft > 0.0f && p_tgt > 0.0f && r_accept*p_dft <= p_tgt) {
-        if (accepted) {
-            *accepted = true;
+        // a candidate the grammar rejects carries no probability, whatever the target thinks
+        auto p_raw = [&](size_t k) {
+            return masked && cand[k].logit == -INFINITY ? 0.0f : cur_p->data[k].p;
+        };
+
+        // masking drops probability mass, so rescale what is left or the residual is over-weighted
+        float p_sum = 0.0f;
+        if (masked) {
+            for (size_t k = 0; k < cur_p->size; ++k) {
+                p_sum += p_raw(k);
+            }
         }
 
-        return id_dft;
-    }
+        const float p_norm = masked && p_sum > 0.0f ? 1.0f/p_sum : 1.0f;
 
-    // rejected: turn the target into the residual distribution max(0, p_tgt - p_dft) and sample from it
-    // only the tokens in the (small) draft support can change, so touch just those
-    size_t n_left = n_dft;
+        auto p_of = [&](size_t k) {
+            return p_raw(k)*p_norm;
+        };
 
-    double sum_res = 0.0;
+        // q_x is never 0 for a token the draft produced, but guard the divide
+        const float q_x = prob_of(q.data(), q.size(), draft[i]);
 
-    for (size_t i = 0; i < cur_p_tgt->size; ++i) {
-        auto & cand = cur_p_tgt->data[i];
+        float p_x = 0.0f;
+        for (size_t k = 0; k < cur_p->size; ++k) {
+            if (cur_p->data[k].id == draft[i]) {
+                p_x = p_of(k);
+                break;
+            }
+        }
 
-        if (n_left > 0) {
-            for (size_t j = 0; j < n_dft; ++j) {
-                if (dft[j].id == cand.id) {
-                    cand.p = std::max(0.0f, cand.p - dft[j].p);
-                    n_left--;
+        if (q_x > 0.0f && (p_x >= q_x || uni(gsmpl->rng) < p_x / q_x)) {
+            common_sampler_accept(gsmpl, draft[i], true);
+            result.push_back(draft[i]);
+            continue;
+        }
+
+        // rejected: tokens outside q's support keep all of p
+        residual.clear();
+        float sum = 0.0f;
+        for (size_t k = 0; k < cur_p->size; ++k) {
+            const float r = p_of(k) - prob_of(q.data(), q.size(), cur_p->data[k].id);
+            if (r > 0.0f) {
+                residual.push_back({ cur_p->data[k].id, 0.0f, r });
+                sum += r;
+            }
+        }
+
+        llama_token id = id_tgt;
+        if (sum > 0.0f) {
+            float u = uni(gsmpl->rng) * sum;
+            id = residual.back().id;
+            for (const auto & e : residual) {
+                u -= e.p;
+                if (u <= 0.0f) {
+                    id = e.id;
                     break;
                 }
             }
         }
 
-        sum_res += cand.p;
-    }
-
-    if (!(sum_res > 0.0)) {
-        // p_tgt is dominated by p_dft everywhere - unreachable in exact arithmetic (the token would
-        // have been accepted), so just fall back to whatever the chain selected
-        return cur_p_tgt->data[cur_p_tgt->selected >= 0 ? cur_p_tgt->selected : 0].id;
-    }
-
-    // inverse-CDF sampling over the unnormalized residual
-    const double sum_cut = sum_res*r_resample;
-
-    double sum_run = 0.0;
-
-    for (size_t i = 0; i < cur_p_tgt->size; ++i) {
-        sum_run += cur_p_tgt->data[i].p;
-
-        if (sum_run > sum_cut) {
-            return cur_p_tgt->data[i].id;
-        }
-    }
-
-    // numerical fallback: the last token with non-zero residual
-    for (size_t i = cur_p_tgt->size; i > 0; --i) {
-        if (cur_p_tgt->data[i - 1].p > 0.0f) {
-            return cur_p_tgt->data[i - 1].id;
-        }
-    }
-
-    GGML_ABORT("no candidate with non-zero residual probability");
-}
-
-std::vector<llama_token> common_sampler_sample_and_accept_n_stochastic(
-        struct common_sampler * gsmpl,
-        struct llama_context  * ctx,
-        const std::vector<int> & idxs,
-        const llama_tokens     & draft,
-        const common_draft_dists & dists,
-        bool grammar_first,
-        common_spec_verify_stats * stats) {
-    GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
-
-    const bool has_dists = std::any_of(dists.begin(), dists.end(),
-            [](const common_draft_dist & d) { return !d.empty(); });
-
-    // without a proposal distribution there is nothing to gain (see common_spec_verify_token), and with
-    // an active grammar the residual is not grammar-constrained - in both cases use the exact-match path
-    //
-    // a lazy grammar (tool calls) that has not seen its trigger yet is not constraining anything, so it
-    // does not force the fallback. the grammar can only become active by accepting the trigger token,
-    // and every accepted token below goes through common_sampler_accept() - so the check is repeated
-    // per position, and the step switches to exact match the moment the grammar wakes up
-    const bool grammar_active = gsmpl->grmr && grammar_should_apply(gsmpl) && llama_sampler_grammar_is_active(gsmpl->grmr);
-
-    if (!has_dists || grammar_active) {
-        LOG_DBG("%s: falling back to exact-match verification for all %zu drafted tokens (%s)\n", __func__, draft.size(),
-                grammar_active ? "grammar active" : dists.empty() ? "draft reported no proposal distributions" : "all proposal distributions empty");
-
-        auto res = common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
-
-        if (stats) {
-            stats->n_fallback  += 1;
-            stats->n_pos_exact += (uint32_t) std::min(res.size(), draft.size());
-            stats->n_acc_exact += (uint32_t) (res.size() - 1);
-        }
-
-        return res;
-    }
-
-    static const common_draft_dist dist_empty;
-
-    std::vector<llama_token> result;
-    result.reserve(idxs.size());
-
-    size_t i = 0;
-    for (; i < draft.size(); i++) {
-        // applies the sampler chain and leaves the post-chain candidates (with normalized p) in cur_p
-        const llama_token id_smpl = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
-
-        const common_draft_dist & dist = i < dists.size() ? dists[i] : dist_empty;
-
-        llama_token id       = id_smpl;
-        bool        accepted = (id_smpl == draft[i]);
-
-        // the target's post-chain probabilities are required - they are missing if the token was picked
-        // by a backend sampler that did not report them, in which case exact-match is the only option
-        const bool has_probs = gsmpl->cur_p.selected >= 0 && gsmpl->cur_p.data[gsmpl->cur_p.selected].p > 0.0f;
-
-        // the previous accept may have triggered a lazy grammar - from here on only exact match is safe
-        const bool grammar_now = gsmpl->grmr && grammar_should_apply(gsmpl) && llama_sampler_grammar_is_active(gsmpl->grmr);
-
-        if (!dist.empty() && has_probs && !grammar_now) {
-            const auto tm = gsmpl->tm();
-
-            // note: the token sampled by the chain above is discarded - the verification below draws
-            //       the continuation itself, from either the draft or the residual distribution
-            const float r_accept   = gsmpl->rand_uniform();
-            const float r_resample = gsmpl->rand_uniform();
-
-            float p_dft = 0.0f;
-            float p_tgt = 0.0f;
-            if (common_log_get_verbosity_thold() >= LOG_LEVEL_DEBUG) {
-                for (const auto & d : dist) {
-                    if (d.id == draft[i]) { p_dft = d.p; break; }
-                }
-                for (size_t k = 0; k < gsmpl->cur_p.size; ++k) {
-                    if (gsmpl->cur_p.data[k].id == draft[i]) { p_tgt = gsmpl->cur_p.data[k].p; break; }
-                }
-            }
-
-            id = common_spec_verify_token(&gsmpl->cur_p, dist.data(), dist.size(), draft[i],
-                    r_accept, r_resample, &accepted);
-
-            LOG_DBG("%s: pos %2zu stochastic: draft %6d p_dft=%.4f p_tgt=%.4f (n_dft=%zu, n_tgt=%zu) r=%.4f -> %s%s\n",
-                    __func__, i, draft[i], p_dft, p_tgt, dist.size(), gsmpl->cur_p.size, r_accept,
-                    accepted ? "ACCEPT" : "reject, resampled ",
-                    accepted ? "" : std::to_string(id).c_str());
-
-            if (stats) {
-                stats->n_pos_stoch += 1;
-                stats->n_acc_stoch += accepted ? 1 : 0;
-            }
-        } else {
-            LOG_DBG("%s: pos %2zu exact-match: draft %6d vs sampled %6d -> %s (%s)\n",
-                    __func__, i, draft[i], id_smpl, accepted ? "ACCEPT" : "reject",
-                    grammar_now ? "grammar became active" : dist.empty() ? "no proposal distribution for this position" : "target has no probabilities (backend sampler)");
-
-            if (stats) {
-                stats->n_pos_exact += 1;
-                stats->n_acc_exact += accepted ? 1 : 0;
-            }
-        }
-
         common_sampler_accept(gsmpl, id, true);
-
         result.push_back(id);
 
-        if (!accepted) {
-            break;
-        }
+        break;
     }
 
     if (i == draft.size()) {

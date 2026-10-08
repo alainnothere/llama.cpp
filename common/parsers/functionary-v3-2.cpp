@@ -42,18 +42,18 @@ common_chat_params common_chat_params_init_functionary_v3_2(const common_chat_te
 
         // Build tool call parsers for each available function
         auto tool_choice = p.choice();
-        foreach_function(inputs.tools, [&](const json & tool) {
+        foreach_function(inputs.tools, [&](size_t tool_index, const json & tool) {
             const auto & function = tool.at("function");
             std::string  name     = function.at("name");
-            const auto & schema   = function.at("parameters");
+            const auto   schema   = common_chat_tool_parameters(function);
 
             // Tool format: >>>function_name\n{json_args}
             auto tool_parser = p.tool(
                 p.tool_open(p.tool_name(p.literal(name)) + p.literal("\n")) +
-                p.tool_args(p.schema(p.json(), "tool-" + name + "-schema", schema))
+                p.tool_args(p.schema(p.json(), "tool-" + std::to_string(tool_index) + "-schema", schema))
             );
 
-            tool_choice |= p.rule("tool-" + name, tool_parser);
+            tool_choice |= p.rule("tool-" + std::to_string(tool_index), tool_parser);
         });
 
         auto content_only = content_until_end;
@@ -82,11 +82,6 @@ common_chat_params common_chat_params_init_functionary_v3_2(const common_chat_te
         data.grammar_lazy = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
 
         data.grammar = build_grammar([&](const common_grammar_builder & builder) {
-            foreach_function(inputs.tools, [&](const json & tool) {
-                const auto & function = tool.at("function");
-                auto         schema   = function.at("parameters");
-                builder.resolve_refs(schema);
-            });
             parser.build_grammar(builder, data.grammar_lazy);
         });
 

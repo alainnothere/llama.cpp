@@ -9,7 +9,7 @@ void llama_model_mimo2::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,   hparams.n_swa);
     ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA,         hparams.rope_freq_base_train_swa, false);
 
-    ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl, hparams.n_layer());
+    ml.get_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl);
 
     float value_scale = 0.0f;
     if (ml.get_key(LLM_KV_ATTENTION_VALUE_SCALE, value_scale, false) && value_scale != 1.0f) {
@@ -25,13 +25,9 @@ void llama_model_mimo2::load_arch_hparams(llama_model_loader & ml) {
 void llama_model_mimo2::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
-    const std::string mtp_probe = "blk." + std::to_string(n_layer) + ".nextn.eh_proj.weight";
-    const bool trunk_only = (hparams.n_layer_nextn > 0) && (ml.get_weight(mtp_probe.c_str()) == nullptr);
-    int mtp_flags         = trunk_only ? TENSOR_NOT_REQUIRED : 0;
-
-    if (!ml.load_mtp) {
-        mtp_flags |= TENSOR_SKIP;
-    }
+    const auto nf = nextn_flags(ml);
+    const int trunk_flags = nf.trunk;
+    const int mtp_flags   = nf.mtp;
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
 
@@ -46,7 +42,7 @@ void llama_model_mimo2::load_arch_tensors(llama_model_loader & ml) {
         uint32_t n_head = hparams.n_head(i);
 
         const bool is_nextn = i >= n_layer;
-        const int  flags    = is_nextn ? mtp_flags : 0;
+        const int  flags    = is_nextn ? mtp_flags : trunk_flags;
 
         create_tensor_qkv(layer, i, n_embd, n_embd_head_k * n_head, n_embd_k_gqa, n_embd_v_gqa, flags);
         layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), { n_embd_head_v * n_head, n_embd }, flags);
@@ -99,10 +95,11 @@ llama_model_mimo2::graph::graph(const llama_model & model, const llm_graph_param
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     const float v_scale = hparams.f_attn_value_scale;
-    const bool emit_h_nextn = cparams.embeddings_nextn;
-    const bool crop_last_layer = inp_out_ids && (!emit_h_nextn || cparams.embeddings_nextn_masked);
+    const bool extract_final_inp = (size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer];
 
     for (int il = 0; il < n_layer; ++il) {
+        res->t_layer_inp[il] = inpL;
+
         ggml_tensor * inpSA = inpL;
 
         uint32_t n_head_l    = hparams.n_head(il);
@@ -180,7 +177,7 @@ llama_model_mimo2::graph::graph(const llama_model & model, const llm_graph_param
             }
         }
 
-        if (il == n_layer - 1 && crop_last_layer) {
+        if (il == n_layer - 1 && crop_before_nextn(inp_out_ids) && !extract_final_inp) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -229,14 +226,19 @@ llama_model_mimo2::graph::graph(const llama_model & model, const llm_graph_param
     }
 
     cur = inpL;
-
-    if (emit_h_nextn) {
-        cb(cur, "h_nextn", -1);
-        res->t_h_nextn = cur;
-
-        if (!cparams.embeddings_nextn_masked && inp_out_ids) {
+    if (extract_final_inp) {
+        res->t_layer_inp[n_layer] = cur;
+        if (crop_before_nextn(inp_out_ids)) {
             cur = ggml_get_rows(ctx0, cur, inp_out_ids);
         }
+    }
+
+    // pre-norm state for MTP; set even when extraction is off
+    cb(cur, "h_nextn", -1);
+    res->t_h_nextn = cur;
+
+    if (crop_after_nextn(inp_out_ids)) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
 
     cur = build_norm(cur,

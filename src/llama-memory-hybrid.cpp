@@ -195,12 +195,24 @@ void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id
 }
 
 void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+    const bool read_attn = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0;
+
+    if (read_attn) {
         mem_attn->state_read(io, seq_id, flags);
     }
+
     // APPEND blobs come from state_write_range and contain only the attention child
     if ((flags & LLAMA_STATE_SEQ_FLAGS_APPEND) == 0) {
-        mem_recr->state_read(io, seq_id, flags);
+        try {
+            mem_recr->state_read(io, seq_id, flags);
+        } catch (...) {
+            // the attention part is already restored - undo it
+            if (read_attn) {
+                mem_attn->state_clear(seq_id);
+            }
+
+            throw;
+        }
     }
 }
 

@@ -58,11 +58,13 @@
 #define KEY_PATCH_SIZE              "clip.vision.patch_size"
 #define KEY_IMAGE_MEAN              "clip.vision.image_mean"
 #define KEY_IMAGE_STD               "clip.vision.image_std"
+#define KEY_IMAGE_RESIZE_ALGO       "clip.vision.image_resize_algo"
 #define KEY_PROJ_SCALE_FACTOR       "clip.vision.projector.scale_factor"
 #define KEY_PROJ_SAMPLE_QUERY_SIDE  "clip.vision.projector.query_side"
 #define KEY_PROJ_SAMPLE_WINDOW_SIDE "clip.vision.projector.window_side"
 #define KEY_PROJ_SPATIAL_OFFSETS    "clip.vision.projector.spatial_offsets"
 #define KEY_SPATIAL_MERGE_SIZE      "clip.vision.spatial_merge_size"
+#define KEY_SWIGLU_CLAMP            "clip.vision.swiglu_clamp"
 
 #define KEY_MM_PATCH_MERGE_TYPE    "clip.vision.mm_patch_merge_type"
 #define KEY_IMAGE_GRID_PINPOINTS   "clip.vision.image_grid_pinpoints"
@@ -450,6 +452,7 @@ enum projector_type {
     PROJECTOR_TYPE_GLM_EDGE,
     PROJECTOR_TYPE_QWEN2VL,
     PROJECTOR_TYPE_QWEN3VL,
+    PROJECTOR_TYPE_LING3VL,
     PROJECTOR_TYPE_STEP3VL,
     PROJECTOR_TYPE_GEMMA3,
     PROJECTOR_TYPE_GEMMA3NV,
@@ -473,6 +476,7 @@ enum projector_type {
     PROJECTOR_TYPE_MERALION,
     PROJECTOR_TYPE_MUSIC_FLAMINGO,
     PROJECTOR_TYPE_LFM2,
+    PROJECTOR_TYPE_D1OMNI_V,
     PROJECTOR_TYPE_KIMIVL,
     PROJECTOR_TYPE_PADDLEOCR,
     PROJECTOR_TYPE_LIGHTONOCR,
@@ -485,7 +489,9 @@ enum projector_type {
     PROJECTOR_TYPE_DEEPSEEKOCR2,
     PROJECTOR_TYPE_DEEPSEEK4V,
     PROJECTOR_TYPE_LFM2A,
+    PROJECTOR_TYPE_D1OMNI_A,
     PROJECTOR_TYPE_GLM4V,
+    PROJECTOR_TYPE_GLM5V,
     PROJECTOR_TYPE_YOUTUVL,
     PROJECTOR_TYPE_YASA2,
     PROJECTOR_TYPE_KIMIK25,
@@ -504,6 +510,7 @@ enum projector_type {
     PROJECTOR_TYPE_POCKETTTS_SPKENC,
     PROJECTOR_TYPE_POCKETTTS_GEN,
     PROJECTOR_TYPE_MUSE_GLIMMER,
+    PROJECTOR_TYPE_COHERE2V,
     PROJECTOR_TYPE_UNKNOWN,
 };
 
@@ -516,6 +523,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_QWEN2VL,           "qwen2vl_merger"},
     { PROJECTOR_TYPE_QWEN25VL,          "qwen2.5vl_merger"},
     { PROJECTOR_TYPE_QWEN3VL,           "qwen3vl_merger"},
+    { PROJECTOR_TYPE_LING3VL,           "ling3vl"},
     { PROJECTOR_TYPE_STEP3VL,           "step3vl"},
     { PROJECTOR_TYPE_GEMMA3,            "gemma3"},
     { PROJECTOR_TYPE_GEMMA3NV,          "gemma3nv"},
@@ -538,6 +546,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_MERALION,          "meralion"},
     { PROJECTOR_TYPE_MUSIC_FLAMINGO,    "musicflamingo"},
     { PROJECTOR_TYPE_LFM2,              "lfm2"},
+    { PROJECTOR_TYPE_D1OMNI_V,          "d1omni_v"},
     { PROJECTOR_TYPE_KIMIVL,            "kimivl"},
     { PROJECTOR_TYPE_PADDLEOCR,         "paddleocr"},
     { PROJECTOR_TYPE_LIGHTONOCR,        "lightonocr"},
@@ -550,7 +559,9 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_DEEPSEEKOCR2,      "deepseekocr2"},
     { PROJECTOR_TYPE_DEEPSEEK4V,        "deepseek4v"},
     { PROJECTOR_TYPE_LFM2A,             "lfm2a"},
+    { PROJECTOR_TYPE_D1OMNI_A,          "d1omni_a"},
     { PROJECTOR_TYPE_GLM4V,             "glm4v"},
+    { PROJECTOR_TYPE_GLM5V,             "glm5v"},
     { PROJECTOR_TYPE_YOUTUVL,           "youtuvl"},
     { PROJECTOR_TYPE_YASA2,             "yasa2"},
     { PROJECTOR_TYPE_KIMIK25,           "kimik25"},
@@ -569,6 +580,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_POCKETTTS_SPKENC,  "pockettts_spkenc"},
     { PROJECTOR_TYPE_POCKETTTS_GEN,     "pockettts_gen"},
     { PROJECTOR_TYPE_MUSE_GLIMMER,      "muse-glimmer"},
+    { PROJECTOR_TYPE_COHERE2V,          "cohere2v"},
 };
 
 static projector_type clip_projector_type_from_string(const std::string & str) {

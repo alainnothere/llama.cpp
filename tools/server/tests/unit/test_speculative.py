@@ -184,11 +184,11 @@ def test_with_ctx_shift():
     assert res.body["truncated"] == True
 
 
-def test_stochastic_acceptance():
+def test_probabilistic_draft_sampling():
     global server
-    # with --spec-accept stochastic the draft samples from its top-k distribution and the target
+    # with --spec-draft-sampling probabilistic the draft samples its tokens and the target
     # accepts with probability min(1, p_tgt/p_dft) instead of requiring an exact match
-    server.spec_accept = "stochastic"
+    server.spec_draft_sampling = "probabilistic"
     server.start()
     res = server.make_request("POST", "/completion", data={
         "prompt": "I believe the meaning of life is",
@@ -239,10 +239,10 @@ def test_draft_ctx_step():
     assert res.body["timings"]["draft_n"] > 0
 
 
-def test_stochastic_acceptance_is_reproducible():
+def test_probabilistic_draft_sampling_is_reproducible():
     global server
-    # both the acceptance rng (seeded from the request's sampling seed) and the draft's proposal rng
-    # are deterministic, so an identical run produces identical tokens
+    # both the acceptance rng and the draft sampler are seeded from the request's sampling seed,
+    # so an identical run produces identical tokens
     request = {
         "prompt": "I believe the meaning of life is",
         "temperature": 0.8,
@@ -253,7 +253,7 @@ def test_stochastic_acceptance_is_reproducible():
         "return_tokens": True,
     }
 
-    server.spec_accept = "stochastic"
+    server.spec_draft_sampling = "probabilistic"
     server.start()
     res = server.make_request("POST", "/completion", data=request)
     assert res.status_code == 200
@@ -261,17 +261,17 @@ def test_stochastic_acceptance_is_reproducible():
     server.stop()
 
     create_server()
-    server.spec_accept = "stochastic"
+    server.spec_draft_sampling = "probabilistic"
     server.start()
     res = server.make_request("POST", "/completion", data=request)
     assert res.status_code == 200
     assert res.body["tokens"] == tokens_a
 
 
-def test_stochastic_acceptance_greedy_sampling():
+def test_probabilistic_draft_sampling_greedy_sampling():
     global server
-    # at temperature 0 both target and draft collapse to a point mass, so the stochastic rule must
-    # reduce to the exact-match rule and produce the very same tokens
+    # at temperature 0 there is nothing to sample, so probabilistic draft sampling must reduce to the
+    # exact-match rule and produce the very same tokens
     request = {
         "prompt": "I believe the meaning of life is",
         "temperature": 0.0,
@@ -288,7 +288,7 @@ def test_stochastic_acceptance_greedy_sampling():
     server.stop()
 
     create_server()
-    server.spec_accept = "stochastic"
+    server.spec_draft_sampling = "probabilistic"
     server.start()
     res = server.make_request("POST", "/completion", data=request)
     assert res.status_code == 200
