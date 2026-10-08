@@ -366,6 +366,12 @@ struct common_params_speculative_ngram_mod {
 
     int32_t n_max = 64;
     int32_t n_min = 48;
+
+    size_t size = 4*1024*1024; // number of hash slots (int32 each)
+
+    float reset_occupancy = 0.0f; // wipe the table in begin() above this occupancy fraction (0 = never)
+
+    std::string cache_path; // load at startup, save on graceful shutdown (empty = no persistence)
 };
 
 struct common_params_speculative_ngram_map {
@@ -395,6 +401,9 @@ struct common_params_speculative {
 
     common_params_speculative_ngram_cache ngram_cache;
 
+    // cap for n-gram drafts, independent of draft.n_max and the auto tuner (-1 = same cap as the draft model)
+    int32_t ngram_draft_n_max = -1;
+
     bool has_dft() const {
         return !draft.mparams.empty();
     }
@@ -408,7 +417,21 @@ struct common_params_speculative {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        uint32_t n_rs = needs_rs_seq ? draft.n_max : 0u;
+
+        // n-gram drafts with their own cap can run past draft.n_max - size the rollback window for them too,
+        // otherwise every long n-gram draft on a hybrid target takes the checkpoint path instead of the cheap rollback
+        const bool has_ngram = std::any_of(types.begin(), types.end(), [](auto t) {
+            return t == COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE || t == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K ||
+                   t == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V || t == COMMON_SPECULATIVE_TYPE_NGRAM_MOD ||
+                   t == COMMON_SPECULATIVE_TYPE_NGRAM_CACHE;
+        });
+
+        if (has_ngram && ngram_draft_n_max > 0) {
+            n_rs = std::max(n_rs, (uint32_t) ngram_draft_n_max);
+        }
+
+        return n_rs;
     }
 };
 

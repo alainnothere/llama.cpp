@@ -79,6 +79,11 @@ struct common_speculative_draft_params {
     // the target's temp and seed, read only when the drafter samples probabilistically
     float    temp = 1.0f;
     uint32_t seed = LLAMA_DEFAULT_SEED;
+
+    // cap for the n-gram drafters only (ngram-simple, ngram-map-k*, ngram-mod, ngram-cache), <= 0 = use n_max
+    // lets n-gram drafts, which are free to build, run longer than the draft-model cap
+    // note: last member, so the positional initializers in the server and the examples stay valid
+    int32_t n_max_ngram = -1;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
@@ -99,6 +104,18 @@ void common_speculative_draft(common_speculative * spec);
 
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
+
+// true for the n-gram drafters (no draft model involved): ngram-simple, ngram-map-k, ngram-map-k4v, ngram-mod, ngram-cache
+bool common_speculative_type_is_ngram(enum common_speculative_type type);
+
+// the implementation that produced the draft of the last common_speculative_draft() call for seq_id
+// COMMON_SPECULATIVE_TYPE_COUNT if no implementation drafted
+enum common_speculative_type common_speculative_type_last(const common_speculative * spec, llama_seq_id seq_id);
+
+// length of that draft as built by the implementation, before the n_max / n_max_ngram truncation
+// and after it (= what was handed to the target for verification). 0 if no implementation drafted
+int32_t common_speculative_n_built_last  (const common_speculative * spec, llama_seq_id seq_id);
+int32_t common_speculative_n_offered_last(const common_speculative * spec, llama_seq_id seq_id);
 
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);

@@ -192,6 +192,11 @@ struct common_speculative_impl {
 
     std::vector<size_t> n_acc_tokens_per_pos; // number of tokens accepted per draft position.
 
+    // per seq, set by common_speculative_draft() when this implementation won the step:
+    // draft length as built by the implementation and as offered after the common truncation
+    std::vector<int32_t> n_built_last;
+    std::vector<int32_t> n_offered_last;
+
     // TODO: track performance of most recent calls
     const bool gen_perf = true; // whether to generate performance stats.
 
@@ -199,7 +204,8 @@ struct common_speculative_impl {
     int64_t t_draft_us  = 0; // total time spent in generating drafts in this implementation in microseconds.
     int64_t t_accept_us = 0; // total time spent in accumulation of this implementation in microseconds.
 
-    common_speculative_impl(common_speculative_type type, uint32_t n_seq, int32_t n_max) : type(type), n_seq(n_seq), n_max(n_max) {}
+    common_speculative_impl(common_speculative_type type, uint32_t n_seq, int32_t n_max)
+        : type(type), n_seq(n_seq), n_max(n_max), n_built_last(n_seq, 0), n_offered_last(n_seq, 0) {}
 
     virtual ~common_speculative_impl() = default;
 
@@ -1974,29 +1980,42 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         // the last position in the prompt that was added to the ngram container
         size_t i_last = 0;
 
-        // length of the last drafted n-gram (number of tokens returned by draft)
-        size_t n_draft_last = 0;
+        // whether the last draft call produced a chain (the length that counts for the backoff is
+        // the offered one, n_offered_last on the base class - the common draft loop may truncate it)
+        bool drafted = false;
 
-        // consecutive accept rounds with low acceptance fraction (< 0.5)
+        // consecutive accept rounds with low acceptance fraction (< 0.25)
         int n_low = 0;
+
+        // draft calls to skip after a low acceptance streak - the shared table is left alone,
+        // only this seq stops drafting from it for a while
+        int cooldown = 0;
+
+        // how many times the backoff fired without a good round in between (doubles the cooldown)
+        int strikes = 0;
     };
 
     std::vector<seq_info> sinfos;
+
+    // occupancy warnings already printed while the begin() wipe is disabled
+    bool warned_occ_50 = false;
+    bool warned_occ_90 = false;
 
     common_speculative_impl_ngram_mod(
             const common_params_speculative & params,
             uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_MOD, n_seq, params.ngram_mod.n_max)
         , params(params.ngram_mod)
-        , mod(params.ngram_mod.n_match, 4*1024*1024)
+        , mod(params.ngram_mod.n_match, params.ngram_mod.size)
         , verbose(std::getenv("LLAMA_TRACE") != nullptr) {
         static_assert(sizeof(llama_token) == sizeof(common_ngram_mod::entry_t));
 
         SPC_TRC("%s", "adding speculative implementation 'ngram-mod'\n");
         SPC_TRC("- n_match=%d, n_max=%d, n_min=%d\n",
                 this->params.n_match, this->params.n_max, this->params.n_min);
-        SPC_TRC("- mod size=%zu (%.3f MB)\n",
-                mod.size(), (float)(mod.size_bytes())/1024/1024);
+        SPC_TRC("- mod size=%zu (%.3f MB), reset_occupancy=%.2f, cache=%s\n",
+                mod.size(), (float)(mod.size_bytes())/1024/1024, (double) this->params.reset_occupancy,
+                this->params.cache_path.empty() ? "none" : this->params.cache_path.c_str());
 
         if (this->params.n_match < 16) {
             SPC_WRN("ngram_mod n_match=%d is too small - poor quality is possible, "
@@ -2004,13 +2023,69 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         }
 
         sinfos.resize(n_seq);
+
+        if (!this->params.cache_path.empty()) {
+            const std::string & path = this->params.cache_path;
+
+            switch (mod.load(path)) {
+                case common_ngram_mod::LOAD_OK:
+                    SPC_INF("loaded ngram_mod table from '%s' (%zu/%zu entries used, %.2f)\n",
+                            path.c_str(), mod.get_used(), mod.size(), (double) mod.get_used() / (double) mod.size());
+                    break;
+                case common_ngram_mod::LOAD_MISSING:
+                    SPC_WRN("could not read ngram_mod table '%s' - starting with an empty one\n", path.c_str());
+                    break;
+                case common_ngram_mod::LOAD_CORRUPT:
+                    SPC_WRN("ngram_mod table '%s' is corrupt or truncated - starting with an empty one, "
+                            "it will be replaced on shutdown\n", path.c_str());
+                    break;
+                case common_ngram_mod::LOAD_MISMATCH:
+                    SPC_WRN("ngram_mod table '%s' was built with a different n_match/size (want n_match=%zu, size=%zu) - "
+                            "starting with an empty one, it will be replaced on shutdown\n",
+                            path.c_str(), mod.get_n(), mod.size());
+                    break;
+            }
+        }
+    }
+
+    // the destructor persists the table, so copying an instance would save it more than once
+    common_speculative_impl_ngram_mod(const common_speculative_impl_ngram_mod &) = delete;
+    common_speculative_impl_ngram_mod & operator=(const common_speculative_impl_ngram_mod &) = delete;
+
+    ~common_speculative_impl_ngram_mod() override {
+        save_table();
+    }
+
+    // write the table back to cache_path. called from the destructor - must never throw
+    void save_table() noexcept {
+        if (params.cache_path.empty()) {
+            return;
+        }
+
+        try {
+            if (mod.save(params.cache_path)) {
+                SPC_INF("saved ngram_mod table to '%s' (%zu/%zu entries used, %.2f)\n",
+                        params.cache_path.c_str(), mod.get_used(), mod.size(), (double) mod.get_used() / (double) mod.size());
+            } else {
+                SPC_WRN("failed to save ngram_mod table '%s' - the file on disk is left untouched\n",
+                        params.cache_path.c_str());
+            }
+        } catch (...) {
+            SPC_WRN("failed to save ngram_mod table '%s' - the file on disk is left untouched\n",
+                    params.cache_path.c_str());
+        }
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         auto & sinfo = sinfos[seq_id];
 
-        sinfo.i_last = 0;
-        sinfo.n_draft_last = 0;
+        sinfo.i_last  = 0;
+        sinfo.drafted = false;
+
+        // new request - forget the backoff of the previous one
+        sinfo.n_low    = 0;
+        sinfo.cooldown = 0;
+        sinfo.strikes  = 0;
 
         const size_t n = mod.get_n();
         if (prompt.size() < n) {
@@ -2026,11 +2101,21 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         const double f = (double)mod.get_used() / (double)mod.size();
         SPC_TRC("ngram_mod occupancy = %zu/%zu (%.2f)\n", mod.get_used(), mod.size(), f);
 
-        constexpr double f_thold = 0.25;
-        if (f > f_thold) {
-            SPC_WRN("ngram_mod occupancy %.2f exceeds threshold (%.2f) - resetting\n", f, f_thold);
+        const double f_thold = params.reset_occupancy;
+        if (f_thold > 0.0) {
+            if (f > f_thold) {
+                SPC_WRN("ngram_mod occupancy %.2f exceeds threshold (%.2f) - resetting\n", f, f_thold);
 
-            mod.reset();
+                mod.reset();
+            }
+        } else if (f > 0.9 && !warned_occ_90) {
+            SPC_WRN("ngram_mod occupancy %.2f is above 0.90 - collisions overwrite older entries, "
+                    "consider a larger --spec-ngram-mod-size\n", f);
+            warned_occ_90 = true;
+            warned_occ_50 = true;
+        } else if (f > 0.5 && !warned_occ_50) {
+            SPC_WRN("ngram_mod occupancy %.2f is above 0.50\n", f);
+            warned_occ_50 = true;
         }
     }
 
@@ -2042,7 +2127,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         const auto & prompt = *dparams.prompt;
 
-        sinfo.n_draft_last = 0;
+        sinfo.drafted = false;
 
         const size_t cur_len = prompt.size();
         if (cur_len < mod.get_n()) {
@@ -2058,6 +2143,12 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
             }
 
             sinfo.i_last = cur_len - n;
+        }
+
+        // backing off after a low acceptance streak - keep learning, but let the next impl draft
+        if (sinfo.cooldown > 0) {
+            sinfo.cooldown--;
+            return;
         }
 
         result.resize(n + params.n_max);
@@ -2086,8 +2177,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         }
         result.resize(result.size() - n);
 
-        // store length of drafted n-gram for later acceptance analysis
-        sinfo.n_draft_last = result.size();
+        sinfo.drafted = !result.empty();
     }
 
     bool process(const common_batch & /*batch*/, const std::vector<int8_t> & /*keep*/) override {
@@ -2115,22 +2205,30 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         auto & sinfo = sinfos[seq_id];
 
-        // compute acceptance fraction if we have a recorded draft length
-        if (sinfo.n_draft_last > 0) {
-            const double f_acc = (double)n_accepted / (double)sinfo.n_draft_last;
+        // acceptance fraction over what the target actually verified: the offered length, after the
+        // common n_max / n_max_ngram truncation. dividing by the built chain would score a 48-chain
+        // cut to 8 and fully accepted as 8/48 and back off a drafter that is doing perfectly
+        const int32_t n_offered = n_offered_last[seq_id];
+        if (sinfo.drafted && n_offered > 0) {
+            sinfo.drafted = false;
+
+            const double f_acc = (double)n_accepted / (double)n_offered;
             if (f_acc < 0.25) {
                 sinfo.n_low++;
                 if (sinfo.n_low >= 5) {
+                    sinfo.cooldown = std::min(16 << std::min(sinfo.strikes, 6), 1024);
+
                     if (verbose) {
-                        SPC_TRC("low acceptance streak (%d) - resetting ngram_mod\n", sinfo.n_low);
+                        SPC_TRC("low acceptance streak (%d) - seq %d skips %d draft calls (strike %d)\n",
+                                sinfo.n_low, seq_id, sinfo.cooldown, sinfo.strikes + 1);
                     }
 
-                    mod.reset();
+                    sinfo.strikes++;
                     sinfo.n_low = 0;
-                    sinfo.i_last = 0;
                 }
             } else {
-                sinfo.n_low = 0;
+                sinfo.n_low   = 0;
+                sinfo.strikes = 0;
             }
         }
     }
@@ -2968,6 +3066,19 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
     return result;
 }
 
+bool common_speculative_type_is_ngram(common_speculative_type type) {
+    switch (type) {
+        case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
+            return true;
+        default:
+            return false;
+    }
+}
+
 void common_speculative_draft(common_speculative * spec) {
     if (spec == nullptr) {
         return;
@@ -2988,6 +3099,13 @@ void common_speculative_draft(common_speculative * spec) {
 
         if (n_drafting == 0) {
             return;
+        }
+    }
+
+    // forget the previous step's winner, so a step without a draft reads as "no implementation"
+    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
+        if (dparams[seq_id].drafting) {
+            spec->impl_last[seq_id] = nullptr;
         }
     }
 
@@ -3013,17 +3131,25 @@ void common_speculative_draft(common_speculative * spec) {
             if (dp.drafting && !result.empty()) {
                 dp.drafting = false;
 
-                if (dp.n_max > 0) {
-                    if (!result.empty() && (int) result.size() > dp.n_max) {
-                        SPC_DBG("truncating draft to %d tokens\n", dp.n_max);
-                        result.resize(dp.n_max);
+                impl->n_built_last[seq_id] = (int32_t) result.size();
+
+                // n-gram drafts are free to build, they get their own cap when the caller sets one
+                const int32_t cap = (common_speculative_type_is_ngram(impl->type) && dp.n_max_ngram > 0)
+                    ? dp.n_max_ngram : dp.n_max;
+
+                if (cap > 0) {
+                    if ((int) result.size() > cap) {
+                        SPC_DBG("truncating draft to %d tokens\n", cap);
+                        result.resize(cap);
 
                         // trim the candidates only if the drafter produced them (n-gram drafters do not)
                         if (dp.result_q && !dp.result_q->empty()) {
-                            dp.result_q->resize(dp.n_max);
+                            dp.result_q->resize(cap);
                         }
                     }
                 }
+
+                impl->n_offered_last[seq_id] = (int32_t) result.size();
 
                 if (!result.empty()) {
                     SPC_DBG("called impl %s, hist size = %zu, call_count = %zu, gen = %zu\n",
@@ -3092,6 +3218,27 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
             impl_other->accept(seq_id, n_accepted, true);
         }
     }
+}
+
+common_speculative_type common_speculative_type_last(const common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr || spec->impl_last[seq_id] == nullptr) {
+        return COMMON_SPECULATIVE_TYPE_COUNT;
+    }
+    return spec->impl_last[seq_id]->type;
+}
+
+int32_t common_speculative_n_built_last(const common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr || spec->impl_last[seq_id] == nullptr) {
+        return 0;
+    }
+    return spec->impl_last[seq_id]->n_built_last[seq_id];
+}
+
+int32_t common_speculative_n_offered_last(const common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr || spec->impl_last[seq_id] == nullptr) {
+        return 0;
+    }
+    return spec->impl_last[seq_id]->n_offered_last[seq_id];
 }
 
 // TODO: support the case of more than one speculative implementations having a state

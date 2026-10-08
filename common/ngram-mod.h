@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <vector>
 #include <cstddef>
+#include <string>
 
 //
 // common_ngram_mod
@@ -22,6 +23,20 @@ struct common_ngram_mod {
     entry_t get(const entry_t * tokens) const; // return -1 if not found
 
     void reset();
+
+    // persistence - see save()/load() in ngram-mod.cpp for the file format
+    enum load_status {
+        LOAD_OK,
+        LOAD_MISSING,  // file does not exist or cannot be opened
+        LOAD_CORRUPT,  // bad magic/version, truncated or trailing data, invalid entries
+        LOAD_MISMATCH, // valid file, but built with a different n or size
+    };
+
+    // write via path + ".tmp" and rename, so an interrupted write never destroys the file on disk
+    bool save(const std::string & path) const;
+
+    // on any status other than LOAD_OK the table is left untouched
+    load_status load(const std::string & path);
 
     size_t get_n()    const;
     size_t get_used() const;

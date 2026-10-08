@@ -4247,6 +4247,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_CTX_STEP"));
     add_opt(common_arg(
+        {"--spec-ngram-draft-n-max"}, "N",
+        string_format("cap for n-gram drafts, independent of the draft-model cap (--spec-draft-n-max, --spec-draft-ctx-step) and the auto tuner; "
+                      "only the context room and n_predict still bound it. -1 = same cap as the draft model (default: %d)", params.speculative.ngram_draft_n_max),
+        [](common_params & params, int value) {
+            if (value < -1 || value == 0) {
+                throw std::invalid_argument("invalid value, expected -1 or a positive number");
+            }
+            params.speculative.ngram_draft_n_max = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_NGRAM_DRAFT_N_MAX"));
+    add_opt(common_arg(
         {"--spec-draft-auto"},
         string_format("automatically tune the draft length per slot, using --spec-draft-n-max as the ceiling: keeps a running estimate of tokens landed per unit of wall time for every draft length tried, uses the best one and periodically probes its neighbours (default: %s)",
                       params.speculative.draft.auto_n ? "enabled" : "disabled"),
@@ -4401,6 +4412,36 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.ngram_mod.n_match = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-mod-size"}, "N",
+        string_format("ngram-mod hash table size in slots, 4 bytes each (default: %zu = %.0f MB)",
+            params.speculative.ngram_mod.size, (double) params.speculative.ngram_mod.size*sizeof(int32_t)/1024/1024),
+        [](common_params & params, int value) {
+            if (value < 1024 || value > (1 << 30)) {
+                throw std::invalid_argument("ngram-mod size must be between 1024 and 2^30 inclusive");
+            }
+            params.speculative.ngram_mod.size = (size_t) value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_NGRAM_MOD_SIZE"));
+    add_opt(common_arg(
+        {"--spec-ngram-mod-reset-occupancy"}, "F",
+        string_format("wipe the ngram-mod table at the start of a request when its occupancy exceeds this fraction, 0 = never (default: %.2f)",
+            (double) params.speculative.ngram_mod.reset_occupancy),
+        [](common_params & params, const std::string & value) {
+            const float f = std::stof(value);
+            if (f < 0.0f || f > 1.0f) {
+                throw std::invalid_argument("ngram-mod reset occupancy must be between 0 and 1 inclusive");
+            }
+            params.speculative.ngram_mod.reset_occupancy = f;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_NGRAM_MOD_RESET_OCCUPANCY"));
+    add_opt(common_arg(
+        {"--spec-ngram-mod-cache"}, "FNAME",
+        "path to an ngram-mod table file, loaded at startup and written back on graceful shutdown (default: none)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.ngram_mod.cache_path = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_NGRAM_MOD_CACHE"));
 
     add_opt(common_arg(
         {"--spec-ngram-simple-size-n"}, "N",

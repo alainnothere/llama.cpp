@@ -367,6 +367,11 @@ struct server_spec_autotune {
         t_start_us = ggml_time_us();
     }
 
+    // drop the step in flight without observing it (it was drafted by an implementation the tuner does not size)
+    void cancel() {
+        t_start_us = 0;
+    }
+
     void observe(int n_landed_step) {
         if (t_start_us == 0) {
             return;
@@ -415,6 +420,42 @@ struct server_spec_autotune {
     }
 };
 
+// per-request speculative stats of one drafting implementation
+struct server_spec_impl_stats {
+    // draft length buckets: 0, 1-4, 5-8, 9-16, 17-32, 33-48, 49+
+    static constexpr int N_HIST = 7;
+
+    int     n_steps    = 0;
+    int64_t n_built    = 0; // chain length produced by the implementation, before the cap
+    int64_t n_offered  = 0; // after the cap - what the target verified
+    int64_t n_accepted = 0;
+    int     n_full     = 0; // steps with every offered token accepted
+    int64_t t_step_us  = 0; // draft + verify wall time of these steps
+
+    int hist_acc  [N_HIST] = {0};
+    int hist_built[N_HIST] = {0};
+
+    static int bucket(int64_t n) {
+        if (n <= 0)  return 0;
+        if (n <= 4)  return 1;
+        if (n <= 8)  return 2;
+        if (n <= 16) return 3;
+        if (n <= 32) return 4;
+        if (n <= 48) return 5;
+        return 6;
+    }
+
+    static std::string hist_str(const int (&h)[N_HIST]) {
+        static const char * names[N_HIST] = { "0", "1-4", "5-8", "9-16", "17-32", "33-48", "49+" };
+
+        std::string res;
+        for (int i = 0; i < N_HIST; ++i) {
+            res += string_format("%s%s:%d", i > 0 ? " " : "", names[i], h[i]);
+        }
+        return res;
+    }
+};
+
 struct server_slot {
     int id;
 
@@ -440,9 +481,79 @@ struct server_slot {
     int32_t spec_n_max    = 0;
     int32_t spec_ctx_step = 0;
 
+    // copy of --spec-ngram-draft-n-max, -1 = n-gram drafts share the draft-model cap
+    int32_t spec_ngram_n_max = -1;
+
     // --spec-draft-auto, the state carries across tasks
     bool spec_auto_enabled = false;
     server_spec_autotune spec_auto;
+
+    // per-request, per drafting implementation stats (index = common_speculative_type)
+    server_spec_impl_stats spec_impl_stats[COMMON_SPECULATIVE_TYPE_COUNT];
+
+    int     spec_n_steps_nodraft = 0; // steps where drafting was attempted but no implementation drafted
+    int64_t spec_t_nodraft_us    = 0;
+
+    int64_t spec_t_step_start_us = 0; // stopwatch of the step in flight, 0 = no draft attempted
+
+    void spec_stats_reset() {
+        for (auto & st : spec_impl_stats) {
+            st = {};
+        }
+        spec_n_steps_nodraft = 0;
+        spec_t_nodraft_us    = 0;
+        spec_t_step_start_us = 0;
+    }
+
+    // close the step in flight: per-impl stats, then the auto tuner - which only sizes the
+    // draft-model cap, so a step drafted by an n-gram implementation must not land in its buckets
+    // n_accepted: draft tokens accepted by the target (0 for an empty draft)
+    void spec_step_end(int n_accepted) {
+        const common_speculative_type type = common_speculative_type_last(spec, id);
+        const bool is_ngram = type != COMMON_SPECULATIVE_TYPE_COUNT && common_speculative_type_is_ngram(type);
+
+        if (spec_auto_enabled) {
+            if (is_ngram) {
+                spec_auto.cancel();
+            } else {
+                spec_auto.observe(n_accepted + 1);
+            }
+        }
+
+        if (spec_t_step_start_us == 0) {
+            return;
+        }
+
+        const int64_t dt_us = ggml_time_us() - spec_t_step_start_us;
+
+        spec_t_step_start_us = 0;
+
+        if (type == COMMON_SPECULATIVE_TYPE_COUNT) {
+            spec_n_steps_nodraft++;
+            spec_t_nodraft_us += dt_us;
+
+            SLT_DBG(*this, "spec step: impl=none built=0 offered=0 accepted=0 t=%.1f ms\n", dt_us/1000.0);
+            return;
+        }
+
+        const int n_built   = common_speculative_n_built_last  (spec, id);
+        const int n_offered = common_speculative_n_offered_last(spec, id);
+
+        auto & st = spec_impl_stats[type];
+
+        st.n_steps++;
+        st.n_built    += n_built;
+        st.n_offered  += n_offered;
+        st.n_accepted += n_accepted;
+        st.n_full     += n_accepted >= n_offered ? 1 : 0;
+        st.t_step_us  += dt_us;
+
+        st.hist_acc  [server_spec_impl_stats::bucket(n_accepted)]++;
+        st.hist_built[server_spec_impl_stats::bucket(n_built)]++;
+
+        SLT_DBG(*this, "spec step: impl=%s built=%d offered=%d accepted=%d t=%.1f ms\n",
+                common_speculative_type_to_str(type).c_str(), n_built, n_offered, n_accepted, dt_us/1000.0);
+    }
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
@@ -704,14 +815,14 @@ struct server_slot {
         generated_token_probs.push_back(token);
     }
 
-    int get_n_draft_max() const {
+    // the max draft that fits the current slot state: context room and n_remaining only
+    int get_n_draft_room() const {
         GGML_ASSERT(task);
 
         if (!can_speculate()) {
             return 0;
         }
 
-        // determine the max draft that fits the current slot state
         // note: slot.prompt is not yet expanded with the `id` token sampled above
         //       also, need to leave space for 1 extra token to allow context shifts
         int n_draft_max = n_ctx - prompt.n_tokens() - 2;
@@ -719,6 +830,19 @@ struct server_slot {
         if (n_remaining() > 0) {
             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
         }
+
+        return n_draft_max;
+    }
+
+    // get_n_draft_room() with the --spec-draft-ctx-step schedule applied
+    int get_n_draft_max() const {
+        GGML_ASSERT(task);
+
+        if (!can_speculate()) {
+            return 0;
+        }
+
+        int n_draft_max = get_n_draft_room();
 
         if (spec_ctx_step > 0) {
             // at long context the verify batch is dominated by KV reads, which grow with the draft
@@ -923,6 +1047,32 @@ struct server_slot {
                 SLT_INF(*this, "draft auto = %s\n", spec_auto.summary().c_str());
             }
 
+        }
+
+        // per drafting implementation: lengths are means per step, t/s = landed tokens (accepted + the
+        // sampled one) per wall time of the steps that implementation drafted
+        for (int t = 0; t < COMMON_SPECULATIVE_TYPE_COUNT; ++t) {
+            const auto & st = spec_impl_stats[t];
+            if (st.n_steps == 0) {
+                continue;
+            }
+
+            const double n = st.n_steps;
+
+            SLT_INF(*this, "draft by impl: %s | steps %d | built %.1f | offered %.1f | accepted %.1f (%.2f) | full %d | step %.1f ms | %.1f t/s | acc hist %s | built hist %s\n",
+                    common_speculative_type_to_str((common_speculative_type) t).c_str(), st.n_steps,
+                    st.n_built/n, st.n_offered/n, st.n_accepted/n,
+                    st.n_offered > 0 ? (double) st.n_accepted/st.n_offered : 0.0,
+                    st.n_full,
+                    st.t_step_us/n/1000.0,
+                    st.t_step_us > 0 ? (st.n_accepted + st.n_steps)*1e6/st.t_step_us : 0.0,
+                    server_spec_impl_stats::hist_str(st.hist_acc).c_str(),
+                    server_spec_impl_stats::hist_str(st.hist_built).c_str());
+        }
+
+        if (spec_n_steps_nodraft > 0) {
+            SLT_INF(*this, "draft by impl: none | steps %d | step %.1f ms\n",
+                    spec_n_steps_nodraft, spec_t_nodraft_us/(double) spec_n_steps_nodraft/1000.0);
         }
 
         common_speculative_print_stats(spec);
@@ -1681,6 +1831,8 @@ private:
 
             slot.spec_n_max    = params_base.speculative.draft.n_max;
             slot.spec_ctx_step = params_base.speculative.draft.ctx_step;
+
+            slot.spec_ngram_n_max = params_base.speculative.ngram_draft_n_max;
 
             slot.spec_auto_enabled = params_base.speculative.draft.auto_n;
             slot.spec_auto.init(slot.spec_n_max);
@@ -3767,6 +3919,14 @@ private:
                             spec_auto.begin();
                         }
 
+                        slot.spec_t_step_start_us = ggml_time_us();
+
+                        // n-gram drafts are free to build: bounded by the context room only, not by
+                        // the ctx-step schedule or the auto tuner
+                        const int n_draft_ngram = slot.spec_ngram_n_max > 0
+                            ? std::min(slot.spec_ngram_n_max, slot.get_n_draft_room())
+                            : -1;
+
                         const bool spec_reject = slot.use_spec_rejection();
 
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
@@ -3779,6 +3939,7 @@ private:
                             /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
                             /* .temp     = */ slot.task->params.sampling.temp,
                             /* .seed     = */ slot.task->params.sampling.seed,
+                            /* .n_max_ngram = */ n_draft_ngram,
                         };
 
                         drafting.push_back(&slot);
@@ -4961,6 +5122,8 @@ private:
                     if (slot.spec_auto_enabled) {
                         slot.spec_auto.init(slot.spec_n_max);
                     }
+
+                    slot.spec_stats_reset();
                 }
             } else if (slot.state != SLOT_STATE_GENERATING) {
                 return;
@@ -4996,10 +5159,10 @@ private:
 
             slot.stats.update_gen_last();
 
-            if (slot.spec_auto_enabled) {
+            if (slot.can_speculate()) {
                 // the draft was empty (for example dropped by --spec-draft-n-min), but the cap that
                 // produced it still paid for this step
-                slot.spec_auto.observe(1);
+                slot.spec_step_end(0);
             }
 
             completion_token_output result;
@@ -5091,9 +5254,7 @@ private:
             slot.stats.n_draft_accepted += n_accepted;
             slot.stats.n_draft_verif_steps += 1;
 
-            if (slot.spec_auto_enabled) {
-                slot.spec_auto.observe((int) n_accepted + 1);
-            }
+            slot.spec_step_end((int) n_accepted);
 
             auto & n_accepted_per_pos = slot.n_accepted_per_pos;
             if (n_accepted_per_pos.empty()) {
