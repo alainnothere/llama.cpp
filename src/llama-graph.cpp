@@ -19,6 +19,7 @@
 
 #include <cassert>
 #include <cmath>
+#include <cinttypes>
 #include <cstring>
 #include <numeric>
 #include <sstream>
@@ -1158,17 +1159,43 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     bool res = true;
 
-    res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
+    // TEMP DIAGNOSTIC: each sub-check logged on failure (WARN so it shows at default -lv)
+    const auto * recr = mctx->get_recr();
+    const auto * attn = mctx->get_attn();
+    const auto & ub   = params.ubatch;
+
+    if (inp_attn->self_k_idxs->ne[0] != ub.n_tokens) {
+        LLAMA_LOG_WARN("%s: no reuse: k_idxs ne0 %" PRId64 " != n_tokens %u\n", __func__, inp_attn->self_k_idxs->ne[0], ub.n_tokens);
+        res = false;
+    }
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
-    res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+    if (!can_reuse_kq_mask(inp_attn->self_kq_mask, attn, ub, params.cparams)) {
+        const auto * m = inp_attn->self_kq_mask;
+        const uint32_t n_stream = params.cparams.kv_unified ? 1 : ub.n_seqs_unq;
+        LLAMA_LOG_WARN("%s: no reuse: kq_mask [%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] vs want [%u,%u,1,%u]\n", __func__,
+                m->ne[0], m->ne[1], m->ne[2], m->ne[3], attn->get_n_kv(), ub.n_tokens/n_stream, n_stream);
+        res = false;
+    }
 
-    res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
+    if (inp_rs->s_copy->ne[0] != recr->get_n_rs()) {
+        LLAMA_LOG_WARN("%s: no reuse: s_copy ne0 %" PRId64 " != n_rs %u\n", __func__, inp_rs->s_copy->ne[0], recr->get_n_rs());
+        res = false;
+    }
 
-    res &= inp_rs->s_copy_main->ne[0] == params.ubatch.n_seqs;
+    if (inp_rs->s_copy_main->ne[0] != ub.n_seqs) {
+        LLAMA_LOG_WARN("%s: no reuse: s_copy_main ne0 %" PRId64 " != n_seqs %u\n", __func__, inp_rs->s_copy_main->ne[0], ub.n_seqs);
+        res = false;
+    }
 
-    res &= inp_rs->head == mctx->get_recr()->get_head();
-    res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    if (inp_rs->head != recr->get_head()) {
+        LLAMA_LOG_WARN("%s: no reuse: head %u != %u\n", __func__, inp_rs->head, recr->get_head());
+        res = false;
+    }
+    if (inp_rs->rs_z != recr->get_rs_z()) {
+        LLAMA_LOG_WARN("%s: no reuse: rs_z %d != %d\n", __func__, inp_rs->rs_z, recr->get_rs_z());
+        res = false;
+    }
 
     return res;
 }
@@ -1440,9 +1467,11 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
     if (!this->params.allow_reuse(params)) {
-        if (debug > 1) {
-            LLAMA_LOG_DEBUG("%s: cannot reuse graph due to incompatible graph parameters\n", __func__);
-        }
+        // TEMP DIAGNOSTIC
+        LLAMA_LOG_WARN("%s: no reuse: graph params differ (n_tokens %u->%u n_seqs %u->%u n_outputs %d->%d gtype %d->%d mctx %p->%p)\n", __func__,
+                this->params.ubatch.n_tokens, params.ubatch.n_tokens, this->params.ubatch.n_seqs, params.ubatch.n_seqs,
+                (int) this->params.n_outputs, (int) params.n_outputs, (int) this->params.gtype, (int) params.gtype,
+                (const void *) this->params.mctx, (const void *) params.mctx);
 
         return false;
     }
