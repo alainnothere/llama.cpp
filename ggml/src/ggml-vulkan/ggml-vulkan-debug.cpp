@@ -6,6 +6,9 @@ bool vk_perf_logger_enabled = false;
 
 bool vk_perf_logger_concurrent = false;
 bool vk_fa_mask_cache_disable = false;
+int vk_mmvq_q6k = -1;
+uint32_t vk_mmvq_rows_override = 0;
+int vk_mmvq_wg_override = -1;
 uint32_t vk_fa_splitk_pct = 100;
 uint32_t vk_fa_fold_max_n = 16;
 uint32_t vk_fa_fold_max_br = 16;

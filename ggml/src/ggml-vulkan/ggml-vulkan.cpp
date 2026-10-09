@@ -2919,7 +2919,17 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
     // RDNA3/4: above four columns, static 4 rows for all types bench faster than the default
     const bool is_rdna3_or_4 = device->vendor_id == VK_VENDOR_ID_AMD && (device->architecture == AMD_RDNA3 || device->architecture == AMD_RDNA4);
-    auto const &rm_int_n = [&](uint32_t rows, uint32_t i) { return (is_rdna3_or_4 && i >= 4) ? 4u : rows; };
+    auto const &rm_int_n = [&](uint32_t rows, uint32_t i) {
+        if (vk_mmvq_rows_override != 0) {
+            return vk_mmvq_rows_override;   // GGML_VK_MMVQ_ROWS, tuning experiments only
+        }
+        // RDNA3/4, DRAM-bound sweep 2026-10-09 (q4_K 32768x8192): n<=2 1 row, n=3..4 2 rows (n=4: 240 -> 212 us),
+        // n>=5 4 rows (n=8: 402 -> 273 us)
+        if (is_rdna3_or_4) {
+            return i >= 4 ? 4u : (i >= 2 ? 2u : rows);
+        }
+        return rows;
+    };
     // RDNA3/4: Static 4 rows for all types bench faster than the default
     auto const &rm_id = [&](uint32_t rows) { return is_rdna3_or_4 ? 4u : rows; };
     uint32_t rm_iq = 2 * rm_kq;
@@ -5289,6 +5299,15 @@ void ggml_vk_instance_init() {
     vk_perf_logger_enabled = getenv("GGML_VK_PERF_LOGGER") != nullptr;
     vk_perf_logger_concurrent = getenv("GGML_VK_PERF_LOGGER_CONCURRENT") != nullptr;
     vk_fa_mask_cache_disable = getenv("GGML_VK_FA_MASK_CACHE_DISABLE") != nullptr;
+    if (const char * e = getenv("GGML_VK_MMVQ_Q6K")) {
+        vk_mmvq_q6k = atoi(e) != 0 ? 1 : 0;
+    }
+    if (const char * e = getenv("GGML_VK_MMVQ_ROWS")) {
+        vk_mmvq_rows_override = (uint32_t)std::stoul(e);
+    }
+    if (const char * e = getenv("GGML_VK_MMVQ_WG")) {
+        vk_mmvq_wg_override = atoi(e);   // 0 = subgroup, 1 = large
+    }
     if (const char * e = getenv("GGML_VK_FA_SPLITK_PCT")) {
         vk_fa_splitk_pct = std::max(1u, (uint32_t)std::stoul(e));
     }
@@ -5620,6 +5639,9 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
 
     // heuristic to choose workgroup size
     uint32_t dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
+    if (vk_mmvq_wg_override >= 0) {
+        dmmv_wg = vk_mmvq_wg_override ? DMMV_WG_SIZE_LARGE : DMMV_WG_SIZE_SUBGROUP;   // GGML_VK_MMVQ_WG, experiments only
+    } else
     if ((ctx->device->vendor_id == VK_VENDOR_ID_NVIDIA && ctx->device->architecture != vk_device_architecture::NVIDIA_PRE_TURING) || ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
         // Prefer larger workgroups when M is small, to spread the work out more
         // and keep more SMs busy.
@@ -5708,6 +5730,9 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
 
     // heuristic to choose workgroup size
     uint32_t dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
+    if (vk_mmvq_wg_override >= 0) {
+        dmmv_wg = vk_mmvq_wg_override ? DMMV_WG_SIZE_LARGE : DMMV_WG_SIZE_SUBGROUP;   // GGML_VK_MMVQ_WG, experiments only
+    } else
     if ((ctx->device->vendor_id == VK_VENDOR_ID_NVIDIA && ctx->device->architecture != vk_device_architecture::NVIDIA_PRE_TURING) || ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
         // Prefer larger workgroups when M is small, to spread the work out more
         // and keep more SMs busy.
@@ -6606,9 +6631,12 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
         return false;
     }
 
-    // q6_k only has 2-byte alignment which makes it somewhat problematic,
-    // using MMVQ is only a win on Intel.
-    bool mmvq_q6 = device->vendor_id == VK_VENDOR_ID_INTEL;
+    // q6_k only has 2-byte alignment which makes it somewhat problematic; the int8 path is a win on
+    // Intel and on RDNA3/4 (measured 2026-10-09, 7900 XT, m=4096 k=14336: n=8 124 -> 93 us, n=4 73 -> 70,
+    // n=1 equal). GGML_VK_MMVQ_Q6K=1/0 forces it on/off.
+    const bool rdna34 = device->vendor_id == VK_VENDOR_ID_AMD &&
+                        (device->architecture == vk_device_architecture::AMD_RDNA3 || device->architecture == vk_device_architecture::AMD_RDNA4);
+    bool mmvq_q6 = vk_mmvq_q6k == 1 || (vk_mmvq_q6k == -1 && (device->vendor_id == VK_VENDOR_ID_INTEL || rdna34));
     if (src0_type == GGML_TYPE_Q6_K && !mmvq_q6) {
         return false;
     }
@@ -16781,6 +16809,23 @@ std::string vk_perf_logger::get_node_fusion_name(const ggml_tensor * node, const
         name << ggml_op_name(node->op) <<
             " K=" << node->ne[0] <<
             " (" << node->src[0]->ne[0] << "," << node->src[0]->ne[1] << "," << node->src[0]->ne[2] << "," << node->src[0]->ne[3] << ")";
+        return name.str();
+    }
+    if (node->op == GGML_OP_CPY || node->op == GGML_OP_CONT || node->op == GGML_OP_DUP ||
+        node->op == GGML_OP_GET_ROWS || node->op == GGML_OP_SET_ROWS || node->op == GGML_OP_ADD ||
+        node->op == GGML_OP_MUL || node->op == GGML_OP_SCALE || node->op == GGML_OP_CONCAT) {
+        // small elementwise / copy ops are the dispatch-overhead suspects: name them by type and shape
+        const ggml_tensor * s0 = node->src[0];
+        std::stringstream name;
+        name << fusion_str << ggml_op_name(node->op)
+             << " " << (s0 ? ggml_type_name(s0->type) : "?") << "->" << ggml_type_name(node->type)
+             << " (" << node->ne[0] << "," << node->ne[1] << "," << node->ne[2] << "," << node->ne[3] << ")";
+        if (s0 && !ggml_is_contiguous(s0)) {
+            name << " src_strided";
+        }
+        if (!ggml_is_contiguous(node)) {
+            name << " dst_strided";
+        }
         return name.str();
     }
     return fusion_str + ggml_op_name(node->op);
