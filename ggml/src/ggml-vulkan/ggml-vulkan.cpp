@@ -14904,7 +14904,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         VK_CHECK(ctx->device->device.getQueryPoolResults(ctx->query_pool, 0, ctx->query_idx, ctx->query_idx*sizeof(uint64_t), timestamps.data(), sizeof(uint64_t), vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait), "get timestamp results", ctx->device);
         if (ctx->query_idx >= 2) {
             const uint64_t gpu_ns = uint64_t((timestamps[ctx->query_idx - 1] - timestamps[0]) * ctx->device->properties.limits.timestampPeriod);
-            ctx->perf_logger->log_graph((uint32_t)cgraph->n_nodes, ctx->perf_dispatch_count, (uint64_t)(perf_t1_us - perf_t0_us), gpu_ns / 1000);
+            const int64_t  now_us = ggml_time_us();
+            // gap = time this device sat idle between the previous graph returning and this one starting:
+            // scheduler copies, input uploads, sampling, the other device's half of the step
+            const uint64_t gap_us = ctx->perf_last_graph_end_us ? (uint64_t)(perf_t0_us - ctx->perf_last_graph_end_us) : 0;
+            ctx->perf_logger->log_graph((uint32_t)cgraph->n_nodes, ctx->perf_dispatch_count, (uint64_t)(perf_t1_us - perf_t0_us), gpu_ns / 1000,
+                                        (uint64_t)(now_us - perf_t0_us), gap_us);
+            ctx->perf_last_graph_end_us = now_us;
         }
         if (!vk_perf_logger_concurrent) {
             // Log each op separately
@@ -16712,12 +16718,14 @@ void vk_perf_logger::print_timings(bool force) {
         std::cerr << "Total time: " << total_all_op_times / 1000.0 << " us." << std::endl;
     }
     if (!graph_nodes.empty()) {
-        uint64_t nodes = 0, dispatches = 0, cpu = 0, gpu = 0;
+        uint64_t nodes = 0, dispatches = 0, cpu = 0, gpu = 0, wall = 0, gap = 0;
         for (size_t i = 0; i < graph_nodes.size(); ++i) {
             nodes += graph_nodes[i];
             dispatches += graph_dispatches[i];
             cpu += graph_cpu_us[i];
             gpu += graph_gpu_us[i];
+            wall += graph_wall_us[i];
+            gap += graph_gap_us[i];
         }
         const double n = (double)graph_nodes.size();
         std::cerr << "Graphs: " << graph_nodes.size()
@@ -16725,6 +16733,8 @@ void vk_perf_logger::print_timings(bool force) {
                   << ", dispatches " << dispatches / n
                   << ", cpu record " << cpu / n << " us"
                   << ", gpu busy " << gpu / n << " us"
+                  << ", wall " << wall / n << " us"
+                  << ", gap before " << gap / n << " us"
                   << " (cpu/gpu " << (gpu ? (double)cpu / (double)gpu : 0.0) << ")" << std::endl;
         std::cerr << "(note: perf logger serializes every op with a barrier, absolute times are inflated; compare ratios)" << std::endl;
     }
@@ -16735,6 +16745,8 @@ void vk_perf_logger::print_timings(bool force) {
     graph_dispatches.clear();
     graph_cpu_us.clear();
     graph_gpu_us.clear();
+    graph_wall_us.clear();
+    graph_gap_us.clear();
     node_desc.clear();
 }
 

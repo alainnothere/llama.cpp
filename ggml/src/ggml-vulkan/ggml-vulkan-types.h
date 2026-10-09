@@ -1223,11 +1223,13 @@ class vk_perf_logger {
     }
 
     // Per-graph summary: CPU time spent recording the command stream vs GPU busy time.
-    void log_graph(uint32_t n_nodes, uint32_t n_dispatches, uint64_t cpu_record_us, uint64_t gpu_us) {
+    void log_graph(uint32_t n_nodes, uint32_t n_dispatches, uint64_t cpu_record_us, uint64_t gpu_us, uint64_t wall_us, uint64_t gap_us) {
         graph_nodes.push_back(n_nodes);
         graph_dispatches.push_back(n_dispatches);
         graph_cpu_us.push_back(cpu_record_us);
         graph_gpu_us.push_back(gpu_us);
+        graph_wall_us.push_back(wall_us);
+        graph_gap_us.push_back(gap_us);
     }
 
     // Free-form per-node description set by the op implementation (e.g. which FA path was chosen).
@@ -1256,7 +1258,7 @@ class vk_perf_logger {
     std::map<std::string, std::vector<uint64_t>> timings;
     std::map<std::string, std::vector<uint64_t>> flops;
     std::vector<uint32_t> graph_nodes, graph_dispatches;
-    std::vector<uint64_t> graph_cpu_us, graph_gpu_us;
+    std::vector<uint64_t> graph_cpu_us, graph_gpu_us, graph_wall_us, graph_gap_us;
     uint32_t print_count {};
 };
 
@@ -1355,6 +1357,8 @@ struct ggml_backend_vk_context {
     // when set, the next node timestamp is logged under this label instead of the node
     // (used when an op already logged its main kernel via ggml_vk_perf_mark_node)
     const char * perf_trailing_label {};
+    // wall clock when the previous graph_compute on this context returned (perf logger gap measurement)
+    int64_t perf_last_graph_end_us {};
 };
 
 struct ggml_backend_vk_buffer_context {
