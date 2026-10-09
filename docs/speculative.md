@@ -374,6 +374,9 @@ top of it). The estimates live per slot and carry across requests. Server logs p
 --spec-ngram-mod-cache                  FNAME
                                         path to an ngram-mod table file, loaded at startup and written back on graceful shutdown (default: none)
                                         (env: LLAMA_ARG_SPEC_NGRAM_MOD_CACHE)
+--spec-ngram-mod-shadow-n               N
+                                        log only: lookup length of a second ngram-mod table that never drafts, its would-land stats are printed per request, persisted next to --spec-ngram-mod-cache as FNAME.shadow-nN when that is set, 0 = off (default: 0)
+                                        (env: LLAMA_ARG_SPEC_NGRAM_MOD_SHADOW_N)
 --spec-ngram-draft-n-max                N
                                         cap for n-gram drafts (all n-gram types), independent of the draft-model cap and the
                                         auto tuner; -1 = same cap as the draft model (default: -1)
@@ -516,7 +519,36 @@ draft by impl: none | steps 164 | step 0.2 ms
 - `acc hist`, `built hist`: steps per length bucket
 - `none`: steps where drafting was attempted but no implementation produced a draft
 
-With `-v` every step is also logged as `spec step: impl=... built=... offered=... accepted=... t=... ms`.
+Each `draft by impl` line ends with `ms by rows: R:step/draft(count) ...`: for every verify batch size R (offered
+tokens + 1, 65+ pooled) the mean step wall time and the mean time spent in the drafters' `draft()` calls, in ms, and
+the number of steps. This is the measured cost curve of the target: the Vulkan mat-vec path ends at 12 columns, so
+expect a jump at R = 13.
+
+Shadow lines (log only, nothing changes what is drafted or verified) follow when they have data:
+
+```
+chain truth: ngram | chains 32 | censored 1 | would land mean 5.4 | full 16 | hist 0:3 1-4:8 5-8:21 9-16:0 17-32:0 33-48:0 49-64:0 65+:0
+ext shadow: mtp+ngram | attempts 718 | hits 40 | tested 12 | landed mean 9.5 (over tested) | hist ... | built hist ...
+alt table: n=8 | attempts 165 | hits 12 | would land mean 2.0 | hist ... | built hist ... | censored 0
+mtp confidence: stop cap:600(acc 3.9) pmin:118(acc 2.1) other:0 | p bins landed/tested: <0.5 a/b 0.5 c/d 0.6 e/f 0.7 g/h 0.8 i/j 0.9 k/l
+```
+
+- `chain truth`: every n-gram chain is kept in full (before the cap) and compared with the tokens the target later
+  committed; `would land` is how many of the chain would have been accepted with no cap, `censored` chains ended with
+  the request before they resolved. Input for choosing `--spec-ngram-draft-n-max`.
+- `ext shadow`: on steps a draft model won, the ngram-mod table is looked up with the context plus the draft; `hits`
+  built a chain, `tested` are hits where the whole draft landed so the extension was really exercised, `landed` is how
+  many extension tokens would have been accepted. Input for an "n-gram extends the draft-model draft" feature.
+- `alt table` (`--spec-ngram-mod-shadow-n N`): a second ngram-mod table with N-token keys, looked up only when the main
+  table did not draft; `would land` as above. With `--spec-ngram-mod-cache FNAME` it is persisted as `FNAME.shadow-nN`
+  (loaded at startup, written on shutdown like the main table), otherwise it is RAM only and starts cold.
+- `mtp confidence`: why draft-mtp stopped (`cap`, `pmin` or `other`, with the mean accepted length of those steps) and,
+  per probability bin of the offered token, how many landed of how many the target tested. The gate `--spec-draft-p-min`
+  checks the top candidate; in probabilistic mode the offered token can have a lower p than the gate saw.
+
+With `-v` every step is also logged as `spec step: impl=... built=... offered=... accepted=... ext=... t=... ms`
+(`ext` = length of the shadow extension built that step). `spec_log_summary.py` in the bench folder sums these lines
+over a log file.
 
 ## Benchmarking
 

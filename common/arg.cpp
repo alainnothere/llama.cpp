@@ -4442,6 +4442,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.ngram_mod.cache_path = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_NGRAM_MOD_CACHE"));
+    add_opt(common_arg(
+        {"--spec-ngram-mod-shadow-n"}, "N",
+        string_format("log only: lookup length of a second ngram-mod table that never drafts, its would-land stats are printed per request, persisted next to --spec-ngram-mod-cache as FNAME.shadow-nN when that is set, 0 = off (default: %d)",
+            params.speculative.ngram_mod.shadow_n),
+        [](common_params & params, int value) {
+            if (value < 0 || value > 1024) {
+                throw std::invalid_argument("ngram-mod shadow n must be between 0 and 1024 inclusive");
+            }
+            params.speculative.ngram_mod.shadow_n = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_NGRAM_MOD_SHADOW_N"));
 
     add_opt(common_arg(
         {"--spec-ngram-simple-size-n"}, "N",

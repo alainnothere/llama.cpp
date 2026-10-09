@@ -435,6 +435,27 @@ struct server_spec_impl_stats {
     int hist_acc  [N_HIST] = {0};
     int hist_built[N_HIST] = {0};
 
+    // by verify batch rows (offered + 1): 1..64 exact, 65 = 65+
+    static constexpr int N_ROWS = 66;
+
+    int     rows_n        [N_ROWS] = {0};
+    int64_t rows_t_step_us [N_ROWS] = {0};
+    int64_t rows_t_draft_us[N_ROWS] = {0};
+
+    // rows:mean step ms/mean draft ms(count)
+    std::string rows_str() const {
+        std::string res;
+        for (int r = 1; r < N_ROWS; ++r) {
+            if (rows_n[r] == 0) {
+                continue;
+            }
+            const double n = rows_n[r];
+            res += string_format("%s%d%s:%.1f/%.1f(%d)", res.empty() ? "" : " ", r, r == N_ROWS - 1 ? "+" : "",
+                    rows_t_step_us[r]/n/1000.0, rows_t_draft_us[r]/n/1000.0, rows_n[r]);
+        }
+        return res;
+    }
+
     static int bucket(int64_t n) {
         if (n <= 0)  return 0;
         if (n <= 4)  return 1;
@@ -551,8 +572,15 @@ struct server_slot {
         st.hist_acc  [server_spec_impl_stats::bucket(n_accepted)]++;
         st.hist_built[server_spec_impl_stats::bucket(n_built)]++;
 
-        SLT_DBG(*this, "spec step: impl=%s built=%d offered=%d accepted=%d t=%.1f ms\n",
-                common_speculative_type_to_str(type).c_str(), n_built, n_offered, n_accepted, dt_us/1000.0);
+        const int i_rows = std::min(n_offered + 1, server_spec_impl_stats::N_ROWS - 1);
+
+        st.rows_n        [i_rows]++;
+        st.rows_t_step_us [i_rows] += dt_us;
+        st.rows_t_draft_us[i_rows] += common_speculative_t_draft_last_us(spec, id);
+
+        SLT_DBG(*this, "spec step: impl=%s built=%d offered=%d accepted=%d ext=%d t=%.1f ms\n",
+                common_speculative_type_to_str(type).c_str(), n_built, n_offered, n_accepted,
+                common_speculative_get_shadow_stats(spec, id).n_ext_last, dt_us/1000.0);
     }
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
@@ -1059,7 +1087,7 @@ struct server_slot {
 
             const double n = st.n_steps;
 
-            SLT_INF(*this, "draft by impl: %s | steps %d | built %.1f | offered %.1f | accepted %.1f (%.2f) | full %d | step %.1f ms | %.1f t/s | acc hist %s | built hist %s\n",
+            SLT_INF(*this, "draft by impl: %s | steps %d | built %.1f | offered %.1f | accepted %.1f (%.2f) | full %d | step %.1f ms | %.1f t/s | acc hist %s | built hist %s | ms by rows: %s\n",
                     common_speculative_type_to_str((common_speculative_type) t).c_str(), st.n_steps,
                     st.n_built/n, st.n_offered/n, st.n_accepted/n,
                     st.n_offered > 0 ? (double) st.n_accepted/st.n_offered : 0.0,
@@ -1067,12 +1095,81 @@ struct server_slot {
                     st.t_step_us/n/1000.0,
                     st.t_step_us > 0 ? (st.n_accepted + st.n_steps)*1e6/st.t_step_us : 0.0,
                     server_spec_impl_stats::hist_str(st.hist_acc).c_str(),
-                    server_spec_impl_stats::hist_str(st.hist_built).c_str());
+                    server_spec_impl_stats::hist_str(st.hist_built).c_str(),
+                    st.rows_str().c_str());
         }
 
         if (spec_n_steps_nodraft > 0) {
             SLT_INF(*this, "draft by impl: none | steps %d | step %.1f ms\n",
                     spec_n_steps_nodraft, spec_t_nodraft_us/(double) spec_n_steps_nodraft/1000.0);
+        }
+
+        // shadow chains: what the n-gram chains would have landed without the cap, and how far an
+        // ngram-mod extension of the draft-model drafts would have gone
+        {
+            const auto sh = common_speculative_get_shadow_stats(spec, id);
+
+            if (sh.ngram_chains + sh.ngram_censored > 0) {
+                const auto & h = sh.ngram_hist;
+                SLT_INF(*this, "chain truth: ngram | chains %d | censored %d | would land mean %.1f | full %d | hist 0:%d 1-4:%d 5-8:%d 9-16:%d 17-32:%d 33-48:%d 49-64:%d 65+:%d\n",
+                        sh.ngram_chains, sh.ngram_censored,
+                        sh.ngram_chains > 0 ? (double) sh.ngram_matched_sum/sh.ngram_chains : 0.0,
+                        sh.ngram_full, h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+            }
+
+            if (sh.ext_attempts > 0) {
+                const auto & h = sh.ext_landed_hist;
+                const auto & b = sh.ext_built_hist;
+                SLT_INF(*this, "ext shadow: mtp+ngram | attempts %d | hits %d | tested %d | landed mean %.1f (over tested) | hist 0:%d 1-4:%d 5-8:%d 9-16:%d 17-32:%d 33-48:%d 49+:%d | built hist 1-4:%d 5-8:%d 9-16:%d 17-32:%d 33-64:%d 65+:%d\n",
+                        sh.ext_attempts, sh.ext_hits, sh.ext_tested,
+                        sh.ext_tested > 0 ? (double) sh.ext_landed_sum/sh.ext_tested : 0.0,
+                        h[0], h[1], h[2], h[3], h[4], h[5], h[6],
+                        b[0], b[1], b[2], b[3], b[4], b[5]);
+            }
+
+            if (sh.alt_attempts > 0) {
+                const auto & h = sh.alt_hist;
+                const auto & b = sh.alt_built_hist;
+                SLT_INF(*this, "alt table: n=%d | attempts %d | hits %d | would land mean %.1f | hist 0:%d 1-4:%d 5-8:%d 9-16:%d 17-32:%d 33-48:%d 49-64:%d 65+:%d | built hist 1-4:%d 5-8:%d 9-16:%d 17-32:%d 33-64:%d 65+:%d | censored %d\n",
+                        sh.alt_n, sh.alt_attempts, sh.alt_hits,
+                        sh.alt_chains > 0 ? (double) sh.alt_matched_sum/sh.alt_chains : 0.0,
+                        h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7],
+                        b[0], b[1], b[2], b[3], b[4], b[5], sh.alt_censored);
+            }
+        }
+
+        // draft-mtp: landing rate by the drafter's probability of the offered token, and by stop reason
+        {
+            const auto ms = common_speculative_get_mtp_stats(spec, id);
+
+            const auto & ss = ms.stop_steps;
+            const auto & sa = ms.stop_accepted;
+
+            if (ss[COMMON_SPECULATIVE_MTP_STOP_CAP] + ss[COMMON_SPECULATIVE_MTP_STOP_PMIN] + ss[COMMON_SPECULATIVE_MTP_STOP_OTHER] > 0) {
+                const auto mean_acc = [&](int r) { return ss[r] > 0 ? (double) sa[r]/ss[r] : 0.0; };
+
+                std::string extra;
+                if (ms.na_tested > 0) {
+                    extra += string_format(" | n/a %d/%d", ms.na_landed, ms.na_tested);
+                }
+                std::string pos;
+                for (int k = 0; k < common_speculative_mtp_stats::N_POS; ++k) {
+                    if (ms.pos_tested[k] > 0) {
+                        pos += string_format(" %d%s:%d/%d", k, k == common_speculative_mtp_stats::N_POS - 1 ? "+" : "", ms.pos_landed[k], ms.pos_tested[k]);
+                    }
+                }
+                if (!pos.empty()) {
+                    extra += " | pos landed/tested:" + pos;
+                }
+
+                const auto & l = ms.pbin_landed;
+                const auto & t = ms.pbin_tested;
+                SLT_INF(*this, "mtp confidence: stop cap:%d(acc %.1f) pmin:%d(acc %.1f) other:%d | p bins landed/tested: <0.5 %d/%d 0.5 %d/%d 0.6 %d/%d 0.7 %d/%d 0.8 %d/%d 0.9 %d/%d%s\n",
+                        ss[COMMON_SPECULATIVE_MTP_STOP_CAP],  mean_acc(COMMON_SPECULATIVE_MTP_STOP_CAP),
+                        ss[COMMON_SPECULATIVE_MTP_STOP_PMIN], mean_acc(COMMON_SPECULATIVE_MTP_STOP_PMIN),
+                        ss[COMMON_SPECULATIVE_MTP_STOP_OTHER],
+                        l[0], t[0], l[1], t[1], l[2], t[2], l[3], t[3], l[4], t[4], l[5], t[5], extra.c_str());
+            }
         }
 
         common_speculative_print_stats(spec);

@@ -372,6 +372,8 @@ struct common_params_speculative_ngram_mod {
     float reset_occupancy = 0.0f; // wipe the table in begin() above this occupancy fraction (0 = never)
 
     std::string cache_path; // load at startup, save on graceful shutdown (empty = no persistence)
+
+    int32_t shadow_n = 0; // log only: n_match of a second, never drafted table (0 = off)
 };
 
 struct common_params_speculative_ngram_map {

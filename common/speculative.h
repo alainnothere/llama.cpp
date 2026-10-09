@@ -117,6 +117,112 @@ enum common_speculative_type common_speculative_type_last(const common_speculati
 int32_t common_speculative_n_built_last  (const common_speculative * spec, llama_seq_id seq_id);
 int32_t common_speculative_n_offered_last(const common_speculative * spec, llama_seq_id seq_id);
 
+// wall time of all the draft() calls tried for seq_id in the last common_speculative_draft() call
+int64_t common_speculative_t_draft_last_us(const common_speculative * spec, llama_seq_id seq_id);
+
+//
+// shadow chains (log only): what a draft would have landed if the target had verified more of it
+//
+
+enum common_speculative_shadow_kind {
+    COMMON_SPECULATIVE_SHADOW_NGRAM_FULL, // n-gram chain before the cap truncation
+    COMMON_SPECULATIVE_SHADOW_MTP_EXT,    // draft-model draft + ngram-mod extension of it
+    COMMON_SPECULATIVE_SHADOW_NGRAM_ALT,  // chain of the ngram-mod shadow table when the main one did not draft
+};
+
+struct common_speculative_shadow_chain {
+    common_speculative_shadow_kind kind = COMMON_SPECULATIVE_SHADOW_NGRAM_FULL;
+
+    size_t       pos_first = 0; // index in the committed token vector of tokens[0]
+    llama_tokens tokens;
+    int32_t      n_prefix  = 0; // MTP_EXT: leading tokens that are the offered draft
+};
+
+struct common_speculative_shadow_stats {
+    // NGRAM_FULL, matched buckets: 0, 1-4, 5-8, 9-16, 17-32, 33-48, 49-64, 65+
+    int32_t ngram_chains      = 0; // resolved
+    int32_t ngram_censored    = 0; // unresolved at request end (getter adds the still pending ones)
+    int32_t ngram_full        = 0;
+    int64_t ngram_matched_sum = 0;
+    int32_t ngram_hist[8]     = {};
+
+    // MTP_EXT, landed buckets: 0, 1-4, 5-8, 9-16, 17-32, 33-48, 49+; built buckets: 1-4, 5-8, 9-16, 17-32, 33-64, 65+
+    int32_t ext_attempts      = 0;
+    int32_t ext_hits          = 0;
+    int32_t ext_resolved      = 0;
+    int32_t ext_censored      = 0;
+    int32_t ext_tested        = 0; // resolved with the whole draft landed
+    int64_t ext_landed_sum    = 0; // over tested
+    int32_t ext_landed_hist[7] = {};
+    int32_t ext_built_hist[6]  = {};
+
+    int32_t n_ext_last        = 0; // extension built by the last draft call, 0 if none
+
+    // NGRAM_ALT, same buckets as NGRAM_FULL / ext built
+    int32_t alt_n             = 0; // n_match of the shadow table
+    int32_t alt_attempts      = 0;
+    int32_t alt_hits          = 0;
+    int32_t alt_chains        = 0; // resolved
+    int32_t alt_censored      = 0;
+    int64_t alt_matched_sum   = 0;
+    int32_t alt_hist[8]       = {};
+    int32_t alt_built_hist[6] = {};
+};
+
+// matched length of the chain against the committed tokens prompt ++ [id_last], -1 while unresolved
+int32_t common_speculative_shadow_resolve(const common_speculative_shadow_chain & chain, const llama_tokens & prompt, llama_token id_last);
+
+// per seq pending chains and stats
+struct common_speculative_shadow_seq {
+    static constexpr size_t N_PENDING_MAX = 8;
+
+    std::vector<common_speculative_shadow_chain> pending; // oldest first
+    common_speculative_shadow_stats stats;
+
+    void push(common_speculative_shadow_chain chain); // drops the oldest as censored on overflow
+    void resolve(const llama_tokens & prompt, llama_token id_last);
+    void censor_all();
+    void record(const common_speculative_shadow_chain & chain, int32_t matched);
+    void censor(const common_speculative_shadow_chain & chain);
+};
+
+common_speculative_shadow_stats common_speculative_get_shadow_stats(const common_speculative * spec, llama_seq_id seq_id);
+
+//
+// draft-mtp confidence (log only): landing rate by the drafter's probability of each offered token
+//
+
+enum common_speculative_mtp_stop {
+    COMMON_SPECULATIVE_MTP_STOP_CAP,   // reached n_max or the caller's cap
+    COMMON_SPECULATIVE_MTP_STOP_PMIN,  // top candidate below p_min
+    COMMON_SPECULATIVE_MTP_STOP_OTHER, // anything else (decode failure)
+    COMMON_SPECULATIVE_MTP_STOP_COUNT,
+};
+
+struct common_speculative_mtp_stats {
+    static constexpr int N_PBIN = 6;  // [0,0.5) [0.5,0.6) [0.6,0.7) [0.7,0.8) [0.8,0.9) [0.9,1]
+    static constexpr int N_POS  = 16; // 15 = 15+
+
+    int32_t stop_steps   [COMMON_SPECULATIVE_MTP_STOP_COUNT] = {};
+    int64_t stop_accepted[COMMON_SPECULATIVE_MTP_STOP_COUNT] = {};
+
+    int32_t pbin_tested[N_PBIN] = {};
+    int32_t pbin_landed[N_PBIN] = {};
+    int32_t na_tested = 0; // tokens without a probability (p <= 0 or not finite)
+    int32_t na_landed = 0;
+
+    int32_t pos_tested[N_POS] = {};
+    int32_t pos_landed[N_POS] = {};
+};
+
+// account one verified step: p[k] is the drafter's probability of offered token k (< 0 = n/a),
+// tokens [0, n_accepted) landed, token n_accepted (if offered) was rejected, the rest were not tested
+void common_speculative_mtp_stats_add(common_speculative_mtp_stats & st, const std::vector<float> & p,
+        int32_t n_offered, int32_t n_accepted, common_speculative_mtp_stop stop);
+
+// zeros if there is no draft-mtp implementation
+common_speculative_mtp_stats common_speculative_get_mtp_stats(const common_speculative * spec, llama_seq_id seq_id);
+
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
