@@ -5,6 +5,11 @@ bool vk_memory_logger_enabled = false;
 bool vk_perf_logger_enabled = false;
 
 bool vk_perf_logger_concurrent = false;
+bool vk_fa_mask_cache_disable = false;
+uint32_t vk_fa_splitk_pct = 100;
+uint32_t vk_fa_fold_max_n = 64;
+uint32_t vk_fa_fold_max_br = 16;
+bool vk_fa_fold_maskopt = true;
 
 bool vk_enable_sync_logger = false;
 

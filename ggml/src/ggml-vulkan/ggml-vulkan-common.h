@@ -6,6 +6,19 @@ extern ggml_backend_buffer_type_i ggml_backend_vk_buffer_type_interface;
 extern bool vk_memory_logger_enabled;
 extern bool vk_perf_logger_enabled;
 extern bool vk_perf_logger_concurrent;
+extern bool vk_fa_mask_cache_disable;
+extern uint32_t vk_fa_splitk_pct;
+// coopmat1 generalized GQA fold applies to Q batches up to this many tokens (0 disables)
+extern uint32_t vk_fa_fold_max_n;
+extern uint32_t vk_fa_fold_max_br;
+extern bool vk_fa_fold_maskopt;
+
+// Perf logger sub-dispatch marks. Only active with GGML_VK_PERF_LOGGER (non-concurrent mode).
+// ggml_vk_perf_mark: the time since the previous timestamp is logged under `label`.
+// ggml_vk_perf_mark_node: same, but logged as `node` (its op name + description); the node's own
+// trailing timestamp is then logged under `trailing_label`.
+void ggml_vk_perf_mark(ggml_backend_vk_context * ctx, vk_context& subctx, const char * label);
+void ggml_vk_perf_mark_node(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * node, const char * trailing_label);
 extern bool vk_enable_sync_logger;
 extern uint32_t vk_perf_logger_frequency;
 extern std::string vk_pipeline_stats_filter;
@@ -262,6 +275,7 @@ inline void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
     const uint32_t wg0 = CEIL_DIV(elements[0], pipeline->wg_denoms[0]);
     const uint32_t wg1 = CEIL_DIV(elements[1], pipeline->wg_denoms[1]);
     const uint32_t wg2 = CEIL_DIV(elements[2], pipeline->wg_denoms[2]);
+    ctx->perf_dispatch_count++;
     VK_LOG_DEBUG("ggml_vk_dispatch_pipeline(" << pipeline->name << ", {";
     for (auto& buffer : descriptor_buffer_infos) {
         std::cerr << "(" << buffer.buffer << ", " << buffer.offset << ", " << buffer.range << "), ";

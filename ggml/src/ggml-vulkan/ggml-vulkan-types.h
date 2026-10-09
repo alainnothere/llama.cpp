@@ -1209,6 +1209,11 @@ class vk_perf_logger {
 
 
     void log_timing(const ggml_tensor * node, const char *fusion_name, uint64_t time) {
+        if (node == nullptr) {
+            // a sub-dispatch mark (see ggml_vk_perf_mark): fusion_name is the label
+            timings[fusion_name ? fusion_name : "?"].push_back(time);
+            return;
+        }
         uint64_t n_flops;
         std::string name = get_node_fusion_name(node, fusion_name, &n_flops);
         if (n_flops) {
@@ -1216,6 +1221,18 @@ class vk_perf_logger {
         }
         timings[name].push_back(time);
     }
+
+    // Per-graph summary: CPU time spent recording the command stream vs GPU busy time.
+    void log_graph(uint32_t n_nodes, uint32_t n_dispatches, uint64_t cpu_record_us, uint64_t gpu_us) {
+        graph_nodes.push_back(n_nodes);
+        graph_dispatches.push_back(n_dispatches);
+        graph_cpu_us.push_back(cpu_record_us);
+        graph_gpu_us.push_back(gpu_us);
+    }
+
+    // Free-form per-node description set by the op implementation (e.g. which FA path was chosen).
+    // Appended to the op name so ops with identical shapes but different code paths are reported apart.
+    std::map<const ggml_tensor *, std::string> node_desc;
 
     void log_timing(const std::vector<ggml_tensor *> &nodes, const std::vector<const char *> &names, uint64_t time) {
         uint64_t total_flops = 0;
@@ -1238,6 +1255,8 @@ class vk_perf_logger {
   private:
     std::map<std::string, std::vector<uint64_t>> timings;
     std::map<std::string, std::vector<uint64_t>> flops;
+    std::vector<uint32_t> graph_nodes, graph_dispatches;
+    std::vector<uint64_t> graph_cpu_us, graph_gpu_us;
     uint32_t print_count {};
 };
 
@@ -1250,6 +1269,21 @@ struct ggml_backend_vk_context {
     ggml_vk_garbage_collector gc;
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset;
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, sync_staging;
+
+    // Scratch for FA inputs derived from the KQ mask (mask_opt bitmaps, sparse index lists).
+    // The mask is identical for every layer that shares it, so each (mask, params) is computed
+    // once per graph evaluation and reused; entries are cleared at the start of every graph.
+    vk_buffer prealloc_mask_scratch;
+    size_t prealloc_size_mask_scratch {};
+    bool prealloc_mask_scratch_need_sync {};
+    struct mask_scratch_entry {
+        const ggml_tensor * mask;
+        uint32_t kind;              // 0 = mask_opt bitmap, 1 = sparse index list
+        uint32_t p0, p1, p2, p3, p4;
+        size_t offset, size;
+    };
+    std::vector<mask_scratch_entry> mask_scratch_entries;
+    size_t mask_scratch_used {};
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
@@ -1316,6 +1350,11 @@ struct ggml_backend_vk_context {
     std::vector<int> query_node_idx;
     int32_t num_queries {};
     int32_t query_idx {};
+    // dispatches recorded for the current graph (perf logger summary)
+    uint32_t perf_dispatch_count {};
+    // when set, the next node timestamp is logged under this label instead of the node
+    // (used when an op already logged its main kernel via ggml_vk_perf_mark_node)
+    const char * perf_trailing_label {};
 };
 
 struct ggml_backend_vk_buffer_context {
