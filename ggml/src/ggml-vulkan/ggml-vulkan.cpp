@@ -3047,6 +3047,23 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q2_K][i], "mul_mat_vec_q2_k_q8_1_f32", arr_dmmv_q2_k_q8_1_f32_len[reduc], arr_dmmv_q2_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(2*rm_kq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(2*rm_kq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q3_K][i], "mul_mat_vec_q3_k_q8_1_f32", arr_dmmv_q3_k_q8_1_f32_len[reduc], arr_dmmv_q3_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_kq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_kq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_K][i], "mul_mat_vec_q4_k_q8_1_f32", arr_dmmv_q4_k_q8_1_f32_len[reduc], arr_dmmv_q4_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_kq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_kq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
+
+                if (w == DMMV_WG_SIZE_SUBGROUP && use_subgroups && is_rdna3_or_4 && i >= 4) {
+                    // shared-B variant: SG_ROWS subgroups per workgroup, subgroup reduction only
+                    const uint32_t sg = 4;
+                    const uint32_t rows_sg = 4;
+#define CREATE_MMVQ_SG(TYPE, NAME, ARR) \
+                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32_sg[TYPE][i], NAME "_sg", ARR ## _len[SHADER_REDUCTION_MODE_SUBGROUP], ARR ## _data[SHADER_REDUCTION_MODE_SUBGROUP], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rows_sg * sg, 1, 1}, {subgroup_size_int * sg, rows_sg, i+1, sg}, 1, true, true, subgroup_size_int);
+                    CREATE_MMVQ_SG(GGML_TYPE_Q4_0, "mul_mat_vec_q4_0_q8_1_f32", arr_dmmv_q4_0_q8_1_f32);
+                    CREATE_MMVQ_SG(GGML_TYPE_Q5_0, "mul_mat_vec_q5_0_q8_1_f32", arr_dmmv_q5_0_q8_1_f32);
+                    CREATE_MMVQ_SG(GGML_TYPE_Q8_0, "mul_mat_vec_q8_0_q8_1_f32", arr_dmmv_q8_0_q8_1_f32);
+                    CREATE_MMVQ_SG(GGML_TYPE_Q2_K, "mul_mat_vec_q2_k_q8_1_f32", arr_dmmv_q2_k_q8_1_f32);
+                    CREATE_MMVQ_SG(GGML_TYPE_Q3_K, "mul_mat_vec_q3_k_q8_1_f32", arr_dmmv_q3_k_q8_1_f32);
+                    CREATE_MMVQ_SG(GGML_TYPE_Q4_K, "mul_mat_vec_q4_k_q8_1_f32", arr_dmmv_q4_k_q8_1_f32);
+                    CREATE_MMVQ_SG(GGML_TYPE_Q5_K, "mul_mat_vec_q5_k_q8_1_f32", arr_dmmv_q5_k_q8_1_f32);
+                    CREATE_MMVQ_SG(GGML_TYPE_Q6_K, "mul_mat_vec_q6_k_q8_1_f32", arr_dmmv_q6_k_q8_1_f32);
+#undef CREATE_MMVQ_SG
+                }
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q5_K][i], "mul_mat_vec_q5_k_q8_1_f32", arr_dmmv_q5_k_q8_1_f32_len[reduc], arr_dmmv_q5_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_kq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_kq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q6_K][i], "mul_mat_vec_q6_k_q8_1_f32", arr_dmmv_q6_k_q8_1_f32_len[reduc], arr_dmmv_q6_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_kq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_kq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
 
@@ -5303,6 +5320,9 @@ void ggml_vk_instance_init() {
     if (const char * e = getenv("GGML_VK_MMVQ_Q6K")) {
         vk_mmvq_q6k = atoi(e) != 0 ? 1 : 0;
     }
+    // off by default: measured 2026-10-09 on a 7900 XT (q4_K 32768x8192) as -4% at n=6, +4% at n=8,
+    // +16% at n=12 vs the plain 4-row workgroup; the B re-reads through L2 were not the bottleneck
+    vk_mmvq_sg = getenv("GGML_VK_MMVQ_SG") != nullptr && atoi(getenv("GGML_VK_MMVQ_SG")) != 0;
     if (const char * e = getenv("GGML_VK_MMVQ_ROWS")) {
         vk_mmvq_rows_override = (uint32_t)std::stoul(e);
     }
@@ -5664,6 +5684,9 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
     if (b_type == GGML_TYPE_Q8_1) {
         if (ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
             dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
+        }
+        if (vk_mmvq_sg && ctx->device->pipeline_dequant_mul_mat_vec_q8_1_f32_sg[a_type][num_cols-1] != nullptr) {
+            return ctx->device->pipeline_dequant_mul_mat_vec_q8_1_f32_sg[a_type][num_cols-1];
         }
         return ctx->device->pipeline_dequant_mul_mat_vec_q8_1_f32[dmmv_wg][a_type][num_cols-1];
     }

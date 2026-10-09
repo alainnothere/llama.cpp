@@ -2,6 +2,7 @@
 
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
 #extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_basic : require
 
 #define MMQ
 #define NEEDS_IQ1S_GRID_GPU
@@ -32,6 +33,17 @@ uint a_offset, b_offset, d_offset;
 #if defined(DATA_A_QUANT_LEGACY) || defined(DATA_A_MXFP4) || defined(DATA_A_Q2_0) || defined(DATA_A_QUANT_K)
 #define MMVQ_A_CACHED
 #endif
+
+// SG_ROWS > 0: the workgroup is SG_ROWS subgroups, each computing its own NUM_ROWS rows over the
+// same k slice; the B (activation) slice of each iteration is staged once in shared memory and
+// read by all of them. Cuts B traffic through L2 by SG_ROWS: at n=12 a 4-row workgroup streamed
+// 853 MB of B against 151 MB of A (q4_K 32768x8192) and was L2-bound (2026-10-09).
+layout (constant_id = 3) const uint SG_ROWS = 0;
+const uint LANES = (SG_ROWS > 0) ? (BLOCK_SIZE / SG_ROWS) : BLOCK_SIZE;
+const uint BSH_QS_SIZE = (SG_ROWS > 0) ? (2 * NUM_COLS * LANES * (K_PER_ITER / 4)) : 1;
+const uint BSH_DS_SIZE = (SG_ROWS > 0) ? (2 * NUM_COLS * LANES) : 1;
+shared int32_t bsh_qs[BSH_QS_SIZE];
+shared vec2    bsh_ds[BSH_DS_SIZE];
 
 #ifdef MMVQ_A_CACHED
 int32_t cache_b_qs[NUM_COLS][K_PER_ITER / 4];
@@ -89,8 +101,67 @@ void load_b(const uint j, const uint col, const uint b_qs_idx) {
 #endif
 }
 
-void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint col, const uint b_qs_idx) {
+// SG_ROWS path: stage this iteration's B slice (all columns, all lanes) into shared memory
+// cooperatively, then every lane picks up its own chunk. Double-buffered so one barrier per
+// iteration suffices (reads of buffer b finish before the barrier of the next iteration, which
+// precedes any write into b again).
+void stage_b(const uint buf, const uint col_base, const uint tid) {
+    const uint n_chunks = NUM_COLS * LANES;
+    for (uint c = tid; c < n_chunks; c += BLOCK_SIZE) {
+        const uint j    = c / LANES;
+        const uint lane = c % LANES;
+        const uint col  = col_base + lane * K_PER_ITER;
+        if (col >= p.ncols) {
+            continue;   // past the end of k: no lane consumes this chunk
+        }
+        const uint b_qs_idx = lane % (32 / K_PER_ITER);
+        const uint b_block_idx = (j*p.batch_stride_b + col) / QUANT_K_Q8_1 + b_offset;
+        const uint b_block_idx_outer = b_block_idx / 4;
+        const uint b_block_idx_inner = b_block_idx % 4;
+        const uint base = ((buf * NUM_COLS + j) * LANES + lane) * (K_PER_ITER / 4);
+        bsh_ds[(buf * NUM_COLS + j) * LANES + lane] = vec2(data_b[b_block_idx_outer].ds[b_block_idx_inner]);
+#if QUANT_R == 2
+        bsh_qs[base + 0] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx];
+        bsh_qs[base + 1] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx + 4];
+#elif K_PER_ITER == 8
+        bsh_qs[base + 0] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx * 2];
+        bsh_qs[base + 1] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx * 2 + 1];
+#elif K_PER_ITER == 16
+        {
+            const ivec4 v = data_b_v4[b_block_idx_outer].qs[b_block_idx_inner * 2 + b_qs_idx];
+            bsh_qs[base + 0] = v.x;
+            bsh_qs[base + 1] = v.y;
+            bsh_qs[base + 2] = v.z;
+            bsh_qs[base + 3] = v.w;
+        }
+#else
+        {
+            const ivec4 v0 = data_b_v4[b_block_idx_outer].qs[b_block_idx_inner * 2    ];
+            const ivec4 v1 = data_b_v4[b_block_idx_outer].qs[b_block_idx_inner * 2 + 1];
+            bsh_qs[base + 0] = v0.x; bsh_qs[base + 1] = v0.y; bsh_qs[base + 2] = v0.z; bsh_qs[base + 3] = v0.w;
+            bsh_qs[base + 4] = v1.x; bsh_qs[base + 5] = v1.y; bsh_qs[base + 6] = v1.z; bsh_qs[base + 7] = v1.w;
+        }
+#endif
+    }
+}
+
+void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint col, const uint b_qs_idx, const uint it, const uint lane, const uint tid) {
 #ifdef MMVQ_A_CACHED
+    if (SG_ROWS > 0) {
+        const uint buf = it & 1;
+        stage_b(buf, col - lane * K_PER_ITER, tid);
+        barrier();
+        if (col >= p.ncols) {
+            return;     // this lane's chunk is past the end of k (workgroup-uniform iteration count)
+        }
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            const uint base = ((buf * NUM_COLS + j) * LANES + lane) * (K_PER_ITER / 4);
+            [[unroll]] for (uint i = 0; i < K_PER_ITER / 4; ++i) {
+                cache_b_qs[j][i] = bsh_qs[base + i];
+            }
+            cache_b_ds[j] = bsh_ds[(buf * NUM_COLS + j) * LANES + lane];
+        }
+    } else
     // all B columns first, then each A block exactly once
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
         load_b(j, col, b_qs_idx);
@@ -122,7 +193,8 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
 }
 
 void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
-    const uint tid = gl_LocalInvocationID.x;
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint lane = (SG_ROWS > 0) ? gl_SubgroupInvocationID : tid;
 
     get_offsets(a_offset, b_offset, d_offset);
     a_offset *= QUANT_K / QUANT_K_Q8_1;
@@ -136,18 +208,23 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
         }
     }
 
-    const uint col_stride = K_PER_ITER * BLOCK_SIZE;
+    const uint col_stride = K_PER_ITER * LANES;
     uint num_iters = p.ncols / col_stride;
-    if (num_iters * col_stride + K_PER_ITER * tid < p.ncols) {
+    if (num_iters * col_stride + K_PER_ITER * lane < p.ncols) {
         num_iters++;
     }
+    if (SG_ROWS > 0) {
+        // the staging loop is workgroup-wide, so every lane must run the same number of iterations
+        num_iters = (p.ncols + col_stride - 1) / col_stride;
+    }
 
-    const uint b_qs_idx = tid % (32 / K_PER_ITER);
-    uint col = tid * K_PER_ITER;
+    const uint b_qs_idx = lane % (32 / K_PER_ITER);
+    uint col = lane * K_PER_ITER;
+    uint it = 0;
     while (num_iters >= 4) {
         // Manually partially unroll the loop
         [[unroll]] for (uint k = 0; k < 4; ++k) {
-            iter(temp, first_row, num_rows, col, b_qs_idx);
+            iter(temp, first_row, num_rows, col, b_qs_idx, it++, lane, tid);
             col += col_stride;
         }
 
@@ -156,22 +233,24 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
 
     if (num_iters >= 2) {
         // Manually partially unroll the loop
-        iter(temp, first_row, num_rows, col, b_qs_idx);
+        iter(temp, first_row, num_rows, col, b_qs_idx, it++, lane, tid);
         col += col_stride;
-        iter(temp, first_row, num_rows, col, b_qs_idx);
+        iter(temp, first_row, num_rows, col, b_qs_idx, it++, lane, tid);
         col += col_stride;
         num_iters -= 2;
     }
 
     if (num_iters > 0) {
-        iter(temp, first_row, num_rows, col, b_qs_idx);
+        iter(temp, first_row, num_rows, col, b_qs_idx, it++, lane, tid);
     }
 
-    reduce_result(temp, d_offset, first_row, num_rows, tid);
+    reduce_result(temp, d_offset, first_row, num_rows, lane);
 }
 
 void main() {
-    const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+    const uint wg_rows   = (SG_ROWS > 0) ? NUM_ROWS * SG_ROWS : NUM_ROWS;
+    const uint first_row = wg_rows * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z)
+                         + ((SG_ROWS > 0) ? NUM_ROWS * gl_SubgroupID : 0);
 
 #ifdef NEEDS_INIT_IQ_SHMEM
     init_iq_shmem(gl_WorkGroupSize);
@@ -182,6 +261,10 @@ void main() {
         compute_outputs(first_row, NUM_ROWS);
     } else {
         if (first_row >= p.stride_d) {
+            if (SG_ROWS > 0) {
+                // this subgroup has no rows but must still take part in the workgroup barriers
+                compute_outputs(first_row, 0);
+            }
             return;
         }
         compute_outputs(first_row, p.stride_d - first_row);

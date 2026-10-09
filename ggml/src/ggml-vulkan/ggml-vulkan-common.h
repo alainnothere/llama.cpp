@@ -9,6 +9,7 @@ extern bool vk_perf_logger_concurrent;
 extern bool vk_fa_mask_cache_disable;
 extern int vk_mmvq_q6k;              // -1 auto, 0 off, 1 on
 extern uint32_t vk_mmvq_rows_override; // 0 = heuristic
+extern bool vk_mmvq_sg;               // GGML_VK_MMVQ_SG=1: shared-B 4-subgroup mmvq variant (RDNA3/4, n>=5); off by default, see ggml-vulkan.cpp
 extern int vk_mmvq_wg_override;      // -1 heuristic, 0 subgroup, 1 large
 extern uint32_t vk_fa_splitk_pct;
 // coopmat1 generalized GQA fold applies to Q batches up to this many tokens (0 disables)
