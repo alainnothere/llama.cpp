@@ -8211,8 +8211,15 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // n=6 587->220 us, n=12 452->308 us per layer (with the small-batch mask_opt below). Tiles taller
     // than 16 rows lose: shared memory triples and occupancy halves (Br=48: 405 us, Br=32: 530 us),
     // so GGML_VK_FA_FOLD_MAX_BR defaults to 16. Sparse is disabled when gqa_T > 1.
+    // GGML_VK_FA_FOLD_MAX_N defaults to 16 (= the tile): for 17..64 tokens the fold splits the batch
+    // into 2-token groups with split_k 1 and loses mask_opt; measured 1.4-1.9x slower than unfolded
+    // at 92k ctx on the 27B (qk=6).
+    // Only worth it when the folded tile holds more rows than the unfolded one (n rows): at qk=6 a
+    // 16-row tile holds 2 tokens = 12 rows, so n=12 gains nothing from folding (log 7, 2026-10-09).
+    const uint32_t fold_rows = (vk_fa_fold_max_br / qk_ratio) * qk_ratio;
     const bool gqa_fold_T = gqa_fold_ok && tuning_params.path == FA_COOPMAT1 && !use_dequant_kv &&
-                            vk_fa_fold_max_n > 0 && neq1 <= vk_fa_fold_max_n && qk_ratio <= 64;
+                            vk_fa_fold_max_n > 0 && neq1 <= vk_fa_fold_max_n && qk_ratio <= 64 &&
+                            fold_rows > (uint32_t)neq1;
     uint32_t gqa_T = 1;
 
     if (gqa_fold_ok && ((N <= 8 && qk_ratio <= max_gqa) || gqa_fold_T)) {
@@ -8316,10 +8323,13 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // Small-batch GQA (decode / speculative verify): the mask is almost entirely zeros, so the
     // all-zero / all-neg-inf bitmap lets the kernel skip the mask load and add on nearly every tile.
     // The bitmap is per Br-row tile of the mask, so every token of the batch must be in tile 0.
-    const bool small_batch_mask_opt = vk_fa_fold_maskopt && gqa_ratio > 1 && neq1 <= tuning_params.block_rows &&
-                                      nem0 >= 16 * tuning_params.block_cols * 4;
+    // The bitmap is computed once per graph (prealloc_mask_scratch), so the old n >= 32 cost gate
+    // is obsolete: any batch over a long KV benefits. Measured 8-11% per FA call at every shape
+    // including n=1 on the 27B at 92k (log 6 vs 7, 2026-10-09).
+    const bool long_kv_mask_opt = vk_fa_fold_maskopt && nem0 >= 16 * tuning_params.block_cols * 4 &&
+                                  (gqa_T == 1 || neq1 <= tuning_params.block_rows);
     bool use_mask_opt = mask && !use_sparse &&
-                        ((gqa_T == 1 && nem1 >= 32 && nem0 * nem1 > 32768) || small_batch_mask_opt) &&
+                        ((nem1 >= 32 && nem0 * nem1 > 32768) || long_kv_mask_opt) &&
                         nem0 >= tuning_params.block_cols * 16
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
