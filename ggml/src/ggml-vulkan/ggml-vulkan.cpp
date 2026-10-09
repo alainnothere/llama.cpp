@@ -1417,7 +1417,8 @@ vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_
                      (use_mask          ? 2 : 0) |
                      (use_logit_softcap ? 4 : 0) |
                      (old_amd_windows   ? 8 : 0) |
-                     (use_sparse        ? 16 : 0);
+                     (use_sparse        ? 16 : 0) |
+                     (vk_fa_ablate & 0x1E0);   // profiling only, see flash_attn_base.glsl
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
@@ -5310,6 +5311,9 @@ void ggml_vk_instance_init() {
     }
     if (const char * e = getenv("GGML_VK_FA_SPLITK_PCT")) {
         vk_fa_splitk_pct = std::max(1u, (uint32_t)std::stoul(e));
+    }
+    if (const char * e = getenv("GGML_VK_FA_ABLATE")) {
+        vk_fa_ablate = (uint32_t)std::stoul(e);
     }
     if (const char * e = getenv("GGML_VK_FA_FOLD_MAX_N")) {
         vk_fa_fold_max_n = (uint32_t)std::stoul(e);

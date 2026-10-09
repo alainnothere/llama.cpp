@@ -176,7 +176,7 @@ void main() {
             mask_cache[idx] = f16vec4(0);
         }
 
-        if (MASK_ENABLE) {
+        if (MASK_ENABLE && !ABL_MASK) {
             if (USE_MASK_OPT && mask_opt_idx != j / 16) {
                 mask_opt_idx = j / 16;
                 mask_opt = data_mask_opt[mo_offset + mask_opt_idx];
@@ -303,6 +303,7 @@ void main() {
         coopmat<FLOAT_TYPE, gl_ScopeSubgroup, MatBc, 16, gl_MatrixUseA> KMat;
         coopmat<FLOAT_TYPE, gl_ScopeSubgroup, 16, MatBr, gl_MatrixUseB> QMat;
 
+        if (!ABL_QK)
         [[unroll]] for (uint32_t d = 0; d < HSK_pad / 16; ++d) {
             // If SHMEM_STAGING is set, a Bc * HSK_pad size tile of K is loaded to shmem
             // If not, K is loaded directly from global memory if aligned, otherwise
@@ -377,7 +378,7 @@ void main() {
             barrier();
         }
 
-        if (MASK_ENABLE && mask_opt_bits != MASK_OPT_ALL_ZERO) {
+        if (MASK_ENABLE && !ABL_MASK && mask_opt_bits != MASK_OPT_ALL_ZERO) {
             [[unroll]] for (uint32_t idx = 0; idx < Bc * Br / 4; idx += gl_WorkGroupSize.x) {
                 uint32_t c = (idx + tid) / (Br / 4);
                 uint32_t r = (idx + tid) % (Br / 4);
@@ -418,6 +419,10 @@ void main() {
             eMf[r] = exp(Moldf - Mf[r]);
 
             Lf[r] = eMf[r]*Lf[r];
+            if (ABL_SOFTMAX) {
+                eMf[r] = 1.0f;
+                Mf[r] = 0.0f;
+            }
         }
 
         [[unroll]] for (uint32_t d0 = 0; d0 < HSV / 4; d0 += threads_per_rowgroup) {
@@ -437,7 +442,8 @@ void main() {
                     Psh[col * psh_stride + row / 4] = FLOAT_TYPEV4(0.0f);
                 } else {
                     const vec4 mfvec = vec4(Mf[r], Mf[r + 1], Mf[r + 2], Mf[r + 3]);
-                    const FLOAT_TYPEV4 Pf = FLOAT_TYPEV4(exp(vec4(sfsh[row / 4 + col * sfshstride]) - mfvec));
+                    const FLOAT_TYPEV4 Pf = ABL_SOFTMAX ? FLOAT_TYPEV4(vec4(sfsh[row / 4 + col * sfshstride]))
+                                                      : FLOAT_TYPEV4(exp(vec4(sfsh[row / 4 + col * sfshstride]) - mfvec));
                     [[unroll]] for (uint32_t vec_idx = 0; vec_idx < 4; ++vec_idx) {
                         Lf[r + vec_idx] += Pf[vec_idx];
                     }
@@ -477,6 +483,7 @@ void main() {
         const uint num_hsv_tiles = (HSV + MatBc * row_split - 1) / (MatBc * row_split); // round up
 
         // Each subgroup handles HSV/4 columns
+        if (!ABL_PV)
         [[unroll]] for (uint32_t hsv_tile = 0; hsv_tile < num_hsv_tiles; ++hsv_tile) {
             const uint hsv_offset = (hsv_tile * row_split + gl_SubgroupID) * 16;
 

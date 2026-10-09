@@ -26,6 +26,11 @@ const bool LOGIT_SOFTCAP   = (Flags & 4) != 0;
 const bool OLD_AMD_WINDOWS = (Flags & 8) != 0;
 // Sparse: gather binding-7 indices instead of scanning [0,KV); p.split_kv = n_kv_max.
 const bool USE_SPARSE      = (Flags & 16) != 0;
+// Ablation bits for profiling (GGML_VK_FA_ABLATE): results are wrong when set, timing is the point.
+const bool ABL_MASK        = (Flags & 32)  != 0; // skip mask load and add
+const bool ABL_SOFTMAX     = (Flags & 64)  != 0; // skip row max / exp / rescale (P = S)
+const bool ABL_PV          = (Flags & 128) != 0; // skip the P.V product and O accumulation
+const bool ABL_QK          = (Flags & 256) != 0; // skip the K loads and Q.K^T product (S = 0)
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
