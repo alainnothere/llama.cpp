@@ -117,6 +117,7 @@ class ServerProcess:
     media_path: str | None = None
     sleep_idle_seconds: int | None = None
     cache_ram: int | None = None
+    override_kv: str | None = None
     cache_disk_path: str | None = None
     cache_disk_queue_depth: int | None = None
     checkpoint_spill_max: int | None = None
@@ -295,6 +296,8 @@ class ServerProcess:
             server_args.extend(["--sleep-idle-seconds", self.sleep_idle_seconds])
         if self.cache_ram is not None:
             server_args.extend(["--cache-ram", self.cache_ram])
+        if self.override_kv:
+            server_args.extend(["--override-kv", self.override_kv])
         if self.cache_disk_path is not None:
             server_args.extend(["--cache-disk-path", self.cache_disk_path])
         if self.cache_disk_queue_depth is not None:

@@ -944,7 +944,8 @@ struct server_slot {
             state = SLOT_STATE_IDLE;
 
             // do not keep context of the child slots - the parent's context is enough
-            if (task->is_child()) {
+            // nor of the stateless slots - no task ever reuses it
+            if (task->is_child() || task->is_stateless()) {
                 prompt_clear();
             }
 
@@ -1988,6 +1989,13 @@ private:
             batch.init(ctx_tgt, std::max(n_batch, params_base.n_parallel), n_embd);
         }
 
+        // decision requests rarely repeat a state, the prompt cache is opt-in for decision models
+        if (decision.type != COMMON_DECISION_TYPE_NONE && !params_base.cache_ram_explicit) {
+            SRV_INF("%s", "decision model: prompt cache disabled by default, use `--cache-ram N` to enable it\n");
+            params_base.cache_ram_mib    = 0;
+            params_base.cache_idle_slots = false;
+        }
+
         if (params_base.cache_ram_mib != 0) {
             if (params_base.cache_ram_mib < 0) {
                 SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
@@ -2339,8 +2347,8 @@ private:
         if (ret) {
             update_cache = update_cache && prompt_cache;
 
-            // cache prompts only for completion tasks
-            update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
+            // cache prompts only for the tasks that reuse them
+            update_cache = update_cache && !task.is_stateless();
 
             if (update_cache) {
                 SRV_TRC("%s", "updating prompt cache\n");
@@ -4237,9 +4245,7 @@ private:
                                 return;
                             }
 
-                            const bool is_stateless_task = slot.task->type == SERVER_TASK_TYPE_EMBEDDING || slot.task->type == SERVER_TASK_TYPE_RERANK;
-
-                            if (slot.task->params.cache_prompt && !is_stateless_task) {
+                            if (slot.task->params.cache_prompt && !slot.task->is_stateless()) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
@@ -4354,10 +4360,11 @@ private:
                             // it here and let the memory answer - the budget is not the only
                             // precondition (a rollback may already be pending from a speculative accept
                             // that stopped on EOG, and a state restored from a checkpoint has no usable
-                            // snapshot groups until decodes refresh them). when it fails, pos_min_thold
-                            // must force the checkpoint search: without that the search is skipped, the
-                            // seq_rm below refuses, and the whole prompt is re-processed on every
-                            // follow-up turn whose divergence sits exactly at the previous stop token.
+                            // snapshot groups until decodes refresh them). when it fails, pos_eval moves
+                            // back one token so pos_min_thold forces the checkpoint search: without that
+                            // the search is skipped, the seq_rm below refuses, and the whole prompt is
+                            // re-processed on every follow-up turn whose divergence sits exactly at the
+                            // previous stop token.
                             bool needs_tail_rewind = false;
                             if (n_past > 0 && (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt))) {
                                 const llama_pos pos_tail = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
@@ -4379,8 +4386,17 @@ private:
                                 }
                             }
 
-                            // the largest pos_min required for a checkpoint to be useful
-                            const auto pos_min_thold = std::max(0, pos_next - n_swa - ((has_new_tokens && !needs_tail_rewind) ? 0 : 1));
+                            // pos_eval is the position of the first token that will be evaluated
+                            const llama_pos pos_eval = pos_next - ((has_new_tokens && !needs_tail_rewind) ? 0 : 1);
+
+                            // a state or a checkpoint is usable when its pos_min <= pos_min_thold.
+                            // SWA: the token at pos_eval attends to the positions > pos_eval - n_swa
+                            // (is_masked_swa: p1 - p0 >= n_swa), so the window must start at or before
+                            // pos_eval - n_swa + 1. a saved SWA state keeps exactly its window
+                            // (pos_max - n_swa + 1), so the bound must be exact, not a cell or two short.
+                            // no SWA: the state must not extend to pos_eval (a recurrent tail at
+                            // pos_eval already holds the token about to be evaluated).
+                            const auto pos_min_thold = std::max(0, n_swa > 0 ? pos_eval - n_swa + 1 : pos_eval);
 
                             // Only enter checkpoint recovery when there is an actual divergence
                             // (n_past < slot tokens). When n_past == slot.n_tokens() the new
@@ -4437,9 +4453,10 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                // pos_min == pos_min_thold means the KV window starts exactly
-                                // where SWA requires — no rewind needed. > catches the case
-                                // where SWA has slid the window past the required minimum.
+                                // pos_min == pos_min_thold: the SWA window starts exactly at the
+                                // oldest position pos_eval attends to - no rewind needed. > means
+                                // the window has slid past it (or, without SWA, the state already
+                                // holds pos_eval) - roll back to a checkpoint.
                                 if (pos_min > pos_min_thold) {
                                     // min-step thinning erases list entries but never their cp_ files.
                                     // re-register the surviving files so the search below can use them.
@@ -4455,7 +4472,10 @@ private:
                                         SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", it->pos_min, it->pos_max, pos_min_thold);
 
                                         // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
-                                        if (it->pos_max > pos_next || !(it->pos_min < pos_min_thold || it->pos_min == 0)) {
+                                        // SWA: same inclusive bound as the live state above. no SWA: keep the strict
+                                        // bound - a checkpoint whose pos_min reaches pos_eval holds pos_eval already
+                                        const bool ckpt_window_ok = n_swa > 0 ? it->pos_min <= pos_min_thold : it->pos_min < pos_min_thold;
+                                        if (it->pos_max > pos_next || !(ckpt_window_ok || it->pos_min == 0)) {
                                             ++it;
                                             continue;
                                         }
