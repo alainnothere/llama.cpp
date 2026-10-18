@@ -424,7 +424,9 @@ void main() {
                         acc += dotPacked4x8EXT(Qf[qib].qs[qiqs + d], k_quants[d]);
                     }
 
-                    Sf[r][c] += ACC_TYPE(acc) * ACC_TYPE(Qf[qib].ds.x) * k_dm.x;
+                    // scale in f32: a q8_0 int dot reaches 32*127*127 > f16 max, so ACC_TYPE(acc)
+                    // is inf with f16 accumulation
+                    Sf[r][c] += ACC_TYPE(float(acc) * float(Qf[qib].ds.x) * float(k_dm.x));
                     if ((d_tid * (HSK_per_thread / 4) + d_block) % 8 == 0) {
                         Sf[r][c] += k_dot_correction(qib, k_dm);
                     }

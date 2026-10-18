@@ -17,6 +17,10 @@ extern uint32_t vk_fa_fold_max_n;
 extern uint32_t vk_fa_ablate;   // GGML_VK_FA_ABLATE bits 32/64/128/256, profiling only
 extern uint32_t vk_fa_fold_max_br;
 extern bool vk_fa_fold_maskopt;
+// GGML_VK_FA_F16ACC: 1 = f16 accumulation even when the op asks for GGML_PREC_F32, 0 = obey the op
+extern int vk_fa_f16acc;
+// GGML_VK_FA_SPARSE_MIN_RATIO: f16-KV, non-cm2 sparse gate, sparse when KV >= max(4096, ratio * n_kv_max)
+extern uint32_t vk_fa_sparse_min_ratio_f16;
 
 // Perf logger sub-dispatch marks. Only active with GGML_VK_PERF_LOGGER (non-concurrent mode).
 // ggml_vk_perf_mark: the time since the previous timestamp is logged under `label`.

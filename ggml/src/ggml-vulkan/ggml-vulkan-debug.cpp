@@ -15,6 +15,8 @@ uint32_t vk_fa_fold_max_n = 16;
 uint32_t vk_fa_ablate = 0;
 uint32_t vk_fa_fold_max_br = 16;
 bool vk_fa_fold_maskopt = true;
+int vk_fa_f16acc = 0;
+uint32_t vk_fa_sparse_min_ratio_f16 = 2;
 
 bool vk_enable_sync_logger = false;
 

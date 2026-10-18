@@ -5342,6 +5342,17 @@ void ggml_vk_instance_init() {
         vk_fa_fold_max_br = std::max(16u, std::min(64u, (uint32_t)std::stoul(e) / 16 * 16));
     }
     vk_fa_fold_maskopt = getenv("GGML_VK_FA_FOLD_MASKOPT_DISABLE") == nullptr;
+    if (const char * e = getenv("GGML_VK_FA_F16ACC")) {
+        vk_fa_f16acc = atoi(e) != 0 ? 1 : 0;
+    }
+    if (const char * e = getenv("GGML_VK_FA_SPARSE_MIN_RATIO")) {
+        vk_fa_sparse_min_ratio_f16 = std::max(1u, (uint32_t)std::stoul(e));
+    }
+    if (vk_fa_f16acc || vk_fa_sparse_min_ratio_f16 != 2) {
+        GGML_LOG_WARN("ggml_vulkan: FA f16 accumulation %s (GGML_VK_FA_F16ACC=0 to obey GGML_PREC_F32), "
+                      "f16 sparse min ratio %u (GGML_VK_FA_SPARSE_MIN_RATIO=2 for the old gate)\n",
+                      vk_fa_f16acc ? "forced on" : "off", vk_fa_sparse_min_ratio_f16);
+    }
     vk_enable_sync_logger = getenv("GGML_VK_SYNC_LOGGER") != nullptr;
     vk_memory_logger_enabled = getenv("GGML_VK_MEMORY_LOGGER") != nullptr;
     const char* GGML_VK_PIPELINE_STATS = getenv("GGML_VK_PIPELINE_STATS");
@@ -8215,7 +8226,10 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     uint32_t workgroups_y = (uint32_t)neq2;
     uint32_t workgroups_z = (uint32_t)neq3;
 
-    const bool f32acc = !ctx->device->fp16 || dst->op_params[3] == GGML_PREC_F32 || k->type == GGML_TYPE_BF16;
+    // GGML_VK_FA_F16ACC=1 overrides the op's GGML_PREC_F32 (llama-graph sets it on every FA); no-fp16
+    // devices and BF16 K have no f16acc pipelines, so they stay f32acc
+    const bool f32acc = !ctx->device->fp16 || k->type == GGML_TYPE_BF16 ||
+                        (dst->op_params[3] == GGML_PREC_F32 && vk_fa_f16acc != 1);
 
     // dequant K/V once into an f16 scratch, reordered KV layout so FA can read without a stride
     auto is_dense_kv_cache = [](const ggml_tensor * t) {
@@ -8228,7 +8242,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     const bool v_quant = v->type != GGML_TYPE_F16 && v->type != GGML_TYPE_BF16 && v->type != GGML_TYPE_F32;
     const bool kv_raw = (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_BF16) && k->type == v->type;
     // gated to AMD, except RDNA4, which regressed in benchmarks
-    const bool kv_raw_strided = ctx->device->vendor_id == VK_VENDOR_ID_AMD &&
+    // upstream 733f57a999 copies strided f16 KV to scratch on AMD; measured 2026-10-18 on 7900 XTX/XT it is 10-13% slower at 16k and a wash at 65k, so it is opt-in here
+    static const bool enable_kv_scratch = getenv("GGML_VK_FA_KV_SCRATCH") != nullptr && atoi(getenv("GGML_VK_FA_KV_SCRATCH")) != 0;
+    const bool kv_raw_strided = enable_kv_scratch && ctx->device->vendor_id == VK_VENDOR_ID_AMD &&
                                 ctx->device->architecture != vk_device_architecture::AMD_RDNA4 &&
                                 neq1 >= 256 &&
                                 kv_raw &&
@@ -8330,7 +8346,8 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     const bool kv_f16 = k_type_eff == GGML_TYPE_F16 && v_type_eff == GGML_TYPE_F16;
     // cm2 dense is fast, so it needs a larger reduction to win.
     // With quantized K/V, sparse only breaks even around 16x (measured on RDNA3/RDNA4).
-    const int64_t min_ratio = tuning_params.path == FA_COOPMAT2 ? 4 : (kv_f16 ? 2 : 16);
+    // The f16 ratio is GGML_VK_FA_SPARSE_MIN_RATIO (default 1; 2 was the old gate).
+    const int64_t min_ratio = tuning_params.path == FA_COOPMAT2 ? 4 : (kv_f16 ? (int64_t)vk_fa_sparse_min_ratio_f16 : 16);
     const bool use_sparse = !disable_sparse && n_kv_max > 0 && mask && gqa_T == 1 &&
                             max_bias == 0.0f && logit_softcap == 0.0f &&
                             // the cm2 sparse gather only reads f16
