@@ -503,6 +503,19 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         const int64_t n_seq_tokens = conv_input->ne[0] - conv_states->ne[0];
 
         // write only the last min(n_seq_tokens, K) snapshots, like the SSM states; rs_depth never selects the rest
+        //
+        // K = n_rs_seq + 1 conv snapshot slots exist for rollback, and slot s is selected by rs_depth, which
+        // the recurrent memory resets to (tokens of the seq in this ubatch) - 1 after every ubatch
+        // (llama_memory_recurrent_context apply(), set_rs_depth(seq_id, n_tokens - 1) in
+        // src/llama-memory-recurrent.cpp ~1385). so after an N-token batch only slots [0, min(N, K)) can
+        // ever be read; no rollback reaches the slots past that.
+        // the SSM state write in build_recurrent_attn (n_written, ~603) already wrote min(n_seq_tokens, K).
+        // the old loop wrote all K: after a 1-token decode 11 of the 12 copies were the same clamped
+        // pre-batch window (s_idx clamped to 0), 96 KB each, on 24 layers per GPU (2026-10-18, 86ecf17dd1).
+        //
+        // the same write-all-K pattern exists, not measured and not changed, in glm5_conv1d
+        // (glm5-next.cpp:215), kimi_k3_conv1d (kimi-k3.cpp:379) and build_conv_state_at
+        // (qwen4exp.cpp:1329). mamba-base.cpp, lfm2.cpp and bailingmoe3.cpp already loop over n_written.
         for (int64_t t = std::max<int64_t>(1, K - n_seq_tokens + 1); t <= K; ++t) {
             const int64_t s_idx  = n_seq_tokens - K + t;
             const int64_t s_slot = K - t;

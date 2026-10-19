@@ -27,6 +27,8 @@
 #include <random>
 #include <utility>
 #include <fstream>
+#include <chrono>
+#include <ctime>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -477,6 +479,124 @@ struct server_spec_impl_stats {
     }
 };
 
+// --spec-stats-file: one JSON line per completed request with the per-request speculative stats
+// the config snapshot is taken once at load, the line is built in full and written with a single call
+struct server_spec_stats_writer {
+    std::string   path;
+    std::ofstream out;
+    json          config = json::object();
+
+    bool enabled() const {
+        return out.is_open();
+    }
+
+    void init(const common_params & params) {
+        if (out.is_open()) {
+            out.close();
+        }
+        config = json::object();
+
+        path = params.speculative.stats_file;
+        if (path.empty()) {
+            return;
+        }
+
+        std::error_code ec;
+        const auto parent = std::filesystem::path(path).parent_path();
+        if (!parent.empty()) {
+            std::filesystem::create_directories(parent, ec);
+        }
+        if (!ec) {
+            out.open(path, std::ios::out | std::ios::app | std::ios::binary);
+        }
+        if (ec || !out.is_open()) {
+            SRV_WRN("cannot open --spec-stats-file '%s'%s%s - speculative stats will not be written\n",
+                    path.c_str(), ec ? ": " : "", ec ? ec.message().c_str() : "");
+            out = {};
+            return;
+        }
+
+        const auto & sp = params.speculative;
+
+        // 0.1f -> 0.1, not 0.10000000149011612
+        const auto f2d = [](float v) { return std::stod(string_format("%g", (double) v)); };
+
+        config["spec_types"]        = common_speculative_type_name_str(sp.types);
+        config["draft_n_max"]       = sp.draft.n_max;
+        config["draft_n_min"]       = sp.draft.n_min;
+        config["draft_ctx_step"]    = sp.draft.ctx_step;
+        config["draft_p_min"]       = f2d(sp.draft.p_min);
+        config["draft_p_split"]     = f2d(sp.draft.p_split);
+        config["draft_auto"]        = sp.draft.auto_n;
+        config["draft_sampling"]    = sp.draft.probabilistic ? "probabilistic" : "greedy";
+        config["ngram_mod_n_match"] = sp.ngram_mod.n_match;
+        config["ngram_mod_n_min"]   = sp.ngram_mod.n_min;
+        config["ngram_mod_n_max"]   = sp.ngram_mod.n_max;
+        config["ngram_mod_size"]    = sp.ngram_mod.size;
+        config["ngram_mod_reset_occupancy"] = f2d(sp.ngram_mod.reset_occupancy);
+        config["ngram_draft_n_max"] = sp.ngram_draft_n_max;
+        config["shadow_n"]          = sp.ngram_mod.shadow_n;
+        for (const auto & [name, m] : { std::make_pair("ngram_simple", &sp.ngram_simple), std::make_pair("ngram_map_k", &sp.ngram_map_k), std::make_pair("ngram_map_k4v", &sp.ngram_map_k4v) }) {
+            config[std::string(name) + "_size_n"]   = m->size_n;
+            config[std::string(name) + "_size_m"]   = m->size_m;
+            config[std::string(name) + "_min_hits"] = m->min_hits;
+        }
+        config["model"]             = std::filesystem::path(params.model.path).filename().string();
+        config["model_draft"]       = sp.draft.mparams.path.empty() ? json(nullptr) : json(std::filesystem::path(sp.draft.mparams.path).filename().string());
+
+        for (const char * name : { "GGML_VK_MMVQ_CHUNK", "GGML_VK_SPLITK_SMALL_N", "GGML_VK_FA_CM1_WAVE32", "GGML_VK_FA_QUANT_STAGING" }) {
+            const char * v = getenv(name);
+            config[name] = v ? json(v) : json(nullptr);
+        }
+
+        SRV_WRN("writing per-request speculative stats to '%s'\n", path.c_str());
+    }
+
+    void write(json line) {
+        if (!out.is_open()) {
+            return;
+        }
+
+        for (const auto & [key, val] : config.items()) {
+            line[key] = val;
+        }
+
+        const std::string s = line.dump_safe() + "\n";
+
+        out.write(s.data(), (std::streamsize) s.size());
+        out.flush();
+
+        if (!out) {
+            SRV_WRN("write to --spec-stats-file '%s' failed - disabling it\n", path.c_str());
+            out.close();
+        }
+    }
+
+    // ISO-8601 local time with the UTC offset, millisecond precision
+    static std::string iso_now(double & t_unix) {
+        const auto now = std::chrono::system_clock::now();
+        const auto ms  = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+        t_unix = ms / 1000.0;
+
+        const std::time_t tt = (std::time_t) (ms / 1000);
+        std::tm tm = {};
+#if defined(_WIN32)
+        localtime_s(&tm, &tt);
+#else
+        localtime_r(&tt, &tm);
+#endif
+        char buf[64];
+        char off[16];
+        std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tm);
+        std::strftime(off, sizeof(off), "%z", &tm); // +hhmm
+        std::string o = off;
+        if (o.size() == 5) {
+            o.insert(3, ":");
+        }
+        return string_format("%s.%03d%s", buf, (int) (ms % 1000), o.c_str());
+    }
+};
+
 struct server_slot {
     int id;
 
@@ -508,6 +628,9 @@ struct server_slot {
     // --spec-draft-auto, the state carries across tasks
     bool spec_auto_enabled = false;
     server_spec_autotune spec_auto;
+
+    // --spec-stats-file, nullptr or disabled = off
+    server_spec_stats_writer * spec_stats_writer = nullptr;
 
     // per-request, per drafting implementation stats (index = common_speculative_type)
     server_spec_impl_stats spec_impl_stats[COMMON_SPECULATIVE_TYPE_COUNT];
@@ -939,7 +1062,9 @@ struct server_slot {
 
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
 
-            // the draft memory must not keep rows past the prompt
+            // the draft memory must not keep rows past the prompt. draft-mtp leaves the seed row of the
+            // next draft (accepted token at pos_next) in ctx_dft after every verify; if it survived into
+            // the next request on this slot it could match that request's first draft by tok/pos
             common_speculative_seed_drop(spec, id);
 
             t_last_used = ggml_time_us();
@@ -1177,6 +1302,225 @@ struct server_slot {
         }
 
         common_speculative_print_stats(spec);
+
+        write_spec_stats();
+    }
+
+    // --spec-stats-file: the same numbers as the log lines of print_timings(), as one JSON line
+    void write_spec_stats() const {
+        if (spec_stats_writer == nullptr || !spec_stats_writer->enabled()) {
+            return;
+        }
+
+        static const char * hist7_names[server_spec_impl_stats::N_HIST] = { "0", "1-4", "5-8", "9-16", "17-32", "33-48", "49+" };
+        static const char * hist8_names[8] = { "0", "1-4", "5-8", "9-16", "17-32", "33-48", "49-64", "65+" };
+        static const char * built6_names[6] = { "1-4", "5-8", "9-16", "17-32", "33-64", "65+" };
+
+        const auto hist_obj = [](const char * const * names, const int32_t * h, int n) {
+            json res = json::object();
+            for (int i = 0; i < n; ++i) {
+                res[names[i]] = h[i];
+            }
+            return res;
+        };
+
+        const auto arr = [](const auto * v, int n) {
+            json res = json::array();
+            for (int i = 0; i < n; ++i) {
+                res.push_back(v[i]);
+            }
+            return res;
+        };
+
+        json j;
+
+        double t_unix = 0.0;
+        j["ts"]     = server_spec_stats_writer::iso_now(t_unix);
+        j["t_unix"] = t_unix;
+
+        const auto & ptask = task ? task : task_prev;
+
+        j["task_id"]              = ptask ? json(ptask->id) : json(nullptr);
+        j["slot_id"]              = id;
+        j["n_ctx_slot"]           = n_ctx;
+        j["n_prompt_tokens"]      = ptask ? json((int64_t) ptask->n_tokens()) : json(nullptr);
+        j["n_prompt_cached"]      = stats.n_prompt_cached;
+        j["n_prompt_processed"]   = stats.n_prompt_processed;
+        j["n_ctx_used"]           = (int64_t) prompt.n_tokens();
+        j["n_decoded"]            = stats.n_gen;
+        j["n_gen_steps"]          = stats.n_gen_steps();
+        j["t_prompt_ms"]          = stats.t_prompt_ms();
+        j["t_gen_ms"]             = stats.t_gen_ms();
+        j["pp_tps"]               = stats.n_prompt_tps();
+        j["tg_tps"]               = stats.n_gen_tps();
+        j["graphs_reused"]        = llama_perf_context(ctx_tgt).n_reused;
+
+        {
+            const char * s = "none";
+            switch (stop) {
+                case STOP_TYPE_NONE:  s = "none";  break;
+                case STOP_TYPE_EOS:   s = "eos";   break;
+                case STOP_TYPE_WORD:  s = "word";  break;
+                case STOP_TYPE_LIMIT: s = "limit"; break;
+            }
+            j["stop_type"] = s;
+            j["truncated"] = truncated;
+        }
+
+        // overall draft acceptance
+        j["n_draft_tokens"]      = stats.n_draft_tokens;
+        j["n_draft_accepted"]    = stats.n_draft_accepted;
+        j["n_draft_verif_steps"] = stats.n_draft_verif_steps;
+        j["draft_acc_rate"]      = stats.n_draft_tokens > 0 ? (double) stats.n_draft_accepted/stats.n_draft_tokens : 0.0;
+        j["draft_mean_len"]      = stats.n_draft_verif_steps > 0 ? 1.0 + (double) stats.n_draft_accepted/stats.n_draft_verif_steps : 1.0;
+        j["acc_per_pos"]         = arr(n_accepted_per_pos.data(), (int) n_accepted_per_pos.size()); // counts; divide by n_draft_verif_steps for the logged rates
+
+        // --spec-draft-auto tuner state at the end of the request
+        if (spec_auto_enabled) {
+            json buckets = json::array();
+            for (int n = 1; n <= spec_auto.n_ceiling; ++n) {
+                if (spec_auto.has(n)) {
+                    buckets.push_back({
+                        {"n",       n},
+                        {"tps",     spec_auto.tps(n)*1e6},
+                        {"landed",  spec_auto.n_landed[n]},
+                        {"step_ms", spec_auto.t_step_us[n]/1000.0},
+                        {"count",   spec_auto.n_count[n]},
+                        {"warm",    spec_auto.warm(n)},
+                    });
+                }
+            }
+            j["auto"] = json::object({ {"n_cur", spec_auto.n_cur}, {"buckets", buckets} });
+        } else {
+            j["auto"] = nullptr;
+        }
+
+        // per drafting implementation
+        json impls = json::array();
+        for (int t = 0; t < COMMON_SPECULATIVE_TYPE_COUNT; ++t) {
+            const auto & st = spec_impl_stats[t];
+            if (st.n_steps == 0) {
+                continue;
+            }
+
+            json rows = json::object();
+            for (int r = 1; r < server_spec_impl_stats::N_ROWS; ++r) {
+                if (st.rows_n[r] == 0) {
+                    continue;
+                }
+                const double n = st.rows_n[r];
+                rows[std::to_string(r) + (r == server_spec_impl_stats::N_ROWS - 1 ? "+" : "")] = json::object({
+                    {"ms",       st.rows_t_step_us[r]/n/1000.0},
+                    {"draft_ms", st.rows_t_draft_us[r]/n/1000.0},
+                    {"n",        st.rows_n[r]},
+                });
+            }
+
+            impls.push_back({
+                {"name",       common_speculative_type_to_str((common_speculative_type) t)},
+                {"steps",      st.n_steps},
+                {"built",      st.n_built},
+                {"offered",    st.n_offered},
+                {"accepted",   st.n_accepted},
+                {"acc_rate",   st.n_offered > 0 ? (double) st.n_accepted/st.n_offered : 0.0},
+                {"full",       st.n_full},
+                {"step_ms",    st.t_step_us/(double) st.n_steps/1000.0},
+                {"t_step_ms",  st.t_step_us/1000.0},
+                {"tps",        st.t_step_us > 0 ? (st.n_accepted + st.n_steps)*1e6/st.t_step_us : 0.0},
+                {"acc_hist",   hist_obj(hist7_names, st.hist_acc,   server_spec_impl_stats::N_HIST)},
+                {"built_hist", hist_obj(hist7_names, st.hist_built, server_spec_impl_stats::N_HIST)},
+                {"ms_by_rows", rows},
+            });
+        }
+        if (spec_n_steps_nodraft > 0) {
+            impls.push_back({
+                {"name",      "none"},
+                {"steps",     spec_n_steps_nodraft},
+                {"step_ms",   spec_t_nodraft_us/(double) spec_n_steps_nodraft/1000.0},
+                {"t_step_ms", spec_t_nodraft_us/1000.0},
+            });
+        }
+        j["impls"] = impls;
+
+        // draft-mtp confidence
+        {
+            const auto ms = common_speculative_get_mtp_stats(spec, id);
+            const auto & ss = ms.stop_steps;
+
+            if (ss[COMMON_SPECULATIVE_MTP_STOP_CAP] + ss[COMMON_SPECULATIVE_MTP_STOP_PMIN] + ss[COMMON_SPECULATIVE_MTP_STOP_OTHER] > 0) {
+                j["mtp"] = json::object({
+                    {"stop_steps",    { {"cap", ss[COMMON_SPECULATIVE_MTP_STOP_CAP]}, {"pmin", ss[COMMON_SPECULATIVE_MTP_STOP_PMIN]}, {"other", ss[COMMON_SPECULATIVE_MTP_STOP_OTHER]} }},
+                    {"stop_accepted", { {"cap", ms.stop_accepted[COMMON_SPECULATIVE_MTP_STOP_CAP]}, {"pmin", ms.stop_accepted[COMMON_SPECULATIVE_MTP_STOP_PMIN]}, {"other", ms.stop_accepted[COMMON_SPECULATIVE_MTP_STOP_OTHER]} }},
+                    {"pbin_edges",    json::array({ 0.0, 0.5, 0.6, 0.7, 0.8, 0.9 })},
+                    {"pbin_tested",   arr(ms.pbin_tested, common_speculative_mtp_stats::N_PBIN)},
+                    {"pbin_landed",   arr(ms.pbin_landed, common_speculative_mtp_stats::N_PBIN)},
+                    {"pos_tested",    arr(ms.pos_tested,  common_speculative_mtp_stats::N_POS)},
+                    {"pos_landed",    arr(ms.pos_landed,  common_speculative_mtp_stats::N_POS)},
+                    {"na_tested",     ms.na_tested},
+                    {"na_landed",     ms.na_landed},
+                });
+            } else {
+                j["mtp"] = nullptr;
+            }
+        }
+
+        // shadow chains
+        {
+            const auto sh = common_speculative_get_shadow_stats(spec, id);
+
+            json shadow = json::object();
+
+            if (sh.ngram_chains + sh.ngram_censored > 0) {
+                shadow["chain_truth"] = json::object({
+                    {"chains",          sh.ngram_chains},
+                    {"censored",        sh.ngram_censored},
+                    {"matched_sum",     sh.ngram_matched_sum},
+                    {"would_land_mean", sh.ngram_chains > 0 ? (double) sh.ngram_matched_sum/sh.ngram_chains : 0.0},
+                    {"full",            sh.ngram_full},
+                    {"hist",            hist_obj(hist8_names, sh.ngram_hist, 8)},
+                });
+            } else {
+                shadow["chain_truth"] = nullptr;
+            }
+
+            if (sh.ext_attempts > 0) {
+                shadow["ext"] = json::object({
+                    {"attempts",    sh.ext_attempts},
+                    {"hits",        sh.ext_hits},
+                    {"resolved",    sh.ext_resolved},
+                    {"censored",    sh.ext_censored},
+                    {"tested",      sh.ext_tested},
+                    {"landed_sum",  sh.ext_landed_sum},
+                    {"landed_mean", sh.ext_tested > 0 ? (double) sh.ext_landed_sum/sh.ext_tested : 0.0},
+                    {"hist",        hist_obj(hist7_names, sh.ext_landed_hist, 7)},
+                    {"built_hist",  hist_obj(built6_names, sh.ext_built_hist, 6)},
+                });
+            } else {
+                shadow["ext"] = nullptr;
+            }
+
+            if (sh.alt_attempts > 0) {
+                shadow["alt"] = json::object({
+                    {"n",               sh.alt_n},
+                    {"attempts",        sh.alt_attempts},
+                    {"hits",            sh.alt_hits},
+                    {"chains",          sh.alt_chains},
+                    {"censored",        sh.alt_censored},
+                    {"matched_sum",     sh.alt_matched_sum},
+                    {"would_land_mean", sh.alt_chains > 0 ? (double) sh.alt_matched_sum/sh.alt_chains : 0.0},
+                    {"hist",            hist_obj(hist8_names, sh.alt_hist, 8)},
+                    {"built_hist",      hist_obj(built6_names, sh.alt_built_hist, 6)},
+                });
+            } else {
+                shadow["alt"] = nullptr;
+            }
+
+            shadow["n_ext_last"] = sh.n_ext_last;
+
+            j["shadow"] = shadow;
+        }
+
+        spec_stats_writer->write(std::move(j));
     }
 
     json to_json(bool only_metrics = false) const {
@@ -1436,6 +1780,9 @@ private:
     // use server_context methods instead
 
     common_params params_base;
+
+    // --spec-stats-file
+    server_spec_stats_writer spec_stats_writer;
 
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
@@ -1920,6 +2267,8 @@ private:
             return false;
         }
 
+        spec_stats_writer.init(params_base);
+
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot & slot = slots[i];
 
@@ -1937,6 +2286,8 @@ private:
 
             slot.spec_auto_enabled = params_base.speculative.draft.auto_n;
             slot.spec_auto.init(slot.spec_n_max);
+
+            slot.spec_stats_writer = &spec_stats_writer;
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
@@ -3921,6 +4272,7 @@ private:
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
                 // the shift below stops at pos_next, a seed row past it would be left behind
+                // (unshifted, at a position the shifted sequence will later reuse)
                 common_speculative_seed_drop(slot.spec, slot.id);
 
                 slot.mem.seq_rm (slot.id, n_keep            , n_keep + n_discard);
@@ -5071,7 +5423,10 @@ private:
         // empty means "nothing was rejected", i.e. replay the whole batch
         std::vector<int8_t> spec_keep;
 
-        // per verified slot: the token sampled after the accepted drafts, i.e. the next draft's id_last
+        // per verified slot: the token sampled after the accepted drafts, i.e. the next draft's id_last.
+        // passed to common_speculative_process() so draft-mtp can decode it as a seed row in the same
+        // catch-up batch instead of a separate 1-row decode at the start of draft() (~1.2-1.4 ms per step
+        // at 92k context). see process() of the draft-mtp impl in common/speculative.cpp
         std::vector<common_speculative_seed> spec_next;
 
         // whether the rollback path below can ever be taken for this target context. it needs a
@@ -5155,7 +5510,8 @@ private:
 
             spec_verified.push_back({ slot.id, n_draft, accepted.size() - 1, restore, std::move(smpl_save) });
 
-            // the restore path reloads the draft state from the checkpoint, so it gets no seed row
+            // the restore path reloads the draft state from the checkpoint, so it gets no seed row;
+            // draft() then falls back to the 1-row decode of id_last
             if (!restore) {
                 spec_next.push_back({ slot.id, accepted.back() });
             }
@@ -5402,7 +5758,12 @@ private:
             slot.sampled = ids.back(); // last accepted token
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
-            // the draft memory may hold the seed row of the next draft at pos_next, keep it
+            // the draft memory may hold the seed row of the next draft at pos_next, keep it.
+            // the target's own memory is cut at pos_next (the accepted token there is decoded by the next
+            // target batch), but in ctx_dft process() already decoded that token at pos_next as the seed and
+            // draft() reuses its output, so ctx_dft is cut from pos_next + 1. a seed anywhere else is stale
+            // (draft() would not match it) and is dropped first, after which both memories are cut at
+            // pos_next as before
             {
                 const llama_pos pos_next = slot.prompt.tokens.pos_next();
                 const llama_pos pos_seed = common_speculative_seed_pos(slot.spec, slot.id);

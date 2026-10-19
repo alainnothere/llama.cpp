@@ -406,6 +406,9 @@ struct common_params_speculative {
     // cap for n-gram drafts, independent of draft.n_max and the auto tuner (-1 = same cap as the draft model)
     int32_t ngram_draft_n_max = -1;
 
+    // server only: append one JSON line of per-request speculative stats to this file (empty = off)
+    std::string stats_file;
+
     bool has_dft() const {
         return !draft.mparams.empty();
     }

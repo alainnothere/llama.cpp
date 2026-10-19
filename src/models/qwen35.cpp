@@ -642,7 +642,8 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     GGML_ASSERT(head_norm_w && "QWEN35 MTP: missing both nextn.shared_head_norm and output_norm");
     cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
 
-    // masked nextn extraction reads n_outputs rows from the front of the tensor, so crop first
+    // masked nextn extraction reads n_outputs rows from row 0 of t_h_nextn:
+    // capture after the crop; see crop_before_nextn in llama-graph.h
     if (crop_before_nextn(inp_out_ids)) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }

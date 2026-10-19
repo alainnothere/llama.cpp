@@ -19,6 +19,9 @@ int vk_fa_f16acc = 0;
 uint32_t vk_fa_sparse_min_ratio_f16 = 2;
 int vk_fa_quant_staging = -1;
 int vk_fa_cm1_wave32 = -1;
+int vk_mmvq_chunk = 48;
+int vk_mmvq_chunk_cols = -1;
+int vk_splitk_small_n = -1;
 
 bool vk_enable_sync_logger = false;
 

@@ -10441,6 +10441,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_pos(type_a, GGML_TYPE_F32, 1000, n, 1024, {1, 1}, {1, 1}));
         }
     }
+    // verify widths past mul_mat_vec_max_cols (12) at Qwen3.8-27B shapes: Vulkan GGML_VK_MMVQ_CHUNK
+    // (mmvq column chunks, uneven last chunks) and GGML_VK_SPLITK_SMALL_N (split K with n < tile N)
+    for (int64_t n : {13, 24, 25, 34, 48}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 1024,  n, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 17408, n, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 48,    n, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 5120,  n, 6144, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 1000,  n, 2048, {1, 1}, {1, 1}));
+    }
 
 #if 0
     {
@@ -11864,6 +11873,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 17408, bs, 5120, {1, 1}, {1, 1}));
         }
     }
+    // Qwen3.8-27B verify widths across the mmvq->mmq boundary (mul_mat_vec_max_cols = 12):
+    // ffn up/gate, ffn down, attn q+gate, attn kv, attn o / gdn out, gdn qkv, gdn z, gdn beta/alpha
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
+                {17408, 5120}, {5120, 17408}, {12288, 5120}, {1024, 5120}, {5120, 6144}, {10240, 5120}, {6144, 5120}, {48, 5120}}) {
+            for (int bs : {8, 12, 13, 16, 24, 34}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, bs, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
+    // Qwen3.8-27B lm_head (n_vocab 248320), every verify row needs logits
+    for (int bs : {8, 12, 13, 16, 24, 34}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, bs, 5120, {1, 1}, {1, 1}));
+    }
 
     // qwen3-30b-a3b
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
@@ -11925,6 +11948,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // long-context decode / speculative verify, Qwen3.x-27B-like: hs 256, 4 kv heads x 6, 32k ctx
     for (int nb : {1, 6, 12}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 32768, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+    // same, verify widths past the GQA fold (16 rows)
+    for (int nb : {13, 16, 24, 34}) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 32768, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     }
     // same model, prefill: K/V strided like a real KV cache (heads interleaved), the shape the AMD f16 scratch copy targets
@@ -12140,6 +12167,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
+    // Qwen3.8-27B GDN (16 k heads, 48 v heads, d=128) at speculative verify widths,
+    // final-state only and with K=n snapshot slots (n_rs_seq > 0). No cache-fusion twin: Vulkan has no
+    // GDN+CPY fusion and at this size the test graph's trailing SUM hangs the queue (ring timeout).
+    for (int n : {12, 34}) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n, 1, 3));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n, 1, 3, false, false, n));
+    }
 
     // lightning_indexer
     for (int kv : { 256, 4096, 65536 }) {

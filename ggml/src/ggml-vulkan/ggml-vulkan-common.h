@@ -25,6 +25,15 @@ extern uint32_t vk_fa_sparse_min_ratio_f16;
 extern int vk_fa_quant_staging;
 // GGML_VK_FA_CM1_WAVE32: coopmat1 FA in wave32 on RDNA3. -1 auto (dense aligned f16 only), 0 off, 1 always
 extern int vk_fa_cm1_wave32;
+// GGML_VK_MMVQ_CHUNK: n in 13..cap batches of a 2D quantized/f16 MUL_MAT run as mmvq column chunks of
+// <= the chunk width instead of the MMQ tile path. stored value is the cap (0 = off).
+// unset/-1 on with cap 48 (default), 0 off, 1..12 cap 48, >= 13 cap = value
+extern int vk_mmvq_chunk;
+// GGML_VK_MMVQ_CHUNK_COLS: widest mmvq chunk. unset/-1 auto per src0 type (q8_0/q8_1/f16/bf16 16, else 12),
+// 1..mul_mat_vec_max_pipeline_cols forces that width for every type
+extern int vk_mmvq_chunk_cols;
+// GGML_VK_SPLITK_SMALL_N: let ggml_vk_guess_split_k split K when n < the tile's N (n_tiles = 1). -1/0 off, 1 on
+extern int vk_splitk_small_n;
 
 // Perf logger sub-dispatch marks. Only active with GGML_VK_PERF_LOGGER (non-concurrent mode).
 // ggml_vk_perf_mark: the time since the previous timestamp is logged under `label`.

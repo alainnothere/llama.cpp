@@ -100,7 +100,10 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 //
 // `next`, when non-empty, gives the token the target sampled after the last kept row of a sequence, i.e. the
 // id_last of the next draft. draft-mtp decodes it in the same draft batch (pos = last kept pos + 1), so the
-// first draft step needs no decode of its own. the row stays in the draft memory - see the seed functions below
+// first draft step needs no decode of its own. the row stays in the draft memory - see the seed functions below.
+// this saves one draft-graph decode + llama_synchronize + sample per step (~1.2-1.4 ms at 92k context).
+// draft-mtp honors `keep` because of it: the seed occupies the position of the first rejected row.
+// other implementations accept and ignore `next`. details: process() of the draft-mtp impl in speculative.cpp
 struct common_speculative_seed {
     llama_seq_id seq_id;
     llama_token  id;
@@ -108,10 +111,14 @@ struct common_speculative_seed {
 
 bool common_speculative_process(common_speculative * spec, const common_batch & batch, const std::vector<int8_t> & keep = {}, const std::vector<common_speculative_seed> & next = {});
 
-// position of the seed row that process() left in the draft memory for seq_id, -1 if none
+// position of the seed row that process() left in the draft memory for seq_id, -1 if none.
+// after verify the caller trims ctx_tgt at pos_next; when this returns pos_next the draft memory must be
+// trimmed from pos_next + 1 instead, or the seed row the next draft() is about to reuse is deleted
 llama_pos common_speculative_seed_pos(const common_speculative * spec, llama_seq_id seq_id);
 
-// remove the seed row of seq_id from the draft memory (call before the sequence leaves generation or is shifted)
+// remove the seed row of seq_id from the draft memory (call before the sequence leaves generation or is shifted).
+// the server calls it on slot release() and before context shift, so a stale seed row past the prompt is
+// never left in ctx_dft and never matches the first draft of a new request
 void common_speculative_seed_drop(common_speculative * spec, llama_seq_id seq_id);
 
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`

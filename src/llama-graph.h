@@ -1058,6 +1058,35 @@ struct llm_graph_context {
     void cb(ggml_tensor * cur, const char * name, int il) const;
 
     // true when the last layer must be narrowed to the output rows before the nextn hidden state is captured
+    //
+    // Why the order matters (bug found and fixed 2026-10-18, commit 86ecf17dd1):
+    // the draft context is run with masked nextn extraction
+    // (llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true) in the draft-mtp ctor,
+    // common/speculative.cpp ~1539). In masked mode the extraction in
+    // llama_context::decode (src/llama-context.cpp ~2158-2175) copies n_outputs rows
+    // starting at row 0 of t_h_nextn. If an MTP tail sets res->t_h_nextn = cur before
+    // ggml_get_rows(cur, inp_out_ids), t_h_nextn still has one row per batch token, and a
+    // batch with more rows than outputs hands the drafter the hidden state of batch row 0
+    // instead of the output row.
+    //
+    // One-row batches hide it: row 0 is the output row. Single-slot drafting with a 1-row
+    // seed decode therefore never showed the bug. It bites multi-slot drafting,
+    // chain_heads models, and the fused seed row appended to the catch-up batch
+    // (common/speculative.cpp, draft-mtp process()).
+    //
+    // Measured 2026-10-18 on Qwen3.8-27B (six-turn session, draft-mtp + ngram-mod,
+    // --spec-draft-auto): with the bug the fused drafter's acceptance fell from 0.544 to
+    // 0.484 and session t/s from 47.4 to 39.3; fixed, 56.6 t/s / 0.650. The synthetic CPU
+    // MTP test model cannot detect this (its drafts are garbage either way); only a real
+    // model's acceptance rate shows it.
+    //
+    // Rule for MTP tails: crop (crop_before_nextn) -> capture res->t_h_nextn -> crop
+    // (crop_after_nextn). Unmasked extraction (the target context) needs every row, so it
+    // captures first and crops afterwards.
+    // Fixed in qwen35, qwen35moe, deepseek2, deepseek32, glm-dsa, glm4-moe, hy-v3,
+    // cohere2moe, bailingmoe3. qwen3next, mimo2, glm5-next, nemotron-h-moe, deepseek4,
+    // gemma4-assistant and dflash already cropped first. eagle3 has no inp_out_ids crop at
+    // all and only works because its batches are all-or-none output.
     bool crop_before_nextn(const ggml_tensor * inp_out_ids) const {
         return inp_out_ids != nullptr && (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked);
     }

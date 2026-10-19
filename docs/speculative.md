@@ -218,6 +218,12 @@ draft wins the step whenever it has one, and by default it is cut to the draft m
 remaining `n_predict`. The auto tuner ignores the steps an n-gram type drafted, so long n-gram verify batches do not
 end up in the draft model's buckets.
 
+`--spec-stats-file FNAME` (server only) appends one JSON line per completed request to `FNAME` with the numbers of
+the per-request log lines (`draft acceptance`, `draft by impl`, `mtp confidence`, `chain truth`, `ext shadow`,
+`alt table`, the `--spec-draft-auto` buckets) together with the request timings, the speculative config and the
+model file name, so runs can be compared after the log is gone. The file is opened in append mode and never
+rotated.
+
 ### Differences between ngram-simple, ngram-map and ngram-mod
 
 - ngram-simple looks for a previous matching n-gram and inserts the following m-gram.
@@ -276,6 +282,9 @@ Use exactly one of these options:
 --spec-draft-auto
                                         automatically tune the draft length per slot, using --spec-draft-n-max as the ceiling: keeps a running estimate of tokens landed per unit of wall time for every draft length tried, uses the best one and periodically probes its neighbours (default: disabled)
                                         (env: LLAMA_ARG_SPEC_DRAFT_AUTO)
+--spec-stats-file                       FNAME
+                                        append one JSON line per completed request with the speculative decoding stats printed at release (per-implementation steps/acceptance/timings, draft-mtp confidence, shadow chains) plus a config snapshot (default: none)
+                                        (env: LLAMA_ARG_SPEC_STATS_FILE)
 --spec-draft-p-split, --draft-p-split   P
                                         speculative decoding split probability (default: 0.10)
                                         (env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT)

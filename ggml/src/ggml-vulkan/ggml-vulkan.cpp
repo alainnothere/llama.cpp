@@ -1320,6 +1320,9 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
     // row_split must equal the subgroup count, Br / row_split must be a multiple of 4 and
     // Bc = 16 * num_subgroups must be >= the subgroup size (flash_attn_cm1.comp), so at Br = 16
     // 4 is the only count valid in wave64 (8 fails 3824/5320 FA tests, 2 leaves Psh unwritten).
+    // Probed 2026-10-18 on a 7900 XTX and dead, do not repeat: row_split 8 violates the shader
+    // (Br / row_split = 2 is not a multiple of 4) and Bc = 16 * row_split doubles the LDS footprint;
+    // row_split 2 leaves Psh rows unwritten in wave64 (Bc = 32 < subgroup size 64).
     // ggml_vk_flash_attn may switch the subgroup size to 32, see GGML_VK_FA_CM1_WAVE32.
     const uint32_t num_subgroups = 4;
 
@@ -2939,6 +2942,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
         // RDNA3/4, DRAM-bound sweep 2026-10-09 (q4_K 32768x8192): n<=2 1 row, n=3..4 2 rows (n=4: 240 -> 212 us),
         // n>=5 4 rows (n=8: 402 -> 273 us)
+        // re-swept 2026-10-18 with GGML_VK_MMVQ_ROWS on the production shape 17408x5120 q4_K: 4 rows beats
+        // 2 by 10.6-13.3% at every n in 5..9; 2 rows wins only on 32768x8192 q4_K n=5, by 4.3%. kept as is
         if (is_rdna3_or_4) {
             return i >= 4 ? 4u : (i >= 2 ? 2u : rows);
         }
@@ -2984,7 +2989,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                               (use_subgroups16 && w == DMMV_WG_SIZE_LARGE) ? SHADER_REDUCTION_MODE_HYBRID :
                                               SHADER_REDUCTION_MODE_SHMEM;
 
-        for (uint32_t i = 0; i < mul_mat_vec_max_cols; ++i) {
+        for (uint32_t i = 0; i < mul_mat_vec_max_pipeline_cols; ++i) {
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_F32 ][i], "mul_mat_vec_f32_f32_f32",  arr_dmmv_f32_f32_f32_len[reduc],  arr_dmmv_f32_f32_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {wg_size_subgroup, 1, i+1}, 1, false, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_F16 ][i], "mul_mat_vec_f16_f32_f32",  arr_dmmv_f16_f32_f32_len[reduc],  arr_dmmv_f16_f32_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_BF16][i], "mul_mat_vec_bf16_f32_f32", arr_dmmv_bf16_f32_f32_len[reduc], arr_dmmv_bf16_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
@@ -5361,11 +5366,39 @@ void ggml_vk_instance_init() {
     if (const char * e = getenv("GGML_VK_FA_SPARSE_MIN_RATIO")) {
         vk_fa_sparse_min_ratio_f16 = std::max(1u, (uint32_t)std::stoul(e));
     }
+    // note: any nonzero value, including "-1", forces staging ON here, so the documented
+    // "-1 auto (= off)" is only reachable by leaving the variable unset. left as is on purpose
+    // (GGML_VK_FA_CM1_WAVE32 below parses -1 as auto).
     if (const char * e = getenv("GGML_VK_FA_QUANT_STAGING")) {
         vk_fa_quant_staging = atoi(e) != 0 ? 1 : 0;
     }
+    // -1 = auto (RDNA3, V not staged, HSV <= 256 or N > 16; see ggml_vk_flash_attn), 0 = off,
+    // any other nonzero value = always. -1 used to fall into "nonzero" and force wave32 on.
     if (const char * e = getenv("GGML_VK_FA_CM1_WAVE32")) {
-        vk_fa_cm1_wave32 = atoi(e) != 0 ? 1 : 0;
+        const int v = atoi(e);
+        vk_fa_cm1_wave32 = v == -1 ? -1 : (v != 0 ? 1 : 0);
+    }
+    // GGML_VK_MMVQ_CHUNK (on by default since 2026-10-19, see ggml_vk_mul_mat): unset/-1 (any negative) on
+    // with cap 48, 0 off, 1..12 cap 48, >= 13 cap = value. The stored value is the column cap, 0 = off.
+    if (const char * e = getenv("GGML_VK_MMVQ_CHUNK")) {
+        const int v = atoi(e);
+        vk_mmvq_chunk = v < 0 ? 48 : (v == 0 ? 0 : (v <= (int)mul_mat_vec_max_cols ? 48 : v));
+    }
+    // GGML_VK_MMVQ_CHUNK_COLS: widest chunk. unset/-1 (any value <= 0) auto per src0 type, see
+    // ggml_vk_mmvq_chunk_width; 1..mul_mat_vec_max_pipeline_cols forces that width for every type.
+    // Qwen3.8-27B Q8_0, 3 GPUs, llama-bench pp N @ d2048, step ms at N = 12/13/16/17/20/24 (2026-10-19):
+    // no chunk 53.0/89.3/89.7/90.9, cols 12 53.1/68.2/69.5/74.7/77.7/83.7, cols 16 -/56.8/67.3/74.8/77.6/83.8,
+    // cols 24 -/-/-/71.0/84.2/97.8. One pass of <= ~17 columns beats two passes of 12 on q8_0: the 13-row
+    // cliff is the second weight pass of 7+6, not a skipped chunk (every n=13 weight matmul chunked, 0 skips).
+    // On the 7900 XTX alone q4_K/q6_K lose with a 16-column pass (q4_K 17408x5120 n=16 137 -> 182 us, 8+8 wins).
+    if (const char * e = getenv("GGML_VK_MMVQ_CHUNK_COLS")) {
+        const int v = atoi(e);
+        vk_mmvq_chunk_cols = v <= 0 ? -1 : std::min((int)mul_mat_vec_max_pipeline_cols, v);
+    }
+    // GGML_VK_SPLITK_SMALL_N: -1 auto (= off), 0 off, any other nonzero value on.
+    if (const char * e = getenv("GGML_VK_SPLITK_SMALL_N")) {
+        const int v = atoi(e);
+        vk_splitk_small_n = v == -1 ? -1 : (v != 0 ? 1 : 0);
     }
     if (vk_fa_f16acc || vk_fa_sparse_min_ratio_f16 != 2) {
         GGML_LOG_WARN("ggml_vulkan: FA f16 accumulation %s (GGML_VK_FA_F16ACC=0 to obey GGML_PREC_F32), "
@@ -5632,7 +5665,7 @@ vk_pipeline ggml_vk_get_to_fp16(ggml_backend_vk_context * ctx, ggml_type type) {
 static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * ctx, ggml_type a_type, ggml_type b_type, uint32_t num_cols, uint32_t m, uint32_t k) {
     VK_LOG_DEBUG("ggml_vk_get_dequantize_mul_mat_vec()");
     GGML_ASSERT(b_type == GGML_TYPE_F32 || b_type == GGML_TYPE_F16 || b_type == GGML_TYPE_Q8_1);
-    GGML_ASSERT(num_cols >= 1 && num_cols <= mul_mat_vec_max_cols);
+    GGML_ASSERT(num_cols >= 1 && num_cols <= mul_mat_vec_max_pipeline_cols);
 
     if (b_type == GGML_TYPE_Q8_1) {
         switch (a_type) {
@@ -5995,7 +6028,13 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
     }
 
     uint32_t split_k = 1;
-    if (ctx->device->shader_core_count != 0 && n >= pipeline->wg_denoms[1]) {
+    // The n >= tile gate leaves split_k at 1 for n in 13..tile-1: every workgroup then walks the whole K
+    // loop serially, so the cost follows k, not m (7900 XTX, 2026-10-19, q6_K k=5120 n=13: m=48 165 us,
+    // m=1024 160 us, m=17408 379 us; n=12 on mmvq is 24/24/132). GGML_VK_SPLITK_SMALL_N=1 drops the gate
+    // (n_tiles is then 1) and lets the k >= 2048 heuristic below pick the split. Measured: only the
+    // small-m shapes move (q6_K 1024x5120 n=13 160 -> 61, 48x5120 165 -> 31 us); m >= 5120 already fills
+    // more than 2/3 of the CUs and stays at split_k 1. Dominated by GGML_VK_MMVQ_CHUNK where both apply.
+    if (ctx->device->shader_core_count != 0 && (n >= pipeline->wg_denoms[1] || vk_splitk_small_n == 1)) {
         // If k is 'large' and the SMs will fill less than halfway, use split_k.
         uint32_t m_tiles = CEIL_DIV(m, pipeline->wg_denoms[0]);
         uint32_t n_tiles = CEIL_DIV(n, pipeline->wg_denoms[1]);
@@ -6754,7 +6793,26 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
     GGML_UNUSED(m);
 }
 
-static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx, bool swap_inputs = false) {
+// GGML_VK_MMVQ_CHUNK_COLS auto: 16 for q8_0/q8_1/f16/bf16, 12 for everything else (2026-10-19).
+// A single 16-wide pass beats 8+8 on q8_0 but loses on the K-quants: 7900 XTX 17408x5120 n=16 q4_K
+// 137 -> 182 us, q6_K 166 -> 197 us; q8_0 154 -> 149 us, n=13 136 -> 121 us (one pass vs 7+6).
+static uint32_t ggml_vk_mmvq_chunk_width(ggml_type src0_type) {
+    if (vk_mmvq_chunk_cols > 0) {
+        return std::min((uint32_t)vk_mmvq_chunk_cols, mul_mat_vec_max_pipeline_cols);
+    }
+    switch (src0_type) {
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q8_1:
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
+            return std::min(16u, mul_mat_vec_max_pipeline_cols);
+        default:
+            return mul_mat_vec_max_cols;
+    }
+}
+
+// chunk_cols: run ne11 > mul_mat_vec_max_cols as column chunks, see GGML_VK_MMVQ_CHUNK in ggml_vk_mul_mat.
+static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx, bool swap_inputs = false, bool chunk_cols = false) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     const ggml_tensor * src0 = dst->src[swap_inputs ? 1 : 0];
     const ggml_tensor * src1 = dst->src[swap_inputs ? 0 : 1];
@@ -6789,11 +6847,19 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     GGML_ASSERT(ne11 == 1 || ne12 * ne13 == 1);
     bool batch_n = ne11 > 1;
 
+    // Column chunks: as even as possible (34 -> 12+11+11). src1 is quantized/staged once as a whole and
+    // each chunk binds its own column window of Y and D (the gate in ggml_vk_mul_mat keeps those
+    // offsets descriptor-aligned). sel_cols is the widest chunk, used for the pipeline choice.
+    GGML_ASSERT(!chunk_cols || (batch_n && !swap_inputs && ctx->num_additional_fused_ops == 0));
+    // fewest passes at the chosen width, then as even as possible (13 @16 -> 13, 17 @16 -> 9+8, 34 -> 12+11+11)
+    const uint32_t n_chunks = chunk_cols ? (uint32_t)CEIL_DIV(ne11, (uint64_t)ggml_vk_mmvq_chunk_width(src0->type)) : 1;
+    const uint32_t sel_cols = (uint32_t)CEIL_DIV(ne11, (uint64_t)n_chunks);
+
     const bool x_non_contig = !ggml_vk_dim01_contiguous(src0);
     const bool y_non_contig = !ggml_vk_dim01_contiguous(src1);
 
     const bool f16_f32_kernel = src1->type == GGML_TYPE_F32;
-    bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && ggml_vk_should_use_mmvq(ctx->device, ne01, ne11, ne10, src0->type);
+    bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && ggml_vk_should_use_mmvq(ctx->device, ne01, sel_cols, ne10, src0->type);
 
     vk_pipeline to_fp16_vk_0 = nullptr;
     vk_pipeline to_fp16_vk_1 = nullptr;
@@ -6807,12 +6873,12 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     }
 
     // Check for mmq first
-    vk_pipeline dmmv = quantize_y ? ggml_vk_get_dequantize_mul_mat_vec(ctx, src0->type, GGML_TYPE_Q8_1, ne11, ne20, ne00) : nullptr;
+    vk_pipeline dmmv = quantize_y ? ggml_vk_get_dequantize_mul_mat_vec(ctx, src0->type, GGML_TYPE_Q8_1, sel_cols, ne20, ne00) : nullptr;
     vk_pipeline to_q8_1 = nullptr;
 
     if (dmmv == nullptr) {
         // Fall back to f16 dequant mul mat
-        dmmv = ggml_vk_get_dequantize_mul_mat_vec(ctx, src0->type, src1->type, ne11, ne20, ne00);
+        dmmv = ggml_vk_get_dequantize_mul_mat_vec(ctx, src0->type, src1->type, sel_cols, ne20, ne00);
         quantize_y = false;
     }
 
@@ -6967,28 +7033,63 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
         fusion_flags |= MAT_VEC_FUSION_FLAGS_BIAS1;
     }
 
-    ggml_pipeline_request_descriptor_sets(ctx, dmmv, CEIL_DIV(ne12 * ne13, ctx->device->properties.limits.maxComputeWorkGroupCount[1]));
+    if (n_chunks > 1) {
+        // ne12 * ne13 == 1 here. Chunks read disjoint Y columns and write disjoint D columns, no barrier.
+        // Y bytes per column: q8_1 is 36 bytes per 32 values (x4 blocks of 144 bytes per 128).
+        const uint64_t y_col_bytes = quantize_y ? ne10 / 32 * ggml_type_size(GGML_TYPE_Q8_1) : ne10 * ggml_type_size(src1->type);
+        const uint64_t d_col_bytes = ne20 * sizeof(float);
+        const uint32_t base_cols = (uint32_t)ne11 / n_chunks;
+        const uint32_t rem_cols  = (uint32_t)ne11 % n_chunks;
+        uint32_t col0 = 0;
+        for (uint32_t c = 0; c < n_chunks; ++c) {
+            const uint32_t cols = base_cols + (c < rem_cols ? 1 : 0);
+            vk_pipeline dmmv_c = ggml_vk_get_dequantize_mul_mat_vec(ctx, src0->type, quantize_y ? GGML_TYPE_Q8_1 : src1->type, cols, ne20, ne00);
+            GGML_ASSERT(dmmv_c != nullptr);
+            if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
+                dmmv_c = ggml_vk_get_64b_indexing_pipeline(ctx, dmmv_c);
+            }
+            ggml_pipeline_request_descriptor_sets(ctx, dmmv_c, 1);
 
-    uint32_t base_work_group_y = 0;
-    while (base_work_group_y < ne12 * ne13) {
+            const uint64_t y_off = col0 * y_col_bytes;
+            const uint64_t d_off = col0 * d_col_bytes;
+            GGML_ASSERT(y_off < d_Y.size && d_off + cols * d_col_bytes <= d_D.size);
+            const vk_subbuffer d_Yc = { d_Y.buffer, d_Y.offset + y_off, d_Y.size - y_off };
+            const vk_subbuffer d_Dc = { d_D.buffer, d_D.offset + d_off, cols * d_col_bytes };
 
-        uint32_t groups_y = std::min((uint32_t)(ne12 * ne13) - base_work_group_y, ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
-        const vk_mat_vec_push_constants pc = {
-            (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
-            stride_batch_x, stride_batch_y, stride_batch_d,
-            fusion_flags, base_work_group_y,
-            (uint32_t)ne02, (uint32_t)ne12, (uint32_t)r2, (uint32_t)r3,
-        };
-        ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
-                                  {
-                                    d_X,
-                                    d_Y,
-                                    d_D,
-                                    d_F0,
-                                    d_F1,
-                                  },
-                                  pc, { groups_x, groups_y, groups_z });
-        base_work_group_y += groups_y;
+            const vk_mat_vec_push_constants pc = {
+                (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
+                stride_batch_x, stride_batch_y, stride_batch_d,
+                0, 0,
+                (uint32_t)ne02, (uint32_t)ne12, (uint32_t)r2, (uint32_t)r3,
+            };
+            ggml_vk_dispatch_pipeline(ctx, subctx, dmmv_c, { d_X, d_Yc, d_Dc, d_Dc, d_Dc }, pc, { groups_x, 1, groups_z });
+            col0 += cols;
+        }
+        GGML_ASSERT(col0 == ne11);
+    } else {
+        ggml_pipeline_request_descriptor_sets(ctx, dmmv, CEIL_DIV(ne12 * ne13, ctx->device->properties.limits.maxComputeWorkGroupCount[1]));
+
+        uint32_t base_work_group_y = 0;
+        while (base_work_group_y < ne12 * ne13) {
+
+            uint32_t groups_y = std::min((uint32_t)(ne12 * ne13) - base_work_group_y, ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+            const vk_mat_vec_push_constants pc = {
+                (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
+                stride_batch_x, stride_batch_y, stride_batch_d,
+                fusion_flags, base_work_group_y,
+                (uint32_t)ne02, (uint32_t)ne12, (uint32_t)r2, (uint32_t)r3,
+            };
+            ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
+                                      {
+                                        d_X,
+                                        d_Y,
+                                        d_D,
+                                        d_F0,
+                                        d_F1,
+                                      },
+                                      pc, { groups_x, groups_y, groups_z });
+            base_work_group_y += groups_y;
+        }
     }
 
     if (x_non_contig) {
@@ -7348,6 +7449,63 @@ void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, con
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, r_buf, p_buf, c_buf, d_buf }, pc, { n_embd, n_tokens, 1 });
 }
 
+// GGML_VK_MMVQ_CHUNK gate, see ggml_vk_mul_mat. nullptr = chunk, otherwise why not.
+// 2D, unfused, f32 out, contiguous; ne10 % 128 == 0 so every chunk's Y window starts on a q8_1 x4
+// block (144 bytes) and every D window is 4-byte aligned for the descriptor offset.
+static const char * ggml_vk_mmvq_chunk_skip_reason(const ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    const uint64_t align = ctx->device->properties.limits.minStorageBufferOffsetAlignment;
+    if (ctx->num_additional_fused_ops != 0)                                     return "fused";
+    if (dst->ne[1] > vk_mmvq_chunk)                                             return "n>cap";
+    if (src0->type != GGML_TYPE_F16 && !ggml_is_quantized(src0->type))          return "src0_type";
+    if (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16)             return "src1_type";
+    if (dst->type != GGML_TYPE_F32)                                             return "dst_type";
+    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) return "batched";
+    if (src1->ne[0] % 128 != 0)                                                 return "k%128";
+    if (!ggml_vk_dim01_contiguous(src0))                                        return "src0_noncontig";
+    if (!ggml_is_contiguous(src1))                                              return "src1_noncontig";
+    if (!ggml_is_contiguous(dst))                                               return "dst_noncontig";
+    if (get_misalign_bytes(ctx, src1) != 0)                                     return "src1_misalign";
+    if (get_misalign_bytes(ctx, dst) != 0)                                      return "dst_misalign";
+    if ((dst->ne[0] * sizeof(float)) % align != 0 ||
+        (src1->ne[0] * ggml_type_size(src1->type)) % align != 0 ||
+        (src1->ne[0] / 32 * ggml_type_size(GGML_TYPE_Q8_1)) % align != 0)      return "col_align";
+    return nullptr;
+}
+
+// GGML_VK_MMVQ_CHUNK_STATS=1: count chunk / skip-reason per MUL_MAT shape with n > mul_mat_vec_max_cols,
+// printed per graph from ggml_backend_vk_graph_compute (first 64 graphs that have any). Debug only.
+static bool vk_mmvq_chunk_stats = getenv("GGML_VK_MMVQ_CHUNK_STATS") != nullptr;
+static std::map<std::string, uint32_t> vk_mmvq_chunk_stats_map;
+static std::mutex vk_mmvq_chunk_stats_mutex;
+
+static const char * ggml_vk_mmvq_chunk_stat(const ggml_backend_vk_context * ctx, const ggml_tensor * dst, const char * reason) {
+    if (vk_mmvq_chunk_stats) {
+        const ggml_tensor * src0 = dst->src[0];
+        std::string key = ctx->device->name + " " + (reason ? reason : "CHUNK") + " " + ggml_type_name(src0->type) +
+                          " m=" + std::to_string(dst->ne[0]) + " n=" + std::to_string(dst->ne[1]) + " k=" + std::to_string(src0->ne[0]);
+        std::lock_guard<std::mutex> guard(vk_mmvq_chunk_stats_mutex);
+        vk_mmvq_chunk_stats_map[key]++;
+    }
+    return reason;
+}
+
+static void ggml_vk_mmvq_chunk_stats_flush() {
+    if (!vk_mmvq_chunk_stats) {
+        return;
+    }
+    static int printed = 0;
+    std::lock_guard<std::mutex> guard(vk_mmvq_chunk_stats_mutex);
+    if (vk_mmvq_chunk_stats_map.empty() || printed >= 64) {
+        vk_mmvq_chunk_stats_map.clear();
+        return;
+    }
+    printed++;
+    for (const auto & kv : vk_mmvq_chunk_stats_map) {
+        fprintf(stderr, "mmvq_chunk_stats: %s x%u\n", kv.first.c_str(), kv.second);
+    }
+    vk_mmvq_chunk_stats_map.clear();
+}
+
 void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
@@ -7417,6 +7575,25 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
     } else if ((dst->ne[1] == 1 || (dst->ne[1] <= mul_mat_vec_max_cols && src1->ne[2] * src1->ne[3] == 1)) &&
                (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type))) {
         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx);
+    // GGML_VK_MMVQ_CHUNK (default on, cap 48): n in 13..cap as mmvq column chunks, width per
+    // ggml_vk_mmvq_chunk_width.
+    // Qwen3.8-27B Q8_0, six-turn session, 3 GPUs (2026-10-19): chunk on (12 wide) 52.6 / 50.2 t/s vs off
+    // 49.7 at draft cap 11; 16 wide at cap 16 step ms 12:110.7 13:117.2 14:125.6 16:139.1 17:165.9 (13-row
+    // cliff gone); 34-row ngram verify 255 -> 211 ms. Known small loss left in: q6_K lm_head 248320x5120
+    // n=34 4833 -> 5966 us (+1.1 ms per 34-row step).
+    // 7900 XTX, 2026-10-19, us at n = 12 (mmvq) / 13 / 34 (MMQ coopmat1 32x32 / 64x64 tile):
+    // q6_K 17408x5120 132/379/374, 5120x17408 115/550/848, 1024x5120 24/160/233, 48x5120 24/165/236;
+    // q4_K 17408x5120 100/291/430. The MMQ tile path runs split_k 1 below n = tile N, so every
+    // workgroup walks the whole K loop serially (~0.76 us per 32-wide step): a latency floor, not bandwidth.
+    // Measured with it on (chunks have no barrier between them, so they overlap): q6_K 17408x5120
+    // n=13/34 148/334, 5120x17408 149/322, 1024x5120 19/33, 48x5120 15/25; q4_K 17408x5120 117/274.
+    // Loses where MMQ is already efficient: q6_K lm_head 248320x5120 n=34 4833 -> 5966, q8_0 m >= 10240
+    // at n=24 (+15..49%) and q8_0 17408x5120 n >= 16. Qwen3.8-27B q6_K weight matmuls per verify step:
+    // n=34 188 -> 101 ms, n=16 143 -> 50 ms (kernel tables, before the per-type width).
+    // Gate: ggml_vk_mmvq_chunk_skip_reason.
+    } else if (vk_mmvq_chunk > 0 && dst->ne[1] > mul_mat_vec_max_cols &&
+               ggml_vk_mmvq_chunk_stat(ctx, dst, ggml_vk_mmvq_chunk_skip_reason(ctx, src0, src1, dst)) == nullptr) {
+        ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx, false, true);
     } else {
         ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, false);
     }
@@ -8434,6 +8611,15 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // nb=12 661.1 -> 545.0; dense prefill 16-27% faster at hs 64..576. It loses whenever V is staged
     // through kvsh (quantized K/V +5..37%, sparse gather +30..60%, unaligned KV +5..15%) and at
     // hs 512 decode (+5..10%), so auto keeps wave64 there. GGML_VK_FA_CM1_WAVE32=0/1 off/always.
+    //
+    // Why this exists at all: the coopmat1 shader is WMMA-native at wave32 on RDNA3, but the device
+    // default subgroup is 64, so before this it always ran wave64. subgroup_size_control lets the
+    // pipeline request 32 (tuning_params.subgroup_size feeds the pipeline state key below).
+    // 5320/5320 test-backend-ops FA cases pass with it forced (2026-10-18). End to end, in a 4k-context
+    // session it showed only as pp +5%; the decode gain at 92k context is unmeasured.
+    // Dead probes from the same session, do not repeat: psh_stride = Br/4 + {0,1,2,4}
+    // (flash_attn_cm1.comp:47) was flat at every nb; row_split 8 / 2 are invalid, see
+    // get_fa_tuning_params_coopmat1. The P.V phase still costs ~2x Q.K and that excess is unexplained.
     if (tuning_params.path == FA_COOPMAT1 && vk_fa_cm1_wave32 != 0 && ctx->device->subgroup_size == 64 &&
         ctx->device->subgroup_size_control && ctx->device->subgroup_min_size <= 32 && ctx->device->subgroup_max_size >= 32) {
         const bool rdna3 = ctx->device->vendor_id == VK_VENDOR_ID_AMD && ctx->device->architecture == AMD_RDNA3;
@@ -15053,6 +15239,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         }
         ctx->perf_logger->print_timings();
     }
+    ggml_vk_mmvq_chunk_stats_flush();
 
     if (!ctx->device->support_async) {
         ggml_vk_synchronize(ctx);

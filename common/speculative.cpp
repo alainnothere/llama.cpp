@@ -1620,6 +1620,39 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     // rejected rows (keep[k] == 0) are skipped, but the target features are still read out of ctx_tgt's
     // embedding buffers by full batch row [TAG_SPEC_AVOID_DRAFT_REEVAL]
+    //
+    // seed fusion (86ecf17dd1, 2026-10-18):
+    // before, each step ran process() (catch-up decode of the n+1 verify rows on ctx_dft) and then draft()
+    // opened with a separate 1-row decode of the seed (id_last at pos0, with the target's hidden state).
+    // that is one extra draft-graph decode + llama_synchronize + sample per step, ~1.2-1.4 ms at 92k
+    // context. now the server passes the accepted token per sequence (`next`, built as spec_next in the
+    // verify lambda of tools/server/server-context.cpp) and this function appends it to the catch-up batch
+    // as a seed row: pos = last kept pos + 1, output = true, embd = llama_get_embeddings_nextn_ith(ctx_tgt, k)
+    // of the last kept row k (the same h that pending_h holds afterwards). draft() reuses that row when
+    // tok, pos and the generation counter (n_dec) all match, i.e. i_last = seed idx and the i == 0
+    // llama_process is skipped; otherwise it seq_rm's the stale seed and falls back to the old 1-row decode.
+    //
+    // preconditions:
+    //   - `keep` must be honored. it used to be ignored: rejected rows were decoded into ctx_dft and the
+    //     server seq_rm'd them afterwards. the seed sits at the position the first rejected row would
+    //     occupy, so decoding rejected rows would put two cells at that pos in ctx_dft.
+    //   - rejected rows must be a suffix of each sequence's rows (asserted below), so kept positions are
+    //     contiguous and "last kept pos + 1" is the next position.
+    //   - chain_heads models get no seed (each head owns its layer KV, draft() rebuilds from pos0 per
+    //     head), is_mem_shared skips the catch-up decode entirely, and the server's restore path passes no
+    //     `next` (the draft state comes from the checkpoint). all three fall back to the 1-row decode.
+    //   - the server must keep the seed row in ctx_dft when it trims memory after verify (seq_rm from
+    //     pos_next + 1 on ctx_dft, pos_next on ctx_tgt) and must call seed_drop on release() and context
+    //     shift, so a stale seed never matches a new request.
+    //
+    // fires on ~99% of steps. measured 2026-10-18, Qwen3.8-27B Q8, six-turn session, draft-mtp + ngram-mod,
+    // --spec-draft-auto, one run each (noise ~2 t/s): fused + h_nextn crop fix, session 47.4 -> 56.6 t/s,
+    // acceptance 0.544 -> 0.650, step 85 -> 70 ms. fused without the crop fix was 39.3 t/s / 0.484, because
+    // the seed row makes every catch-up batch multi-row (see crop_before_nextn in src/llama-graph.h).
+    // open question: the acceptance gain is larger than removing one decode row explains and is not
+    // attributed yet. candidates: keep being honored (rejected rows no longer sit in ctx_dft KV), the seed
+    // decoding jointly with the catch-up rows instead of alone, and the auto tuner settling on a shorter
+    // chain (4.2 built vs 6.3).
     bool process(const common_batch & batch_in, const std::vector<int8_t> & keep, const std::vector<common_speculative_seed> & next) override {
         if (batch_in.size() <= 0) {
             return true;
@@ -1650,7 +1683,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     rejected[seq_id] = true;
                     continue;
                 }
-                // kept positions must stay contiguous
+                // kept positions must stay contiguous: the seed row goes at last kept pos + 1, which is
+                // only the right position if nothing after it was kept
                 GGML_ASSERT(!rejected[seq_id] && "rejected rows must be a suffix of the sequence rows");
 
                 i_batch_end[seq_id] = k;
@@ -1831,7 +1865,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
-        // the first step reuses the seed rows of the catch-up decode only if every drafting seq has a valid one
+        // the first step reuses the seed rows of the catch-up decode only if every drafting seq has a valid one.
+        // the check is all-or-none because step 0 is a single decode for every drafting seq: either it is
+        // skipped (all outputs come from the catch-up decode) or it runs (and would overwrite those outputs).
+        // gen == n_dec: no ctx_dft decode since process(), so the seed's output row is still the latest.
+        // tok/pos: guard against a draft that does not start where the seed was placed; a mismatch drops
+        // the seed and decodes the first row as before.
         bool use_seed = n_drafting > 0;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (drafting[seq_id]) {
