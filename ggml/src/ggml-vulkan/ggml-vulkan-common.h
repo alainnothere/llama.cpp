@@ -21,6 +21,8 @@ extern bool vk_fa_fold_maskopt;
 extern int vk_fa_f16acc;
 // GGML_VK_FA_SPARSE_MIN_RATIO: f16-KV, non-cm2 sparse gate, sparse when KV >= max(4096, ratio * n_kv_max)
 extern uint32_t vk_fa_sparse_min_ratio_f16;
+// GGML_VK_FA_QUANT_STAGING: coopmat1 whole-tile K/V shmem staging for quantized K or V. -1 auto (= off), 0 off, 1 on
+extern int vk_fa_quant_staging;
 
 // Perf logger sub-dispatch marks. Only active with GGML_VK_PERF_LOGGER (non-concurrent mode).
 // ggml_vk_perf_mark: the time since the previous timestamp is logged under `label`.

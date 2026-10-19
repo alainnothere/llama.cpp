@@ -1308,9 +1308,6 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
 static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc) {
     GGML_UNUSED(n_rows);
     GGML_UNUSED(n_kv);
-    GGML_UNUSED(k_type);
-    GGML_UNUSED(v_type);
-    GGML_UNUSED(f32acc);
 
     vk_fa_tuning_params result{};
     result.path = FA_COOPMAT1;
@@ -1332,6 +1329,18 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
     result.d_split = std::min(std::min(result.subgroup_size, 8u), D_lsb / 4);
 
     result.shmem_staging = (device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) ? 1 : 0;
+
+    // GGML_VK_FA_QUANT_STAGING=1: quantized K/V dequantize the whole Bc x D tile once instead of per
+    // 16-wide d-chunk with two barriers each. Dropped again when the larger kvsh does not fit, so the
+    // path stays coopmat1. Auto (-1) is off: measured 2026-10-18 on a 7900 XT, hs 256 qk 6 kv 32k q8_0,
+    // staging is 4-8% slower at n=1/6/12 (shared memory per workgroup goes ~26 KB -> ~51 KB); XTX too noisy to call.
+    const bool quant_staging = vk_fa_quant_staging == 1;
+    if (!result.shmem_staging && quant_staging && (ggml_is_quantized(k_type) || ggml_is_quantized(v_type))) {
+        result.shmem_staging = 1;
+        if (!ggml_vk_flash_attn_coopmat_shmem_support(device, result, hsk, hsv, f32acc, k_type, v_type)) {
+            result.shmem_staging = 0;
+        }
+    }
 
     return result;
 }
@@ -5348,6 +5357,9 @@ void ggml_vk_instance_init() {
     if (const char * e = getenv("GGML_VK_FA_SPARSE_MIN_RATIO")) {
         vk_fa_sparse_min_ratio_f16 = std::max(1u, (uint32_t)std::stoul(e));
     }
+    if (const char * e = getenv("GGML_VK_FA_QUANT_STAGING")) {
+        vk_fa_quant_staging = atoi(e) != 0 ? 1 : 0;
+    }
     if (vk_fa_f16acc || vk_fa_sparse_min_ratio_f16 != 2) {
         GGML_LOG_WARN("ggml_vulkan: FA f16 accumulation %s (GGML_VK_FA_F16ACC=0 to obey GGML_PREC_F32), "
                       "f16 sparse min ratio %u (GGML_VK_FA_SPARSE_MIN_RATIO=2 for the old gate)\n",
@@ -8304,6 +8316,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     if (gqa_ratio > 1 && gqa_fold_T && tuning_params.path == FA_COOPMAT1) {
         // pick the tile height (multiple of 16) that needs the fewest token groups and fits shared memory
         uint32_t best_Br = 0, best_wgs = UINT32_MAX;
+        bool best_staging = tuning_params.shmem_staging;
         for (uint32_t cand = 16; cand <= vk_fa_fold_max_br; cand += 16) {
             if (cand < qk_ratio) {
                 continue;
@@ -8311,19 +8324,26 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
             vk_fa_tuning_params tp = tuning_params;
             tp.block_rows = cand;
             if (!ggml_vk_flash_attn_coopmat_shmem_support(ctx->device, tp, HSK, HSV, f32acc, k_type_eff, v_type_eff)) {
-                continue;
+                // the whole-tile K/V staging buffer is the first thing to give up for a taller tile
+                tp.shmem_staging = false;
+                if (!tuning_params.shmem_staging ||
+                    !ggml_vk_flash_attn_coopmat_shmem_support(ctx->device, tp, HSK, HSV, f32acc, k_type_eff, v_type_eff)) {
+                    continue;
+                }
             }
             const uint32_t T   = cand / qk_ratio;
             const uint32_t wgs = CEIL_DIV((uint32_t)neq1, T);
             if (wgs < best_wgs) {
-                best_wgs = wgs;
-                best_Br  = cand;
+                best_wgs     = wgs;
+                best_Br      = cand;
+                best_staging = tp.shmem_staging;
             }
         }
         if (best_Br != 0) {
             gqa_T = std::min<uint32_t>(best_Br / qk_ratio, (uint32_t)neq1);
             N = gqa_T * qk_ratio;
             tuning_params.block_rows = best_Br;
+            tuning_params.shmem_staging = best_staging;
             workgroups_x = CEIL_DIV((uint32_t)neq1, gqa_T);
         }
     }
