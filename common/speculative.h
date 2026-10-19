@@ -97,7 +97,22 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 // committed to: a 0 entry is a drafted token that the target has just rejected and whose KV is about
 // to be dropped from the target memory, so there is no point in mirroring it into the draft state.
 // implementations that can skip such rows do so, the rest simply replay the whole batch
-bool common_speculative_process(common_speculative * spec, const common_batch & batch, const std::vector<int8_t> & keep = {});
+//
+// `next`, when non-empty, gives the token the target sampled after the last kept row of a sequence, i.e. the
+// id_last of the next draft. draft-mtp decodes it in the same draft batch (pos = last kept pos + 1), so the
+// first draft step needs no decode of its own. the row stays in the draft memory - see the seed functions below
+struct common_speculative_seed {
+    llama_seq_id seq_id;
+    llama_token  id;
+};
+
+bool common_speculative_process(common_speculative * spec, const common_batch & batch, const std::vector<int8_t> & keep = {}, const std::vector<common_speculative_seed> & next = {});
+
+// position of the seed row that process() left in the draft memory for seq_id, -1 if none
+llama_pos common_speculative_seed_pos(const common_speculative * spec, llama_seq_id seq_id);
+
+// remove the seed row of seq_id from the draft memory (call before the sequence leaves generation or is shifted)
+void common_speculative_seed_drop(common_speculative * spec, llama_seq_id seq_id);
 
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);

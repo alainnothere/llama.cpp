@@ -213,7 +213,11 @@ struct common_speculative_impl {
 
     // `keep` is either empty (replay the whole batch) or has one entry per batch row - see
     // common_speculative_process() in speculative.h
-    virtual bool process(const common_batch & batch, const std::vector<int8_t> & keep) = 0;
+    virtual bool process(const common_batch & batch, const std::vector<int8_t> & keep, const std::vector<common_speculative_seed> & next) = 0;
+
+    // seed row left in the draft memory by process(), see common_speculative_seed_pos()
+    virtual llama_pos seed_pos(llama_seq_id /*seq_id*/) const { return -1; }
+    virtual void      seed_drop(llama_seq_id /*seq_id*/) {}
 
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
@@ -310,7 +314,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
         common_sampler_reset(smpls[seq_id].get());
     }
 
-    bool process(const common_batch & batch_in, const std::vector<int8_t> & keep) override {
+    bool process(const common_batch & batch_in, const std::vector<int8_t> & keep, const std::vector<common_speculative_seed> & /*next*/) override {
         auto * ctx_dft = params.ctx_dft;
 
         const int32_t n_tokens = batch_in.size();
@@ -683,7 +687,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         }
     }
 
-    bool process(const common_batch & batch_in, const std::vector<int8_t> & /*keep*/) override {
+    bool process(const common_batch & batch_in, const std::vector<int8_t> & /*keep*/, const std::vector<common_speculative_seed> & /*next*/) override {
         if (batch_in.size() <= 0) {
             return true;
         }
@@ -1191,7 +1195,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     // note: `keep` is ignored - the target features are read row-by-row out of ctx_tgt's embedding
     //       buffers, which are indexed by full batch row [TAG_SPEC_AVOID_DRAFT_REEVAL]
-    bool process(const common_batch & batch_in, const std::vector<int8_t> & /*keep*/) override {
+    bool process(const common_batch & batch_in, const std::vector<int8_t> & /*keep*/, const std::vector<common_speculative_seed> & /*next*/) override {
         if (batch_in.size() <= 0) {
             return true;
         }
@@ -1462,6 +1466,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // per seq: the next draft's first row (id_last at pos0), decoded by process() as an output row of the
+    // catch-up batch, so draft() can sample it without a decode of its own. its KV stays in ctx_dft
+    struct seed_row {
+        llama_token tok = LLAMA_TOKEN_NULL;
+        llama_pos   pos = -1;
+        int32_t     idx = -1; // batch index in the catch-up decode
+        uint64_t    gen = 0;  // n_dec after that decode; any later ctx_dft decode overwrites the output
+    };
+
+    std::vector<seed_row> seeds;
+
+    uint64_t n_dec = 0; // number of decodes submitted to ctx_dft by this implementation
+
     // log only, per seq: probability of each drafted token and why drafting stopped, folded into
     // conf_stats when the target verifies the draft
     std::vector<std::vector<float>>           conf_p;
@@ -1537,6 +1554,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
 
         i_last.assign(n_seq, -1);
+        seeds.assign(n_seq, {});
         i_batch_beg.assign(n_seq, -1);
         i_batch_end.assign(n_seq, -1);
 
@@ -1586,9 +1604,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
-    // note: `keep` is ignored - the target features are read row-by-row out of ctx_tgt's embedding
-    //       buffers, which are indexed by full batch row [TAG_SPEC_AVOID_DRAFT_REEVAL]
-    bool process(const common_batch & batch_in, const std::vector<int8_t> & /*keep*/) override {
+    llama_pos seed_pos(llama_seq_id seq_id) const override {
+        return seq_id >= 0 && seq_id < (llama_seq_id) n_seq ? seeds[seq_id].pos : -1;
+    }
+
+    void seed_drop(llama_seq_id seq_id) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || seeds[seq_id].pos < 0) {
+            return;
+        }
+        if (!llama_memory_seq_rm(llama_get_memory(params.ctx_dft), seq_id, seeds[seq_id].pos, -1)) {
+            SPC_ERR("failed to remove the seed row of seq %d at pos %d\n", (int) seq_id, (int) seeds[seq_id].pos);
+        }
+        seeds[seq_id] = {};
+    }
+
+    // rejected rows (keep[k] == 0) are skipped, but the target features are still read out of ctx_tgt's
+    // embedding buffers by full batch row [TAG_SPEC_AVOID_DRAFT_REEVAL]
+    bool process(const common_batch & batch_in, const std::vector<int8_t> & keep, const std::vector<common_speculative_seed> & next) override {
         if (batch_in.size() <= 0) {
             return true;
         }
@@ -1600,17 +1632,30 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const int32_t n_tokens = batch_in.size();
 
-        // remember the first and last batch index for each sequence
+        GGML_ASSERT(keep.empty() || (int32_t) keep.size() == n_tokens);
+
+        // remember the first and last kept batch index for each sequence
         std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
         std::fill(i_batch_end.begin(), i_batch_end.end(), -1);
 
-        for (int k = 0; k < n_tokens; ++k) {
-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                if (batch_in.tokens[k].seq_id == seq_id) {
-                    i_batch_end[seq_id] = k;
-                    if (i_batch_beg[seq_id] < 0) {
-                        i_batch_beg[seq_id] = k;
-                    }
+        {
+            std::vector<bool> rejected(n_seq, false);
+
+            for (int k = 0; k < n_tokens; ++k) {
+                const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
+                if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+                    continue;
+                }
+                if (!keep.empty() && !keep[k]) {
+                    rejected[seq_id] = true;
+                    continue;
+                }
+                // kept positions must stay contiguous
+                GGML_ASSERT(!rejected[seq_id] && "rejected rows must be a suffix of the sequence rows");
+
+                i_batch_end[seq_id] = k;
+                if (i_batch_beg[seq_id] < 0) {
+                    i_batch_beg[seq_id] = k;
                 }
             }
         }
@@ -1622,6 +1667,30 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
+            auto * mem_dft = llama_get_memory(ctx_dft);
+
+            // the batch rewrites the position of an old seed row, so drop it
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_batch_beg[seq_id] < 0 || seeds[seq_id].pos < 0) {
+                    continue;
+                }
+                if (!llama_memory_seq_rm(mem_dft, seq_id, seeds[seq_id].pos, -1)) {
+                    SPC_ERR("failed to remove the seed row of seq %d at pos %d\n", (int) seq_id, (int) seeds[seq_id].pos);
+                    return false;
+                }
+                seeds[seq_id] = {};
+            }
+
+            // with chained heads each head owns its own layer KV, so the seed row is left to draft()
+            std::vector<llama_token> next_tok(n_seq, LLAMA_TOKEN_NULL);
+            if (!chain_heads) {
+                for (const auto & nx : next) {
+                    if (nx.seq_id >= 0 && nx.seq_id < (llama_seq_id) n_seq && i_batch_end[nx.seq_id] >= 0) {
+                        next_tok[nx.seq_id] = nx.id;
+                    }
+                }
+            }
+
             batch.clear();
 
             // pair each token with the tgt embedding shifted right by one position, and
@@ -1633,6 +1702,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
 
             for (int k = 0; k < n_tokens; ++k) {
+                if (!keep.empty() && !keep[k]) {
+                    continue;
+                }
+
                 const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
 
                 const int32_t idx = batch.add(batch_in.tokens[k].id, batch_in.tokens[k].pos[0], seq_id, false);
@@ -1642,9 +1715,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     : h_tgt + (size_t) (k - 1) * n_embd;
 
                 batch.set_embd(idx, { h_row, 1, (size_t) n_embd });
-            }
 
-            auto * mem_dft = llama_get_memory(ctx_dft);
+                if (k == i_batch_end[seq_id] && next_tok[seq_id] != LLAMA_TOKEN_NULL) {
+                    auto & sd = seeds[seq_id];
+
+                    sd.tok = next_tok[seq_id];
+                    sd.pos = batch_in.tokens[k].pos[0] + 1;
+                    sd.idx = batch.add(sd.tok, sd.pos, seq_id, true);
+
+                    // the same h row that pending_h holds after this call
+                    batch.set_embd(sd.idx, { llama_get_embeddings_nextn_ith(ctx_tgt, k), 1, (size_t) n_embd });
+                }
+            }
 
             bool ok = true;
             for (int head = 0; head < n_mtp_layers; ++head) {
@@ -1666,11 +1748,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     ok = false;
                     break;
                 }
+                n_dec++;
             }
 
             if (chain_heads) {
                 llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
             }
+
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (next_tok[seq_id] != LLAMA_TOKEN_NULL) {
+                    seeds[seq_id].gen = n_dec;
+                    if (!ok) {
+                        seeds[seq_id] = {};
+                    }
+                }
+            }
+
             if (!ok) {
                 return false;
             }
@@ -1730,17 +1823,47 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 common_sampler_reset(smpls[seq_id].get());
             }
 
-            const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
-            batch.set_embd(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
-
-            i_last[seq_id] = idx;
-
             conf_p[seq_id].clear();
             conf_stop[seq_id] = COMMON_SPECULATIVE_MTP_STOP_OTHER;
 
             if (chain_heads) {
                 chain_h[seq_id].assign(pending_h[seq_id].begin(), pending_h[seq_id].end());
             }
+        }
+
+        // the first step reuses the seed rows of the catch-up decode only if every drafting seq has a valid one
+        bool use_seed = n_drafting > 0;
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (drafting[seq_id]) {
+                const auto & sd = seeds[seq_id];
+                const auto & dp = dparams[seq_id];
+                use_seed = use_seed && sd.pos >= 0 && sd.gen == n_dec && sd.tok == dp.id_last && sd.pos == dp.pos0;
+            }
+        }
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (!drafting[seq_id]) {
+                continue;
+            }
+
+            auto & sd = seeds[seq_id];
+            const auto & dp = dparams[seq_id];
+
+            if (use_seed) {
+                i_last[seq_id] = sd.idx;
+            } else {
+                // the first row is decoded again, so drop the seed row in its place
+                if (sd.pos >= 0 && !llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, sd.pos, -1)) {
+                    SPC_ERR("failed to remove the seed row of seq %d at pos %d\n", (int) seq_id, (int) sd.pos);
+                }
+
+                const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
+                batch.set_embd(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
+
+                i_last[seq_id] = idx;
+            }
+
+            sd = {};
         }
 
         int i = 0;
@@ -1762,10 +1885,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
-            int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
-            if (ret != 0) {
-                SPC_ERR("llama_process[%d] returned %d\n", i, ret);
-                break;
+            if (i > 0 || !use_seed) {
+                int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                if (ret != 0) {
+                    SPC_ERR("llama_process[%d] returned %d\n", i, ret);
+                    break;
+                }
+                n_dec++;
             }
 
             // rebuild the batch for the next step: the growing-KV paths re-add only the
@@ -1925,7 +2051,7 @@ struct common_speculative_impl_ngram_simple : public common_speculative_impl {
         // noop
     }
 
-    bool process(const common_batch & /*batch*/, const std::vector<int8_t> & /*keep*/) override {
+    bool process(const common_batch & /*batch*/, const std::vector<int8_t> & /*keep*/, const std::vector<common_speculative_seed> & /*next*/) override {
         // TODO: implement
         return true;
     }
@@ -1973,7 +2099,7 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
         common_ngram_map_begin(config[seq_id], prompt);
     }
 
-    bool process(const common_batch & /*batch*/, const std::vector<int8_t> & /*keep*/) override {
+    bool process(const common_batch & /*batch*/, const std::vector<int8_t> & /*keep*/, const std::vector<common_speculative_seed> & /*next*/) override {
         // TODO: implement
         return true;
     }
@@ -2293,7 +2419,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         sinfo.drafted = !result.empty();
     }
 
-    bool process(const common_batch & /*batch*/, const std::vector<int8_t> & /*keep*/) override {
+    bool process(const common_batch & /*batch*/, const std::vector<int8_t> & /*keep*/, const std::vector<common_speculative_seed> & /*next*/) override {
         // TODO: implement
         return true;
     }
@@ -2575,7 +2701,7 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
         }
     }
 
-    bool process(const common_batch & /*batch*/, const std::vector<int8_t> & /*keep*/) override {
+    bool process(const common_batch & /*batch*/, const std::vector<int8_t> & /*keep*/, const std::vector<common_speculative_seed> & /*next*/) override {
         // TODO: implement
         return true;
     }
@@ -3227,7 +3353,7 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
     spec->t_draft_last_us[seq_id] = 0;
 }
 
-bool common_speculative_process(common_speculative * spec, const common_batch & batch, const std::vector<int8_t> & keep) {
+bool common_speculative_process(common_speculative * spec, const common_batch & batch, const std::vector<int8_t> & keep, const std::vector<common_speculative_seed> & next) {
     bool result = true;
 
     if (spec == nullptr) {
@@ -3235,10 +3361,35 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
     }
 
     for (auto & impl : spec->impls) {
-        result = result && impl->process(batch, keep);
+        result = result && impl->process(batch, keep, next);
     }
 
     return result;
+}
+
+llama_pos common_speculative_seed_pos(const common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr) {
+        return -1;
+    }
+
+    for (const auto & impl : spec->impls) {
+        const llama_pos pos = impl->seed_pos(seq_id);
+        if (pos >= 0) {
+            return pos;
+        }
+    }
+
+    return -1;
+}
+
+void common_speculative_seed_drop(common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->seed_drop(seq_id);
+    }
 }
 
 bool common_speculative_type_is_ngram(common_speculative_type type) {

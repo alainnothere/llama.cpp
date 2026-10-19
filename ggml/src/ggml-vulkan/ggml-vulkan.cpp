@@ -1317,6 +1317,10 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
     const uint32_t coopmat_block_rows = 16;
     const uint32_t coopmat_block_cols = 16;
 
+    // row_split must equal the subgroup count, Br / row_split must be a multiple of 4 and
+    // Bc = 16 * num_subgroups must be >= the subgroup size (flash_attn_cm1.comp), so at Br = 16
+    // 4 is the only count valid in wave64 (8 fails 3824/5320 FA tests, 2 leaves Psh unwritten).
+    // ggml_vk_flash_attn may switch the subgroup size to 32, see GGML_VK_FA_CM1_WAVE32.
     const uint32_t num_subgroups = 4;
 
     result.block_rows = coopmat_block_rows;
@@ -5360,6 +5364,9 @@ void ggml_vk_instance_init() {
     if (const char * e = getenv("GGML_VK_FA_QUANT_STAGING")) {
         vk_fa_quant_staging = atoi(e) != 0 ? 1 : 0;
     }
+    if (const char * e = getenv("GGML_VK_FA_CM1_WAVE32")) {
+        vk_fa_cm1_wave32 = atoi(e) != 0 ? 1 : 0;
+    }
     if (vk_fa_f16acc || vk_fa_sparse_min_ratio_f16 != 2) {
         GGML_LOG_WARN("ggml_vulkan: FA f16 accumulation %s (GGML_VK_FA_F16ACC=0 to obey GGML_PREC_F32), "
                       "f16 sparse min ratio %u (GGML_VK_FA_SPARSE_MIN_RATIO=2 for the old gate)\n",
@@ -8421,6 +8428,23 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                         ((nem1 >= 32 && nem0 * nem1 > 32768) || long_kv_mask_opt) &&
                         nem0 >= tuning_params.block_cols * 16
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
+
+    // RDNA3 coopmat1 in wave32 (WMMA's native width; wave64 issues it as two halves). Measured
+    // 2026-10-18 on a 7900 XTX, hs 256 qk 6 kv 32k f16: nb=1 194.0 -> 187.5 us, nb=6 354.5 -> 321.0,
+    // nb=12 661.1 -> 545.0; dense prefill 16-27% faster at hs 64..576. It loses whenever V is staged
+    // through kvsh (quantized K/V +5..37%, sparse gather +30..60%, unaligned KV +5..15%) and at
+    // hs 512 decode (+5..10%), so auto keeps wave64 there. GGML_VK_FA_CM1_WAVE32=0/1 off/always.
+    if (tuning_params.path == FA_COOPMAT1 && vk_fa_cm1_wave32 != 0 && ctx->device->subgroup_size == 64 &&
+        ctx->device->subgroup_size_control && ctx->device->subgroup_min_size <= 32 && ctx->device->subgroup_max_size >= 32) {
+        const bool rdna3 = ctx->device->vendor_id == VK_VENDOR_ID_AMD && ctx->device->architecture == AMD_RDNA3;
+        const bool v_staged = use_sparse || !aligned || ggml_is_quantized(k_type_eff) || ggml_is_quantized(v_type_eff);
+        const bool wave32 = vk_fa_cm1_wave32 == 1 || (rdna3 && !v_staged && (HSV <= 256 || N > 16));
+        if (wave32) {
+            tuning_params.subgroup_size  = 32;
+            tuning_params.workgroup_size = tuning_params.row_split * 32;
+        }
+    }
+
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
                                                                    mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff);
 

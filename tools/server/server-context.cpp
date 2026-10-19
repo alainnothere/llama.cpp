@@ -939,6 +939,9 @@ struct server_slot {
 
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
 
+            // the draft memory must not keep rows past the prompt
+            common_speculative_seed_drop(spec, id);
+
             t_last_used = ggml_time_us();
 
             state = SLOT_STATE_IDLE;
@@ -3917,6 +3920,9 @@ private:
 
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
+                // the shift below stops at pos_next, a seed row past it would be left behind
+                common_speculative_seed_drop(slot.spec, slot.id);
+
                 slot.mem.seq_rm (slot.id, n_keep            , n_keep + n_discard);
                 slot.mem.seq_add(slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
 
@@ -4072,8 +4078,8 @@ private:
 
             // the draft context is only fed the rows the target accepted [TAG_SPEC_AVOID_DRAFT_REEVAL],
             // so this rewind is normally a no-op - it still has to run for the implementations that
-            // replay the full verify batch (eagle3/mtp/dflash) and for the tokens that draft() itself
-            // wrote into ctx_dft while generating the previous draft
+            // replay the full verify batch (eagle3/dflash) and for the tokens that draft() itself
+            // wrote into ctx_dft while generating this draft (draft-mtp: starting at its seed row)
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
             if (ctx_dft) {
@@ -5065,6 +5071,9 @@ private:
         // empty means "nothing was rejected", i.e. replay the whole batch
         std::vector<int8_t> spec_keep;
 
+        // per verified slot: the token sampled after the accepted drafts, i.e. the next draft's id_last
+        std::vector<common_speculative_seed> spec_next;
+
         // whether the rollback path below can ever be taken for this target context. it needs a
         // checkpoint restore, which is only used when the context cannot drop the rejected rows in
         // place - see `use_ckpt_tgt` in the verification pass. for a plain range-truncatable context
@@ -5146,6 +5155,11 @@ private:
 
             spec_verified.push_back({ slot.id, n_draft, accepted.size() - 1, restore, std::move(smpl_save) });
 
+            // the restore path reloads the draft state from the checkpoint, so it gets no seed row
+            if (!restore) {
+                spec_next.push_back({ slot.id, accepted.back() });
+            }
+
             slot.spec_i_batch.clear();
             slot.spec_draft = std::move(accepted);
         });
@@ -5175,7 +5189,7 @@ private:
         if (spec) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
-                ok = common_speculative_process(spec.get(), batch.view, spec_keep);
+                ok = common_speculative_process(spec.get(), batch.view, spec_keep, spec_next);
             });
 
             if (!ok) {
@@ -5388,7 +5402,24 @@ private:
             slot.sampled = ids.back(); // last accepted token
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
-            slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            // the draft memory may hold the seed row of the next draft at pos_next, keep it
+            {
+                const llama_pos pos_next = slot.prompt.tokens.pos_next();
+                const llama_pos pos_seed = common_speculative_seed_pos(slot.spec, slot.id);
+
+                if (pos_seed >= 0 && pos_seed != pos_next) {
+                    common_speculative_seed_drop(slot.spec, slot.id);
+                }
+
+                if (slot.ctx_dft && pos_seed == pos_next) {
+                    if (!llama_memory_seq_rm(llama_get_memory(slot.ctx_tgt), slot.id, pos_next,     -1) ||
+                        !llama_memory_seq_rm(llama_get_memory(slot.ctx_dft), slot.id, pos_next + 1, -1)) {
+                        GGML_ABORT("failed to remove sequence %d from pos %d\n", slot.id, pos_next);
+                    }
+                } else {
+                    slot.mem.seq_rm(slot.id, pos_next, -1);
+                }
+            }
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;

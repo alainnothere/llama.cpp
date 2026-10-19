@@ -18,6 +18,7 @@ bool vk_fa_fold_maskopt = true;
 int vk_fa_f16acc = 0;
 uint32_t vk_fa_sparse_min_ratio_f16 = 2;
 int vk_fa_quant_staging = -1;
+int vk_fa_cm1_wave32 = -1;
 
 bool vk_enable_sync_logger = false;
 

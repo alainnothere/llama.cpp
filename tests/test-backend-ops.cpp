@@ -11854,6 +11854,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 32768, bs, 8192, {1, 1}, {1, 1}));
         }
     }
+    // MMVQ rows-per-workgroup sweep at n=5..9 (speculative verify widths): the shape above plus the
+    // Qwen3.x-27B FFN weight (17408x5120); n=6/8 at 32768x8192 are already in the loop above
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+        for (int bs : {5, 7, 9}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 32768, bs, 8192, {1, 1}, {1, 1}));
+        }
+        for (int bs : {5, 6, 7, 8, 9}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 17408, bs, 5120, {1, 1}, {1, 1}));
+        }
+    }
 
     // qwen3-30b-a3b
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {

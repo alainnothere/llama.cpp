@@ -546,10 +546,17 @@ llama_model_bailingmoe3::graph_mtp::graph_mtp(const llama_model & model, const l
     cur = ggml_add(ctx0, cur, ffn_inp);
     cur = build_norm(cur, layer.nextn.shared_head_norm, nullptr, LLM_NORM_RMS, -1);
 
+    // masked nextn extraction reads n_outputs rows from the front of the tensor, so crop first
+    if (crop_before_nextn(inp_out_ids)) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
+
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
 
-    cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    if (crop_after_nextn(inp_out_ids)) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
     cur = ggml_mul_mat(ctx0, model.output, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;

@@ -703,10 +703,17 @@ llama_model_deepseek32::graph_mtp::graph_mtp(const llama_model & model, const ll
     GGML_ASSERT(head_norm_w && "DEEPSEEK32 MTP: missing both nextn.shared_head_norm and output_norm");
     cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
 
+    // masked nextn extraction reads n_outputs rows from the front of the tensor, so crop first
+    if (crop_before_nextn(inp_out_ids)) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
+
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
 
-    cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    if (crop_after_nextn(inp_out_ids)) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
     cb(cur, "mtp_shared_head_norm", -1);
 
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;

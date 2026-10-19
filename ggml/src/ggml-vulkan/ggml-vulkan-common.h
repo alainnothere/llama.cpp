@@ -23,6 +23,8 @@ extern int vk_fa_f16acc;
 extern uint32_t vk_fa_sparse_min_ratio_f16;
 // GGML_VK_FA_QUANT_STAGING: coopmat1 whole-tile K/V shmem staging for quantized K or V. -1 auto (= off), 0 off, 1 on
 extern int vk_fa_quant_staging;
+// GGML_VK_FA_CM1_WAVE32: coopmat1 FA in wave32 on RDNA3. -1 auto (dense aligned f16 only), 0 off, 1 always
+extern int vk_fa_cm1_wave32;
 
 // Perf logger sub-dispatch marks. Only active with GGML_VK_PERF_LOGGER (non-concurrent mode).
 // ggml_vk_perf_mark: the time since the previous timestamp is logged under `label`.
