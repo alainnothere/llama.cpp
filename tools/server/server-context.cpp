@@ -529,6 +529,10 @@ struct server_spec_stats_writer {
         config["draft_p_split"]     = f2d(sp.draft.p_split);
         config["draft_auto"]        = sp.draft.auto_n;
         config["draft_sampling"]    = sp.draft.probabilistic ? "probabilistic" : "greedy";
+        // 2026-10-20: target backend sampling (-bs) is the A/B for the ~12 ms fixed + ~1 ms/row off-GPU
+        // cost per verify step (logits D2H (n+1) x 993 KB + CPU sampler chain per row, whatifs suspect 6);
+        // in the snapshot so spec_stats.py groups A vs B runs by itself.
+        config["backend_sampling"]  = params.sampling.backend_sampling;
         config["ngram_mod_n_match"] = sp.ngram_mod.n_match;
         config["ngram_mod_n_min"]   = sp.ngram_mod.n_min;
         config["ngram_mod_n_max"]   = sp.ngram_mod.n_max;
@@ -544,7 +548,7 @@ struct server_spec_stats_writer {
         config["model"]             = std::filesystem::path(params.model.path).filename().string();
         config["model_draft"]       = sp.draft.mparams.path.empty() ? json(nullptr) : json(std::filesystem::path(sp.draft.mparams.path).filename().string());
 
-        for (const char * name : { "GGML_VK_MMVQ_CHUNK", "GGML_VK_SPLITK_SMALL_N", "GGML_VK_FA_CM1_WAVE32", "GGML_VK_FA_QUANT_STAGING" }) {
+        for (const char * name : { "GGML_VK_MMVQ_CHUNK", "GGML_VK_SPLITK_SMALL_N", "GGML_VK_FA_CM1_WAVE32", "GGML_VK_FA_QUANT_STAGING", "GGML_VK_MMVQ_SLOPE_STATS" }) {
             const char * v = getenv(name);
             config[name] = v ? json(v) : json(nullptr);
         }

@@ -1364,6 +1364,45 @@ struct ggml_backend_vk_context {
     const char * perf_trailing_label {};
     // wall clock when the previous graph_compute on this context returned (perf logger gap measurement)
     int64_t perf_last_graph_end_us {};
+
+    // for GGML_VK_MMVQ_SLOPE_STATS (see ggml_vk_mmvq_slope_begin): one entry per timed node (or fused group)
+    // of the current graph, timestamps query..query+1 bracket it. slope_path is filled by the dispatch site.
+    // op[0] == 0 marks a weight MUL_MAT (legacy key: m/k from src0, n = dst columns); otherwise op holds
+    // "OP[:subop][ (FUSION)]" and m/k are dst->ne[1]/ne[0].
+    struct vk_mmvq_slope_sample {
+        int32_t   query;
+        ggml_type type;
+        uint32_t  m, k, n, ntok;
+        uint64_t  bytes;
+        char      op[64];
+        char      path[56];   // slope_path + "+add"
+        // exemplar data (2026-10-20 enrichment), formatted into JSON at collect only for the first sample of
+        // a key. node stays valid until collect: both run inside the same graph_compute.
+        const ggml_tensor * node;
+        uint32_t  fused;                         // num_additional_fused_ops of the group
+        uint32_t  kv;                            // FLASH_ATTN_EXT exact KV length, 0 otherwise
+        uint32_t  rows_per_wg, chunk_cols, n_chunks, split_k;   // MUL_MAT dispatch parameters, 0 = unknown
+        std::string fa;                          // FLASH_ATTN_EXT: the perf logger's node_desc string
+    };
+    std::vector<vk_mmvq_slope_sample> slope_samples;
+    char slope_path[48] {};
+    // filled by the dispatch site next to slope_path, reset by ggml_vk_mmvq_slope_begin
+    uint32_t slope_kv {}, slope_rows_per_wg {}, slope_chunk_cols {}, slope_n_chunks {}, slope_split_k {};
+    std::string slope_fa;
+    // process-wide backend-context counter, assigned in ggml_backend_vk_init: the MTP draft llama_context
+    // owns its own ggml_backend_vk_context on the same device, so ctx id is what separates draft from target
+    uint32_t slope_ctx_id {};
+    // per graph: process-wide graph counter, n_nodes, the largest n_nodes seen so far on this DEVICE (all
+    // contexts with this ctx->name, snapshot at graph start) and the "target"/"draft"/"other" class derived
+    // from the two (see ggml_vk_mmvq_slope_graph_kind)
+    uint64_t slope_graph_id {};
+    uint32_t slope_graph_nodes {};
+    uint32_t slope_max_nodes {};
+    const char * slope_graph_kind {""};
+    // token count of the current graph (src1->ne[1] of its first weight MUL_MAT; 0 = graph has none)
+    uint32_t slope_ntok {};
+    // fusion name of the node group being dispatched (the perf logger's string), nullptr when unfused
+    const char * slope_fusion_name {};
 };
 
 struct ggml_backend_vk_buffer_context {

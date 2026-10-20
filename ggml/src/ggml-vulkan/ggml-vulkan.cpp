@@ -1,5 +1,7 @@
 #include "ggml-vulkan-common.h"
 
+#include <cstdarg>
+
 namespace {
 inline std::ostream & operator<<(std::ostream & os, vk::Buffer buffer) {
     return os << static_cast<VkBuffer>(buffer);
@@ -1140,6 +1142,475 @@ void ggml_vk_queue_command_pools_cleanup(vk_device& device) {
     if (device->transfer_queue && device->transfer_queue->cmd_pool.buffers_in_use() >= cleanup_frequency) {
         ggml_vk_command_pool_cleanup(device, device->transfer_queue->cmd_pool);
     }
+}
+
+// GGML_VK_MMVQ_SLOPE_STATS=<path> (2026-10-20): per-op GPU time of every node dispatched by ggml_vk_build_graph,
+// appended as JSON lines to <path> every 30 s and at backend free ("1" or "-" = stderr). Read with
+// contextFiles/llama.cpp_bench/mmvq_slope.py. The name is historical: the first version timed weight matmuls only.
+// Keys:
+//  - weight MUL_MAT (quantized/f16/bf16 2-D src0, 2-D f32 src1, n = 1..64 columns), unchanged from the first
+//    version so old readers keep working: dev, gpu, type (src0), m, k (src0 ne[1], ne[0]), n (dst columns),
+//    path (kernel path), plus ntok.
+//  - every other node, fused groups timed once from their first node: dev, gpu, op ("OP[:subop][ (FUSION)]",
+//    FUSION = the perf logger's fusion string), type (src0, else dst), m, k = dst ne[1], ne[0], ntok, path
+//    (flash attention: "fa <path> N= KV<n>k Br= Bc= sk=", empty for most ops). Non-weight MUL_MAT (KQ/KQV,
+//    or > 64 columns) reports op "MUL_MAT_OTHER". For 2-D activations m == ntok; the reader folds that.
+//  - ntok = src1->ne[1] of the graph's first weight MUL_MAT (the step's token count), the same for every key
+//    of that graph; 0 when the graph has no weight matmul.
+//  bytes = ggml_nbytes of dst plus every non-null src of the first node (a traffic hint, not a measurement).
+// Why (first version): production spec decoding verifies n+1 rows per step and each extra row costs ~7 ms per
+// step on the 27B (54 ms at 4 rows -> 113 ms at 12); test-backend-ops puts the mmvq growth at ~10 us per
+// column past 8 columns on isolated shapes.
+// Why (every op, 2026-10-20): production run, 27B Q8 on three GPUs: the weight matmuls total 39 ms per step at
+// n=3 rows and 50 ms at n=12, ~1 ms per extra row, while the whole verify step goes 54 -> 113 ms, ~6-7 ms per
+// row. 5-6 ms per row is somewhere else (flash attention, GatedDeltaNet, recurrent-state snapshot copies,
+// activation quant, norms, CPY, mask upload); this names the op.
+// Inflation: one ggml_vk_sync_buffers barrier before and after every node (no op overlaps its neighbours, so
+// concurrent-mode overlap is gone and each step pays ~2 barriers + 2 timestamps per node, several hundred per
+// graph: small elementwise ops read their own latency plus a pipeline drain), plus a fence wait at the end of
+// every graph (as GGML_VK_PERF_LOGGER does). Absolute step times are not production times; compare ntok
+// against ntok. The weight-matmul bracket includes the activation quantize_y / to_f16 dispatch when the op runs
+// it; ops that reuse the previous op's quantized src1 (Q/K/V sharing one input) skip it, so the first of such
+// a group reads higher. Fused bias adds are inside the bracket ("+add" in path).
+// Smoke 2026-10-20 (weight-matmul version), 7900 XTX, test-backend-ops perf q4_K 4096x14336 (same op
+// repeated): us/run knob off -> on n=4 33.5 -> 35.6, n=8 51.1 -> 53.6 (~2.5 us per timed matmul); bracket
+// avg 34.0 / 50.7, i.e. the bracket reads the kernel, the barriers land outside it. That test's GB/s exceed
+// DRAM peak (weights sit in the 96 MB Infinity Cache); in the 27B server they do not fit, so GB/s there is real.
+static bool vk_mmvq_slope_stats = false;
+static std::string vk_mmvq_slope_stats_path;   // "" = stderr
+struct vk_mmvq_slope_acc {
+    uint64_t count = 0;
+    double   sum_ns = 0.0;
+    double   min_ns = 0.0;
+    double   max_ns = 0.0;
+    uint64_t bytes = 0;
+    // exemplar: JSON fields (each starting with ',') of the key's first sample since the last flush
+    std::string exemplar;
+    // fields that can vary within a key: min/max since the last flush
+    uint32_t kv_min = 0, kv_max = 0;            // FLASH_ATTN_EXT exact KV
+    uint32_t nodes_first = 0, nodes_min = 0, nodes_max = 0;   // n_nodes of the sample's graph (first = exemplar's)
+    uint32_t ref_max = 0;                       // largest graph on the device when the sample was classified
+    uint64_t gid_min = 0, gid_max = 0;          // graph_id
+};
+// key = the JSON fields that identify the sample, so a flush just prints it
+static std::map<std::string, vk_mmvq_slope_acc> vk_mmvq_slope_map;
+// one JSON line per timed graph, flushed with the keys
+static std::vector<std::string> vk_mmvq_slope_graph_lines;
+static std::mutex vk_mmvq_slope_mutex;
+static int64_t vk_mmvq_slope_last_flush_us = 0;
+// per-process graph counter (all devices), graph_id of the sample/graph lines
+static std::atomic<uint64_t> vk_mmvq_slope_graph_counter {0};
+// per-process backend-context counter (ggml_backend_vk_init), "ctx" of the key and graph lines
+static std::atomic<uint32_t> vk_mmvq_slope_ctx_counter {0};
+// largest n_nodes seen per device (ctx->name) across ALL contexts on it, under vk_mmvq_slope_mutex. Per
+// context it failed (2026-10-20 production, Vulkan1): the MTP draft context's own max was 55 nodes, so all
+// 5653 of its 55-node graphs classified "target" and merged into the verify keys.
+static std::map<std::string, uint32_t> vk_mmvq_slope_dev_max_nodes;
+
+// Graph class by node count against the largest graph seen on this device so far, over all its backend
+// contexts (2026-10-20). A convenience label only: target graphs grow ~45 nodes per token (1208 at ntok 2 ->
+// 1658 at 12 on Vulkan2), so any node threshold is fragile; "ctx" (the backend context id) is the real
+// draft/target separator and is part of the key. Original rationale: the target
+// graph's share of the model on this device vs the MTP drafter's one decoder block (~1/60 of a full 27B
+// graph, ~1/20 of a 3-way layer split). The threshold is a guess, so the raw nodes and reference max are
+// recorded next to it; early graphs (before the first target graph) can be misclassified, the reader can
+// reclassify with the per-device max over the whole file. ntok == 0 (no weight matmul) is "other".
+static const char * ggml_vk_mmvq_slope_graph_kind(uint32_t nodes, uint32_t max_nodes, uint32_t ntok) {
+    if (ntok == 0) {
+        return "other";
+    }
+    if ((uint64_t)nodes * 2 >= max_nodes) {
+        return "target";
+    }
+    if ((uint64_t)nodes * 8 <= max_nodes) {
+        return "draft";
+    }
+    return "other";
+}
+
+// JSON string, at most max_len input bytes; non-ASCII bytes become '?' so truncation can never split a
+// UTF-8 sequence into invalid output (tensor names are ASCII in practice)
+static void ggml_vk_mmvq_slope_json_str(std::string & out, const char * s, size_t max_len) {
+    if (!s) {
+        out += "null";
+        return;
+    }
+    out += '"';
+    for (size_t i = 0; s[i] && i < max_len; ++i) {
+        const unsigned char c = (unsigned char)s[i];
+        if (c == '"' || c == '\\') {
+            out += '\\';
+            out += (char)c;
+        } else if (c < 0x20 || c >= 0x80) {
+            out += '?';
+        } else {
+            out += (char)c;
+        }
+    }
+    out += '"';
+}
+
+static void ggml_vk_mmvq_slope_json_tensor(std::string & out, const char * shape_key, const char * type_key, const ggml_tensor * t) {
+    char b[192];
+    if (!t) {
+        snprintf(b, sizeof(b), ",\"%s\":null,\"%s\":null", shape_key, type_key);
+    } else {
+        snprintf(b, sizeof(b), ",\"%s\":[%lld,%lld,%lld,%lld],\"%s\":\"%s\"", shape_key,
+                 (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3], type_key, ggml_type_name(t->type));
+    }
+    out += b;
+}
+
+// Exemplar fields of one sample (see ggml_vk_mmvq_slope_begin for the list). Only called for the first
+// sample of a key per flush window, so its cost does not scale with the node count.
+static std::string ggml_vk_mmvq_slope_exemplar(const ggml_backend_vk_context::vk_mmvq_slope_sample & s) {
+    const ggml_tensor * n = s.node;
+    std::string out;
+    out.reserve(1024);
+    ggml_vk_mmvq_slope_json_tensor(out, "src0", "t0", n->src[0]);
+    ggml_vk_mmvq_slope_json_tensor(out, "src1", "t1", n->src[1]);
+    ggml_vk_mmvq_slope_json_tensor(out, "src2", "t2", n->src[2]);
+    ggml_vk_mmvq_slope_json_tensor(out, "dst", "tdst", n);
+    char b[256];
+    snprintf(b, sizeof(b), ",\"c0\":%s,\"c1\":%s,\"nout\":%lld,\"fused\":%u,\"op_params\":[%d,%d,%d,%d]",
+             n->src[0] ? (ggml_is_contiguous(n->src[0]) ? "1" : "0") : "null",
+             n->src[1] ? (ggml_is_contiguous(n->src[1]) ? "1" : "0") : "null",
+             (long long)ggml_nrows(n), s.fused, n->op_params[0], n->op_params[1], n->op_params[2], n->op_params[3]);
+    out += b;
+    out += ",\"name\":";
+    ggml_vk_mmvq_slope_json_str(out, n->name, 48);
+    out += ",\"src0_name\":";
+    ggml_vk_mmvq_slope_json_str(out, n->src[0] ? n->src[0]->name : nullptr, 48);
+    if (n->op == GGML_OP_MUL_MAT || n->op == GGML_OP_MUL_MAT_ID) {
+        snprintf(b, sizeof(b), ",\"rows_per_wg\":%u,\"chunk_cols\":%u,\"n_chunks\":%u,\"split_k\":%u",
+                 s.rows_per_wg, s.chunk_cols, s.n_chunks, s.split_k);
+        out += b;
+    }
+    if (n->op == GGML_OP_FLASH_ATTN_EXT) {
+        snprintf(b, sizeof(b), ",\"kv\":%u,\"fa\":", s.kv);
+        out += b;
+        ggml_vk_mmvq_slope_json_str(out, s.fa.c_str(), 512);
+    }
+    return out;
+}
+
+// weight MUL_MAT: keeps the first version's key (m/k from src0, n = columns)
+static bool ggml_vk_mmvq_slope_eligible(const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    return dst->op == GGML_OP_MUL_MAT && src0 && src1 &&
+           (ggml_is_quantized(src0->type) || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16) &&
+           src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+           src1->type == GGML_TYPE_F32 && dst->ne[1] >= 1 && dst->ne[1] <= 64;
+}
+
+// Token count of the step this graph computes: src1->ne[1] of the first weight MUL_MAT (2-D f32 activations).
+static uint32_t ggml_vk_mmvq_slope_graph_ntok(const ggml_cgraph * cgraph) {
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op == GGML_OP_MUL_MAT && node->src[0] && node->src[1] &&
+            node->src[0]->ne[2] == 1 && node->src[0]->ne[3] == 1 &&
+            node->src[1]->type == GGML_TYPE_F32 && node->src[1]->ne[2] == 1 && node->src[1]->ne[3] == 1) {
+            return (uint32_t)node->src[1]->ne[1];
+        }
+    }
+    return 0;
+}
+
+static void ggml_vk_mmvq_slope_path(ggml_backend_vk_context * ctx, const char * fmt, ...) {
+    if (!vk_mmvq_slope_stats) {
+        return;
+    }
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(ctx->slope_path, sizeof(ctx->slope_path), fmt, args);
+    va_end(args);
+}
+
+// MUL_MAT dispatch parameters for the exemplar (0 = not known for that path)
+static void ggml_vk_mmvq_slope_mm(ggml_backend_vk_context * ctx, uint32_t rows_per_wg, uint32_t chunk_cols, uint32_t n_chunks, uint32_t split_k) {
+    if (!vk_mmvq_slope_stats) {
+        return;
+    }
+    ctx->slope_rows_per_wg = rows_per_wg;
+    ctx->slope_chunk_cols  = chunk_cols;
+    ctx->slope_n_chunks    = n_chunks;
+    ctx->slope_split_k     = split_k;
+}
+
+// Line fields (2026-10-20). Owner's rule: "add as much info as you can, it's better to have more and filter
+// than need it and not have it; the less guesses the better". Two guesses this removes: the reader could not
+// tell the MTP drafter's catch-up graph from the target verify graph (same device context, so steps were
+// miscounted), and the FA key carried a short hand-made path so gqa_T / qk_ratio / split_k / mask opt /
+// sparse had to be inferred. Old fields keep their names; readers must ignore fields they do not know.
+// Key lines (one per key per flush window; the key = the fields that group samples):
+//   t            epoch seconds at flush
+//   dev, gpu     ggml device name, Vulkan deviceName                                                  [key]
+//   ctx          backend-context id (process-wide counter, ggml_backend_vk_init). The MTP draft
+//                llama_context creates its own ggml_backend_vk_context on the same device, so this is the
+//                draft/target separator; readers classify by ctx (largest graphs on a device = target)  [key]
+//   op           "OP[:subop][ (FUSION)]", absent on weight MUL_MAT lines (legacy format)               [key]
+//   type         src0 type (dst type when src0 is absent)                                              [key]
+//   m, k         weight MUL_MAT: src0 ne[1], ne[0]; every other op: dst ne[1], ne[0]                   [key]
+//   n            weight MUL_MAT only: dst columns                                                      [key]
+//   ntok         src1->ne[1] of the graph's first weight matmul (the step's token count)               [key]
+//   path         kernel path set by the dispatch site (FA: "fa <path> N= KV<n>k Br= Bc= sk=")           [key]
+//   graph_kind   "target" / "draft" / "other" (ggml_vk_mmvq_slope_graph_kind) of the sample's graph,
+//                node-count heuristic against the device-wide max; fallback label only, prefer ctx     [key]
+//   count, sum_us, min_us, max_us   bracket statistics over the window
+//   bytes        ggml_nbytes of dst + srcs of the last sample (traffic hint, not a measurement)
+//   graph_nodes  n_nodes of the exemplar's graph; graph_nodes_min / graph_nodes_max over the key's samples
+//   graph_ref_nodes  largest graph on that device (all contexts) when the samples were classified (max)
+//   graph_id_min, graph_id_max   first / last graph_id (per-process graph counter) the key was seen in
+//   kv_min, kv_max   FLASH_ATTN_EXT only: exact KV range over the key's samples
+// Exemplar fields (from the key's first sample in the window; constant within a key in practice):
+//   src0, src1, src2, dst   shapes [ne0,ne1,ne2,ne3], null when absent
+//   t0, t1, t2, tdst        type names, null when absent
+//   c0, c1       ggml_is_contiguous(src0 / src1) as 0/1, null when absent
+//   nout         ggml_nrows(dst) (output rows of the first node of the group)
+//   fused        num_additional_fused_ops of the group (0 = single node)
+//   op_params    first 4 int32 op_params of the first node (rope mode, scale bits, unary/glu op, ...)
+//   name         dst->name, 48 chars max; src0_name: src0->name (the weight name on a weight MUL_MAT)
+//   rows_per_wg, chunk_cols, n_chunks, split_k   MUL_MAT / MUL_MAT_ID: dispatch parameters, 0 = unknown;
+//                mmvq/dmmv: rows_per_wg = wg_denoms[0], chunk_cols = widest chunk (= all columns when
+//                n_chunks == 1), split_k 0; mm/mmq: rows_per_wg = M tile, chunk_cols/n_chunks 0, split_k
+//   kv           FLASH_ATTN_EXT: exact KV of the exemplar
+//   fa           FLASH_ATTN_EXT: the perf logger's node_desc string (path, mmq/shmem, k/v types, dqkv, hs, n,
+//                N, KV, qk, gqa, T = gqa_T, Br, Bc, Tr, wg, cores, splitk, splitkv, f16/f32acc, maskopt
+//                (cached), sparse (cached), nomask, unaligned), built whenever the knob is on
+// Graph lines ("graph":1, one per timed graph_compute, written after the key lines of the same flush):
+//   t, dev, ctx, gpu  as above (t = epoch seconds at collect)
+//   graph_id     per-process monotonically increasing counter across all devices
+//   nodes        cgraph->n_nodes; ref_nodes = largest n_nodes seen on this device (all contexts) so far
+//   ntok, kind   as ntok / graph_kind above
+//   brackets     timed node groups; timestamps = queries written; dispatches = pipeline dispatches
+//   bracketed_us     sum of all brackets of the graph
+//   first_to_last_us last timestamp - first timestamp (GPU span)
+//   cpu_record_us    graph_compute start -> end of command recording (the perf logger's cpu)
+//   wall_us          graph_compute start -> fence wait + timestamp readback done (the perf logger's wall)
+//   gap_us           previous graph on this context returned -> this one started (the perf logger's gap)
+//   t0_us            ggml_time_us() at graph_compute start (orders graphs across devices)
+// Returns the query index of the opening timestamp, or -1 when this node is not timed. Called once per node
+// group from ggml_vk_build_graph, before the op switch.
+static int32_t ggml_vk_mmvq_slope_begin(ggml_backend_vk_context * ctx, vk_context& subctx) {
+    // the concurrent perf logger groups nodes by sync-point timestamps; extra marks would break that
+    if (!vk_mmvq_slope_stats || (vk_perf_logger_enabled && vk_perf_logger_concurrent) || !ctx->query_pool ||
+        ctx->query_idx + 3 >= ctx->num_queries) {
+        return -1;
+    }
+    ggml_vk_sync_buffers(ctx, subctx);
+    if (vk_perf_logger_enabled) {
+        // the perf logger labels the interval ending at each timestamp: here the (empty) gap before the op
+        ctx->query_nodes[ctx->query_idx] = nullptr;
+        ctx->query_fusion_names[ctx->query_idx] = "slope_pre";
+    }
+    const int32_t q = ctx->query_idx;
+    subctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->query_pool, ctx->query_idx++);
+    ctx->slope_path[0] = '\0';
+    ctx->slope_fa.clear();
+    ctx->slope_kv = ctx->slope_rows_per_wg = ctx->slope_chunk_cols = ctx->slope_n_chunks = ctx->slope_split_k = 0;
+    return q;
+}
+
+static void ggml_vk_mmvq_slope_end(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * node, int32_t q) {
+    if (q < 0) {
+        return;
+    }
+    if (vk_perf_logger_enabled) {
+        // An op that called ggml_vk_perf_mark_node already wrote its node-labelled timestamp; under the perf
+        // logger the bracket then closes there (see collect) and this one is labelled as its trailing part.
+        ctx->query_nodes[ctx->query_idx] = node;
+        ctx->query_fusion_names[ctx->query_idx] = nullptr;
+        ctx->perf_trailing_label = "slope_post";
+    }
+    GGML_ASSERT(ctx->query_idx == q + 1 || vk_perf_logger_enabled);
+    subctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->query_pool, ctx->query_idx++);
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    ggml_backend_vk_context::vk_mmvq_slope_sample s {};
+    s.query = q;
+    s.ntok  = ctx->slope_ntok;
+    s.node  = node;
+    s.fused = (uint32_t)ctx->num_additional_fused_ops;
+    s.kv    = ctx->slope_kv;
+    s.rows_per_wg = ctx->slope_rows_per_wg;
+    s.chunk_cols  = ctx->slope_chunk_cols;
+    s.n_chunks    = ctx->slope_n_chunks;
+    s.split_k     = ctx->slope_split_k;
+    s.fa.swap(ctx->slope_fa);   // begin() clears it again for the next node
+    if (ggml_vk_mmvq_slope_eligible(node)) {
+        s.type  = node->src[0]->type;
+        s.m     = (uint32_t)node->src[0]->ne[1];
+        s.k     = (uint32_t)node->src[0]->ne[0];
+        s.n     = (uint32_t)node->ne[1];
+        s.bytes = ggml_nbytes(node->src[0]) + ggml_nbytes(node->src[1]) + ggml_nbytes(node);
+        snprintf(s.path, sizeof(s.path), "%s%s", ctx->slope_path[0] ? ctx->slope_path : "?",
+                 ctx->num_additional_fused_ops > 0 ? "+add" : "");
+    } else {
+        s.type  = node->src[0] ? node->src[0]->type : node->type;
+        s.m     = (uint32_t)node->ne[1];
+        s.k     = (uint32_t)node->ne[0];
+        s.n     = s.ntok;
+        s.bytes = ggml_nbytes(node);
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            if (node->src[j]) {
+                s.bytes += ggml_nbytes(node->src[j]);
+            }
+        }
+        const char * op = node->op == GGML_OP_MUL_MAT ? "MUL_MAT_OTHER" : ggml_op_name(node->op);
+        const char * sub = node->op == GGML_OP_UNARY ? ggml_unary_op_name(ggml_get_unary_op(node)) :
+                           node->op == GGML_OP_GLU   ? ggml_glu_op_name(ggml_get_glu_op(node))     : nullptr;
+        const char * fus = ctx->num_additional_fused_ops > 0 ? ctx->slope_fusion_name : nullptr;
+        snprintf(s.op, sizeof(s.op), "%s%s%s%s%s%s", op, sub ? ":" : "", sub ? sub : "",
+                 fus ? " (" : "", fus ? fus : "", fus ? ")" : "");
+        snprintf(s.path, sizeof(s.path), "%s", ctx->slope_path);
+    }
+    ctx->slope_samples.push_back(std::move(s));
+}
+
+// Under the perf logger the closing timestamp is not q+1 (sub-dispatch marks sit in between), so the
+// bracket is [q, next timestamp labelled with a node]; find it by the recorded labels.
+// t0_us / t1_us / now_us / gap_us are the perf logger's Graphs-summary numbers (graph_compute start, end of
+// CPU recording, after the fence wait and timestamp readback, idle time since the previous graph on this
+// context returned); they go into the per-graph line.
+static void ggml_vk_mmvq_slope_collect(ggml_backend_vk_context * ctx, const std::vector<uint64_t> & ts,
+                                       int64_t t0_us, int64_t t1_us, int64_t now_us, int64_t gap_us) {
+    if (!vk_mmvq_slope_stats) {
+        return;
+    }
+    const double period = ctx->device->properties.limits.timestampPeriod;
+    std::lock_guard<std::mutex> guard(vk_mmvq_slope_mutex);
+    double bracketed_ns = 0.0;
+    uint32_t n_brackets = 0;
+    for (size_t i = 0; i < ctx->slope_samples.size(); ++i) {
+        const auto & s = ctx->slope_samples[i];
+        int32_t q1 = s.query + 1;
+        if (vk_perf_logger_enabled) {
+            const int32_t lim = i + 1 < ctx->slope_samples.size() ? ctx->slope_samples[i + 1].query : (int32_t)ts.size();
+            while (q1 + 1 < lim && ctx->query_fusion_names[q1] != nullptr) {
+                q1++;
+            }
+        }
+        if (q1 >= (int32_t)ts.size()) {
+            continue;
+        }
+        // min_us is raw: on RADV NAVI31 ~0.05% of brackets read < 3 us for a 33 MB q4_K read (smoke run
+        // 2026-10-20, 14 of 28k), physically impossible, cause not found. Fit on avg, not min.
+        const double ns = double(ts[q1] - ts[s.query]) * period;
+        bracketed_ns += ns;
+        n_brackets++;
+        // key = what groups samples: the pre-2026-10-20 fields plus ctx (the backend context: the MTP draft
+        // llama_context has its own on the same device and runs the same shapes at the same ntok, so draft and
+        // target must not merge) and graph_kind (the C++ label, kept for readers without ctx).
+        // deviceName <= 256 bytes.
+        char key[768];
+        if (s.op[0] == '\0') {
+            snprintf(key, sizeof(key), "\"dev\":\"%s\",\"ctx\":%u,\"gpu\":\"%s\",\"type\":\"%s\",\"m\":%u,\"k\":%u,\"n\":%u,\"path\":\"%s\",\"ntok\":%u,\"graph_kind\":\"%s\"",
+                     ctx->name.c_str(), ctx->slope_ctx_id, ctx->device->properties.deviceName.data(), ggml_type_name(s.type), s.m, s.k, s.n,
+                     s.path, s.ntok, ctx->slope_graph_kind);
+        } else {
+            snprintf(key, sizeof(key), "\"dev\":\"%s\",\"ctx\":%u,\"gpu\":\"%s\",\"op\":\"%s\",\"type\":\"%s\",\"m\":%u,\"k\":%u,\"ntok\":%u,\"path\":\"%s\",\"graph_kind\":\"%s\"",
+                     ctx->name.c_str(), ctx->slope_ctx_id, ctx->device->properties.deviceName.data(), s.op, ggml_type_name(s.type), s.m, s.k,
+                     s.ntok, s.path, ctx->slope_graph_kind);
+        }
+        auto & a = vk_mmvq_slope_map[key];
+        if (a.count == 0) {
+            a.exemplar = ggml_vk_mmvq_slope_exemplar(s);
+            a.kv_min = a.kv_max = s.kv;
+            a.nodes_first = a.nodes_min = a.nodes_max = ctx->slope_graph_nodes;
+            a.gid_min = a.gid_max = ctx->slope_graph_id;
+        }
+        if (a.count == 0 || ns < a.min_ns) {
+            a.min_ns = ns;
+        }
+        if (a.count == 0 || ns > a.max_ns) {
+            a.max_ns = ns;
+        }
+        a.kv_min    = std::min(a.kv_min, s.kv);
+        a.kv_max    = std::max(a.kv_max, s.kv);
+        a.nodes_min = std::min(a.nodes_min, ctx->slope_graph_nodes);
+        a.nodes_max = std::max(a.nodes_max, ctx->slope_graph_nodes);
+        a.ref_max   = std::max(a.ref_max, ctx->slope_max_nodes);
+        a.gid_min   = std::min(a.gid_min, ctx->slope_graph_id);
+        a.gid_max   = std::max(a.gid_max, ctx->slope_graph_id);
+        a.count++;
+        a.sum_ns += ns;
+        a.bytes = s.bytes;
+    }
+    ctx->slope_samples.clear();
+
+    // per-graph line: the step budget without the perf logger
+    const long long t = (long long)std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const double first_to_last_us = ts.size() >= 2 ? double(ts.back() - ts.front()) * period / 1000.0 : 0.0;
+    char b[1024];
+    snprintf(b, sizeof(b), "{\"t\":%lld,\"dev\":\"%s\",\"ctx\":%u,\"gpu\":\"%s\",\"graph\":1,\"graph_id\":%llu,\"nodes\":%u,\"ref_nodes\":%u,"
+             "\"ntok\":%u,\"kind\":\"%s\",\"brackets\":%u,\"timestamps\":%zu,\"dispatches\":%u,\"bracketed_us\":%.1f,"
+             "\"first_to_last_us\":%.1f,\"cpu_record_us\":%lld,\"wall_us\":%lld,\"gap_us\":%lld,\"t0_us\":%lld}\n",
+             t, ctx->name.c_str(), ctx->slope_ctx_id, ctx->device->properties.deviceName.data(), (unsigned long long)ctx->slope_graph_id,
+             ctx->slope_graph_nodes, ctx->slope_max_nodes, ctx->slope_ntok, ctx->slope_graph_kind, n_brackets, ts.size(),
+             ctx->perf_dispatch_count, bracketed_ns / 1000.0, first_to_last_us, (long long)(t1_us - t0_us),
+             (long long)(now_us - t0_us), (long long)gap_us, (long long)t0_us);
+    vk_mmvq_slope_graph_lines.emplace_back(b);
+}
+
+// Appends one JSON line per key and resets. Opens the file per flush: the server runs for days and the
+// file may be truncated or rotated underneath it.
+static void ggml_vk_mmvq_slope_flush(bool force) {
+    if (!vk_mmvq_slope_stats) {
+        return;
+    }
+    std::lock_guard<std::mutex> guard(vk_mmvq_slope_mutex);
+    const int64_t now_us = ggml_time_us();
+    if (vk_mmvq_slope_last_flush_us == 0) {
+        vk_mmvq_slope_last_flush_us = now_us;
+    }
+    if ((!force && now_us - vk_mmvq_slope_last_flush_us < 30 * 1000000LL) ||
+        (vk_mmvq_slope_map.empty() && vk_mmvq_slope_graph_lines.empty())) {
+        return;
+    }
+    vk_mmvq_slope_last_flush_us = now_us;
+    FILE * f = vk_mmvq_slope_stats_path.empty() ? stderr : fopen(vk_mmvq_slope_stats_path.c_str(), "a");
+    if (!f) {
+        GGML_LOG_WARN("ggml_vulkan: GGML_VK_MMVQ_SLOPE_STATS: cannot open %s, dropping %zu keys and %zu graph lines\n",
+                      vk_mmvq_slope_stats_path.c_str(), vk_mmvq_slope_map.size(), vk_mmvq_slope_graph_lines.size());
+        vk_mmvq_slope_map.clear();
+        vk_mmvq_slope_graph_lines.clear();
+        return;
+    }
+    const long long t = (long long)std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    std::string line;
+    for (const auto & kv : vk_mmvq_slope_map) {
+        const auto & a = kv.second;
+        char b[512];
+        snprintf(b, sizeof(b), "{\"t\":%lld,", t);
+        line = b;
+        line += kv.first;
+        snprintf(b, sizeof(b), ",\"count\":%llu,\"sum_us\":%.1f,\"min_us\":%.1f,\"max_us\":%.1f,\"bytes\":%llu,"
+                 "\"graph_nodes\":%u,\"graph_nodes_min\":%u,\"graph_nodes_max\":%u,\"graph_ref_nodes\":%u,"
+                 "\"graph_id_min\":%llu,\"graph_id_max\":%llu",
+                 (unsigned long long)a.count, a.sum_ns / 1000.0, a.min_ns / 1000.0, a.max_ns / 1000.0, (unsigned long long)a.bytes,
+                 a.nodes_first, a.nodes_min, a.nodes_max, a.ref_max, (unsigned long long)a.gid_min, (unsigned long long)a.gid_max);
+        line += b;
+        if (a.kv_max > 0) {
+            snprintf(b, sizeof(b), ",\"kv_min\":%u,\"kv_max\":%u", a.kv_min, a.kv_max);
+            line += b;
+        }
+        line += a.exemplar;
+        line += "}\n";
+        fputs(line.c_str(), f);
+    }
+    for (const auto & gl : vk_mmvq_slope_graph_lines) {
+        fputs(gl.c_str(), f);
+    }
+    if (f != stderr) {
+        fclose(f);
+    } else {
+        fflush(f);
+    }
+    vk_mmvq_slope_map.clear();
+    vk_mmvq_slope_graph_lines.clear();
 }
 
 void ggml_vk_perf_mark(ggml_backend_vk_context * ctx, vk_context& subctx, const char * label) {
@@ -5334,6 +5805,17 @@ void ggml_vk_instance_init() {
 
     vk_perf_logger_enabled = getenv("GGML_VK_PERF_LOGGER") != nullptr;
     vk_perf_logger_concurrent = getenv("GGML_VK_PERF_LOGGER_CONCURRENT") != nullptr;
+    // GGML_VK_MMVQ_SLOPE_STATS: unset = off (zero cost). "1" or "-" = JSON lines to stderr, any other value =
+    // append JSON lines to that file every 30 s and at backend free. Brackets every dispatched node (fused
+    // groups once) in GPU timestamps; see ggml_vk_mmvq_slope_begin. Works without GGML_VK_PERF_LOGGER;
+    // with GGML_VK_PERF_LOGGER_CONCURRENT it records nothing. Measurement instrument, slows every step.
+    if (const char * e = getenv("GGML_VK_MMVQ_SLOPE_STATS")) {
+        vk_mmvq_slope_stats = true;
+        vk_mmvq_slope_stats_path = (strcmp(e, "1") == 0 || strcmp(e, "-") == 0) ? "" : e;
+        if (vk_perf_logger_enabled && vk_perf_logger_concurrent) {
+            GGML_LOG_WARN("ggml_vulkan: GGML_VK_MMVQ_SLOPE_STATS records nothing with GGML_VK_PERF_LOGGER_CONCURRENT\n");
+        }
+    }
     vk_fa_mask_cache_disable = getenv("GGML_VK_FA_MASK_CACHE_DISABLE") != nullptr;
     if (const char * e = getenv("GGML_VK_MMVQ_Q6K")) {
         vk_mmvq_q6k = atoi(e) != 0 ? 1 : 0;
@@ -6527,6 +7009,11 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const uint64_t d_ne = ggml_nelements(dst);
 
     const uint32_t split_k = ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k, pipeline);
+    // GGML_VK_MMVQ_SLOPE_STATS path: mmq = q8_1 B, mm = f16/f32 B (dequant of A if needed); tile M x N, split_k
+    ggml_vk_mmvq_slope_path(ctx, "%s %ux%u sk%u%s", quantize_y ? "mmq" : "mm", pipeline->wg_denoms[0], pipeline->wg_denoms[1], split_k,
+                            qx_needs_dequant ? " deq" : "");
+    // rows_per_wg = M tile; no column chunking on this path
+    ggml_vk_mmvq_slope_mm(ctx, pipeline->wg_denoms[0], 0, 0, split_k);
 
     const uint64_t qx_sz = ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
     const uint64_t qy_sz = ggml_type_size(src1->type) * y_ne / ggml_blck_size(src1->type);
@@ -7032,6 +7519,15 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
         d_F1 = ggml_vk_tensor_subbuffer(ctx, bias);
         fusion_flags |= MAT_VEC_FUSION_FLAGS_BIAS1;
     }
+
+    // GGML_VK_MMVQ_SLOPE_STATS path: mmvq = q8_1 integer-dot B, dmmv = f32/f16 B; rN = rows per workgroup
+    if (n_chunks > 1) {
+        ggml_vk_mmvq_slope_path(ctx, "%s-chunk %ux%u r%u", quantize_y ? "mmvq" : "dmmv", sel_cols, n_chunks, dmmv->wg_denoms[0]);
+    } else {
+        ggml_vk_mmvq_slope_path(ctx, "%s%s r%u", quantize_y ? "mmvq" : "dmmv", swap_inputs ? "-swap" : "", dmmv->wg_denoms[0]);
+    }
+    // chunk_cols = widest chunk (= all columns when n_chunks == 1); no split_k on the mat-vec path
+    ggml_vk_mmvq_slope_mm(ctx, dmmv->wg_denoms[0], sel_cols, n_chunks, 0);
 
     if (n_chunks > 1) {
         // ne12 * ne13 == 1 here. Chunks read disjoint Y columns and write disjoint D columns, no barrier.
@@ -7539,8 +8035,13 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
 
             m_offset += cur_M_size;
         }
+        if (vk_mmvq_slope_stats) {
+            const std::string inner = ctx->slope_path;   // vsnprintf must not read its own output buffer
+            ggml_vk_mmvq_slope_path(ctx, "m-split %s", inner.c_str());
+        }
     } else if (ggml_vk_can_use_fwht(ctx, src1, dst)) {
         ggml_vk_fwht(ctx, subctx, src1, dst);
+        ggml_vk_mmvq_slope_path(ctx, "fwht");
     } else if (src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && dst->ne[1] == 1 &&
         // detect 0213 permutation, and batch size of 1
         src0->nb[0] <= src0->nb[2] &&
@@ -7554,12 +8055,14 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
         src0->ne[1] <= ctx->device->properties.limits.maxComputeWorkGroupCount[1] &&
         src1->ne[2] <= ctx->device->properties.limits.maxComputeWorkGroupCount[2]) {
         ggml_vk_mul_mat_vec_p021_f16_f32(ctx, subctx, cgraph, node_idx);
+        ggml_vk_mmvq_slope_path(ctx, "p021");
     } else if (src0->type == GGML_TYPE_F16 && !ggml_is_contiguous(src0) && !ggml_is_transposed(src1) && dst->ne[1] == 1 &&
                !ggml_is_permuted(src0) && !ggml_is_permuted(src1) &&
                src0->ne[3] <= ctx->device->properties.limits.maxComputeWorkGroupCount[0] &&
                src0->ne[1] <= ctx->device->properties.limits.maxComputeWorkGroupCount[1] &&
                src1->ne[2] <= ctx->device->properties.limits.maxComputeWorkGroupCount[2]) {
         ggml_vk_mul_mat_vec_nc_f16_f32(ctx, subctx, cgraph, node_idx);
+        ggml_vk_mmvq_slope_path(ctx, "nc");
     // With one output row, B^T*A has the same flat output as A^T*B.
     } else if (ctx->num_additional_fused_ops == 0 &&
                (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) &&
@@ -8811,7 +9314,8 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         ? ggml_vk_fa_mask_scratch(ctx, subctx, mask, 1, (uint32_t)n_kv_max, KV, nem1, nem2, nem3, sparse_idx_size, sparse_cached)
         : q_buf;
 
-    if (vk_perf_logger_enabled && ctx->perf_logger) {
+    // the perf logger's node_desc; GGML_VK_MMVQ_SLOPE_STATS records the same string as its "fa" field
+    if ((vk_perf_logger_enabled && ctx->perf_logger) || vk_mmvq_slope_stats) {
         char buf[384];
         const char * path = tuning_params.path == FA_COOPMAT2 ? "cm2" : tuning_params.path == FA_COOPMAT1 ? "cm1" : "scalar";
         const bool mmq = tuning_params.path == FA_SCALAR && ggml_vk_fa_scalar_uses_mmq(ctx->device, k_type_eff, v_type_eff);
@@ -8828,8 +9332,20 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                  use_sparse ? (sparse_cached ? " sparse(cached)" : " sparse") : "",
                  mask ? "" : " nomask",
                  aligned ? "" : " unaligned");
-        ctx->perf_logger->node_desc[dst] = buf;
+        if (vk_perf_logger_enabled && ctx->perf_logger) {
+            ctx->perf_logger->node_desc[dst] = buf;
+        }
+        if (vk_mmvq_slope_stats) {
+            ctx->slope_fa = buf;
+            ctx->slope_kv = KV;
+            ctx->slope_split_k = split_k;
+        }
     }
+    // GGML_VK_MMVQ_SLOPE_STATS path; KV in 1024-token buckets so a growing context does not mint a key per
+    // step (the exact KV is the key's "kv" / "kv_min" / "kv_max")
+    ggml_vk_mmvq_slope_path(ctx, "fa %s N=%u KV%uk Br=%u Bc=%u sk=%u",
+                            xe_fa_opt ? "xe" : tuning_params.path == FA_COOPMAT2 ? "cm2" : tuning_params.path == FA_COOPMAT1 ? "cm1" : "scalar",
+                            N, KV / 1024, Br, Bc, split_k);
 
     if (use_dequant_kv) {
         const uint64_t k_sz = (uint64_t)ggml_nelements(k) * kv_scratch_ts;
@@ -12814,6 +13330,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
     // closed explicitly below, and by the destructor on the early returns
     ggml_vk_debug_label dbg(compute_ctx, cgraph, node_idx, ctx->num_additional_fused_ops);
 
+    // GGML_VK_MMVQ_SLOPE_STATS bracket (barrier + timestamp on each side) around the whole node group, -1 and
+    // no work when the knob is off. The early `return false`s in the switch leave an orphan opening timestamp
+    // and no sample: harmless, collect only reads the samples' queries.
+    const int32_t slope_q = ggml_vk_mmvq_slope_begin(ctx, compute_ctx);
+
     switch (node->op) {
     case GGML_OP_REPEAT:
         ggml_vk_repeat(ctx, compute_ctx, src0, node);
@@ -13223,6 +13744,8 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         return false;
     }
 
+    ggml_vk_mmvq_slope_end(ctx, compute_ctx, node, slope_q);
+
     // the submit path below can end the command buffer, so close the region first
     dbg.close();
 
@@ -13390,6 +13913,7 @@ void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     if (vk_perf_logger_enabled) {
         ctx->perf_logger->print_timings(true);
     }
+    ggml_vk_mmvq_slope_flush(true);
 }
 
 int ggml_vk_get_device_count() {
@@ -14751,16 +15275,17 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ggml_vk_submit_transfer_ctx(ctx);
 
     vk_context compute_ctx;
-    const int64_t perf_t0_us = vk_perf_logger_enabled ? ggml_time_us() : 0;
+    const int64_t perf_t0_us = (vk_perf_logger_enabled || vk_mmvq_slope_stats) ? ggml_time_us() : 0;
     ctx->perf_dispatch_count = 0;
     ctx->perf_trailing_label = nullptr;
     // mask-derived FA scratch is valid for one graph evaluation only
     ctx->mask_scratch_entries.clear();
     ctx->mask_scratch_used = 0;
-    if (vk_perf_logger_enabled) {
+    // the query pool is shared by GGML_VK_PERF_LOGGER and GGML_VK_MMVQ_SLOPE_STATS
+    if (vk_perf_logger_enabled || vk_mmvq_slope_stats) {
         // allocate/resize the query pool. Ops may add sub-dispatch marks (ggml_vk_perf_mark), so
-        // reserve several queries per node.
-        const int32_t queries_needed = cgraph->n_nodes * 4 + 100;
+        // reserve several queries per node; the slope stats add two per node.
+        const int32_t queries_needed = cgraph->n_nodes * (vk_mmvq_slope_stats ? 6 : 4) + 100;
         if (ctx->num_queries < queries_needed) {
             if (ctx->query_pool) {
                 ctx->device->device.destroyQueryPool(ctx->query_pool);
@@ -14781,7 +15306,24 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         std::fill(ctx->query_fusion_node_count.begin(), ctx->query_fusion_node_count.end(), 0);
         std::fill(ctx->query_nodes.begin(), ctx->query_nodes.end(), nullptr);
         std::fill(ctx->query_node_idx.begin(), ctx->query_node_idx.end(), 0);
-
+        ctx->query_idx = 0;
+        ctx->slope_samples.clear();
+        if (vk_mmvq_slope_stats) {
+            ctx->slope_samples.reserve(cgraph->n_nodes);
+            ctx->slope_ntok = ggml_vk_mmvq_slope_graph_ntok(cgraph);
+            ctx->slope_graph_id = ++vk_mmvq_slope_graph_counter;
+            ctx->slope_graph_nodes = (uint32_t)cgraph->n_nodes;
+            {
+                // device-wide reference max (all contexts on this device), snapshot for this graph
+                std::lock_guard<std::mutex> guard(vk_mmvq_slope_mutex);
+                uint32_t & dev_max = vk_mmvq_slope_dev_max_nodes[ctx->name];
+                dev_max = std::max(dev_max, ctx->slope_graph_nodes);
+                ctx->slope_max_nodes = dev_max;
+            }
+            ctx->slope_graph_kind = ggml_vk_mmvq_slope_graph_kind(ctx->slope_graph_nodes, ctx->slope_max_nodes, ctx->slope_ntok);
+        }
+    }
+    if (vk_perf_logger_enabled) {
         // A compute context may already be open: ggml_backend_vk_cpy_tensor_async records
         // device-to-device copies into it and leaves it for the next graph compute to flush
         // (multi-GPU). Reuse it; the pending commands precede timestamp 0 and are not measured.
@@ -15140,6 +15682,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                       (i + ctx->num_additional_fused_ops >= last_node) ||
                       (almost_ready && !ctx->almost_ready_fence_pending);
 
+        ctx->slope_fusion_name = fusion_string;   // GGML_VK_MMVQ_SLOPE_STATS op label
         bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
 
         if (vk_perf_logger_enabled && enqueued) {
@@ -15184,13 +15727,19 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     ctx->last_total_flops = total_flops;
 
-    if (vk_perf_logger_enabled) {
+    if (vk_perf_logger_enabled || (vk_mmvq_slope_stats && ctx->query_idx > 0)) {
         // CPU time spent recording this graph (before the final submit/wait)
         const int64_t perf_t1_us = ggml_time_us();
 
-        // End the command buffer and submit/wait
-        GGML_ASSERT(!ctx->compute_ctx.expired());
-        compute_ctx = ctx->compute_ctx.lock();
+        // End the command buffer and submit/wait. The perf logger always leaves a context open (its
+        // trailing timestamp); for the slope stats alone the last node already submitted, so the fence
+        // goes on an empty context: it signals after everything submitted before it on this queue.
+        if (vk_perf_logger_enabled) {
+            GGML_ASSERT(!ctx->compute_ctx.expired());
+            compute_ctx = ctx->compute_ctx.lock();
+        } else {
+            compute_ctx = ggml_vk_get_compute_ctx(ctx);
+        }
         ggml_vk_ctx_end(compute_ctx);
 
         ggml_vk_submit(compute_ctx, ctx->device->fence);
@@ -15201,17 +15750,23 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         // Get the results and pass them to the logger
         std::vector<uint64_t> timestamps(ctx->query_idx);
         VK_CHECK(ctx->device->device.getQueryPoolResults(ctx->query_pool, 0, ctx->query_idx, ctx->query_idx*sizeof(uint64_t), timestamps.data(), sizeof(uint64_t), vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait), "get timestamp results", ctx->device);
-        if (ctx->query_idx >= 2) {
+        // Graphs-summary numbers, shared by the perf logger and the slope stats' per-graph line. now_us is
+        // taken before the slope collect so its CPU time is not in either's wall (2026-10-20; previously the
+        // perf logger read the clock after collect).
+        const int64_t now_us = ggml_time_us();
+        // gap = time this device sat idle between the previous graph returning and this one starting:
+        // scheduler copies, input uploads, sampling, the other device's half of the step
+        const uint64_t gap_us = ctx->perf_last_graph_end_us ? (uint64_t)(perf_t0_us - ctx->perf_last_graph_end_us) : 0;
+        ctx->perf_last_graph_end_us = now_us;
+        ggml_vk_mmvq_slope_collect(ctx, timestamps, perf_t0_us, perf_t1_us, now_us, (int64_t)gap_us);
+        if (vk_perf_logger_enabled && ctx->query_idx >= 2) {
             const uint64_t gpu_ns = uint64_t((timestamps[ctx->query_idx - 1] - timestamps[0]) * ctx->device->properties.limits.timestampPeriod);
-            const int64_t  now_us = ggml_time_us();
-            // gap = time this device sat idle between the previous graph returning and this one starting:
-            // scheduler copies, input uploads, sampling, the other device's half of the step
-            const uint64_t gap_us = ctx->perf_last_graph_end_us ? (uint64_t)(perf_t0_us - ctx->perf_last_graph_end_us) : 0;
             ctx->perf_logger->log_graph((uint32_t)cgraph->n_nodes, ctx->perf_dispatch_count, (uint64_t)(perf_t1_us - perf_t0_us), gpu_ns / 1000,
                                         (uint64_t)(now_us - perf_t0_us), gap_us);
-            ctx->perf_last_graph_end_us = now_us;
         }
-        if (!vk_perf_logger_concurrent) {
+        if (!vk_perf_logger_enabled) {
+            // slope stats only, nothing else reads the timestamps
+        } else if (!vk_perf_logger_concurrent) {
             // Log each op separately
             for (int i = 1; i < ctx->query_idx; i++) {
                 auto node = ctx->query_nodes[i];
@@ -15237,9 +15792,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->perf_logger->log_timing(nodes, names, uint64_t((timestamps[i] - timestamps[i-1]) * ctx->device->properties.limits.timestampPeriod));
             }
         }
-        ctx->perf_logger->print_timings();
+        if (vk_perf_logger_enabled) {
+            ctx->perf_logger->print_timings();
+        }
+    } else if (vk_mmvq_slope_stats) {
+        // no node was timed (no per-graph line either): still close the gap interval, or the next graph's
+        // gap_us would swallow this one
+        ctx->perf_last_graph_end_us = ggml_time_us();
     }
     ggml_vk_mmvq_chunk_stats_flush();
+    ggml_vk_mmvq_slope_flush(false);
 
     if (!ctx->device->support_async) {
         ggml_vk_synchronize(ctx);
@@ -15721,6 +16283,8 @@ ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
     VK_LOG_DEBUG("ggml_backend_vk_init(" << dev_num << ")");
 
     ggml_backend_vk_context * ctx = new ggml_backend_vk_context;
+    // GGML_VK_MMVQ_SLOPE_STATS "ctx": one id per backend context (the MTP draft context gets its own)
+    ctx->slope_ctx_id = ++vk_mmvq_slope_ctx_counter;
     ggml_vk_init(ctx, dev_num);
 
     ggml_backend_t vk_backend = new ggml_backend {
