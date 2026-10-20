@@ -24,6 +24,8 @@
 #include <exception>
 #include <memory>
 #include <filesystem>
+
+extern char ** environ;
 #include <random>
 #include <utility>
 #include <fstream>
@@ -548,9 +550,19 @@ struct server_spec_stats_writer {
         config["model"]             = std::filesystem::path(params.model.path).filename().string();
         config["model_draft"]       = sp.draft.mparams.path.empty() ? json(nullptr) : json(std::filesystem::path(sp.draft.mparams.path).filename().string());
 
-        for (const char * name : { "GGML_VK_MMVQ_CHUNK", "GGML_VK_SPLITK_SMALL_N", "GGML_VK_FA_CM1_WAVE32", "GGML_VK_FA_QUANT_STAGING", "GGML_VK_MMVQ_SLOPE_STATS" }) {
-            const char * v = getenv(name);
-            config[name] = v ? json(v) : json(nullptr);
+        // every GGML_VK_* variable in the environment, not a hand-kept list: 2026-10-20 the FA tile-height
+        // A/B (GGML_VK_FA_FOLD_MAX_BR) was about to run untagged because the list only knew four knobs.
+        // Unset knobs are simply absent; spec_stats.py groups on whatever differs.
+        for (char ** e = environ; e && *e; ++e) {
+            const char * kv = *e;
+            if (strncmp(kv, "GGML_VK_", 8) != 0) {
+                continue;
+            }
+            const char * eq = strchr(kv, '=');
+            if (!eq) {
+                continue;
+            }
+            config[std::string(kv, eq - kv)] = std::string(eq + 1);
         }
 
         SRV_WRN("writing per-request speculative stats to '%s'\n", path.c_str());

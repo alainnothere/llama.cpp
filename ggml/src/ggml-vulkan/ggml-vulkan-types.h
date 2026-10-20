@@ -1455,12 +1455,18 @@ struct vk_fa_tuning_params {
     bool shmem_staging;
     bool disable_subgroups;
     uint32_t limit_occupancy_shmem;
+    // coopmat1 only: persistent P.V accumulators (GGML_VK_FA_PV_REG, flash_attn_cm1.comp PV_REG).
+    // 0 off, 1 ACC_TYPE accumulators (Flags 1024), 2 f16 accumulators (Flags 1024|2048, perf probe),
+    // 3 = 1 + step C transposed-V staging (Flags 1024|4096). 1-3 include step B (row-major S/P).
+    uint32_t pv_reg;
+    // pv_reg was chosen by GGML_VK_FA_PV_REG=-1 (auto) rather than forced; description only, not in the pipeline key
+    bool pv_reg_auto;
 
     void print() const {
         std::cerr << "path=" << path << " workgroup_size=" << workgroup_size << " subgroup_size=" << subgroup_size <<
                      " block_rows=" << block_rows << " block_cols=" << block_cols << " d_split=" << d_split <<
                      " row_split=" << row_split << " shmem_staging=" << shmem_staging << " disable_subgroups=" << disable_subgroups <<
-                     " limit_occupancy_shmem=" << limit_occupancy_shmem << std::endl;
+                     " limit_occupancy_shmem=" << limit_occupancy_shmem << " pv_reg=" << pv_reg << (pv_reg_auto ? "(auto)" : "") << std::endl;
     }
 };
 

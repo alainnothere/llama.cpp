@@ -14,7 +14,7 @@ extern int vk_mmvq_wg_override;      // -1 heuristic, 0 subgroup, 1 large
 extern uint32_t vk_fa_splitk_pct;
 // coopmat1 generalized GQA fold applies to Q batches up to this many tokens (0 disables)
 extern uint32_t vk_fa_fold_max_n;
-extern uint32_t vk_fa_ablate;   // GGML_VK_FA_ABLATE bits 32/64/128/256, profiling only
+extern uint32_t vk_fa_ablate;   // GGML_VK_FA_ABLATE bits 32/64/128/256/512, profiling only
 extern uint32_t vk_fa_fold_max_br;
 extern bool vk_fa_fold_maskopt;
 // GGML_VK_FA_F16ACC: 1 = f16 accumulation even when the op asks for GGML_PREC_F32, 0 = obey the op
@@ -25,6 +25,11 @@ extern uint32_t vk_fa_sparse_min_ratio_f16;
 extern int vk_fa_quant_staging;
 // GGML_VK_FA_CM1_WAVE32: coopmat1 FA in wave32 on RDNA3. -1 auto (dense aligned f16 only), 0 off, 1 always
 extern int vk_fa_cm1_wave32;
+// GGML_VK_FA_PV_REG: coopmat1 persistent P.V accumulators (dense aligned f16 only). 0 off (default),
+// 1 on with ACC_TYPE (f32 under GGML_PREC_F32) accumulators, 2 on with f16 accumulators (perf probe),
+// 3 = 1 + transposed-V staging (step C), -1 auto (RDNA3: 3, else 1, else off). 1-3 include step B (row-major S/P).
+// Default 0 until a production read of mode 3; flipping to auto is the initializer in ggml-vulkan-debug.cpp.
+extern int vk_fa_pv_reg;
 // GGML_VK_MMVQ_CHUNK: n in 13..cap batches of a 2D quantized/f16 MUL_MAT run as mmvq column chunks of
 // <= the chunk width instead of the MMQ tile path. stored value is the cap (0 = off).
 // unset/-1 on with cap 48 (default), 0 off, 1..12 cap 48, >= 13 cap = value

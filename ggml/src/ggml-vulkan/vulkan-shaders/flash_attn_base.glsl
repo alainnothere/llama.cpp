@@ -31,6 +31,21 @@ const bool ABL_MASK        = (Flags & 32)  != 0; // skip mask load and add
 const bool ABL_SOFTMAX     = (Flags & 64)  != 0; // skip row max / exp / rescale (P = S)
 const bool ABL_PV          = (Flags & 128) != 0; // skip the P.V product and O accumulation
 const bool ABL_QK          = (Flags & 256) != 0; // skip the K loads and Q.K^T product (S = 0)
+// 2026-10-20: P.V operands loaded in the per-lane-contiguous layout (P as A RowMajor, V as B ColumnMajor)
+// over exactly the same addresses and bytes as the real loads. RDNA3 WMMA wants an A lane to hold a row and a
+// B lane a column, both along K; Q.K gets that (K A RowMajor, Q B ColumnMajor = 2 b128 per lane per tile), P.V
+// gets the opposite on both operands (16 scalar d16 loads per lane per tile). t(0) - t(512) is the most a layout
+// fix can win. cm1 aligned f16 only (the staged-V kvsh loads are not swapped). On the PV_REG path (steps A+B)
+// only the global V load is swapped (P is already contiguous); in mode 3 (step C) it is a no-op. See
+// contextFiles/aiInstructionsAndResponses/fa-cm1-pv-partition-design.md sections 2 and 5.
+const bool ABL_PV_LAYOUT   = (Flags & 512) != 0;
+// Not an ablation: GGML_VK_FA_PV_REG=1|2 requests the cm1 persistent P.V accumulator path (flash_attn_cm1.comp, PV_REG).
+// The shader re-checks its own gate, so a stray bit on an ineligible variant runs the old code.
+const bool PV_REG_REQ      = (Flags & 1024) != 0;
+// GGML_VK_FA_PV_REG=2 adds bit 2048: f16 (O_TYPE) persistent accumulators instead of ACC_TYPE, perf probe only.
+const bool PV_REG_F16_REQ  = (Flags & 2048) != 0;
+// GGML_VK_FA_PV_REG=3 adds bit 4096 (with 1024, ACC_TYPE accumulators): step C, V staged transposed through kvsh.
+const bool PV_REG_C_REQ    = (Flags & 4096) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;

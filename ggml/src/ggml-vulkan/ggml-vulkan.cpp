@@ -1905,7 +1905,10 @@ vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_
                      (use_logit_softcap ? 4 : 0) |
                      (old_amd_windows   ? 8 : 0) |
                      (use_sparse        ? 16 : 0) |
-                     (vk_fa_ablate & 0x1E0);   // profiling only, see flash_attn_base.glsl
+                     (vk_fa_ablate & 0x3E0) |  // profiling only, see flash_attn_base.glsl (512 = ABL_PV_LAYOUT)
+                     (params.pv_reg != 0 ? 1024 : 0) |   // GGML_VK_FA_PV_REG, flash_attn_cm1.comp PV_REG
+                     (params.pv_reg == 2 ? 2048 : 0) |   // mode 2: f16 persistent accumulators
+                     (params.pv_reg == 3 ? 4096 : 0);    // mode 3: + step C, V transposed through kvsh
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
@@ -5860,6 +5863,34 @@ void ggml_vk_instance_init() {
         const int v = atoi(e);
         vk_fa_cm1_wave32 = v == -1 ? -1 : (v != 0 ? 1 : 0);
     }
+    // GGML_VK_FA_PV_REG (2026-10-20): coopmat1 FA with persistent P.V accumulators (flash_attn_cm1.comp PV_REG).
+    // 0 off, 1 = steps A+B with ACC_TYPE accumulators (f32 under GGML_PREC_F32 = production; the old path sums
+    // P.V in f16 throughout), 2 = A+B with f16 accumulators (perf probe), 3 = A+B+C (V staged transposed
+    // through kvsh), -1 = auto: mode 3 on RDNA3 when eligible (dense aligned f16, nothing staged, the same
+    // conditions as GGML_VK_FA_CM1_WAVE32 auto) and its shared memory fits, else mode 1 if it fits, else off.
+    // The default is 0 until one production read of mode 3; the flip is the initializer of vk_fa_pv_reg in
+    // ggml-vulkan-debug.cpp (0 -> -1).
+    // Why: in production (GGML_VK_MMVQ_SLOPE_STATS, 7900 XTX, Qwen 27B-like hs 256, qk 6, f16 KV) FA costs
+    // 5.1 us per 1k KV at 1 token and +1.1 us per 1k KV per extra 16-row tile (4 tok 6.4, 6 tok 8.3, 8 tok 10.5,
+    // 10 tok 13.2, 12 tok 14.9); within a tile P.V cost ~2x Q.K at equal MMA count and equal global bytes,
+    // because both P.V operands were loaded per-lane strided (16 x 16-bit loads per lane per 16x16 tile).
+    // Measured 2026-10-20, 7900 XTX, test-backend-ops 27B case (hs 256, 4 kv heads x 6, kv 32768, f16), us/run
+    // at nb 1/6/12; 5320/5320 FA tests in every mode at wave32 and wave64:
+    //   wave32  old    187.4/322.5/545.1   mode 1 185.1/283.6/483.6   mode 2 186.0/278.2/476.5
+    //           mode 3 181.3/234.7/457.0   (-3% / -27% / -16% vs old)
+    //   wave64  old    194.0/354.9/661.8   mode 1 189.5/280.8/499.5   mode 3 181.8/262.2/486.2
+    //   unmasked (GGML_VK_FA_ABLATE=32, = production decode where mask_opt skips the mask): old 181.3/281.6/511.1,
+    //           mode 3 181.4/191.4/360.5 (-32% / -29% at nb 6 / 12)
+    //   loop skeleton (ABLATE=480) old 25.6/46.8/88.1 -> mode 3 21.1/30.4/48.6
+    //   mode 3 + ABLATE=512 457.3 at nb12 (no-op, as designed); the mode-1 + 512 bound is ~363: the transposed-V
+    //   staging still costs ~95 us at nb12 and ~25 at nb6 (open, design brief section 9).
+    // RADV ISA of the FA pipeline, per-block body: old 284 strided d16 V loads + 256 ds_load_u16 P loads,
+    // 14 s_barrier; mode 3 0 d16 loads, V = 32 buffer_load_b64 + 32 ds_store_b64 + 32 ds_load_b128, 9 s_barrier.
+    // Design: contextFiles/aiInstructionsAndResponses/fa-cm1-pv-partition-design.md.
+    if (const char * e = getenv("GGML_VK_FA_PV_REG")) {
+        const int v = atoi(e);
+        vk_fa_pv_reg = v < 0 ? -1 : ((v == 2 || v == 3) ? v : (v != 0 ? 1 : 0));
+    }
     // GGML_VK_MMVQ_CHUNK (on by default since 2026-10-19, see ggml_vk_mul_mat): unset/-1 (any negative) on
     // with cap 48, 0 off, 1..12 cap 48, >= 13 cap = value. The stored value is the column cap, 0 = off.
     if (const char * e = getenv("GGML_VK_MMVQ_CHUNK")) {
@@ -8810,24 +8841,36 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
     const uint32_t qstride = hsk_pad / 4 + 2;
     const uint32_t Qf = Br * qstride * f16vec4;
 
+    // PV_REG (GGML_VK_FA_PV_REG 1/2/3, flash_attn_cm1.comp) step B: Psh/sfsh shrink to one element and the
+    // row-major Psh2 (f16vec2, row stride Bc/2 + 4) / sfsh2 (ACC vec2, row stride Bc/2 + 8) take over; the old
+    // path declares one-element Psh2/sfsh2 placeholders.
+    const bool pv_reg = params.pv_reg != 0;
     const uint32_t psh_stride = Br / 4 + 2;
-    const uint32_t Psh = Bc * psh_stride * f16vec4;
+    const uint32_t Psh = pv_reg ? f16vec4 + Br * (Bc / 2 + 4) * 4 : Bc * psh_stride * f16vec4 + 4;
 
     const uint32_t sfshstride = (hsk <= 128) ? (Br + 8) : Br;
-    const uint32_t sfsh = Bc * sfshstride * acctype;
+    const uint32_t sfsh = pv_reg ? 4 * acctype + Br * (Bc / 2 + 8) * 2 * acctype : Bc * sfshstride * acctype + 2 * acctype;
 
+    // PV_REG: pvsh is one element (no per-slice bounce), emsh is 16x16 ACC_TYPE (1024 B f32acc, 512 B f16acc),
+    // kvsh is one element in modes 1/2 and the transposed-V slices in mode 3 (HSV_pad rows x 6 f16vec4 =
+    // 12,288 B at hs 256). 27B shape (hs 256, Br 16, Bc 64, f32acc): old 25,968 + 28 B of placeholders =
+    // 25,996 B; modes 1/2 17,048 B; mode 3 29,328 B. The mode is only set after every shmem-driven decision in
+    // ggml_vk_flash_attn, so earlier calls see the old, conservative footprint (mode 3 is +3.3 KB over it, far
+    // under every RDNA/NVIDIA/Intel limit, and the host re-checks below).
     const uint32_t kvshstride = (params.shmem_staging ? std::max(hsk_pad, hsv_pad) : MatBr) / 4 + 2;
     const uint32_t vsh_stride = MatBc / 4 * row_split;
-    const uint32_t ksh = ((kvshstride >= vsh_stride) ? (Bc * kvshstride) : (Bc * vsh_stride)) * f16vec4;
+    const uint32_t ksh = pv_reg ? (params.pv_reg == 3 ? hsv_pad * 6 * f16vec4 : f16vec4)
+                                : ((kvshstride >= vsh_stride) ? (Bc * kvshstride) : (Bc * vsh_stride)) * f16vec4;
 
     // BF16 PVMat accumulator is f32 (no bf16 accumulator support), so pvsh is vec4 (16 bytes)
     const uint32_t pvsh_elem_size = (k_type == GGML_TYPE_BF16) ? 16u : f16vec4;
     const uint32_t osh_stride = params.row_split * MatBr / 4;
-    const uint32_t pvsh = Br * osh_stride * pvsh_elem_size;
+    const uint32_t pvsh = pv_reg ? pvsh_elem_size : Br * osh_stride * pvsh_elem_size;
+    const uint32_t emsh = pv_reg ? 16 * 16 * acctype : 4 * acctype;
 
     const uint32_t slope = Br * acctype;
 
-    const uint32_t total_size = tmpsh + iq_shmem + Qf + Psh + sfsh + ksh + pvsh + slope;
+    const uint32_t total_size = tmpsh + iq_shmem + Qf + Psh + sfsh + ksh + pvsh + emsh + slope;
     const bool supported = total_size <= device->properties.limits.maxComputeSharedMemorySize;
 
     VK_LOG_DEBUG("ggml_vk_flash_attn_coopmat_shmem_support(HSK=" << hsk << ", HSV=" << hsv << ", f32acc=" << f32acc << ", total_size=" << total_size << ", supported=" << supported);
@@ -9134,6 +9177,40 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         }
     }
 
+    // GGML_VK_FA_PV_REG: eligibility = the wave32 auto conditions (dense, aligned, f16 K/V, nothing staged
+    // through kvsh) plus the shader's own PV_REG gate (flash_attn_cm1.comp): Br 16, HSK/HSV multiples of 16,
+    // HSV a multiple of 64 and <= 256 (<= 4 accumulators per subgroup), HSV <= HSK (O is rebuilt in Qf).
+    // Set last, so the shmem-driven choices above (fold height, staging fallback) used the old footprint.
+    // Forced modes 1-3 are vendor-neutral (plain KHR coopmat); auto (-1) additionally requires RDNA3, the only
+    // hardware it was measured on. Auto picks mode 3, then mode 1, by the shared-memory check.
+    tuning_params.pv_reg = 0;
+    tuning_params.pv_reg_auto = false;
+    if (tuning_params.path == FA_COOPMAT1 && vk_fa_pv_reg != 0) {
+        const bool v_staged = use_sparse || !aligned || ggml_is_quantized(k_type_eff) || ggml_is_quantized(v_type_eff);
+        const bool eligible = !v_staged && !tuning_params.shmem_staging &&
+                              k_type_eff == GGML_TYPE_F16 && v_type_eff == GGML_TYPE_F16 &&
+                              tuning_params.block_rows == 16 && tuning_params.row_split == 4 &&
+                              HSK % 16 == 0 && HSV % 64 == 0 && HSV <= 256 && HSV <= HSK;
+        const bool is_auto = vk_fa_pv_reg < 0;
+        const bool rdna3 = ctx->device->vendor_id == VK_VENDOR_ID_AMD && ctx->device->architecture == AMD_RDNA3;
+        if (eligible && (!is_auto || rdna3)) {
+            // forced: the requested mode, mode 3 falling back to 1 if it does not fit (29,328 vs 25,996 B at hs 256);
+            // auto: 3, else 1, else off
+            const uint32_t want = is_auto ? 3u : (uint32_t)vk_fa_pv_reg;
+            auto fits = [&]() {
+                return ggml_vk_flash_attn_coopmat_shmem_support(ctx->device, tuning_params, HSK, HSV, f32acc, k_type_eff, v_type_eff);
+            };
+            tuning_params.pv_reg = want;
+            if (!fits()) {
+                tuning_params.pv_reg = want == 3 ? 1u : 0u;   // only mode 3 has a fallback
+                if (tuning_params.pv_reg != 0 && !fits()) {
+                    tuning_params.pv_reg = 0;
+                }
+            }
+            tuning_params.pv_reg_auto = is_auto && tuning_params.pv_reg != 0;
+        }
+    }
+
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
                                                                    mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff);
 
@@ -9322,7 +9399,10 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         snprintf(buf, sizeof(buf), " [%s%s%s k=%s v=%s%s hs=%u/%u n=%u N=%u KV=%u qk=%u gqa=%u T=%u Br=%u Bc=%u Tr=%u wg=%ux%ux%u cores=%u splitk=%u splitkv=%u%s%s%s%s%s]",
                  xe_fa_opt ? "xe" : path,
                  mmq ? " mmq" : "",
-                 tuning_params.shmem_staging ? " shmem" : "",
+                 tuning_params.pv_reg == 1 ? (tuning_params.pv_reg_auto ? " pvreg(auto)" : " pvreg")
+                 : tuning_params.pv_reg == 2 ? " pvreg16"
+                 : tuning_params.pv_reg == 3 ? (tuning_params.pv_reg_auto ? " pvregC(auto)" : " pvregC")
+                 : (tuning_params.shmem_staging ? " shmem" : ""),
                  ggml_type_name(k->type), ggml_type_name(v->type),
                  use_dequant_kv ? " dqkv->f16" : "",
                  HSK, HSV, (uint32_t)neq1, N, KV, qk_ratio, gqa_ratio, gqa_T, Br, Bc, Tr,
