@@ -31,6 +31,8 @@ extern char ** environ;
 #include <fstream>
 #include <chrono>
 #include <ctime>
+#include <cstdio>
+#include <mutex>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -42,6 +44,120 @@ extern char ** environ;
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// [LLAMA_SERVER_UBATCH_STATS] 2026-10-20 - env-gated per-llama_process JSON line (server side)
+//
+// LLAMA_SERVER_UBATCH_STATS=<path> appends one JSON line per target decode made by update_slots()
+// ("1" or "-" = stderr). Unset = off: one cached bool check per site, no clock reads. The file is
+// opened in append mode, written and closed per line under a mutex.
+//
+// Why it exists. 27B hybrid Qwen3.8, three Vulkan GPUs in a layer split: prompt processing runs
+// ~200 t/s at --spec-ngram-draft-n-max 64 vs ~700 at 33. The flag sizes the recurrent rollback
+// window (need_n_rs_seq(), common/common.h:420 -> n_rs_seq -> 1 + n_rs_seq state planes per layer,
+// src/llama-memory-recurrent.cpp:102). Vulkan per-graph lines, cap 64, after the submit-batching
+// fix: per 512-token chunk the period is 2412 ms; target graphs Vulkan2 302 -> Vulkan3 350 ->
+// Vulkan1 283 ms, then a few 1-9 node MTP draft graphs on Vulkan2, then ~900 ms with no GPU graph,
+// then the next chunk. At cap 33 all non-GPU time per chunk was ~70 ms. The library line
+// (LLAMA_DECODE_STATS, src/llama-context.cpp) splits llama_decode; this one splits what the server
+// does around it, so between them every microsecond of the period has an owner.
+//
+// One line = one target decode plus its post_decode plus everything since the previous line ended.
+// Fields: t (unix s), slot, n_tokens, n_past (pos of the first token of the decoded view),
+// t_decode_us (llama_process + its sync when the view has an output - mid-prompt chunks do not
+// sync, so their GPU time lands in whatever reads target output next, normally
+// common_speculative_process of the MTP drafter), t_spec_process_us (common_speculative_process in
+// post_decode: draft prefill of the chunk + n-gram updates), t_post_decode_us (rest of
+// post_decode), t_checkpoint_us / n_checkpoints_created / checkpoint_bytes (create_checkpoint and
+// the speculative update_tgt/update_dft, in-RAM blob bytes from llama_state_seq_get_data*),
+// t_prompt_cache_us (prompt_save/prompt_load/update/spill/lazify/merge/drop of the prompt and
+// disk cache), t_batch_build_us (pre_decode minus checkpoint and cache time inside it, only on the
+// first line of an update_slots() iteration), t_since_prev_us (wall since the previous line),
+// t_other_us = t_since_prev_us minus all named phases (queue wait, update_slots() bookkeeping,
+// idle time between requests).
+//
+// Re-measure: run the server with LLAMA_SERVER_UBATCH_STATS=/tmp/us.jsonl (and LLAMA_DECODE_STATS
+// for the library side), one long prompt at cap 33 and at 64, then
+//   python3 ~/Documents/contextFiles/llama.cpp_bench/decode_stats.py --server /tmp/us.jsonl --decode /tmp/ds.jsonl
+// The ~900 ms must show up in one column of the 512+ bucket; t_other_us growing alone would put it
+// outside update_slots().
+struct server_ubatch_stats {
+    bool        on        = false;
+    bool        to_stderr = false;
+    std::string path;
+    std::mutex  mtx;
+
+    int64_t t_prev_end      = 0; // end of the previous line, 0 = no line yet
+    int64_t t_checkpoint    = 0;
+    int64_t n_checkpoints   = 0;
+    int64_t checkpoint_bytes = 0;
+    int64_t t_prompt_cache  = 0;
+    int64_t t_batch_build   = 0;
+    int64_t t_spec_process  = 0;
+    int64_t t_post_decode   = 0;
+
+    server_ubatch_stats() {
+        const char * v = getenv("LLAMA_SERVER_UBATCH_STATS");
+        if (v && *v) {
+            on        = true;
+            to_stderr = strcmp(v, "1") == 0 || strcmp(v, "-") == 0;
+            path      = v;
+        }
+    }
+
+    void write(const char * line) {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (to_stderr) {
+            fputs(line, stderr);
+            fflush(stderr);
+            return;
+        }
+        FILE * f = fopen(path.c_str(), "a");
+        if (!f) {
+            return;
+        }
+        fputs(line, f);
+        fclose(f);
+    }
+
+    void emit(int slot, int n_tokens, int n_past, int64_t t_decode) {
+        const int64_t now   = ggml_time_us();
+        const int64_t since = t_prev_end > 0 ? now - t_prev_end : 0;
+        const int64_t named = t_decode + t_spec_process + t_post_decode + t_checkpoint + t_prompt_cache + t_batch_build;
+
+        const double t_unix = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+
+        char buf[1024];
+        snprintf(buf, sizeof(buf),
+                "{\"t\":%.6f,\"slot\":%d,\"n_tokens\":%d,\"n_past\":%d,\"t_decode_us\":%" PRId64 ",\"t_spec_process_us\":%" PRId64 ","
+                "\"t_post_decode_us\":%" PRId64 ",\"t_checkpoint_us\":%" PRId64 ",\"n_checkpoints_created\":%" PRId64 ",\"checkpoint_bytes\":%" PRId64 ","
+                "\"t_prompt_cache_us\":%" PRId64 ",\"t_batch_build_us\":%" PRId64 ",\"t_since_prev_us\":%" PRId64 ",\"t_other_us\":%" PRId64 "}\n",
+                t_unix, slot, n_tokens, n_past, t_decode, t_spec_process,
+                t_post_decode, t_checkpoint, n_checkpoints, checkpoint_bytes,
+                t_prompt_cache, t_batch_build, since, t_prev_end > 0 ? since - named : 0);
+        write(buf);
+
+        t_checkpoint = n_checkpoints = checkpoint_bytes = 0;
+        t_prompt_cache = t_batch_build = t_spec_process = t_post_decode = 0;
+        t_prev_end = ggml_time_us();
+    }
+};
+
+static server_ubatch_stats & server_ustats() {
+    static server_ubatch_stats st;
+    return st;
+}
+
+// adds the scope's wall time to one LLAMA_SERVER_UBATCH_STATS accumulator; no clock read when off
+struct server_ustats_timer {
+    int64_t * t;
+    int64_t   t_start;
+    explicit server_ustats_timer(int64_t & t_) : t(server_ustats().on ? &t_ : nullptr), t_start(t ? ggml_time_us() : 0) {}
+    ~server_ustats_timer() {
+        if (t) {
+            *t += ggml_time_us() - t_start;
+        }
+    }
+};
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -764,6 +880,7 @@ struct server_slot {
     server_prompt prompt;
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
+        server_ustats_timer ut(server_ustats().t_prompt_cache); // [LLAMA_SERVER_UBATCH_STATS]
         if (prompt.tokens.size() == 0) {
             return false;
         }
@@ -800,6 +917,7 @@ struct server_slot {
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, const std::string & conversation_id) {
+        server_ustats_timer ut(server_ustats().t_prompt_cache); // [LLAMA_SERVER_UBATCH_STATS]
         bool res = prompt_cache.load(prompt, tokens, conversation_id, ctx_tgt, ctx_dft, id);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
@@ -1881,7 +1999,7 @@ private:
         SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
         slot.prompt_save(*prompt_cache);
         slot.prompt_clear();
-        prompt_cache->update();
+        { server_ustats_timer ut(server_ustats().t_prompt_cache); prompt_cache->update(); }
     }
 
     // Flush every idle slot's live KV state into the prompt cache.
@@ -2736,14 +2854,14 @@ private:
                 // with headroom over_budget() is false and the fast async path below
                 // (load, then lazy update) is unchanged.
                 if (prompt_cache->over_budget()) {
-                    prompt_cache->spill_all_to_disk();
+                    { server_ustats_timer ut(server_ustats().t_prompt_cache); prompt_cache->spill_all_to_disk(); }
                 }
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens, task.conversation_id)) {
                     ret->prompt_clear();
                 }
 
-                prompt_cache->update();
+                { server_ustats_timer ut(server_ustats().t_prompt_cache); prompt_cache->update(); }
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             } else if (prompt_cache) {
@@ -2754,12 +2872,12 @@ private:
                 // tokens from scratch instead of resuming from cache.
                 if (ret->prompt.tokens.size() > 0) {
                     ret->prompt_save(*prompt_cache);
-                    prompt_cache->update();
+                    { server_ustats_timer ut(server_ustats().t_prompt_cache); prompt_cache->update(); }
                 }
                 // prompt_load() is never called on this path, so merge_checkpoint_spills()
                 // must be called explicitly to make disk-spilled checkpoints visible to the
                 // rewind logic in update_slots().
-                prompt_cache->merge_checkpoint_spills(ret->prompt);
+                { server_ustats_timer ut(server_ustats().t_prompt_cache); prompt_cache->merge_checkpoint_spills(ret->prompt); }
             }
         }
 
@@ -3501,6 +3619,12 @@ private:
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+        // [LLAMA_SERVER_UBATCH_STATS] the whole call counts as checkpoint time except the spill/lazify
+        // block below, which is moved to t_prompt_cache_us
+        auto & ust = server_ustats();
+        const int64_t t_ckpt_start = ust.on ? ggml_time_us() : 0;
+        int64_t t_ckpt_spill = 0;
+
         const int id_task = slot.task->id;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
@@ -3575,8 +3699,16 @@ private:
         // persist the checkpoint the moment it exists (async); older checkpoints whose
         // file has committed become disk-backed so only the newest stays resident
         if (prompt_cache) {
+            server_ustats_timer ut(t_ckpt_spill);
             prompt_cache->spill_checkpoint(cur, slot.prompt.conversation_id);
             prompt_cache->lazify_checkpoints(slot.prompt);
+        }
+
+        if (ust.on) {
+            ust.t_checkpoint     += ggml_time_us() - t_ckpt_start - t_ckpt_spill;
+            ust.t_prompt_cache   += t_ckpt_spill;
+            ust.n_checkpoints    += 1;
+            ust.checkpoint_bytes += (int64_t) cur.size();
         }
 
         SLT_TRC(slot,
@@ -3686,7 +3818,7 @@ private:
 
                                 if (slot.prompt_save(*prompt_cache)) {
                                     SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
-                                    prompt_cache->update();
+                                    { server_ustats_timer ut(server_ustats().t_prompt_cache); prompt_cache->update(); }
                                 }
 
                                 if (params_base.kv_unified) {
@@ -4138,6 +4270,11 @@ private:
         const int64_t it_t_dec0  = w_t_decode;
         const int64_t it_t_post0 = w_t_post_decode;
 
+        // [LLAMA_SERVER_UBATCH_STATS] pre_decode wall minus the checkpoint/cache time spent inside it
+        auto & ust = server_ustats();
+        const int64_t ust_pre_start = ust.on ? ggml_time_us() : 0;
+        const int64_t ust_pre_named = ust.t_checkpoint + ust.t_prompt_cache;
+
         try {
             scoped_timer t(perf_instr, w_t_pre_decode, w_n_pre_decode);
             pre_decode();
@@ -4147,6 +4284,10 @@ private:
 
             // the batch is half-built and not rendered, skip now to avoid UB
             return;
+        }
+
+        if (ust.on) {
+            ust.t_batch_build += ggml_time_us() - ust_pre_start - (ust.t_checkpoint + ust.t_prompt_cache - ust_pre_named);
         }
 
         GGML_ASSERT(batch.slot_batched || batch.size() == 0);
@@ -4174,12 +4315,15 @@ private:
         int32_t n_batch = llama_n_batch(ctx_tgt);
         for (int32_t off = 0; off < batch.size(); off = off_next) {
             const int32_t n_tokens = std::min(n_batch, batch.size() - off);
+            int64_t ust_t_decode = 0;
             try {
                 scoped_timer t(perf_instr, w_t_decode, w_n_decode);
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
 
                 batch.render(off, n_tokens);
+                const int64_t ust_dec_start = ust.on ? ggml_time_us() : 0;
                 bool ok = decode(n_batch, off);
+                ust_t_decode = ust.on ? ggml_time_us() - ust_dec_start : 0;
                 if (perf_instr) {
                     // make t_decode measure compute, not submission. decode() already syncs when
                     // has_output is true (see the [TAG_SPEC_OVERLAP] note there), so only the
@@ -4209,6 +4353,9 @@ private:
                 break; // stop any further processing
             }
 
+            const int64_t ust_post_start = ust.on ? ggml_time_us() : 0;
+            const int64_t ust_post_named = ust.t_checkpoint + ust.t_prompt_cache + ust.t_spec_process;
+
             try {
                 scoped_timer t(perf_instr, w_t_post_decode, w_n_post_decode);
                 post_decode(n_tokens, off);
@@ -4216,6 +4363,13 @@ private:
                 SRV_ERR("post_decode() failed: %s\n", e.what());
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
+            }
+
+            // [LLAMA_SERVER_UBATCH_STATS] one line per target decode, after its post_decode
+            if (ust.on) {
+                ust.t_post_decode += ggml_time_us() - ust_post_start - (ust.t_checkpoint + ust.t_prompt_cache + ust.t_spec_process - ust_post_named);
+                ust.emit(batch.slot_batched ? batch.slot_batched->id : -1, n_tokens,
+                        off < (int32_t) batch.tokens.size() ? (int) batch.tokens[off].pos[0] : -1, ust_t_decode);
             }
         }
 
@@ -4471,7 +4625,15 @@ private:
                 if (use_ckpt_tgt) {
                     //const int64_t t_start = ggml_time_us();
 
-                    ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    {
+                        // [LLAMA_SERVER_UBATCH_STATS] speculative checkpoint, counted with the context checkpoints
+                        server_ustats_timer ut(server_ustats().t_checkpoint);
+                        ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    }
+                    if (server_ustats().on) {
+                        server_ustats().n_checkpoints    += 1;
+                        server_ustats().checkpoint_bytes += (int64_t) ckpt.size();
+                    }
 
                     //const int64_t t_total = ggml_time_us() - t_start;
                     //printf("checkpoint total: %f ms\n", t_total / 1000.0);
@@ -4483,6 +4645,7 @@ private:
                 }
 
                 if (use_ckpt_dft) {
+                    server_ustats_timer ut(server_ustats().t_checkpoint);
                     ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
             }
@@ -4713,7 +4876,7 @@ private:
                                     }
 
                                     if (conv_boundary > 0 && n_lcp >= (int) conv_boundary) {
-                                        prompt_cache->drop_stale_checkpoint_spills(slot.prompt, n_lcp);
+                                        { server_ustats_timer ut(server_ustats().t_prompt_cache); prompt_cache->drop_stale_checkpoint_spills(slot.prompt, n_lcp); }
                                     }
                                 }
                             } else {
@@ -4835,7 +4998,7 @@ private:
                                     // min-step thinning erases list entries but never their cp_ files.
                                     // re-register the surviving files so the search below can use them.
                                     if (prompt_cache) {
-                                        prompt_cache->merge_checkpoint_spills(slot.prompt);
+                                        { server_ustats_timer ut(server_ustats().t_prompt_cache); prompt_cache->merge_checkpoint_spills(slot.prompt); }
                                     }
 
                                     bool do_reset = true;
@@ -5560,6 +5723,7 @@ private:
         //     update_dft() at the start of every new draft cycle in pre_decode()
         if (spec) {
             bool ok = true;
+            server_ustats_timer ut(server_ustats().t_spec_process); // [LLAMA_SERVER_UBATCH_STATS]
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch.view, spec_keep, spec_next);
             });

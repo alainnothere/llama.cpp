@@ -1060,6 +1060,76 @@ inline void vk_command_pool::destroy(vk::Device& device) {
     cmd_buffers.clear();
 }
 
+// GGML_VK_MMVQ_SLOPE_STATS CPU phase timers (2026-10-20, see ggml_vk_mmvq_slope_begin for the emitted fields).
+// graph_compute points vk_slope_phases_cur at its context's accumulator for the recording part of the graph
+// (graph start -> end of recording, the cpu_record_us interval) and clears it after; a timer only records
+// when the knob is on AND that thread-local pointer is set, so buffer creation / waits on other threads (model
+// load, other contexts) never land in this graph. Exclusive accounting: a timer nested in another (alloc
+// inside a prealloc drain, submit inside a sync buffer write) subtracts its time from the parent, so the
+// phase sums add up to at most cpu_record_us and t_other_us = cpu_record_us - sum stays honest. The count of
+// a timer nested in a timer of the SAME phase is not taken (buffer_write_2d -> buffer_write_2d_async is one
+// host copy, not two).
+enum vk_slope_phase : int {
+    VK_SLOPE_ALLOC,        // ggml_vk_create_buffer (every create path: check, device, host_malloc, prealloc)
+    VK_SLOPE_FREE,         // ~vk_buffer_struct (vkFreeMemory + vkDestroyBuffer when the last ref drops)
+    VK_SLOPE_DESC,         // ggml_pipeline_allocate_descriptor_sets when it grows (pool create + vkAllocateDescriptorSets)
+    VK_SLOPE_DESC_UPDATE,  // vkUpdateDescriptorSets in ggml_vk_dispatch_pipeline (binding-cache miss)
+    VK_SLOPE_PIPELINE,     // lazy ggml_vk_load_shaders from ggml_pipeline_request_descriptor_sets
+    VK_SLOPE_WAIT,         // fence waits: synchronize, wait_for_fence, sync buffer write/read/copy/memset, serialized submit
+    VK_SLOPE_SUBMIT,       // ggml_vk_submit (vkQueueSubmit, incl. the queue mutex)
+    VK_SLOPE_CPY_HOST,     // host<->staging memcpy / buffer_write*/read* (sync and async paths)
+    VK_SLOPE_QUERY_POOL,   // the instrument's own query pool create/reset/fill at graph start
+    VK_SLOPE_SYNC,         // ggml_vk_sync_buffers (barrier recording)
+    VK_SLOPE_CMDBUF,       // ggml_vk_ctx_begin / ggml_vk_ctx_end (command buffer get/begin/end)
+    VK_SLOPE_PREALLOC,     // ggml_vk_preallocate_buffers own time (its drain/alloc/free land in their phases)
+    VK_SLOPE_INSTR,        // the instrument's per-node begin/end bookkeeping (minus its barriers, in SYNC)
+    VK_SLOPE_PHASE_COUNT
+};
+struct vk_slope_timer;
+struct vk_slope_phases {
+    int64_t  us[VK_SLOPE_PHASE_COUNT] {};
+    uint32_t n[VK_SLOPE_PHASE_COUNT] {};
+    uint32_t n_desc_pool {};      // descriptor pools created
+    uint32_t n_desc_flush {};     // descriptor binding-cache flushes (a buffer was destroyed since the last dispatch)
+    uint32_t n_prealloc_drain {}; // ggml_vk_preallocate_buffers called with a subctx (mid-graph submit + synchronize)
+    uint64_t alloc_bytes {};      // bytes requested by ggml_vk_create_buffer
+    vk_slope_timer * cur {};      // innermost running timer (exclusive accounting)
+};
+extern bool vk_mmvq_slope_stats;
+extern thread_local vk_slope_phases * vk_slope_phases_cur;
+static inline vk_slope_phases * vk_slope_phases_get() {
+    return vk_mmvq_slope_stats ? vk_slope_phases_cur : nullptr;
+}
+struct vk_slope_timer {
+    vk_slope_phases * p;
+    vk_slope_phase    ph;
+    int64_t           t0 {};
+    int64_t           child_us {};
+    vk_slope_timer *  prev {};
+    explicit vk_slope_timer(vk_slope_phase ph_) : p(vk_slope_phases_get()), ph(ph_) {
+        if (p) {
+            prev = p->cur;
+            p->cur = this;
+            t0 = ggml_time_us();
+        }
+    }
+    ~vk_slope_timer() {
+        if (p) {
+            const int64_t el = ggml_time_us() - t0;
+            p->us[ph] += el - child_us;
+            if (!prev || prev->ph != ph) {
+                p->n[ph]++;
+            }
+            p->cur = prev;
+            if (prev) {
+                prev->child_us += el;
+            }
+        }
+    }
+    vk_slope_timer(const vk_slope_timer &) = delete;
+    vk_slope_timer & operator=(const vk_slope_timer &) = delete;
+};
+
 struct vk_buffer_struct {
     vk::Buffer buffer = VK_NULL_HANDLE;
     vk::DeviceMemory device_memory = VK_NULL_HANDLE;
@@ -1075,6 +1145,7 @@ struct vk_buffer_struct {
             return;
         }
         VK_LOG_DEBUG("~vk_buffer_struct(" << buffer << ", " << size << ")");
+        vk_slope_timer slope_t(VK_SLOPE_FREE);   // GGML_VK_MMVQ_SLOPE_STATS t_free_us / n_free
 
         // bump before destroying, so a thread that sees the buffer gone also sees the new count
         device->buffer_destroy_count.fetch_add(1, std::memory_order_release);
@@ -1383,6 +1454,7 @@ struct ggml_backend_vk_context {
         uint32_t  kv;                            // FLASH_ATTN_EXT exact KV length, 0 otherwise
         uint32_t  rows_per_wg, chunk_cols, n_chunks, split_k;   // MUL_MAT dispatch parameters, 0 = unknown
         std::string fa;                          // FLASH_ATTN_EXT: the perf logger's node_desc string
+        int64_t   cpu_us;                        // CPU time of the op switch (ggml_time_us), see slope_cpu_t0
     };
     std::vector<vk_mmvq_slope_sample> slope_samples;
     char slope_path[48] {};
@@ -1403,6 +1475,18 @@ struct ggml_backend_vk_context {
     uint32_t slope_ntok {};
     // fusion name of the node group being dispatched (the perf logger's string), nullptr when unfused
     const char * slope_fusion_name {};
+    // CPU phase timers of the current graph's recording (vk_slope_phases_cur points here during it) and the
+    // per-node CPU bracket start (ggml_vk_mmvq_slope_begin -> _end, the op switch only)
+    vk_slope_phases slope_phases;
+    int64_t slope_cpu_t0 {};
+    // per-graph sum of the per-node CPU brackets (inclusive of the phases inside them, informative only)
+    int64_t slope_switch_us {};
+    // per graph: wall time of the final submit and fence wait after recording (outside cpu_record_us), and
+    // node counts by op (CPY+DUP, SET_ROWS, MUL_MAT+MUL_MAT_ID, FLASH_ATTN_EXT)
+    int64_t slope_final_submit_us {}, slope_final_wait_us {};
+    uint32_t slope_n_cpy {}, slope_n_set_rows {}, slope_n_mul_mat {}, slope_n_fa {};
+    // submit threshold inputs/outputs of the current graph (2026-10-20 flops_per_submit fix, graph line fields)
+    uint64_t slope_graph_flops {}, slope_flops_prev {}, slope_flops_per_submit {}, slope_flops_per_submit_final {};
 };
 
 struct ggml_backend_vk_buffer_context {

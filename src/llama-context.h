@@ -485,4 +485,41 @@ private:
     mutable int64_t bz_x_logits = 0;
     mutable int64_t bz_x_nextn  = 0;
     mutable int64_t t_prev_debug   = 0; // 5s print cadence for the breakdown
+
+    // [LLAMA_DECODE_STATS] env-gated per-decode JSON line, see the parse site in llama-context.cpp
+    // (2026-10-20, hunting the ~900 ms host gap per 512-token prompt chunk at n_rs_seq 64)
+public:
+    struct decode_stats_acc {
+        int64_t t_mem_apply      = 0; // memory_update + init_batch (split_equal, prepare) + per-ubatch mctx->apply
+        int64_t t_graph_reserve  = 0; // sched_reserve() when it actually reserved
+        int64_t t_graph_build    = 0; // model.build_graph
+        int64_t t_sched_alloc    = 0; // ggml_backend_sched_reset + ggml_backend_sched_alloc_graph (split + gallocr)
+        int64_t t_set_inputs     = 0; // res->set_inputs
+        int64_t t_compute        = 0; // ggml_backend_sched_graph_compute_async (host side, incl. CPU splits)
+        int64_t t_output_reserve = 0; // output_reserve()
+        int64_t t_output         = 0; // logits/embd/nextn/sampling extraction + output id mapping
+        int64_t t_mem_commit     = 0; // error-path seq_rm only, this tree has no commit phase
+        int32_t n_ubatch         = 0;
+        int32_t n_reused         = 0;
+    };
+private:
+    bool             dstats_on     = false;
+    int32_t          dstats_ctx_id = -1;
+    decode_stats_acc dstats;
+    int64_t          dstats_t_sync   = 0;  // synchronize() wait since the previous line of this context
+    int32_t          dstats_n_nodes  = -1; // of the last built graph (cached, reused graphs keep it)
+    int32_t          dstats_n_splits = -1;
+    int32_t          dstats_n_cpu    = -1; // nodes the scheduler put on a CPU backend
+    // 2026-10-20: pre-formatted JSON fragment ("cpu_ops":{..},"cpu_names":{..},"cpu_src_bufts":{..},
+    // "split_backends":"..") of the last built graph, rebuilt only when the graph is rebuilt (reused
+    // graphs keep the same placement), so the per-decode emit just appends it
+    std::string      dstats_place_json;
+    void dstats_capture_placement(ggml_cgraph * gf);
+    // 2026-10-20: CPU PLACEMENT warning #3 - checked once per context on the first graph that is
+    // allocated in process_ubatch, independent of LLAMA_DECODE_STATS (see llama-context.cpp)
+    bool             placement_checked = false;
+    void check_cpu_placement(ggml_cgraph * gf);
+    void dstats_emit_ctx_create() const;
+    void dstats_emit(int ret, int64_t t_start_us, uint32_t n_tokens, uint32_t n_outputs);
+    int  decode_impl(const llama_batch_ext & batch_inp); // decode() body, decode() wraps it for the stats line
 };

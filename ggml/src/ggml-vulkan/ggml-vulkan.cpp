@@ -344,6 +344,7 @@ static VkDeviceSize ggml_vk_get_max_buffer_range(const ggml_backend_vk_context *
 }
 
 void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
+    vk_slope_timer slope_t(VK_SLOPE_WAIT);   // GGML_VK_MMVQ_SLOPE_STATS t_wait_us
     // Use waitForFences while most of the graph executes. Hopefully the CPU can sleep
     // during this wait.
     if (ctx->almost_ready_fence_pending) {
@@ -851,6 +852,7 @@ void ggml_pipeline_request_descriptor_sets(ggml_backend_vk_context *ctx, vk_pipe
     VK_LOG_DEBUG("ggml_pipeline_request_descriptor_sets(" << pipeline->name << ", " << n << ")");
     ctx->pipeline_descriptor_set_requirements += n;
     if (!pipeline->compiled) {
+        vk_slope_timer slope_t(VK_SLOPE_PIPELINE);   // GGML_VK_MMVQ_SLOPE_STATS t_pipeline_us / n_pipeline_compile
         ggml_vk_load_shaders(ctx->device, pipeline);
     }
     ggml_pipeline_allocate_descriptor_sets(ctx);
@@ -862,6 +864,7 @@ void ggml_pipeline_allocate_descriptor_sets(ggml_backend_vk_context * ctx) {
         // Enough descriptors are available
         return;
     }
+    vk_slope_timer slope_t(VK_SLOPE_DESC);   // GGML_VK_MMVQ_SLOPE_STATS t_desc_us / n_desc_alloc / n_desc_pool
 
     vk_device& device = ctx->device;
 
@@ -880,6 +883,9 @@ void ggml_pipeline_allocate_descriptor_sets(ggml_backend_vk_context * ctx) {
             vk::DescriptorPoolSize descriptor_pool_size(vk::DescriptorType::eStorageBuffer, MAX_PARAMETER_COUNT * VK_DEVICE_DESCRIPTOR_POOL_SIZE);
             vk::DescriptorPoolCreateInfo descriptor_pool_create_info({}, VK_DEVICE_DESCRIPTOR_POOL_SIZE, descriptor_pool_size);
             ctx->descriptor_pools.push_back(device->device.createDescriptorPool(descriptor_pool_create_info));
+            if (slope_t.p) {
+                slope_t.p->n_desc_pool++;
+            }
         }
 
         std::vector<vk::DescriptorSetLayout> layouts(alloc_count);
@@ -907,6 +913,7 @@ static vk_command_buffer* ggml_vk_create_cmd_buffer(vk_device& device, vk_comman
 }
 
 void ggml_vk_submit(vk_context& ctx, vk::Fence fence) {
+    vk_slope_timer slope_t(VK_SLOPE_SUBMIT);   // GGML_VK_MMVQ_SLOPE_STATS t_submit_us / n_submit (fence-only submits too)
     if (ctx->seqs.empty()) {
         if (fence) {
             ctx->p->q->handle->submit({}, fence);
@@ -1176,7 +1183,12 @@ void ggml_vk_queue_command_pools_cleanup(vk_device& device) {
 // repeated): us/run knob off -> on n=4 33.5 -> 35.6, n=8 51.1 -> 53.6 (~2.5 us per timed matmul); bracket
 // avg 34.0 / 50.7, i.e. the bracket reads the kernel, the barriers land outside it. That test's GB/s exceed
 // DRAM peak (weights sit in the 96 MB Infinity Cache); in the 27B server they do not fit, so GB/s there is real.
-static bool vk_mmvq_slope_stats = false;
+bool vk_mmvq_slope_stats = false;              // extern in ggml-vulkan-types.h (phase timers in other TUs)
+// GGML_VK_SUBMIT_FLOPS_PREV=1 (2026-10-20): A/B switch, restores the upstream submit threshold that sizes this
+// graph's submissions from the PREVIOUS graph's flops on the context. Default off = size from this graph's
+// own flops (pre-pass in ggml_backend_vk_graph_compute, see the long comment at flops_per_submit there).
+static bool vk_submit_flops_prev = false;
+thread_local vk_slope_phases * vk_slope_phases_cur = nullptr;   // set by graph_compute while recording
 static std::string vk_mmvq_slope_stats_path;   // "" = stderr
 struct vk_mmvq_slope_acc {
     uint64_t count = 0;
@@ -1191,6 +1203,7 @@ struct vk_mmvq_slope_acc {
     uint32_t nodes_first = 0, nodes_min = 0, nodes_max = 0;   // n_nodes of the sample's graph (first = exemplar's)
     uint32_t ref_max = 0;                       // largest graph on the device when the sample was classified
     uint64_t gid_min = 0, gid_max = 0;          // graph_id
+    int64_t  cpu_sum_us = 0, cpu_max_us = 0;    // CPU time of the op switch (ggml_vk_build_graph), sum / max
 };
 // key = the JSON fields that identify the sample, so a flush just prints it
 static std::map<std::string, vk_mmvq_slope_acc> vk_mmvq_slope_map;
@@ -1363,6 +1376,9 @@ static void ggml_vk_mmvq_slope_mm(ggml_backend_vk_context * ctx, uint32_t rows_p
 //   graph_ref_nodes  largest graph on that device (all contexts) when the samples were classified (max)
 //   graph_id_min, graph_id_max   first / last graph_id (per-process graph counter) the key was seen in
 //   kv_min, kv_max   FLASH_ATTN_EXT only: exact KV range over the key's samples
+//   cpu_us, cpu_max_us  CPU time (ggml_time_us) of the op switch in ggml_vk_build_graph, sum / max over the
+//                key's samples; same bracket as the GPU timestamps (after the opening barrier+timestamp,
+//                before the closing ones), inclusive of the phases the op triggers (see the graph line)
 // Exemplar fields (from the key's first sample in the window; constant within a key in practice):
 //   src0, src1, src2, dst   shapes [ne0,ne1,ne2,ne3], null when absent
 //   t0, t1, t2, tdst        type names, null when absent
@@ -1390,6 +1406,42 @@ static void ggml_vk_mmvq_slope_mm(ggml_backend_vk_context * ctx, uint32_t rows_p
 //   wall_us          graph_compute start -> fence wait + timestamp readback done (the perf logger's wall)
 //   gap_us           previous graph on this context returned -> this one started (the perf logger's gap)
 //   t0_us            ggml_time_us() at graph_compute start (orders graphs across devices)
+//  CPU phases of the recording interval (cpu_record_us), exclusive time (nested phases subtract from the
+//  parent: an alloc inside a prealloc drain counts only as alloc), us + counts, struct vk_slope_phases:
+//   t_alloc_us, n_alloc, alloc_bytes   ggml_vk_create_buffer (all create paths incl. prealloc, sync staging)
+//   t_free_us, n_free                  ~vk_buffer_struct (vkFreeMemory + vkDestroyBuffer, last ref dropped)
+//   t_desc_us, n_desc_alloc, n_desc_pool  ggml_pipeline_allocate_descriptor_sets growth (pools created)
+//   t_desc_update_us, n_desc_update    vkUpdateDescriptorSets in ggml_vk_dispatch_pipeline (binding-cache miss)
+//   n_desc_flush                       binding cache dropped because a buffer was destroyed (all sets rewrite)
+//   t_pipeline_us, n_pipeline_compile  lazy ggml_vk_load_shaders from ggml_pipeline_request_descriptor_sets
+//   t_wait_us, n_wait                  fence waits: ggml_vk_wait_for_fence, synchronize, serialized submit,
+//                                      sync buffer write/read/copy/memset
+//   t_submit_us, n_submit              ggml_vk_submit (vkQueueSubmit + queue mutex; fence-only submits too)
+//   t_cpy_host_us, n_cpy_host          buffer_write*/read* (sync + async), staging in/out memcpys, memsets
+//   t_query_pool_us                    this instrument's query pool create/reset/fill at graph start
+//   t_sync_buffers_us, n_sync          ggml_vk_sync_buffers (includes the instrument's 2 per node)
+//   t_cmdbuf_us, n_cmdbuf              ggml_vk_ctx_begin / ggml_vk_ctx_end
+//   t_prealloc_us, n_prealloc, n_prealloc_drain  ggml_vk_preallocate_buffers own time / calls / mid-graph drains
+//   t_instr_us                         per-node begin/end bookkeeping of this instrument (minus its barriers)
+//   t_other_us                         cpu_record_us - sum of all t_* above (fusion checks, op setup, ...)
+//   t_switch_us                        sum of the per-op cpu_us of the graph (inclusive, informative)
+//   t_final_submit_us, t_final_wait_us the instrument's closing submit and fence wait (after cpu_record_us)
+//   n_nodes_cpy (CPY+DUP), n_nodes_set_rows, n_nodes_mul_mat (+ID), n_nodes_fa   node counts by op
+//   graph_flops        this graph's flops (ggml_vk_get_node_flops pre-pass), basis of the submit threshold
+//   flops_prev         previous graph's total flops on this context (the old threshold basis; 2^64-1 = none)
+//   flops_per_submit, flops_per_submit_final   submit threshold at graph start / after the warm-up doublings
+//   submit_flops_prev  1 when GGML_VK_SUBMIT_FLOPS_PREV=1 (old previous-graph rule) is active
+//   (2026-10-20: the old rule made Vulkan2, the middle card, submit 212x per graph, 260 ms; see the comment
+//   at flops_per_submit in ggml_backend_vk_graph_compute)
+//  Timers run only on the graph_compute thread between graph start and end of recording (thread-local
+//  pointer), so creates/waits on other threads never land here. Cost with the knob unset: one bool load.
+// Memory lines ("mem":1, one per DRM card per flush, Linux amdgpu sysfs): t, card (cardN index, not a Vulkan
+//   device), vram_used, vram_total, gtt_used, gtt_total in bytes; correlate with graph lines by t.
+// Why (CPU phases, 2026-10-20): --spec-ngram-draft-n-max 64 sets n_rs_seq 64 (65 recurrent state planes per
+// layer, +4.6 GB VRAM over the 33 cap); the 7900 XT (Vulkan2, 20 GB, 15.2 GB VRAM + 1.7 GB GTT used) records
+// 108 ms per 65-row graph and 281 ms per 512-row prompt graph vs 1-16 ms on the other cards and 16 ms on the
+// same card at the 33 cap; a 512-token prompt chunk takes 2.5-3.3 s wall with 1.1-1.8 s GPU, ~1.4 s host.
+// Prealloc sizes only grow there, so it is not scratch oscillation; these fields name the phase.
 // Returns the query index of the opening timestamp, or -1 when this node is not timed. Called once per node
 // group from ggml_vk_build_graph, before the op switch.
 static int32_t ggml_vk_mmvq_slope_begin(ggml_backend_vk_context * ctx, vk_context& subctx) {
@@ -1398,17 +1450,23 @@ static int32_t ggml_vk_mmvq_slope_begin(ggml_backend_vk_context * ctx, vk_contex
         ctx->query_idx + 3 >= ctx->num_queries) {
         return -1;
     }
-    ggml_vk_sync_buffers(ctx, subctx);
-    if (vk_perf_logger_enabled) {
-        // the perf logger labels the interval ending at each timestamp: here the (empty) gap before the op
-        ctx->query_nodes[ctx->query_idx] = nullptr;
-        ctx->query_fusion_names[ctx->query_idx] = "slope_pre";
+    int32_t q;
+    {
+        vk_slope_timer slope_t(VK_SLOPE_INSTR);   // t_instr_us: the bracket's own bookkeeping
+        ggml_vk_sync_buffers(ctx, subctx);
+        if (vk_perf_logger_enabled) {
+            // the perf logger labels the interval ending at each timestamp: here the (empty) gap before the op
+            ctx->query_nodes[ctx->query_idx] = nullptr;
+            ctx->query_fusion_names[ctx->query_idx] = "slope_pre";
+        }
+        q = ctx->query_idx;
+        subctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->query_pool, ctx->query_idx++);
+        ctx->slope_path[0] = '\0';
+        ctx->slope_fa.clear();
+        ctx->slope_kv = ctx->slope_rows_per_wg = ctx->slope_chunk_cols = ctx->slope_n_chunks = ctx->slope_split_k = 0;
     }
-    const int32_t q = ctx->query_idx;
-    subctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->query_pool, ctx->query_idx++);
-    ctx->slope_path[0] = '\0';
-    ctx->slope_fa.clear();
-    ctx->slope_kv = ctx->slope_rows_per_wg = ctx->slope_chunk_cols = ctx->slope_n_chunks = ctx->slope_split_k = 0;
+    // CPU bracket of the op switch, closed first thing in ggml_vk_mmvq_slope_end (key line cpu_us / cpu_max_us)
+    ctx->slope_cpu_t0 = ggml_time_us();
     return q;
 }
 
@@ -1416,6 +1474,10 @@ static void ggml_vk_mmvq_slope_end(ggml_backend_vk_context * ctx, vk_context& su
     if (q < 0) {
         return;
     }
+    // inclusive: the phases the op triggered (barriers, descriptor writes, prealloc drains, ...) are inside
+    const int64_t cpu_us = ggml_time_us() - ctx->slope_cpu_t0;
+    ctx->slope_switch_us += cpu_us;
+    vk_slope_timer slope_t(VK_SLOPE_INSTR);
     if (vk_perf_logger_enabled) {
         // An op that called ggml_vk_perf_mark_node already wrote its node-labelled timestamp; under the perf
         // logger the bracket then closes there (see collect) and this one is labelled as its trailing part.
@@ -1438,6 +1500,7 @@ static void ggml_vk_mmvq_slope_end(ggml_backend_vk_context * ctx, vk_context& su
     s.n_chunks    = ctx->slope_n_chunks;
     s.split_k     = ctx->slope_split_k;
     s.fa.swap(ctx->slope_fa);   // begin() clears it again for the next node
+    s.cpu_us = cpu_us;
     if (ggml_vk_mmvq_slope_eligible(node)) {
         s.type  = node->src[0]->type;
         s.m     = (uint32_t)node->src[0]->ne[1];
@@ -1536,6 +1599,8 @@ static void ggml_vk_mmvq_slope_collect(ggml_backend_vk_context * ctx, const std:
         a.count++;
         a.sum_ns += ns;
         a.bytes = s.bytes;
+        a.cpu_sum_us += s.cpu_us;
+        a.cpu_max_us = std::max(a.cpu_max_us, s.cpu_us);
     }
     ctx->slope_samples.clear();
 
@@ -1543,15 +1608,89 @@ static void ggml_vk_mmvq_slope_collect(ggml_backend_vk_context * ctx, const std:
     const long long t = (long long)std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     const double first_to_last_us = ts.size() >= 2 ? double(ts.back() - ts.front()) * period / 1000.0 : 0.0;
-    char b[1024];
+    char b[2048];
     snprintf(b, sizeof(b), "{\"t\":%lld,\"dev\":\"%s\",\"ctx\":%u,\"gpu\":\"%s\",\"graph\":1,\"graph_id\":%llu,\"nodes\":%u,\"ref_nodes\":%u,"
              "\"ntok\":%u,\"kind\":\"%s\",\"brackets\":%u,\"timestamps\":%zu,\"dispatches\":%u,\"bracketed_us\":%.1f,"
-             "\"first_to_last_us\":%.1f,\"cpu_record_us\":%lld,\"wall_us\":%lld,\"gap_us\":%lld,\"t0_us\":%lld}\n",
+             "\"first_to_last_us\":%.1f,\"cpu_record_us\":%lld,\"wall_us\":%lld,\"gap_us\":%lld,\"t0_us\":%lld",
              t, ctx->name.c_str(), ctx->slope_ctx_id, ctx->device->properties.deviceName.data(), (unsigned long long)ctx->slope_graph_id,
              ctx->slope_graph_nodes, ctx->slope_max_nodes, ctx->slope_ntok, ctx->slope_graph_kind, n_brackets, ts.size(),
              ctx->perf_dispatch_count, bracketed_ns / 1000.0, first_to_last_us, (long long)(t1_us - t0_us),
              (long long)(now_us - t0_us), (long long)gap_us, (long long)t0_us);
-    vk_mmvq_slope_graph_lines.emplace_back(b);
+    std::string gl = b;
+    // CPU phases of the recording interval (see ggml_vk_mmvq_slope_begin); frozen at t1_us, graph_compute
+    // cleared vk_slope_phases_cur before the final submit/wait
+    const vk_slope_phases & ph = ctx->slope_phases;
+    int64_t phase_sum = 0;
+    for (int i = 0; i < VK_SLOPE_PHASE_COUNT; ++i) {
+        phase_sum += ph.us[i];
+    }
+    snprintf(b, sizeof(b),
+             ",\"t_alloc_us\":%lld,\"n_alloc\":%u,\"alloc_bytes\":%llu,\"t_free_us\":%lld,\"n_free\":%u,"
+             "\"t_desc_us\":%lld,\"n_desc_alloc\":%u,\"n_desc_pool\":%u,\"t_desc_update_us\":%lld,\"n_desc_update\":%u,\"n_desc_flush\":%u,"
+             "\"t_pipeline_us\":%lld,\"n_pipeline_compile\":%u,\"t_wait_us\":%lld,\"n_wait\":%u,\"t_submit_us\":%lld,\"n_submit\":%u,"
+             "\"t_cpy_host_us\":%lld,\"n_cpy_host\":%u,\"t_query_pool_us\":%lld,\"t_sync_buffers_us\":%lld,\"n_sync\":%u,"
+             "\"t_cmdbuf_us\":%lld,\"n_cmdbuf\":%u,\"t_prealloc_us\":%lld,\"n_prealloc\":%u,\"n_prealloc_drain\":%u,"
+             "\"t_instr_us\":%lld,\"t_other_us\":%lld,\"t_switch_us\":%lld,\"t_final_submit_us\":%lld,\"t_final_wait_us\":%lld,"
+             "\"n_nodes_cpy\":%u,\"n_nodes_set_rows\":%u,\"n_nodes_mul_mat\":%u,\"n_nodes_fa\":%u,"
+             "\"graph_flops\":%llu,\"flops_prev\":%llu,\"flops_per_submit\":%llu,\"flops_per_submit_final\":%llu,"
+             "\"submit_flops_prev\":%d}\n",
+             (long long)ph.us[VK_SLOPE_ALLOC], ph.n[VK_SLOPE_ALLOC], (unsigned long long)ph.alloc_bytes,
+             (long long)ph.us[VK_SLOPE_FREE], ph.n[VK_SLOPE_FREE],
+             (long long)ph.us[VK_SLOPE_DESC], ph.n[VK_SLOPE_DESC], ph.n_desc_pool,
+             (long long)ph.us[VK_SLOPE_DESC_UPDATE], ph.n[VK_SLOPE_DESC_UPDATE], ph.n_desc_flush,
+             (long long)ph.us[VK_SLOPE_PIPELINE], ph.n[VK_SLOPE_PIPELINE],
+             (long long)ph.us[VK_SLOPE_WAIT], ph.n[VK_SLOPE_WAIT], (long long)ph.us[VK_SLOPE_SUBMIT], ph.n[VK_SLOPE_SUBMIT],
+             (long long)ph.us[VK_SLOPE_CPY_HOST], ph.n[VK_SLOPE_CPY_HOST], (long long)ph.us[VK_SLOPE_QUERY_POOL],
+             (long long)ph.us[VK_SLOPE_SYNC], ph.n[VK_SLOPE_SYNC],
+             (long long)ph.us[VK_SLOPE_CMDBUF], ph.n[VK_SLOPE_CMDBUF],
+             (long long)ph.us[VK_SLOPE_PREALLOC], ph.n[VK_SLOPE_PREALLOC], ph.n_prealloc_drain,
+             (long long)ph.us[VK_SLOPE_INSTR], (long long)((t1_us - t0_us) - phase_sum), (long long)ctx->slope_switch_us,
+             (long long)ctx->slope_final_submit_us, (long long)ctx->slope_final_wait_us,
+             ctx->slope_n_cpy, ctx->slope_n_set_rows, ctx->slope_n_mul_mat, ctx->slope_n_fa,
+             (unsigned long long)ctx->slope_graph_flops, (unsigned long long)ctx->slope_flops_prev,
+             (unsigned long long)ctx->slope_flops_per_submit, (unsigned long long)ctx->slope_flops_per_submit_final,
+             vk_submit_flops_prev ? 1 : 0);
+    gl += b;
+    vk_mmvq_slope_graph_lines.emplace_back(std::move(gl));
+}
+
+// Memory lines (2026-10-20): one {"t","mem":1,"card","vram_used","vram_total","gtt_used","gtt_total"} line per
+// DRM card that exposes amdgpu mem_info_* in sysfs, once per flush. card = the /sys/class/drm/cardN index,
+// NOT a Vulkan device index; nothing is mapped, the reader correlates by time (and vram_total). Linux only,
+// unreadable files are skipped silently. Why: at n_rs_seq 64 the XT sits at 15.2 GB VRAM + 1.7 GB GTT and
+// records 10-20x slower than at 33; this shows whether GTT spill moves with the recording time.
+static bool ggml_vk_mmvq_slope_read_u64(const char * path, unsigned long long & v) {
+    FILE * f = fopen(path, "r");
+    if (!f) {
+        return false;
+    }
+    const bool ok = fscanf(f, "%llu", &v) == 1;
+    fclose(f);
+    return ok;
+}
+
+static void ggml_vk_mmvq_slope_mem_lines(FILE * out, long long t) {
+#ifdef __linux__
+    for (int card = 0; card < 64; ++card) {
+        char path[128];
+        unsigned long long vram_used = 0, vram_total = 0, gtt_used = 0, gtt_total = 0;
+        snprintf(path, sizeof(path), "/sys/class/drm/card%d/device/mem_info_vram_used", card);
+        if (!ggml_vk_mmvq_slope_read_u64(path, vram_used)) {
+            continue;
+        }
+        snprintf(path, sizeof(path), "/sys/class/drm/card%d/device/mem_info_vram_total", card);
+        ggml_vk_mmvq_slope_read_u64(path, vram_total);
+        snprintf(path, sizeof(path), "/sys/class/drm/card%d/device/mem_info_gtt_used", card);
+        ggml_vk_mmvq_slope_read_u64(path, gtt_used);
+        snprintf(path, sizeof(path), "/sys/class/drm/card%d/device/mem_info_gtt_total", card);
+        ggml_vk_mmvq_slope_read_u64(path, gtt_total);
+        fprintf(out, "{\"t\":%lld,\"mem\":1,\"card\":%d,\"vram_used\":%llu,\"vram_total\":%llu,\"gtt_used\":%llu,\"gtt_total\":%llu}\n",
+                t, card, vram_used, vram_total, gtt_used, gtt_total);
+    }
+#else
+    GGML_UNUSED(out);
+    GGML_UNUSED(t);
+#endif
 }
 
 // Appends one JSON line per key and resets. Opens the file per flush: the server runs for days and the
@@ -1593,6 +1732,8 @@ static void ggml_vk_mmvq_slope_flush(bool force) {
                  (unsigned long long)a.count, a.sum_ns / 1000.0, a.min_ns / 1000.0, a.max_ns / 1000.0, (unsigned long long)a.bytes,
                  a.nodes_first, a.nodes_min, a.nodes_max, a.ref_max, (unsigned long long)a.gid_min, (unsigned long long)a.gid_max);
         line += b;
+        snprintf(b, sizeof(b), ",\"cpu_us\":%lld,\"cpu_max_us\":%lld", (long long)a.cpu_sum_us, (long long)a.cpu_max_us);
+        line += b;
         if (a.kv_max > 0) {
             snprintf(b, sizeof(b), ",\"kv_min\":%u,\"kv_max\":%u", a.kv_min, a.kv_max);
             line += b;
@@ -1604,6 +1745,7 @@ static void ggml_vk_mmvq_slope_flush(bool force) {
     for (const auto & gl : vk_mmvq_slope_graph_lines) {
         fputs(gl.c_str(), f);
     }
+    ggml_vk_mmvq_slope_mem_lines(f, t);
     if (f != stderr) {
         fclose(f);
     } else {
@@ -1646,6 +1788,7 @@ vk_subbuffer ggml_vk_subbuffer(const ggml_backend_vk_context* ctx, const vk_buff
 
 void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subctx) {
     VK_LOG_DEBUG("ggml_vk_sync_buffers()");
+    vk_slope_timer slope_t(VK_SLOPE_SYNC);   // GGML_VK_MMVQ_SLOPE_STATS t_sync_buffers_us / n_sync
 
     const bool transfer_queue = subctx->p->q->transfer_only;
 
@@ -5820,6 +5963,11 @@ void ggml_vk_instance_init() {
         }
     }
     vk_fa_mask_cache_disable = getenv("GGML_VK_FA_MASK_CACHE_DISABLE") != nullptr;
+    // GGML_VK_SUBMIT_FLOPS_PREV=1: old (previous-graph) submit threshold, for A/B; see flops_per_submit in
+    // ggml_backend_vk_graph_compute
+    if (const char * e = getenv("GGML_VK_SUBMIT_FLOPS_PREV")) {
+        vk_submit_flops_prev = strcmp(e, "0") != 0;
+    }
     if (const char * e = getenv("GGML_VK_MMVQ_Q6K")) {
         vk_mmvq_q6k = atoi(e) != 0 ? 1 : 0;
     }
@@ -6421,6 +6569,7 @@ void ggml_vk_cmd_label_begin(vk::CommandBuffer buf, const char * name) {
 
 void ggml_vk_ctx_end(vk_context& ctx) {
     VK_LOG_DEBUG("ggml_vk_ctx_end(" << ctx << ", " << ctx->seqs.size() << ")");
+    vk_slope_timer slope_t(VK_SLOPE_CMDBUF);   // GGML_VK_MMVQ_SLOPE_STATS t_cmdbuf_us / n_cmdbuf
     if (ctx->s == nullptr) {
         return;
     }
@@ -6440,6 +6589,7 @@ void ggml_vk_ctx_end(vk_context& ctx) {
 
 void ggml_vk_ctx_begin(vk_device& device, vk_context& subctx) {
     VK_LOG_DEBUG("ggml_vk_ctx_begin(" << device->name << ")");
+    vk_slope_timer slope_t(VK_SLOPE_CMDBUF);   // GGML_VK_MMVQ_SLOPE_STATS t_cmdbuf_us / n_cmdbuf
     if (subctx->s != nullptr) {
         ggml_vk_ctx_end(subctx);
     }
@@ -6500,8 +6650,11 @@ bool ggml_vk_submit_transfer_ctx(ggml_backend_vk_context * ctx) {
     vk_context cpy_ctx = ctx->transfer_ctx.lock();
     ggml_vk_ctx_end(cpy_ctx);
 
-    for (auto& cpy : cpy_ctx->in_memcpys) {
-        memcpy(cpy.dst, cpy.src, cpy.n);
+    if (!cpy_ctx->in_memcpys.empty()) {
+        vk_slope_timer slope_t(VK_SLOPE_CPY_HOST);   // GGML_VK_MMVQ_SLOPE_STATS t_cpy_host_us
+        for (auto& cpy : cpy_ctx->in_memcpys) {
+            memcpy(cpy.dst, cpy.src, cpy.n);
+        }
     }
 
     ctx->transfer_semaphore.value++;
@@ -13211,6 +13364,12 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
     GGML_ABORT("fatal error");
 #endif
 
+    // GGML_VK_MMVQ_SLOPE_STATS t_prealloc_us (own time) / n_prealloc / n_prealloc_drain; the drain's submit and
+    // wait and the creates/destroys land in t_submit/t_wait/t_alloc/t_free
+    vk_slope_timer slope_t(VK_SLOPE_PREALLOC);
+    if (subctx && slope_t.p) {
+        slope_t.p->n_prealloc_drain++;
+    }
     if (subctx) {
         // Submit and wait for any pending work before reallocating the buffers
         ggml_vk_ctx_end(subctx);
@@ -13870,12 +14029,15 @@ void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
 #endif
 
         // Do staging buffer copies
-        for (auto& cpy : subctx->in_memcpys) {
-            memcpy(cpy.dst, cpy.src, cpy.n);
-        }
+        if (!subctx->in_memcpys.empty() || !subctx->memsets.empty()) {
+            vk_slope_timer slope_t(VK_SLOPE_CPY_HOST);   // GGML_VK_MMVQ_SLOPE_STATS t_cpy_host_us
+            for (auto& cpy : subctx->in_memcpys) {
+                memcpy(cpy.dst, cpy.src, cpy.n);
+            }
 
-        for (auto& mset : subctx->memsets) {
-            memset(mset.dst, mset.val, mset.n);
+            for (auto& mset : subctx->memsets) {
+                memset(mset.dst, mset.val, mset.n);
+            }
         }
 
         if (ctx->device->serialize_submissions) {
@@ -13896,6 +14058,7 @@ void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
 
     if (tensor_idx == subctx->exit_tensor_idx) {
         // Do staging buffer copies
+        vk_slope_timer slope_t(VK_SLOPE_CPY_HOST);   // GGML_VK_MMVQ_SLOPE_STATS t_cpy_host_us
         for (auto& cpy : subctx->out_memcpys) {
             memcpy(cpy.dst, cpy.src, cpy.n);
         }
@@ -14517,12 +14680,16 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
 
         ggml_vk_ctx_end(compute_ctx);
 
-        for (auto& cpy : compute_ctx->in_memcpys) {
-            memcpy(cpy.dst, cpy.src, cpy.n);
+        if (!compute_ctx->in_memcpys.empty()) {
+            vk_slope_timer slope_t(VK_SLOPE_CPY_HOST);   // GGML_VK_MMVQ_SLOPE_STATS t_cpy_host_us
+            for (auto& cpy : compute_ctx->in_memcpys) {
+                memcpy(cpy.dst, cpy.src, cpy.n);
+            }
         }
 
         if (ctx->device->serialize_submissions) {
             ggml_vk_submit(compute_ctx, ctx->fence);
+            vk_slope_timer slope_t(VK_SLOPE_WAIT);   // GGML_VK_MMVQ_SLOPE_STATS t_wait_us
             VK_CHECK(ctx->device->device.waitForFences({ ctx->fence }, true, UINT64_MAX), "synchronize waitForFences", ctx->device);
             ctx->device->device.resetFences({ ctx->fence });
         } else {
@@ -14562,8 +14729,11 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
     }
 
     if (do_transfer) {
-        for (auto& cpy : compute_ctx->out_memcpys) {
-            memcpy(cpy.dst, cpy.src, cpy.n);
+        if (!compute_ctx->out_memcpys.empty()) {
+            vk_slope_timer slope_t(VK_SLOPE_CPY_HOST);   // GGML_VK_MMVQ_SLOPE_STATS t_cpy_host_us
+            for (auto& cpy : compute_ctx->out_memcpys) {
+                memcpy(cpy.dst, cpy.src, cpy.n);
+            }
         }
         ctx->compute_ctx.reset();
     }
@@ -15356,6 +15526,30 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     vk_context compute_ctx;
     const int64_t perf_t0_us = (vk_perf_logger_enabled || vk_mmvq_slope_stats) ? ggml_time_us() : 0;
+    // GGML_VK_MMVQ_SLOPE_STATS CPU phases: accumulate into this context from here to the end of recording
+    // (perf_t1_us); the guard clears the thread-local on every exit path, the explicit clear below freezes it
+    // before the final submit/wait
+    struct slope_phases_guard {
+        ~slope_phases_guard() { vk_slope_phases_cur = nullptr; }
+    } slope_phases_guard_;
+    if (vk_mmvq_slope_stats) {
+        ctx->slope_phases = {};
+        ctx->slope_switch_us = 0;
+        ctx->slope_final_submit_us = ctx->slope_final_wait_us = 0;
+        ctx->slope_n_cpy = ctx->slope_n_set_rows = ctx->slope_n_mul_mat = ctx->slope_n_fa = 0;
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            switch (cgraph->nodes[i]->op) {
+                case GGML_OP_CPY:
+                case GGML_OP_DUP:            ctx->slope_n_cpy++;      break;
+                case GGML_OP_SET_ROWS:       ctx->slope_n_set_rows++; break;
+                case GGML_OP_MUL_MAT:
+                case GGML_OP_MUL_MAT_ID:     ctx->slope_n_mul_mat++;  break;
+                case GGML_OP_FLASH_ATTN_EXT: ctx->slope_n_fa++;       break;
+                default: break;
+            }
+        }
+        vk_slope_phases_cur = &ctx->slope_phases;
+    }
     ctx->perf_dispatch_count = 0;
     ctx->perf_trailing_label = nullptr;
     // mask-derived FA scratch is valid for one graph evaluation only
@@ -15363,6 +15557,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ctx->mask_scratch_used = 0;
     // the query pool is shared by GGML_VK_PERF_LOGGER and GGML_VK_MMVQ_SLOPE_STATS
     if (vk_perf_logger_enabled || vk_mmvq_slope_stats) {
+        vk_slope_timer slope_t(VK_SLOPE_QUERY_POOL);   // t_query_pool_us: create/reset/fill, the instrument's own cost
         // allocate/resize the query pool. Ops may add sub-dispatch marks (ggml_vk_perf_mark), so
         // reserve several queries per node; the slope stats add two per node.
         const int32_t queries_needed = cgraph->n_nodes * (vk_mmvq_slope_stats ? 6 : 4) + 100;
@@ -15443,11 +15638,55 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             flops_cap = 2'000'000'000ULL * ctx->device->shader_core_count;
         }
     }
-    uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
+    // Submit threshold (fork change 2026-10-20; GGML_VK_SUBMIT_FLOPS_PREV=1 restores the old rule for A/B).
+    //
+    // Old rule (upstream): flops_per_submit = min(flops_cap, ctx->last_total_flops / 40), i.e. ~40 submissions
+    // per graph sized from the PREVIOUS graph_compute on this backend context. It assumes consecutive graphs
+    // on a context are alike (a decode loop: graph N+1 ~ graph N), so last graph's flops predict this one's.
+    //
+    // Why it broke: 27B hybrid model, layer split over three GPUs, the 7900 XT (Vulkan2) is the MIDDLE card.
+    // The scheduler also runs tiny graphs on it between the real ones: cross-device copy / memory-op graphs
+    // and the recurrent-state rollback/plane ops (per-graph lines on Vulkan2: 1747 "other, ntok 0, 1
+    // dispatch" graphs and 882 "draft, 0 nodes, 3 dispatches" graphs). Every big target graph there was
+    // preceded by one of those (135 of 135 followed a < 1000-node graph), so last_total_flops was about one
+    // node's worth, the threshold collapsed to almost nothing, and every weight matmul flushed its own
+    // submission (the flush-before-node check below plus the batch_flops >= flops_per_submit submit flag).
+    // --spec-ngram-draft-n-max 64 (n_rs_seq 64, 65 state planes per layer) made the tiny graphs far more
+    // frequent than the 33 chain cap did, which is why it surfaced on 2026-10-20 (at 33 the XT recorded
+    // 16 ms per 512-row graph; the two XTX, first/last in the split, rarely see a tiny graph in between).
+    // Measured with GGML_VK_MMVQ_SLOPE_STATS, Vulkan2 per 512-row prompt graph: cpu_record 265 ms of which
+    // t_submit 260 ms, n_submit 212, vs 31-35 submits and 28-37 ms on the two XTX; same 212 submits / 117 ms
+    // at 65 rows. ~1.2 ms per vkQueueSubmit on RADV. No alloc, no descriptor flush, no waits, no compiles.
+    // Prompt processing fell from ~700 to ~200 t/s.
+    //
+    // New rule: size from THIS graph's own flops, summed in a cheap O(n_nodes) pre-pass with the same
+    // ggml_vk_get_node_flops the loop uses (empty ops skipped; they count 0 anyway). A tiny graph then gets a
+    // tiny threshold, which is harmless: it has a node or three. last_total_flops is still updated after the
+    // loop (nothing else reads it today, kept for the A/B knob and any future reader). The submit_count < 3
+    // doubling warm-up in submit_after is unchanged: the first submissions stay small so the GPU starts early.
+    //
+    // Re-measure: GGML_VK_MMVQ_SLOPE_STATS=<file>, then mmvq_slope.py --cpu <file>: per-graph n_submit and
+    // t_submit_us by device / ntok bucket; the graph line also carries graph_flops, flops_prev (the previous
+    // graph's total, what the old rule used), flops_per_submit (the initial threshold chosen) and
+    // flops_per_submit_final (after the warm-up doublings), plus submit_flops_prev (knob state).
+    uint64_t graph_flops = 0;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        if (!ggml_op_is_empty(cgraph->nodes[i]->op)) {
+            graph_flops += ggml_vk_get_node_flops(cgraph->nodes[i]);
+        }
+    }
+    const uint64_t flops_basis = vk_submit_flops_prev ? ctx->last_total_flops : graph_flops;
+    uint64_t flops_per_submit = std::min(flops_cap, flops_basis / 40u);
+    if (vk_mmvq_slope_stats) {
+        ctx->slope_graph_flops = graph_flops;
+        ctx->slope_flops_prev = ctx->last_total_flops;
+        ctx->slope_flops_per_submit = flops_per_submit;
+    }
 
     auto const submit_after = [&](int start, int end) {
         if (ctx->device->serialize_submissions) {
             try {
+                vk_slope_timer slope_t(VK_SLOPE_WAIT);   // GGML_VK_MMVQ_SLOPE_STATS t_wait_us
                 auto res = ctx->device->device.waitForFences({ ctx->fence }, true, UINT64_MAX);
                 if (res != vk::Result::eSuccess) {
                     GGML_LOG_ERROR("ggml_vulkan: waitForFences error during serialized submission\n");
@@ -15806,6 +16045,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     }
 
     ctx->last_total_flops = total_flops;
+    if (vk_mmvq_slope_stats) {
+        ctx->slope_flops_per_submit_final = flops_per_submit;
+    }
+    vk_slope_phases_cur = nullptr;   // recording done: freeze the phase sums (collect reads them)
 
     if (vk_perf_logger_enabled || (vk_mmvq_slope_stats && ctx->query_idx > 0)) {
         // CPU time spent recording this graph (before the final submit/wait)
@@ -15822,8 +16065,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         }
         ggml_vk_ctx_end(compute_ctx);
 
+        const int64_t final_submit_t0_us = vk_mmvq_slope_stats ? ggml_time_us() : 0;
         ggml_vk_submit(compute_ctx, ctx->device->fence);
+        const int64_t final_wait_t0_us = vk_mmvq_slope_stats ? ggml_time_us() : 0;
         VK_CHECK(ctx->device->device.waitForFences({ ctx->device->fence }, true, UINT64_MAX), "GGML_VULKAN_PERF waitForFences", ctx->device);
+        if (vk_mmvq_slope_stats) {
+            ctx->slope_final_submit_us = final_wait_t0_us - final_submit_t0_us;
+            ctx->slope_final_wait_us   = ggml_time_us() - final_wait_t0_us;
+        }
         ctx->device->device.resetFences({ ctx->device->fence });
         ctx->compute_ctx.reset();
 

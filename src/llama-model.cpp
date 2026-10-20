@@ -1983,6 +1983,60 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         const int max_offloadable_layers       = n_layer_all + 1;
 
         LLAMA_LOG_INFO("%s: offloaded %d/%d layers to GPU\n", __func__, std::min(n_gpu_layers, max_offloadable_layers), max_backend_supported_layers);
+
+        // CPU PLACEMENT warning #1 of 3 (2026-10-20).
+        //
+        // What: when GPU devices are in use but some repeating layer (or the output
+        // layer) was assigned to the CPU device, say so at WARN with the indices.
+        //
+        // Why: 2026-10-20 `--spec-ngram-draft-n-max 64` grew the recurrent rollback
+        // planes (n_rs_seq 64 -> 202 MB per GatedDeltaNet layer) and
+        // `--fit on --fit-target 6144,1536,2048 -ts 16,26,24` answered by lowering
+        // n_gpu_layers by one, leaving one GDN layer on the CPU. Decode graph went from
+        // 4 splits / 2 CPU nodes to 21 splits / 152 CPU nodes, a 2048-token prompt
+        // batch from 3.3 s to 9.2 s, generation ~50 -> ~30 t/s. Nobody noticed for an
+        // hour because the INFO line above is demoted below the default -lv 3 by this
+        // fork ("logs : reduce v2"; INFO -> TRACE).
+        //
+        // Suppression rule: only n_gpu_layers == 0 (explicit "CPU only") is silent.
+        // An explicit partial -ngl N is NOT exempted, deliberately: --fit writes
+        // params.n_gpu_layers itself (common/fit.cpp set_ngl_tensor_split_tbo, and it
+        // refuses to run if the user set -ngl), so at this level a fit-chosen value is
+        // indistinguishable from a user-typed one, and the fit-chosen one is exactly
+        // the case this warning exists for. llama_model_params carries no "set by
+        // user" bit and adding one is a public API change. A deliberate -ngl N user
+        // gets one extra line per load; the message says it is expected then.
+        //
+        // Partial layers (fit's per-tensor overflow via tensor_buft_overrides, -ot)
+        // are not reported here: the layer's device stays the GPU. Their cost shows up
+        // in warning #3 (llama-context.cpp, CPU nodes in the first scheduled graph).
+        //
+        // Re-measure: run with -lv 3 and `--fit on` on a config that just barely does
+        // not fit, grep "CPU PLACEMENT:"; or force it with -ngl <n_layer>.
+        // !ml.no_alloc: --fit's memory probes load the model with no_alloc (common/fit.cpp
+        // mparams_copy.no_alloc = true) many times while searching; a probe putting layers
+        // on the CPU is the search working, not a placement anyone will run with.
+        if (!devices.empty() && params.n_gpu_layers != 0 && !ml.no_alloc) {
+            std::vector<int> cpu_layers;
+            for (int il = 0; il < n_layer_all; ++il) {
+                ggml_backend_dev_t dev = pimpl->dev_layer[il].dev;
+                if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    cpu_layers.push_back(il);
+                }
+            }
+            const bool output_on_cpu = pimpl->dev_output.dev != nullptr &&
+                    ggml_backend_dev_type(pimpl->dev_output.dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+            if (!cpu_layers.empty() || output_on_cpu) {
+                LLAMA_LOG_WARN("CPU PLACEMENT: %s: %zu/%d repeating layers on the CPU [%s]%s with %zu GPU device(s), "
+                        "n_gpu_layers = %d (%s); a layer on the CPU in a GPU split costs seconds per prompt batch; "
+                        "check -ts / --fit-target / -ngl (expected only if you asked for this -ngl on purpose)\n",
+                        __func__, cpu_layers.size(), n_layer_all,
+                        cpu_layers.empty() ? "none" : llama_format_index_ranges(cpu_layers).c_str(),
+                        output_on_cpu ? ", plus the output layer" : "",
+                        devices.size(), params.n_gpu_layers,
+                        params.n_gpu_layers < 0 ? "default/all" : "set by -ngl or --fit");
+            }
+        }
     }
 
     // print memory requirements per buffer type

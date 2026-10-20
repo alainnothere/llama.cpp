@@ -39,6 +39,13 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
         return buf;
     }
 
+    // GGML_VK_MMVQ_SLOPE_STATS t_alloc_us / n_alloc / alloc_bytes: vkCreateBuffer + vkAllocateMemory + bind + map;
+    // under VRAM pressure the allocate is where the kernel evicts to GTT
+    vk_slope_timer slope_t(VK_SLOPE_ALLOC);
+    if (slope_t.p) {
+        slope_t.p->alloc_bytes += size;
+    }
+
     vk::BufferUsageFlags usage_flags = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst;
     vk::MemoryAllocateFlags mem_flags {};
     if (device->buffer_device_address) {
@@ -328,6 +335,7 @@ void ggml_vk_ensure_sync_staging_buffer(ggml_backend_vk_context * ctx, size_t si
 
 static void ggml_vk_buffer_write_nc_async(ggml_backend_vk_context * ctx, vk_context& subctx, vk_buffer& dst, size_t offset, const ggml_tensor * tensor, bool sync_staging = false) {
     VK_LOG_DEBUG("ggml_vk_buffer_write_nc_async(" << tensor << ")");
+    vk_slope_timer slope_t(VK_SLOPE_CPY_HOST);   // GGML_VK_MMVQ_SLOPE_STATS t_cpy_host_us
     GGML_ASSERT(!ggml_is_contiguous(tensor));
     // Buffer is already mapped
     if(dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
@@ -425,6 +433,7 @@ static void ggml_vk_buffer_write_nc_async(ggml_backend_vk_context * ctx, vk_cont
 
 bool ggml_vk_buffer_write_2d_async(vk_context subctx, vk_buffer& dst, size_t offset, const void * src, size_t spitch, size_t dpitch, size_t width, size_t height, bool sync_staging) {
     VK_LOG_DEBUG("ggml_vk_buffer_write_2d_async(" << width << ", " << height << ")");
+    vk_slope_timer slope_t(VK_SLOPE_CPY_HOST);   // GGML_VK_MMVQ_SLOPE_STATS t_cpy_host_us
     // Check if src is pinned memory
     vk_buffer buf = nullptr;
     size_t buf_offset = 0;
@@ -498,6 +507,7 @@ bool ggml_vk_buffer_write_async(vk_context subctx, vk_buffer& dst, size_t offset
 
 void ggml_vk_buffer_write_2d(vk_buffer& dst, size_t offset, const void * src, size_t spitch, size_t dpitch, size_t width, size_t height) {
     VK_LOG_DEBUG("ggml_vk_buffer_write_2d(" << width << ", " << height << ")");
+    vk_slope_timer slope_t(VK_SLOPE_CPY_HOST);   // GGML_VK_MMVQ_SLOPE_STATS t_cpy_host_us (its wait is in t_wait_us)
     // Buffer is already mapped
     if(dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
         GGML_ASSERT(dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent);
@@ -527,7 +537,10 @@ void ggml_vk_buffer_write_2d(vk_buffer& dst, size_t offset, const void * src, si
         }
 
         ggml_vk_submit(subctx, dst->device->fence);
-        VK_CHECK(dst->device->device.waitForFences({ dst->device->fence }, true, UINT64_MAX), "vk_buffer_write_2d waitForFences", dst->device);
+        {
+            vk_slope_timer slope_w(VK_SLOPE_WAIT);   // GGML_VK_MMVQ_SLOPE_STATS t_wait_us
+            VK_CHECK(dst->device->device.waitForFences({ dst->device->fence }, true, UINT64_MAX), "vk_buffer_write_2d waitForFences", dst->device);
+        }
         dst->device->device.resetFences({ dst->device->fence });
         ggml_vk_queue_command_pools_cleanup(dst->device);
     }
@@ -540,6 +553,7 @@ void ggml_vk_buffer_write(vk_buffer& dst, size_t offset, const void * src, size_
 
 bool ggml_vk_buffer_read_2d_async(vk_context subctx, vk_buffer& src, size_t offset, void * dst, size_t spitch, size_t dpitch, size_t width, size_t height, bool sync_staging) {
     VK_LOG_DEBUG("ggml_vk_buffer_read_2d_async(offset=" << offset << ", width=" << width << ", height=" << height << ")");
+    vk_slope_timer slope_t(VK_SLOPE_CPY_HOST);   // GGML_VK_MMVQ_SLOPE_STATS t_cpy_host_us
     GGML_ASSERT(width > 0);
     GGML_ASSERT(height > 0);
     GGML_ASSERT(src != nullptr);
@@ -619,6 +633,7 @@ static bool ggml_vk_buffer_read_async(vk_context subctx, vk_buffer& src, size_t 
 
 void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, size_t spitch, size_t dpitch, size_t width, size_t height) {
     VK_LOG_DEBUG("ggml_vk_buffer_read_2d(" << src->buffer << ", " << offset << ", " << width << ", " << height << ")");
+    vk_slope_timer slope_t(VK_SLOPE_CPY_HOST);   // GGML_VK_MMVQ_SLOPE_STATS t_cpy_host_us (its wait is in t_wait_us)
 
     // If the device is not an UMA device the memory is host-accessible through rebar. While writing
     // through PCIe is sufficient fast reading back data from PCIe is slower than going through
@@ -641,8 +656,11 @@ void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, size_t sp
             {}, {});
         ggml_vk_ctx_end(subctx);
         ggml_vk_submit(subctx, src->device->fence);
-        VK_CHECK(src->device->device.waitForFences({ src->device->fence }, true, UINT64_MAX),
-                 "vk_buffer_read_2d uma waitForFences", src->device);
+        {
+            vk_slope_timer slope_w(VK_SLOPE_WAIT);   // GGML_VK_MMVQ_SLOPE_STATS t_wait_us
+            VK_CHECK(src->device->device.waitForFences({ src->device->fence }, true, UINT64_MAX),
+                     "vk_buffer_read_2d uma waitForFences", src->device);
+        }
         src->device->device.resetFences({ src->device->fence });
         ggml_vk_queue_command_pools_cleanup(src->device);
 
@@ -663,7 +681,10 @@ void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, size_t sp
         ggml_vk_ctx_end(subctx);
 
         ggml_vk_submit(subctx, src->device->fence);
-        VK_CHECK(src->device->device.waitForFences({ src->device->fence }, true, UINT64_MAX), "vk_buffer_read_2d waitForFences", src->device);
+        {
+            vk_slope_timer slope_w(VK_SLOPE_WAIT);   // GGML_VK_MMVQ_SLOPE_STATS t_wait_us
+            VK_CHECK(src->device->device.waitForFences({ src->device->fence }, true, UINT64_MAX), "vk_buffer_read_2d waitForFences", src->device);
+        }
         src->device->device.resetFences({ src->device->fence });
         ggml_vk_queue_command_pools_cleanup(src->device);
 
@@ -698,7 +719,10 @@ void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& src, size
         ggml_vk_buffer_copy_async(subctx, dst, dst_offset, src, src_offset, size);
         ggml_vk_ctx_end(subctx);
         ggml_vk_submit(subctx, src->device->fence);
-        VK_CHECK(src->device->device.waitForFences({ src->device->fence }, true, UINT64_MAX), "vk_buffer_copy waitForFences", src->device);
+        {
+            vk_slope_timer slope_w(VK_SLOPE_WAIT);   // GGML_VK_MMVQ_SLOPE_STATS t_wait_us
+            VK_CHECK(src->device->device.waitForFences({ src->device->fence }, true, UINT64_MAX), "vk_buffer_copy waitForFences", src->device);
+        }
         src->device->device.resetFences({ src->device->fence });
         ggml_vk_queue_command_pools_cleanup(src->device);
     } else {
@@ -742,7 +766,10 @@ void ggml_vk_buffer_memset(vk_buffer& dst, size_t offset, uint32_t c, size_t siz
     ggml_vk_ctx_end(subctx);
 
     ggml_vk_submit(subctx, dst->device->fence);
-    VK_CHECK(dst->device->device.waitForFences({ dst->device->fence }, true, UINT64_MAX), "vk_memset waitForFences", dst->device);
+    {
+        vk_slope_timer slope_w(VK_SLOPE_WAIT);   // GGML_VK_MMVQ_SLOPE_STATS t_wait_us
+        VK_CHECK(dst->device->device.waitForFences({ dst->device->fence }, true, UINT64_MAX), "vk_memset waitForFences", dst->device);
+    }
     dst->device->device.resetFences({ dst->device->fence });
     ggml_vk_queue_command_pools_cleanup(dst->device);
 }

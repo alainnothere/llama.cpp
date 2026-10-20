@@ -131,6 +131,27 @@ std::string format(const char * fmt, ...) {
     return std::string(buf.data(), size);
 }
 
+std::string llama_format_index_ranges(const std::vector<int> & idx) {
+    // 2026-10-20: see the declaration in llama-impl.h; e.g. {12,13,40} -> "12-13,40"
+    std::string out;
+    size_t i = 0;
+    while (i < idx.size()) {
+        size_t j = i;
+        while (j + 1 < idx.size() && idx[j + 1] <= idx[j] + 1) {
+            j++;
+        }
+        if (!out.empty()) {
+            out += ",";
+        }
+        out += std::to_string(idx[i]);
+        if (idx[j] != idx[i]) {
+            out += "-" + std::to_string(idx[j]);
+        }
+        i = j + 1;
+    }
+    return out;
+}
+
 std::string llama_format_tensor_shape(const std::vector<int64_t> & ne) {
     char buf[256];
     snprintf(buf, sizeof(buf), "%6" PRId64, ne.at(0));

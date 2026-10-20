@@ -7,6 +7,9 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
+#include "llama-memory-recurrent.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -14,7 +17,12 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cinttypes>
+#include <cstdio>
+#include <mutex>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -42,6 +50,103 @@ struct llama_debug_timer {
         }
     }
 };
+// [LLAMA_DECODE_STATS] 2026-10-20 - env-gated per-llama_decode JSON line (library side)
+//
+// LLAMA_DECODE_STATS=<path> appends one JSON line per llama_context::decode() call to <path>;
+// "1" or "-" writes to stderr. Unset = off: one cached bool check per site, no clock reads.
+// The file is opened in append mode, written and closed on every line under a mutex (decodes are
+// rare, one per ubatch batch), so several contexts and a concurrent tail/rotate are safe.
+//
+// Why it exists. 27B hybrid Qwen3.8 (48 GatedDeltaNet + 16 attention layers), three Vulkan GPUs in
+// a layer split, --ubatch 1024 (graphs seen are 512 rows). With --spec-ngram-draft-n-max 64 prompt
+// processing runs ~200 t/s vs ~700 at 33. The flag sizes the recurrent rollback window:
+// need_n_rs_seq() (common/common.h:420) -> cparams.n_rs_seq = max(draft n-max, ngram n-max) ->
+// llama_memory_recurrent allocates (1 + n_rs_seq) state planes per layer
+// (llama-memory-recurrent.cpp:102). Vulkan per-graph lines (GGML_VK_MMVQ_SLOPE_STATS), cap 64,
+// after the vkQueueSubmit batching fix (recording now 6 ms): per 512-token chunk, period 2412 ms;
+// Vulkan2 302 ms -> Vulkan3 350 -> Vulkan1 283 (35-90 ms host between them), then a few 1-9 node
+// MTP draft graphs on Vulkan2, then ~900 ms with NO GPU graph running, then the next chunk. At cap
+// 33 the whole non-GPU time per chunk was ~70 ms. So ~0.9-1.4 s/chunk of host time scales with
+// n_rs_seq. Checkpoints were ruled out (state_write emits one plane via rs_idx[seq], files 150 MB
+// flat) and nothing hits disk. Code reading (2026-10-20) found nothing in apply/find_slot/split_equal
+// /s_copy that loops over planes: they are O(mem_size) = O(n_seq_max), plane count only enters as a
+// multiplier in s_copy() (one int per cell). This line says which phase and which context owns the
+// gap; pair it with LLAMA_SERVER_UBATCH_STATS (tools/server/server-context.cpp) for the server side.
+//
+// Fields: t (unix s), ctx (sequential id per llama_context in creation order: target is created
+// first, the MTP/draft context after it), n_layer, n_rs_seq, ret, n_tokens, n_ubatch (ubatches
+// this call), n_outputs, graph_reused (all ubatches reused the previous graph), n_reused, n_nodes /
+// n_splits / n_nodes_cpu (of the last built graph; n_nodes_cpu > 0 means a CPU split runs inside
+// t_compute and blocks the host), t_total_us, t_mem_apply_us, t_graph_reserve_us (sched_reserve
+// when it really reserved: new sched + 3 worst-case graph reserves + compute buffer realloc),
+// t_graph_build_us, t_sched_alloc_us (sched reset + alloc_graph), t_sched_split_us (null: split
+// and gallocr run inside ggml_backend_sched_alloc_graph and are not separable without touching
+// ggml-backend.cpp), t_set_inputs_us, t_compute_us (host side of graph_compute_async: Vulkan
+// submits, cross-device input copies that wait, any CPU split), t_output_reserve_us,
+// t_output_us, t_mem_commit_us (no commit phase in this tree: only the failed-ubatch seq_rm),
+// t_other_us = total - named phases, t_sync_prev_us (synchronize() wait on this context since its
+// previous line, including any sync inside this call such as output_reserve's - this is where the
+// async GPU time lands; only the in-call part overlaps t_total), rs_depth_max
+// (max rollback budget over seqs after the call; -1 when the memory has no recurrent part).
+// 2026-10-20 additions: cpu_ops / cpu_names / cpu_src_bufts / split_backends on every decode line
+// (see dstats_capture_placement) and one {"ctx_create":1,...} line per context listing the memory
+// buffers with their buffer types (see dstats_emit_ctx_create).
+//
+// Re-measure: LLAMA_DECODE_STATS=/tmp/ds.jsonl LLAMA_SERVER_UBATCH_STATS=/tmp/us.jsonl on the
+// server, run one long prompt at --spec-ngram-draft-n-max 33 and 64, then
+//   python3 ~/Documents/contextFiles/llama.cpp_bench/decode_stats.py --decode /tmp/ds.jsonl --server /tmp/us.jsonl
+// and compare the 512+ bucket per ctx. Expected if the gap is library side: one phase per ctx
+// growing by ~0.9 s at 64; if every phase stays flat, the gap is in the server (see its file).
+struct llama_decode_stats_sink {
+    bool        on        = false;
+    bool        to_stderr = false;
+    std::string path;
+    std::mutex  mtx;
+
+    llama_decode_stats_sink() {
+        const char * v = getenv("LLAMA_DECODE_STATS");
+        if (v && *v) {
+            on        = true;
+            to_stderr = strcmp(v, "1") == 0 || strcmp(v, "-") == 0;
+            path      = v;
+        }
+    }
+
+    void write(const std::string & line) {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (to_stderr) {
+            fputs(line.c_str(), stderr);
+            fflush(stderr);
+            return;
+        }
+        FILE * f = fopen(path.c_str(), "a");
+        if (!f) {
+            return;
+        }
+        fputs(line.c_str(), f);
+        fclose(f);
+    }
+};
+
+static llama_decode_stats_sink & llama_decode_stats() {
+    static llama_decode_stats_sink sink;
+    return sink;
+}
+
+static std::atomic<int32_t> g_llama_ctx_seq_id{0};
+
+// adds the scope's wall time to one LLAMA_DECODE_STATS accumulator; no clock read when off
+struct llama_dstats_timer {
+    int64_t * t;
+    int64_t   t_start;
+    llama_dstats_timer(bool on, int64_t & t_) : t(on ? &t_ : nullptr), t_start(on ? ggml_time_us() : 0) {}
+    ~llama_dstats_timer() {
+        if (t) {
+            *t += ggml_time_us() - t_start;
+        }
+    }
+};
+
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
         case LLAMA_CONTEXT_TYPE_DEFAULT: return LLM_GRAPH_TYPE_DEFAULT;
@@ -307,6 +412,10 @@ llama_context::llama_context(
         }
     }
 
+    // [LLAMA_DECODE_STATS] ids are handed out even when off, so they stay stable across runs
+    dstats_ctx_id = g_llama_ctx_seq_id.fetch_add(1);
+    dstats_on     = llama_decode_stats().on;
+
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
     cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 
@@ -504,6 +613,11 @@ llama_context::llama_context(
                 throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
             }
         }
+    }
+
+    // [LLAMA_DECODE_STATS] one ctx_create line per context, after the memory and the scheduler exist
+    if (dstats_on) {
+        dstats_emit_ctx_create();
     }
 
     // Initialize the full vocabulary token ids for backend samplers.
@@ -818,11 +932,15 @@ void llama_context::synchronize() {
     }
 
     const bool instr = cparams.perf_instrumentation;
-    const int64_t t_sync_start = instr ? ggml_time_us() : 0;
+    const int64_t t_sync_start = (instr || dstats_on) ? ggml_time_us() : 0;
     ggml_backend_sched_synchronize(sched.get());
     if (instr) {
         t_sync += ggml_time_us() - t_sync_start;
         n_sync++;
+    }
+    if (dstats_on) {
+        // [LLAMA_DECODE_STATS] reported as t_sync_prev_us on the next line of this context
+        dstats_t_sync += ggml_time_us() - t_sync_start;
     }
     n_sync_total++;
     synced_gen = async_gen;
@@ -1494,8 +1612,13 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    if (dstats_on) {
+        dstats.n_ubatch++;
+    }
+
     if (mctx) {
         llama_debug_timer t(cparams.perf_instrumentation, t_mctx_apply, n_mctx_apply);
+        llama_dstats_timer dt(dstats_on, dstats.t_mem_apply);
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
             ret = GGML_STATUS_FAILED;
@@ -1524,17 +1647,25 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
+        if (dstats_on) {
+            dstats.n_reused++;
+        }
     } else {
         gf_res_prev_active = nullptr;
         res->reset();
 
+        const int64_t t_reset_start = dstats_on ? ggml_time_us() : 0;
         ggml_backend_sched_reset(sched.get());
+        if (dstats_on) {
+            dstats.t_sched_alloc += ggml_time_us() - t_reset_start;
+        }
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
         //const auto t_start_us = ggml_time_us();
 
         {
             llama_debug_timer t(cparams.perf_instrumentation, t_build_graph, n_build_graph);
+            llama_dstats_timer dt(dstats_on, dstats.t_graph_build);
             gf = model.build_graph(gparams);
         }
 
@@ -1548,11 +1679,26 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         {
             llama_debug_timer t(cparams.perf_instrumentation, t_alloc_graph, n_alloc_graph);
+            llama_dstats_timer dt(dstats_on, dstats.t_sched_alloc);
             if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
                 LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
                 ret = GGML_STATUS_ALLOC_FAILED;
                 return nullptr;
             }
+        }
+
+        // [LLAMA_DECODE_STATS] shape of the freshly built graph, O(n_nodes) once per rebuild and only
+        // when the instrument is on. a CPU-assigned node means a CPU split that blocks the host inside
+        // graph_compute - one of the 2026-10-20 suspects for the plane-scaled host gap
+        if (dstats_on) {
+            dstats_capture_placement(gf);
+        }
+
+        // CPU PLACEMENT warning #3 (2026-10-20): once per context, knob-independent, see
+        // check_cpu_placement. One O(n_nodes) walk for the whole life of the context.
+        if (!placement_checked) {
+            placement_checked = true;
+            check_cpu_placement(gf);
         }
 
         gf_res_prev_active = res;
@@ -1561,6 +1707,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // set the input data for the input tensors
     {
         llama_debug_timer t(cparams.perf_instrumentation, t_set_inputs, n_set_inputs);
+        llama_dstats_timer dt(dstats_on, dstats.t_set_inputs);
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
     }
@@ -1568,6 +1715,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     ggml_status status;
     {
         llama_debug_timer t(cparams.perf_instrumentation, t_compute, n_compute);
+        llama_dstats_timer dt(dstats_on, dstats.t_compute);
         status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     }
     if (status != GGML_STATUS_SUCCESS) {
@@ -1823,7 +1971,380 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+// [LLAMA_DECODE_STATS] the wrapper owns the stats line so every early return of the body is covered
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    if (!dstats_on) {
+        return decode_impl(batch_inp);
+    }
+
+    dstats = {};
+
+    const int64_t t_start_us = ggml_time_us();
+    const int     ret        = decode_impl(batch_inp);
+
+    dstats_emit(ret, t_start_us, (uint32_t) batch_inp.tokens.size(), ret == 0 ? (uint32_t) n_outputs : 0u);
+
+    return ret;
+}
+
+// [LLAMA_DECODE_STATS] 2026-10-20 - where the scheduler put the nodes of the last built graph
+//
+// Why. Production at --spec-ngram-draft-n-max 64 (n_rs_seq 64, 65 recurrent planes per layer, 27B
+// Qwen3.8 hybrid, 3 Vulkan GPUs layer split, XT on a PCIe x1 link): target ctx 512-row decodes
+// t_total 9249 ms / t_compute 9108 ms, n_nodes 13064, n_splits 21, n_nodes_cpu 152; 65-row verify
+// decodes 846 ms with the three GPUs' graph walls summing to ~370 ms, 21 splits, 152 CPU nodes;
+// 13-64 rows 699 ms, 21 splits, 86-138 CPU nodes; 1-12 rows 6 splits, 72-87 CPU nodes; the draft
+// ctx (n_rs_seq 0) 2 splits, 1 CPU node. Old logs at the same model: 4 splits (3 GPUs + the CPU
+// token-embedding get_rows). At cap 33 a 512 chunk took 984 ms wall, so the placement is specific
+// to the bigger window. n_nodes_cpu alone can't tell harmless CPU views (VIEW/RESHAPE of graph
+// inputs like rs_s_copy get the CPU from pass 4 of ggml_backend_sched_split_graph and never
+// compute or split; pass 5 skips view ops) from real CPU work, hence:
+//   cpu_ops        {ggml_op_desc: count} of CPU-assigned nodes (views included, so VIEW/RESHAPE
+//                  counts say how much of n_nodes_cpu is bookkeeping)
+//   cpu_names      top 12 node-name prefixes with digits and the trailing "-" removed
+//                  ("cache_s_l12 (view)" -> "cache_s_l (view)", "conv_input-40" -> "conv_input")
+//   cpu_src_bufts  top 8 buffer-type names of the srcs of those nodes (view srcs resolved to their
+//                  view_src's buffer; "none" = no buffer yet)
+//   split_backends the split sequence, "Vulkan" shortened to "V" (Vulkan1 -> V1), comma separated,
+//                  cut at 160 chars with a trailing "~" (ggml_backend_sched_get_split_backend, a
+//                  fork-only accessor added to ggml-backend.cpp for this)
+// Cost: O(n_nodes * GGML_MAX_SRC) map work once per graph rebuild, only when the instrument is on.
+// Re-measure: same recipe as the header of this file; the reader (decode_stats.py) aggregates
+// these per ctx and row bucket.
+static bool dstats_backend_is_cpu(ggml_backend_t b) {
+    return b && ggml_backend_dev_type(ggml_backend_get_device(b)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+}
+
+static std::string dstats_json_str(const std::string & v) {
+    std::string out;
+    out.reserve(v.size() + 2);
+    out += '"';
+    for (const char c : v) {
+        if (c == '"' || c == '\\') {
+            out += '\\';
+            out += c;
+        } else if ((unsigned char) c < 0x20) {
+            out += ' ';
+        } else {
+            out += c;
+        }
+    }
+    out += '"';
+    return out;
+}
+
+// {"k":n,...} of the max_n largest counts (ties: name order), max_n <= 0 = all
+static std::string dstats_json_counts(const std::map<std::string, int> & m, int max_n) {
+    std::vector<std::pair<std::string, int>> v(m.begin(), m.end());
+    std::stable_sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.second > b.second; });
+    if (max_n > 0 && (int) v.size() > max_n) {
+        v.resize(max_n);
+    }
+    std::string out = "{";
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (i > 0) {
+            out += ',';
+        }
+        out += dstats_json_str(v[i].first);
+        out += ':';
+        out += std::to_string(v[i].second);
+    }
+    out += '}';
+    return out;
+}
+
+static std::string dstats_name_prefix(const char * name) {
+    std::string out;
+    for (const char * p = name; *p; ++p) {
+        if (*p < '0' || *p > '9') {
+            out += *p;
+        }
+    }
+    while (!out.empty() && (out.back() == '-' || out.back() == '_' || out.back() == ' ')) {
+        out.pop_back();
+    }
+    if (out.size() > 48) {
+        out.resize(48);
+    }
+    return out.empty() ? std::string("(unnamed)") : out;
+}
+
+// 2026-10-20: the CPU-node walk shared by dstats_capture_placement (LLAMA_DECODE_STATS) and
+// check_cpu_placement (CPU PLACEMENT warning #3). Factored out of dstats_capture_placement so the
+// warning gets the same counts without the knob; dstats semantics are unchanged (n_cpu counts
+// every CPU-assigned node, views included, as before). n_cpu_nonview skips the zero-cost layout
+// ops (NONE/VIEW/RESHAPE/PERMUTE/TRANSPOSE), which is what the warning thresholds on.
+// bufts == nullptr skips the per-src buffer-type tally (only the stats line prints it).
+struct llama_cpu_placement_counts {
+    int                        n_cpu         = 0;
+    int                        n_cpu_nonview = 0;
+    std::map<std::string, int> ops;
+    std::map<std::string, int> names;
+};
+
+static bool llama_op_is_view(enum ggml_op op) {
+    return op == GGML_OP_NONE || op == GGML_OP_VIEW || op == GGML_OP_RESHAPE ||
+           op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;
+}
+
+static void llama_count_cpu_placement(ggml_backend_sched_t s, ggml_cgraph * gf,
+        llama_cpu_placement_counts & out, std::map<std::string, int> * bufts) {
+    const int n_nodes = ggml_graph_n_nodes(gf);
+    for (int i = 0; i < n_nodes; ++i) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        if (!dstats_backend_is_cpu(ggml_backend_sched_get_tensor_backend(s, node))) {
+            continue;
+        }
+        out.n_cpu++;
+        if (!llama_op_is_view(node->op)) {
+            out.n_cpu_nonview++;
+        }
+        out.ops[ggml_op_desc(node)]++;
+        out.names[dstats_name_prefix(node->name)]++;
+        if (!bufts) {
+            continue;
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            const ggml_tensor * src = node->src[j];
+            if (!src) {
+                continue;
+            }
+            ggml_backend_buffer_t buf = src->view_src ? src->view_src->buffer : src->buffer;
+            (*bufts)[buf ? ggml_backend_buft_name(ggml_backend_buffer_get_type(buf)) : "none"]++;
+        }
+    }
+}
+
+// "OP=n, OP=n" of the max_n largest counts (ties: name order), for the human-readable warning
+static std::string llama_fmt_top_counts(const std::map<std::string, int> & m, int max_n) {
+    std::vector<std::pair<std::string, int>> v(m.begin(), m.end());
+    std::stable_sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.second > b.second; });
+    if ((int) v.size() > max_n) {
+        v.resize(max_n);
+    }
+    std::string out;
+    for (const auto & [k, n] : v) {
+        if (!out.empty()) {
+            out += ", ";
+        }
+        out += k + "=" + std::to_string(n);
+    }
+    return out.empty() ? std::string("-") : out;
+}
+
+// CPU PLACEMENT warning #3 of 3 (2026-10-20).
+//
+// What: on the first graph a context allocates in process_ubatch, count the nodes the scheduler
+// put on a CPU backend and WARN once (never again for this context) when either
+//   - non-view CPU nodes > 1 (the floor of 1 is the token-embedding GET_ROWS: the input layer is
+//     always on the CPU, llama-model.cpp "there is very little benefit to offloading the input
+//     layer"), or
+//   - n_splits > n_backends + 1 (a healthy layer split on this box is one split per GPU plus the
+//     embedding split; anything beyond that is the graph bouncing between devices).
+// Prints n_splits, n_nodes_cpu (non-view and total), top 4 CPU ops and top 2 CPU tensor name
+// prefixes (digits stripped, so "attn_norm-12" and "attn_norm-13" tally together).
+//
+// Why: 2026-10-20 `--spec-ngram-draft-n-max 64` -> n_rs_seq 64 -> 202 MB RS planes per GDN layer,
+// fit (`--fit on --fit-target 6144,1536,2048 -ts 16,26,24`) dropped one GDN layer to the CPU:
+// decode graph 4 splits / 2 CPU nodes -> 21 splits / 152 CPU nodes, 2048-token prompt batch
+// 3.3 s -> 9.2 s, generation ~50 -> ~30 t/s. Warnings #1/#2 catch whole layers and state buffers;
+// this one also catches partial layers (fit's tensor_buft_overrides overflow, -ot, an op a GPU
+// backend refuses via supports_op) because it looks at where the ops actually run.
+//
+// Not warned: contexts whose backends are all CPU (CPU-only runs, nothing to compare against).
+// The first graph is representative: graphs are rebuilt on shape change, but placement follows
+// weight/state location, which does not change during a context's life. A context whose first
+// graph is a 1-token decode still shows a CPU layer (every layer's ops run each token).
+//
+// Cost: one O(n_nodes) walk with two small string maps, once per context. Measured nothing;
+// it is noise next to the ggml_backend_sched_alloc_graph call right before it.
+//
+// Re-measure: -lv 3, grep "CPU PLACEMENT:"; force with -ngl <n_layer> (layer 0 on the CPU), or
+// LLAMA_DECODE_STATS=1 for the same counts per rebuild in the stats file ("n_cpu", "cpu_ops").
+void llama_context::check_cpu_placement(ggml_cgraph * gf) {
+    bool any_non_cpu = false;
+    for (const auto & b : backends) {
+        if (!dstats_backend_is_cpu(b.get())) {
+            any_non_cpu = true;
+            break;
+        }
+    }
+    if (!any_non_cpu) {
+        return;
+    }
+
+    ggml_backend_sched_t s = sched.get();
+
+    llama_cpu_placement_counts pc;
+    llama_count_cpu_placement(s, gf, pc, nullptr);
+
+    const int n_splits   = ggml_backend_sched_get_n_splits(s);
+    const int n_backends = (int) backends.size();
+
+    if (pc.n_cpu_nonview <= 1 && n_splits <= n_backends + 1) {
+        return;
+    }
+
+    LLAMA_LOG_WARN("CPU PLACEMENT: %s: first graph of this context has %d splits over %d backends and %d non-view "
+            "nodes on the CPU (%d incl. views, of %d); top CPU ops: %s; top CPU tensors: %s; "
+            "a layer on the CPU in a GPU split costs seconds per prompt batch; check -ts / --fit-target / -ngl\n",
+            __func__, n_splits, n_backends, pc.n_cpu_nonview, pc.n_cpu, ggml_graph_n_nodes(gf),
+            llama_fmt_top_counts(pc.ops, 4).c_str(), llama_fmt_top_counts(pc.names, 2).c_str());
+}
+
+void llama_context::dstats_capture_placement(ggml_cgraph * gf) {
+    ggml_backend_sched_t s = sched.get();
+
+    dstats_n_nodes  = ggml_graph_n_nodes(gf);
+    dstats_n_splits = ggml_backend_sched_get_n_splits(s);
+
+    llama_cpu_placement_counts pc;
+    std::map<std::string, int> bufts;
+    llama_count_cpu_placement(s, gf, pc, &bufts);
+
+    dstats_n_cpu = pc.n_cpu;
+    const auto & ops   = pc.ops;
+    const auto & names = pc.names;
+
+    std::string sb;
+    bool        cut = false;
+    for (int i = 0; i < dstats_n_splits; ++i) {
+        ggml_backend_t b    = ggml_backend_sched_get_split_backend(s, i);
+        std::string    name = b ? ggml_backend_name(b) : "?";
+        if (name.rfind("Vulkan", 0) == 0) {
+            name = "V" + name.substr(6);
+        }
+        if (sb.size() + name.size() + 1 > 160) {
+            cut = true;
+            break;
+        }
+        if (!sb.empty()) {
+            sb += ',';
+        }
+        sb += name;
+    }
+    if (cut) {
+        sb += '~';
+    }
+
+    dstats_place_json  = "\"cpu_ops\":" + dstats_json_counts(ops, 0);
+    dstats_place_json += ",\"cpu_names\":" + dstats_json_counts(names, 12);
+    dstats_place_json += ",\"cpu_src_bufts\":" + dstats_json_counts(bufts, 8);
+    dstats_place_json += ",\"split_backends\":" + dstats_json_str(sb);
+}
+
+// [LLAMA_DECODE_STATS] 2026-10-20 - one line per context listing where its memory landed
+//
+// {"ctx_create":1,"ctx":id,"n_rs_seq":..,"n_seq_max":..,"offload_kqv":..,"pipeline_parallel":..,
+//  "mem_bufs":[{"name":"kv"|"rs"|"mem","buft":..,"is_host":..,"size":bytes},...]}
+// Built from llama_memory_i::memory_breakdown() (buft -> bytes, summed over the part's buffers);
+// for the hybrid memories the attention and recurrent parts are listed separately so "rs" shows
+// where the (1 + n_rs_seq) planes per layer went. Placement rule (llama-memory-recurrent.cpp
+// constructor, ~line 80): buft = ggml_backend_dev_buffer_type(model.dev_layer(il)) when offload
+// (= cparams.offload_kqv), else ggml_backend_cpu_buffer_type(); no size threshold and no host
+// fallback, a failed ggml_backend_alloc_ctx_tensors_from_buft throws ("failed to allocate buffer
+// for rs cache"). So "is_host":true on "rs" means --no-kv-offload OR a layer that model.dev_layer()
+// itself put on the CPU (fit lowering n_gpu_layers - the 2026-10-20 incident, see CPU PLACEMENT #2). Production log
+// 2026-10-20 at n_rs_seq 63 already shows Vulkan1/2/3 RS buffers 2992/2992/3591 MiB.
+void llama_context::dstats_emit_ctx_create() const {
+    std::string bufs;
+    auto add = [&](const char * kind, const llama_memory_i * m) {
+        if (!m) {
+            return;
+        }
+        for (const auto & [buft, size] : m->memory_breakdown()) {
+            if (!bufs.empty()) {
+                bufs += ',';
+            }
+            bufs += "{\"name\":\"";
+            bufs += kind;
+            bufs += "\",\"buft\":" + dstats_json_str(ggml_backend_buft_name(buft));
+            bufs += ",\"is_host\":";
+            bufs += ggml_backend_buft_is_host(buft) ? "true" : "false";
+            bufs += ",\"size\":" + std::to_string(size) + "}";
+        }
+    };
+
+    if (auto * h = dynamic_cast<const llama_memory_hybrid *>(memory.get())) {
+        add("kv", h->get_mem_attn());
+        add("rs", h->get_mem_recr());
+    } else if (auto * hi = dynamic_cast<const llama_memory_hybrid_iswa *>(memory.get())) {
+        add("kv", hi->get_mem_attn());
+        add("rs", hi->get_mem_recr());
+    } else if (auto * r = dynamic_cast<const llama_memory_recurrent *>(memory.get())) {
+        add("rs", r);
+    } else {
+        add("mem", memory.get());
+    }
+
+    const std::string line = "{\"ctx_create\":1,\"ctx\":" + std::to_string(dstats_ctx_id) +
+        ",\"n_rs_seq\":" + std::to_string(cparams.n_rs_seq) +
+        ",\"n_seq_max\":" + std::to_string(cparams.n_seq_max) +
+        ",\"offload_kqv\":" + (cparams.offload_kqv ? "true" : "false") +
+        ",\"pipeline_parallel\":" + (cparams.pipeline_parallel ? "true" : "false") +
+        ",\"mem_bufs\":[" + bufs + "]}\n";
+
+    llama_decode_stats().write(line);
+}
+
+void llama_context::dstats_emit(int ret, int64_t t_start_us, uint32_t n_tokens, uint32_t n_outputs_all) {
+    const int64_t t_total = ggml_time_us() - t_start_us;
+    const auto  & d       = dstats;
+
+    const int64_t t_named = d.t_mem_apply + d.t_graph_reserve + d.t_graph_build + d.t_sched_alloc + d.t_set_inputs +
+                            d.t_compute + d.t_output_reserve + d.t_output + d.t_mem_commit;
+
+    // rollback budget of the recurrent part, if any. rs_depth is n_seq_max entries, cheap
+    int32_t rs_depth_max = -1;
+    {
+        const llama_memory_recurrent * mem_recr = nullptr;
+        if (auto * m = dynamic_cast<const llama_memory_recurrent *>(memory.get())) {
+            mem_recr = m;
+        } else if (auto * h = dynamic_cast<const llama_memory_hybrid *>(memory.get())) {
+            mem_recr = h->get_mem_recr();
+        } else if (auto * hi = dynamic_cast<const llama_memory_hybrid_iswa *>(memory.get())) {
+            mem_recr = hi->get_mem_recr();
+        }
+        if (mem_recr) {
+            rs_depth_max = 0;
+            for (const uint32_t v : mem_recr->rs_depth) {
+                rs_depth_max = std::max<int32_t>(rs_depth_max, (int32_t) v);
+            }
+        }
+    }
+
+    const double t_unix = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+
+    char buf[1536];
+    snprintf(buf, sizeof(buf),
+            "{\"t\":%.6f,\"ctx\":%d,\"n_layer\":%u,\"n_rs_seq\":%u,\"ret\":%d,\"n_tokens\":%u,\"n_ubatch\":%d,\"n_outputs\":%u,"
+            "\"graph_reused\":%s,\"n_reused\":%d,\"n_nodes\":%d,\"n_splits\":%d,\"n_nodes_cpu\":%d,"
+            "\"t_total_us\":%" PRId64 ",\"t_mem_apply_us\":%" PRId64 ",\"t_graph_reserve_us\":%" PRId64 ",\"t_graph_build_us\":%" PRId64 ","
+            "\"t_sched_alloc_us\":%" PRId64 ",\"t_sched_split_us\":null,\"t_set_inputs_us\":%" PRId64 ",\"t_compute_us\":%" PRId64 ","
+            "\"t_output_reserve_us\":%" PRId64 ",\"t_output_us\":%" PRId64 ",\"t_mem_commit_us\":%" PRId64 ",\"t_other_us\":%" PRId64 ","
+            "\"t_sync_prev_us\":%" PRId64 ",\"rs_depth_max\":%d",
+            t_unix, dstats_ctx_id, model.hparams.n_layer(), cparams.n_rs_seq, ret, n_tokens, d.n_ubatch, n_outputs_all,
+            (d.n_ubatch > 0 && d.n_reused == d.n_ubatch) ? "true" : "false", d.n_reused, dstats_n_nodes, dstats_n_splits, dstats_n_cpu,
+            t_total, d.t_mem_apply, d.t_graph_reserve, d.t_graph_build,
+            d.t_sched_alloc, d.t_set_inputs, d.t_compute,
+            d.t_output_reserve, d.t_output, d.t_mem_commit, t_total - t_named,
+            dstats_t_sync, rs_depth_max);
+
+    dstats_t_sync = 0;
+
+    // placement fragment of the last built graph (dstats_capture_placement): can be a few hundred
+    // bytes, so it is appended here instead of growing the fixed snprintf buffer
+    std::string line = buf;
+    if (!dstats_place_json.empty()) {
+        line += ',';
+        line += dstats_place_json;
+    }
+    line += "}\n";
+
+    llama_decode_stats().write(line);
+}
+
+int llama_context::decode_impl(const llama_batch_ext & batch_inp) {
     const bool instr = cparams.perf_instrumentation;
     const int64_t t_decode_early_start = instr ? ggml_time_us() : 0;
     if (instr) {
@@ -1934,17 +2455,28 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         n_decode_early++;
     }
 
-    sched_reserve();
+    {
+        // [LLAMA_DECODE_STATS] counts only when a reserve really happens (it returns early otherwise)
+        llama_dstats_timer dt(dstats_on && sched_need_reserve, dstats.t_graph_reserve);
+        sched_reserve();
+    }
 
     bool did_optimize = false;
 
     // handle any pending shifts/copies
-    memory_update(false);
+    {
+        llama_dstats_timer dt(dstats_on, dstats.t_mem_apply);
+        memory_update(false);
+    }
 
     llama_memory_context_ptr mctx;
 
     while (true) {
-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
+        {
+            // [LLAMA_DECODE_STATS] split_equal(n_ubatch, ..., n_rs_seq + 1) + prepare() (find_slot dry run)
+            llama_dstats_timer dt(dstats_on, dstats.t_mem_apply);
+            mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
+        }
         if (!mctx) {
             return -2;
         }
@@ -1964,7 +2496,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                     if (!did_optimize) {
                         did_optimize = true;
 
-                        if (memory_update(true)) {
+                        bool updated;
+                        {
+                            llama_dstats_timer dt(dstats_on, dstats.t_mem_apply);
+                            updated = memory_update(true);
+                        }
+                        if (updated) {
                             LLAMA_LOG_DEBUG("%s: retrying batch size %d after cache optimization\n", __func__, balloc->get_n_tokens());
 
                             continue;
@@ -1987,7 +2524,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
 
     // reserve output buffer
-    if (output_reserve(n_outputs_all) < n_outputs_all) {
+    uint32_t n_outputs_reserved;
+    {
+        llama_dstats_timer dt(dstats_on, dstats.t_output_reserve);
+        n_outputs_reserved = output_reserve(n_outputs_all);
+    }
+    if (n_outputs_reserved < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
     };
@@ -2026,6 +2568,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
         if (!res) {
+            // [LLAMA_DECODE_STATS] t_mem_commit_us: the only memory bookkeeping after compute in this tree
+            llama_dstats_timer dt(dstats_on, dstats.t_mem_commit);
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
             llama_pos pos_min[LLAMA_MAX_SEQ];
             for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
@@ -2061,7 +2605,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
         //}
 
-        const int64_t t_extract_start = instr ? ggml_time_us() : 0;
+        const int64_t t_extract_start = (instr || dstats_on) ? ggml_time_us() : 0;
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
@@ -2209,6 +2753,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             t_ubatch_other += ggml_time_us() - t_extract_start;
             n_ubatch_other++;
         }
+        if (dstats_on) {
+            dstats.t_output += ggml_time_us() - t_extract_start;
+        }
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
 
@@ -2220,7 +2767,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     } while (mctx->next());
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
-    const int64_t t_map_start = instr ? ggml_time_us() : 0;
+    const int64_t t_map_start = (instr || dstats_on) ? ggml_time_us() : 0;
     n_outputs = n_outputs_all;
 
     // set output mappings
@@ -2272,6 +2819,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (instr) {
         t_decode_other += ggml_time_us() - t_map_start;
         n_decode_other++;
+    }
+    if (dstats_on) {
+        dstats.t_output += ggml_time_us() - t_map_start;
     }
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();

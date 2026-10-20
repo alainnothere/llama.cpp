@@ -71,6 +71,9 @@ llama_memory_recurrent::llama_memory_recurrent(
         return it->second.get();
     };
 
+    // 2026-10-20: layer indices per buffer type, only consumed by the CPU PLACEMENT warning
+    std::map<ggml_backend_buffer_type_t, std::vector<int>> buft_layers;
+
     r_l.resize(n_layer);
     s_l.resize(n_layer);
     p_l.resize(n_layer);
@@ -98,6 +101,7 @@ llama_memory_recurrent::llama_memory_recurrent(
         if (!ctx) {
             throw std::runtime_error("failed to create ggml context for rs cache");
         }
+        buft_layers[buft].push_back(i); // for the CPU PLACEMENT warning below
 
         const uint32_t n_rows = mem_size * (1 + n_rs_seq);
         ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
@@ -123,6 +127,34 @@ llama_memory_recurrent::llama_memory_recurrent(
         }
         ggml_backend_buffer_clear(buf, 0);
         LLAMA_LOG_INFO("%s: %10s RS buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+
+        // CPU PLACEMENT warning #2 of 3 (2026-10-20), recurrent-state half (the KV half
+        // is in llama_kv_cache's constructor).
+        //
+        // What: offload is on, a GPU device exists, and this RS buffer still landed in a
+        // host buffer type -> WARN with buft name, MiB and the layers it holds.
+        //
+        // Why: 2026-10-20, `--spec-ngram-draft-n-max 64` made each GatedDeltaNet layer's
+        // RS planes 202 MB (n_rs_seq 64 rows of rollback per seq), the fit dropped one
+        // layer to the CPU, and its RS buffer followed it there (buft comes from
+        // model.dev_layer(i) above). Decode went 4 splits / 2 CPU nodes -> 21 / 152,
+        // 2048-token batch 3.3 s -> 9.2 s, tg ~50 -> ~30 t/s. The INFO line above is
+        // invisible at the default -lv 3 in this fork (INFO demoted to TRACE).
+        //
+        // Not warned: offload == false (-nkvo, user asked for host state), CPU-only runs
+        // (model.n_devices() == 0: every buffer is host by definition), no_alloc probes.
+        //
+        // Re-measure: -lv 3, grep "CPU PLACEMENT:"; force with -ngl <n_layer> on a
+        // hybrid (Qwen3.5/3.6 GDN, LFM2) model so layer 0 lands on the CPU.
+        if (offload && model.n_devices() > 0 && !hparams.no_alloc && ggml_backend_buft_is_host(buft)) {
+            const auto it = buft_layers.find(buft);
+            LLAMA_LOG_WARN("CPU PLACEMENT: %s: RS (recurrent state) buffer %s = %.2f MiB is in host memory with offload on, "
+                    "holding layers [%s] (n_rs_seq = %u); a layer on the CPU in a GPU split costs seconds per prompt batch; "
+                    "check -ts / --fit-target / -ngl\n",
+                    __func__, ggml_backend_buft_name(buft), ggml_backend_buffer_get_size(buf)/1024.0/1024.0,
+                    it != buft_layers.end() ? llama_format_index_ranges(it->second).c_str() : "?",
+                    n_rs_seq);
+        }
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 

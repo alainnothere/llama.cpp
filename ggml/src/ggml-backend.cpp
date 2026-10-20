@@ -2153,6 +2153,22 @@ int ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched) {
     return sched->n_copies;
 }
 
+// [fork, 2026-10-20] see ggml-backend.h. sched->splits[i].backend_id is set by pass 5 of
+// ggml_backend_sched_split_graph; the split list stays valid until the next split/reset, so call it
+// after ggml_backend_sched_alloc_graph and before the next reset. NULL instead of an assert on a bad
+// index because the only caller is a diagnostic that must never abort a decode.
+ggml_backend_t ggml_backend_sched_get_split_backend(ggml_backend_sched_t sched, int i) {
+    GGML_ASSERT(sched);
+    if (i < 0 || i >= sched->n_splits) {
+        return NULL;
+    }
+    const int backend_id = sched->splits[i].backend_id;
+    if (backend_id < 0 || backend_id >= sched->n_backends) {
+        return NULL;
+    }
+    return sched->backends[backend_id];
+}
+
 int ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->n_backends;

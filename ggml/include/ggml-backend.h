@@ -340,6 +340,11 @@ extern "C" {
     // Get the number of splits of the last graph
     GGML_API int                  ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched);
     GGML_API int                  ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched);
+    // [fork, 2026-10-20] backend of split i (0 <= i < n_splits) of the last split graph; NULL when out of range.
+    // read-only diagnostic accessor for llama.cpp's LLAMA_DECODE_STATS "split_backends" field
+    // (src/llama-context.cpp): n_splits alone said 21 at --spec-ngram-draft-n-max 64 vs 4 in old logs,
+    // this says which backends the graph bounces between. not in upstream ggml.
+    GGML_API ggml_backend_t       ggml_backend_sched_get_split_backend(ggml_backend_sched_t sched, int i);
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);

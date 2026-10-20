@@ -107,4 +107,10 @@ std::string format(const char * fmt, ...);
 std::string llama_format_tensor_shape(const std::vector<int64_t> & ne);
 std::string llama_format_tensor_shape(const struct ggml_tensor * t);
 
+// 2026-10-20: compact "12-13,40" rendering of a sorted list of layer indices.
+// Shared by the three "CPU PLACEMENT:" warnings (llama-model.cpp load_tensors,
+// llama-kv-cache.cpp / llama-memory-recurrent.cpp constructors). Input must be
+// ascending; duplicates are tolerated (collapsed into the running range).
+std::string llama_format_index_ranges(const std::vector<int> & idx);
+
 std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i);

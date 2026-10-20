@@ -132,6 +132,9 @@ llama_kv_cache::llama_kv_cache(
         return it->second.get();
     };
 
+    // 2026-10-20: layer indices per buffer type, only consumed by the CPU PLACEMENT warning
+    std::map<ggml_backend_buffer_type_t, std::vector<int>> buft_layers;
+
     GGML_ASSERT(n_stream == 1 || n_stream == n_seq_max);
 
     v_heads.resize(n_stream);
@@ -236,6 +239,7 @@ llama_kv_cache::llama_kv_cache(
         if (!ctx) {
             throw std::runtime_error("failed to create ggml context for kv cache");
         }
+        buft_layers[buft].push_back((int) il); // for the CPU PLACEMENT warning below
 
         const bool has_k = true;
         const bool has_v = !is_mla;
@@ -299,6 +303,31 @@ llama_kv_cache::llama_kv_cache(
         }
 
         LLAMA_LOG_WARN("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+
+        // CPU PLACEMENT warning #2 of 3 (2026-10-20), KV half (the recurrent-state half,
+        // with the incident numbers, is in llama_memory_recurrent's constructor).
+        //
+        // What: offload is on, a GPU device exists, and this KV buffer still landed in a
+        // host buffer type -> WARN with buft name, MiB and the layers it holds. The size
+        // line above is already WARN but does not say "this is wrong" or which layers.
+        //
+        // Why: a layer that model.dev_layer() put on the CPU (fit lowering n_gpu_layers,
+        // short -ts) drags its KV with it; attention for that layer then runs on the CPU
+        // and splits the graph. 2026-10-20 the hybrid case cost 3.3 s -> 9.2 s per
+        // 2048-token batch and ~50 -> ~30 t/s.
+        //
+        // Not warned: offload == false (-nkvo), CPU-only runs (model.n_devices() == 0),
+        // no_alloc probes (--fit measures with dummy zero-size buffers).
+        //
+        // Re-measure: -lv 3, grep "CPU PLACEMENT:"; force with -ngl <n_layer>.
+        if (offload && model.n_devices() > 0 && !hparams.no_alloc && ggml_backend_buft_is_host(buft)) {
+            const auto it = buft_layers.find(buft);
+            LLAMA_LOG_WARN("CPU PLACEMENT: %s: KV buffer %s = %.2f MiB is in host memory with offload on, "
+                    "holding layers [%s]; a layer on the CPU in a GPU split costs seconds per prompt batch; "
+                    "check -ts / --fit-target / -ngl\n",
+                    __func__, ggml_backend_buft_name(buft), ggml_backend_buffer_get_size(buf)/1024.0/1024.0,
+                    it != buft_layers.end() ? llama_format_index_ranges(it->second).c_str() : "?");
+        }
 
         ggml_backend_buffer_clear(buf, 0);
         ctxs_bufs.emplace_back(std::move(ctx), buf);

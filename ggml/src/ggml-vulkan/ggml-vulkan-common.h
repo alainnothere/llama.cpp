@@ -326,6 +326,12 @@ inline void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
             b.clear();
         }
         ctx->descriptor_set_bindings_destroy_count = destroy_count;
+        if (vk_mmvq_slope_stats) {
+            // GGML_VK_MMVQ_SLOPE_STATS n_desc_flush: every set after this re-writes its bindings
+            if (vk_slope_phases * sp = vk_slope_phases_get()) {
+                sp->n_desc_flush++;
+            }
+        }
     }
 
     // skip the write if this set already holds these bindings from the last graph
@@ -343,6 +349,7 @@ inline void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
     }
     if (!same) {
         vk::WriteDescriptorSet write_descriptor_set{ descriptor_set, 0, 0, pipeline->parameter_count, vk::DescriptorType::eStorageBuffer, nullptr, descriptor_buffer_infos.begin() };
+        vk_slope_timer slope_t(VK_SLOPE_DESC_UPDATE);   // GGML_VK_MMVQ_SLOPE_STATS t_desc_update_us / n_desc_update
         ctx->device->device.updateDescriptorSets({ write_descriptor_set }, {});
         bindings.assign(descriptor_buffer_infos.begin(), descriptor_buffer_infos.end());
     }
