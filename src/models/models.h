@@ -98,6 +98,12 @@ struct llm_build_delta_net_base : public llm_graph_context {
             ggml_tensor *        b,
             ggml_tensor *        s,
             int                  il);
+
+    // static I32 [n_rs_seq + 1] graph input = {n_rs_seq, ..., 1, 0}; build_conv_state conts it per layer
+    // and views the last n_w entries as the slot index of its per-column set_rows snapshot writes.
+    // one per graph, shared by every GDN layer (nullptr until the first layer that needs it builds it).
+    // see the 2026-10-20 comments in delta-net-base.cpp for why it is an index and why it is K-sized.
+    ggml_tensor * conv_snap_slot_idx = nullptr;
 };
 
 struct llm_build_rwkv6_base : public llm_graph_context {

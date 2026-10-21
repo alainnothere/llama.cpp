@@ -21,6 +21,7 @@ int vk_fa_quant_staging = -1;
 int vk_fa_cm1_wave32 = -1;
 int vk_fa_pv_reg = -1;   // GGML_VK_FA_PV_REG default -1 = auto (mode 3 on RDNA3 dense aligned f16, mode 1 if LDS short): production read 2026-10-20 15:54, 45k KV, FA per 1k KV at 4/12 tokens 6.4/14.9 -> 5.2/10.8
 int vk_mmvq_chunk = 48;
+int vk_mmvq_chunk_longk = 80;   // GGML_VK_MMVQ_CHUNK_LONGK: chunk cap for m <= 1.5 k shapes (2026-10-20), see ggml_vk_mmvq_chunk_skip_reason
 int vk_mmvq_chunk_cols = -1;
 int vk_splitk_small_n = -1;
 

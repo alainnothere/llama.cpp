@@ -11878,7 +11878,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
         for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
                 {17408, 5120}, {5120, 17408}, {12288, 5120}, {1024, 5120}, {5120, 6144}, {10240, 5120}, {6144, 5120}, {48, 5120}}) {
-            for (int bs : {8, 12, 13, 16, 24, 34}) {
+            for (int bs : {8, 12, 13, 16, 24, 34, 49, 65}) {   // 49/65 added 2026-10-20: n-gram chain caps 48/64 (+1 row)
                 test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, bs, k, {1, 1}, {1, 1}));
             }
         }

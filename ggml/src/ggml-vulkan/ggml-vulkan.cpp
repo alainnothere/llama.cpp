@@ -6045,6 +6045,13 @@ void ggml_vk_instance_init() {
         const int v = atoi(e);
         vk_mmvq_chunk = v < 0 ? 48 : (v == 0 ? 0 : (v <= (int)mul_mat_vec_max_cols ? 48 : v));
     }
+    // GGML_VK_MMVQ_CHUNK_LONGK: column cap for shapes with m <= 1.5 k (down projections, k/v projections),
+    // see ggml_vk_mmvq_chunk_skip_reason for the table. Default 80 (covers the 65-row verify of a 64-chain
+    // n-gram draft); 0 = same cap as GGML_VK_MMVQ_CHUNK for every shape (the 2026-10-19 behaviour).
+    if (const char * e = getenv("GGML_VK_MMVQ_CHUNK_LONGK")) {
+        const int v = atoi(e);
+        vk_mmvq_chunk_longk = v < 0 ? 80 : v;
+    }
     // GGML_VK_MMVQ_CHUNK_COLS: widest chunk. unset/-1 (any value <= 0) auto per src0 type, see
     // ggml_vk_mmvq_chunk_width; 1..mul_mat_vec_max_pipeline_cols forces that width for every type.
     // Qwen3.8-27B Q8_0, 3 GPUs, llama-bench pp N @ d2048, step ms at N = 12/13/16/17/20/24 (2026-10-19):
@@ -8135,7 +8142,32 @@ void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, con
 static const char * ggml_vk_mmvq_chunk_skip_reason(const ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     const uint64_t align = ctx->device->properties.limits.minStorageBufferOffsetAlignment;
     if (ctx->num_additional_fused_ops != 0)                                     return "fused";
-    if (dst->ne[1] > vk_mmvq_chunk)                                             return "n>cap";
+    // Column cap per shape (2026-10-20 evening, XTX, test-backend-ops perf, us per call, tile = the int8
+    // MMQ coopmat path the op takes when chunking is skipped). Above 48 columns the two FFN shapes want
+    // opposite paths:
+    //   tall  17408x5120 (m > k)  rows 49/65: tile 296/408  chunk 444/583  (q6_K 375/584 vs 458/606)
+    //   long-K 5120x17408 (k > m) rows 49/65: tile 665/604  chunk 418/550  (q6_K 846/856 vs 433/567,
+    //                                                                      q4_K 657/631 vs 368/480)
+    //   1024x5120 (k/v proj)      rows 49/65: tile 172/169  chunk  35/40   (4x)
+    //   5120x6144 (gdn out)       rows 49/65: tile 231/212  chunk 153/202
+    //   6144x5120                 rows 49/65: tile 197/180  chunk 158/204  (mixed, small)
+    //   12288x5120 / 10240x5120   rows 49/65: tile 233/255, 230/252  chunk 304/401, 257/338
+    // The tile path walks K serially per workgroup with split_k = 1 for n below the tile width
+    // (ggml_vk_guess_split_k), so it is fine when m is large (many workgroups) and bad when k is long and
+    // m small. Rule: m > 1.5 k keeps the 48 cap (tile above it); otherwise the cap is
+    // GGML_VK_MMVQ_CHUNK_LONGK (default 80, so a 64-chain n-gram verify (65 rows) stays on mmvq chunks).
+    // Why it matters: the n-gram drafter's 49/65-row verify steps; at 65 rows the matmuls were the largest
+    // per-row cost (+43 ms per XTX from 12 to 65 rows) and the down projection on the tile path was the
+    // worst single item. Re-measure: perf cases n=49/65 in tests/test-backend-ops.cpp (added today),
+    // GGML_VK_MMVQ_CHUNK_STATS=1 for skip reasons, the slope instrument's MUL_MAT path field on the server.
+    // Split-K for small n (GGML_VK_SPLITK_SMALL_N) only helped the long-K tile at 65 (q8 604 -> 438) and is
+    // dominated by chunking, so it stays off. Kernel caveat: these weights fit the 96 MB Infinity Cache in
+    // the test; the server's own 65-row numbers (tile 448 / chunk 616 for up/gate) rank the same way.
+    {
+        const int64_t m = src0->ne[1], k = src0->ne[0];
+        const int cap = (vk_mmvq_chunk_longk > 0 && 2 * m <= 3 * k) ? std::max(vk_mmvq_chunk, vk_mmvq_chunk_longk) : vk_mmvq_chunk;
+        if (dst->ne[1] > cap)                                                   return "n>cap";
+    }
     if (src0->type != GGML_TYPE_F16 && !ggml_is_quantized(src0->type))          return "src0_type";
     if (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16)             return "src1_type";
     if (dst->type != GGML_TYPE_F32)                                             return "dst_type";

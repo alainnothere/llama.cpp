@@ -34,6 +34,7 @@ extern int vk_fa_pv_reg;
 // <= the chunk width instead of the MMQ tile path. stored value is the cap (0 = off).
 // unset/-1 on with cap 48 (default), 0 off, 1..12 cap 48, >= 13 cap = value
 extern int vk_mmvq_chunk;
+extern int vk_mmvq_chunk_longk;
 // GGML_VK_MMVQ_CHUNK_COLS: widest mmvq chunk. unset/-1 auto per src0 type (q8_0/q8_1/f16/bf16 16, else 12),
 // 1..mul_mat_vec_max_pipeline_cols forces that width for every type
 extern int vk_mmvq_chunk_cols;
