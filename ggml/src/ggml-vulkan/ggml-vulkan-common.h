@@ -14,6 +14,8 @@ extern int vk_mmvq_wg_override;      // -1 heuristic, 0 subgroup, 1 large
 extern uint32_t vk_fa_splitk_pct;
 // coopmat1 generalized GQA fold applies to Q batches up to this many tokens (0 disables)
 extern uint32_t vk_fa_fold_max_n;
+// GGML_VK_FA_UNFOLDED_SPLITK: coopmat1 FA split_k for unfolded multi-tile batches. -1 auto (floor, raised when under 2/3 of the target), 0 floor only, N force
+extern int vk_fa_unfolded_splitk;
 extern uint32_t vk_fa_ablate;   // GGML_VK_FA_ABLATE bits 32/64/128/256/512, profiling only
 extern uint32_t vk_fa_fold_max_br;
 extern bool vk_fa_fold_maskopt;

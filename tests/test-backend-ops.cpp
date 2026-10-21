@@ -11954,6 +11954,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int nb : {13, 16, 24, 34}) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 32768, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     }
+    // unfolded split_k steps (GGML_VK_FA_UNFOLDED_SPLITK): Tr 2 / 3 / 3 / 4 at 32k and the production 128k (K+V 512 MB)
+    for (int kv : {32768, 131072}) {
+        for (int nb : {32, 33, 48, 49}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
     // same model, prefill: K/V strided like a real KV cache (heads interleaved), the shape the AMD f16 scratch copy targets
     for (int kv : {16384, 65536}) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));

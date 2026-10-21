@@ -5989,6 +5989,10 @@ void ggml_vk_instance_init() {
     if (const char * e = getenv("GGML_VK_FA_FOLD_MAX_N")) {
         vk_fa_fold_max_n = (uint32_t)std::stoul(e);
     }
+    if (const char * e = getenv("GGML_VK_FA_UNFOLDED_SPLITK")) {
+        const int v = atoi(e);
+        vk_fa_unfolded_splitk = v < 0 ? -1 : std::min(v, 64);
+    }
     if (const char * e = getenv("GGML_VK_FA_FOLD_MAX_BR")) {
         vk_fa_fold_max_br = std::max(16u, std::min(64u, (uint32_t)std::stoul(e) / 16 * 16));
     }
@@ -9463,8 +9467,30 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         split_k = shader_core_count * 2 / (workgroups_x * workgroups_y * workgroups_z);
     } else if (gqa_ratio <= 1) {
         uint32_t total_wgs_no_split = Tr * workgroups_y * workgroups_z;
-        if (total_wgs_no_split < shader_core_count * 2) {
-            split_k = shader_core_count * 2 / total_wgs_no_split;
+        // Unfolded coopmat1 verify batches (N > GGML_VK_FA_FOLD_MAX_N, more than one row tile). 27B (24 q / 4 kv heads,
+        // hs 256, f16 KV), production slope file 2026-10-21, FA us per call per 1k KV at 128-146k KV, floor rule:
+        //   7900 XTX (96 CU, target 192): Tr 2 (17-32 rows) sk 4 = 20.1, Tr 3 (33-45) sk 2 = 34.4, Tr 4 (49) sk 2 = 39.3
+        //   7900 XT  (84 CU, target 168): Tr 2 sk 3 = 30.7, Tr 3 sk 2 = 45.5, Tr 4 sk 1 = 77.2
+        // K/V re-reads grow with Tr (one pass per row tile per head), so 1 : 1.5 : 2 is expected without any split_k effect.
+        // test-backend-ops perf 2026-10-21 (nb 32/33/48/49, kv 32k and 128k, one run per arm; ~40% above production per
+        // 1k KV because of the random mask):
+        //   round up to >= target (sk XTX 4/3/2, XT 4/3/2): lost 4-14% on 5 of 8 rows (XT nb32 sk 3->4 +20..22%), the
+        //   ragged second round of workgroups costs more than the shorter KV walk saves. XT nb49 sk 1->2 won 8-10%.
+        //   XTX forced: nb49 sk 3 +23% (1.5 rounds), sk 4 -2%; nb33 sk 4 +5%, sk 6 -7% (deep splits: separate, untested rule).
+        // So auto keeps the floor and only raises split_k when the floor dispatch fills less than 2/3 of the target. That
+        // fires only when the floor gave sk 1 (any floor sk >= 2 fills more than 2/3): XT nb49 96/168 wg -> sk 2. XTX
+        // Tr 2-4 (100/75/100% filled) keep sk 4/2/2. Untested: XTX Tr 5 (65-80 rows, 120/192) also goes sk 1 -> 2.
+        // GGML_VK_FA_UNFOLDED_SPLITK: -1 auto (this rule, default), 0 = floor only, N = force split_k N (1..64).
+        // Folded and single-tile batches keep the floor rule. GGML_VK_FA_SPLITK_PCT still scales the target.
+        const uint32_t target = shader_core_count * 2;
+        const bool unfolded_cm1 = tuning_params.path == FA_COOPMAT1 && N > vk_fa_fold_max_n && Tr > 1;
+        if (unfolded_cm1 && vk_fa_unfolded_splitk > 0) {
+            split_k = (uint32_t)vk_fa_unfolded_splitk;
+        } else if (total_wgs_no_split < target) {
+            split_k = target / total_wgs_no_split;
+            if (unfolded_cm1 && vk_fa_unfolded_splitk < 0 && split_k * total_wgs_no_split * 3 < target * 2) {
+                split_k = CEIL_DIV(target, total_wgs_no_split);
+            }
         }
     }
 

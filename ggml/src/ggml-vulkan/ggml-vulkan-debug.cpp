@@ -12,6 +12,7 @@ bool vk_mmvq_sg = false;
 int vk_mmvq_wg_override = -1;
 uint32_t vk_fa_splitk_pct = 100;
 uint32_t vk_fa_fold_max_n = 16;
+int vk_fa_unfolded_splitk = -1;
 uint32_t vk_fa_ablate = 0;
 uint32_t vk_fa_fold_max_br = 16;
 bool vk_fa_fold_maskopt = true;
