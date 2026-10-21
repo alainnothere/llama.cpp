@@ -91,6 +91,8 @@ struct llama_debug_timer {
 // 2026-10-20 additions: cpu_ops / cpu_names / cpu_src_bufts / split_backends on every decode line
 // (see dstats_capture_placement) and one {"ctx_create":1,...} line per context listing the memory
 // buffers with their buffer types (see dstats_emit_ctx_create).
+// 2026-10-21 additions: "sched" totals, "copies" and "splits" arrays from the ggml-backend scheduler
+// (cross-device copy timings per hop and per-split overlap, see dstats_fold_sched).
 //
 // Re-measure: LLAMA_DECODE_STATS=/tmp/ds.jsonl LLAMA_SERVER_UBATCH_STATS=/tmp/us.jsonl on the
 // server, run one long prompt at --spec-ngram-draft-n-max 33 and 64, then
@@ -791,6 +793,8 @@ void llama_context::sched_reserve() {
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
+    // [LLAMA_DECODE_STATS] per-hop copy timings from the scheduler, see dstats_fold_sched
+    ggml_backend_sched_set_stats_enabled(sched.get(), dstats_on);
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -831,6 +835,7 @@ void llama_context::sched_reserve() {
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
                 ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
+                ggml_backend_sched_set_stats_enabled(sched.get(), dstats_on);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -2233,6 +2238,116 @@ void llama_context::dstats_capture_placement(ggml_cgraph * gf) {
     dstats_place_json += ",\"split_backends\":" + dstats_json_str(sb);
 }
 
+// [LLAMA_DECODE_STATS] 2026-10-21 - what one cross-device hop costs, per hop, in production
+//
+// Why. The open question is the price of a single split-input copy between two GPUs on this box
+// (3 Vulkan GPUs, XT on a PCIe x1 link). The layer split pays ~2 hops per step today, -sm tensor
+// would pay ~128 (one per layer and direction), so per-hop cost x 128 says whether tensor parallel
+// can ever beat the layer split here. On this branch Vulkan cpy_tensor_async refuses cross-device
+// (ggml-vulkan.cpp, "Async copy only works within the same device"), so every GPU->GPU hop takes the
+// scheduler's bounce path: ggml_backend_synchronize(src), sync dst, then ggml_backend_tensor_copy,
+// which is a malloc + get + set through host memory. The async D2D copy exists only on branch
+// koopa-freefall. t_compute_us lumps these waits with the Vulkan submits; this splits them out.
+//
+// Source: ggml_backend_sched_stats (fork-only, ggml-backend.h), filled by compute_splits when the
+// scheduler has stats enabled (only when LLAMA_DECODE_STATS is set, see the two sched_new sites).
+// Per decode line, over every graph computed during the call (n_graphs, normally one per ubatch):
+//   "sched":  {n_graphs, n_splits, n_cross_copies, n_copies_dropped, n_splits_dropped, bytes,
+//              t_dst_wait_us, t_src_sync_us, t_copy_us, t_split_sync_us, t_wall_us}, sums; t_wall_us
+//              is compute_splits wall, t_split_sync_us the input-less splits waiting on the previous
+//              backend. n_cross_copies counts every split input copy, CPU->GPU graph inputs included
+//              (path "in"), so group by (src, dst) before reading a GPU hop out of it.
+//   "copies": [{g, split, name, src, dst, path, bytes, t_dst_wait_us, t_src_sync_us, t_copy_us}]
+//              path: "in" graph input, "async" cpy_tensor_async took it (t_copy = enqueue only),
+//              "bounce" src sync + dst sync + host copy, "cb" MoE expert copy callback.
+//              t_dst_wait sums both dst syncs of the bounce path; t_copy includes the refused
+//              cpy_tensor_async attempt. g = graph index inside this line. Reading a bounce hop:
+//              t_src_sync is mostly the source split's GPU work draining (the stall the bounce path
+//              forces, so it scales with that split, not the hop), t_copy is the host round trip
+//              itself, t_dst_wait the dst queue draining; the hop's own price is t_copy + the part of
+//              t_src_sync that t_issue_to_next_wait_us of the source split did not already hide.
+//   "splits": [{g, backend, n_nodes, n_inputs, t_issue_us, t_issue_to_next_wait_us}]
+//              t_issue_us is the host time of graph_compute_async (Vulkan: record + submit; a CPU
+//              split computes inside it); t_issue_to_next_wait_us is issue return -> the next
+//              split's first blocking call (or its issue when it has none), i.e. how long the host
+//              ran ahead of this split's GPU work. -1 on the last split: its window runs into the
+//              caller's output extraction / synchronize (t_output_us, t_sync_prev_us).
+// The scheduler keeps 128 copies and 64 splits per graph, this line 512 / 256; overflow only bumps
+// the *_dropped counters, totals stay exact. Size: ~150 B per copy, a 21-split graph ~4 KB/line.
+//
+// Re-measure: LLAMA_DECODE_STATS=/tmp/ds.jsonl on the server, then
+//   python3 ~/Documents/contextFiles/llama.cpp_bench/decode_stats.py --sched --decode /tmp/ds.jsonl
+// (per ctx and n_tokens bucket: per (src,dst) pair count/decode, bytes, p50/p90 of the three timings,
+// per-step sum; per split backend p50 issue-to-next-wait).
+void llama_context::dstats_fold_sched() {
+    const ggml_backend_sched_stats * st = ggml_backend_sched_get_last_stats(sched.get());
+    if (!st) {
+        return;
+    }
+
+    static constexpr int max_copies_line = 512;
+    static constexpr int max_splits_line = 256;
+
+    auto & d = dstats;
+    const int g = d.s_n_graphs++;
+
+    d.s_n_splits     += st->n_splits;
+    d.s_n_copies     += st->n_copies;
+    d.s_bytes        += (int64_t) st->nbytes;
+    d.s_t_dst_wait   += st->t_dst_wait_us;
+    d.s_t_src_sync   += st->t_src_sync_us;
+    d.s_t_copy       += st->t_copy_us;
+    d.s_t_split_sync += st->t_split_sync_us;
+    d.s_t_wall       += st->t_wall_us;
+
+    ggml_backend_sched_t s = sched.get();
+    const int n_backends = ggml_backend_sched_get_n_backends(s);
+    auto bname = [&](int id) -> std::string {
+        return (id >= 0 && id < n_backends) ? ggml_backend_name(ggml_backend_sched_get_backend(s, id)) : "?";
+    };
+    static const char * path_names[] = { "in", "async", "bounce", "cb" };
+
+    const int n_copies_rec = std::min<int>(st->n_copies, GGML_BACKEND_SCHED_STATS_MAX_COPIES);
+    for (int i = 0; i < n_copies_rec; ++i) {
+        if (d.s_n_copies_rec >= max_copies_line) {
+            d.s_n_copies_drop += n_copies_rec - i;
+            break;
+        }
+        const auto & c = st->copies[i];
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                ",\"path\":\"%s\",\"bytes\":%zu,\"t_dst_wait_us\":%" PRId64 ",\"t_src_sync_us\":%" PRId64 ",\"t_copy_us\":%" PRId64 "}",
+                (c.path >= 0 && c.path < 4) ? path_names[c.path] : "?", c.nbytes, c.t_dst_wait_us, c.t_src_sync_us, c.t_copy_us);
+        if (!d.s_copies_json.empty()) {
+            d.s_copies_json += ',';
+        }
+        d.s_copies_json += "{\"g\":" + std::to_string(g) + ",\"split\":" + std::to_string(c.split_id) +
+            ",\"name\":" + dstats_json_str(c.name) + ",\"src\":" + dstats_json_str(bname(c.src_backend)) +
+            ",\"dst\":" + dstats_json_str(bname(c.dst_backend)) + buf;
+        d.s_n_copies_rec++;
+    }
+    d.s_n_copies_drop += st->n_copies - n_copies_rec;
+
+    const int n_splits_rec = std::min<int>(st->n_splits, GGML_BACKEND_SCHED_STATS_MAX_SPLITS);
+    for (int i = 0; i < n_splits_rec; ++i) {
+        if (d.s_n_splits_rec >= max_splits_line) {
+            d.s_n_splits_drop += n_splits_rec - i;
+            break;
+        }
+        const auto & sp = st->splits[i];
+        char buf[192];
+        snprintf(buf, sizeof(buf),
+                ",\"n_nodes\":%d,\"n_inputs\":%d,\"t_issue_us\":%" PRId64 ",\"t_issue_to_next_wait_us\":%" PRId64 "}",
+                sp.n_nodes, sp.n_inputs, sp.t_issue_us, sp.t_issue_to_next_wait_us);
+        if (!d.s_splits_json.empty()) {
+            d.s_splits_json += ',';
+        }
+        d.s_splits_json += "{\"g\":" + std::to_string(g) + ",\"backend\":" + dstats_json_str(bname(sp.backend)) + buf;
+        d.s_n_splits_rec++;
+    }
+    d.s_n_splits_drop += st->n_splits - n_splits_rec;
+}
+
 // [LLAMA_DECODE_STATS] 2026-10-20 - one line per context listing where its memory landed
 //
 // {"ctx_create":1,"ctx":id,"n_rs_seq":..,"n_seq_max":..,"offload_kqv":..,"pipeline_parallel":..,
@@ -2338,6 +2453,19 @@ void llama_context::dstats_emit(int ret, int64_t t_start_us, uint32_t n_tokens, 
     if (!dstats_place_json.empty()) {
         line += ',';
         line += dstats_place_json;
+    }
+    // scheduler hop timings (dstats_fold_sched), absent when no graph was computed in this call
+    if (d.s_n_graphs > 0) {
+        char sb[512];
+        snprintf(sb, sizeof(sb),
+                ",\"sched\":{\"n_graphs\":%d,\"n_splits\":%d,\"n_cross_copies\":%d,\"n_copies_dropped\":%d,\"n_splits_dropped\":%d,"
+                "\"bytes\":%" PRId64 ",\"t_dst_wait_us\":%" PRId64 ",\"t_src_sync_us\":%" PRId64 ",\"t_copy_us\":%" PRId64 ","
+                "\"t_split_sync_us\":%" PRId64 ",\"t_wall_us\":%" PRId64 "}",
+                d.s_n_graphs, d.s_n_splits, d.s_n_copies, d.s_n_copies_drop, d.s_n_splits_drop,
+                d.s_bytes, d.s_t_dst_wait, d.s_t_src_sync, d.s_t_copy, d.s_t_split_sync, d.s_t_wall);
+        line += sb;
+        line += ",\"copies\":[" + d.s_copies_json + "]";
+        line += ",\"splits\":[" + d.s_splits_json + "]";
     }
     line += "}\n";
 
@@ -3354,6 +3482,11 @@ ggml_status llama_context::graph_compute(
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+    }
+
+    // [LLAMA_DECODE_STATS] every graph of the call, not only process_ubatch's (cheap: one bool when off)
+    if (dstats_on) {
+        dstats_fold_sched();
     }
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));

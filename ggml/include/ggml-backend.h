@@ -346,6 +346,59 @@ extern "C" {
     // this says which backends the graph bounces between. not in upstream ggml.
     GGML_API ggml_backend_t       ggml_backend_sched_get_split_backend(ggml_backend_sched_t sched, int i);
 
+    // [fork, 2026-10-21] per-graph timings of the split input copies, for llama.cpp's LLAMA_DECODE_STATS
+    // (src/llama-context.cpp folds them into its "sched"/"copies"/"splits" fields). The question: what one
+    // cross-device hop costs on a 3x Vulkan box. The layer split pays ~2 per step, -sm tensor would pay ~128,
+    // and on this tree Vulkan cpy_tensor_async refuses cross-device, so every GPU->GPU hop is the bounce path
+    // (src sync + dst sync + host round trip). Async D2D only exists on branch koopa-freefall. not in upstream ggml.
+    // Off by default; when off the scheduler does one pointer test per split/input and no clock reads.
+    #define GGML_BACKEND_SCHED_STATS_MAX_COPIES 128
+    #define GGML_BACKEND_SCHED_STATS_MAX_SPLITS 64
+
+    enum ggml_backend_sched_copy_path {
+        GGML_BACKEND_SCHED_COPY_PATH_INPUT  = 0, // graph input (user data): dst sync, then blocking ggml_backend_tensor_copy
+        GGML_BACKEND_SCHED_COPY_PATH_ASYNC  = 1, // dst cpy_tensor_async accepted it: dst event wait/sync + enqueue
+        GGML_BACKEND_SCHED_COPY_PATH_BOUNCE = 2, // fallback: src sync, dst sync, blocking ggml_backend_tensor_copy
+        GGML_BACKEND_SCHED_COPY_PATH_CB     = 3, // host weight taken by the copy callback (llama: MoE expert copy)
+    };
+
+    struct ggml_backend_sched_copy_stats {
+        char    name[GGML_MAX_NAME]; // the input tensor (not the "<backend>#name#copy" duplicate)
+        int32_t split_id;
+        int32_t src_backend;         // ggml_backend_sched_get_backend() index, -1 if unassigned
+        int32_t dst_backend;
+        int32_t path;                // enum ggml_backend_sched_copy_path
+        size_t  nbytes;
+        int64_t t_dst_wait_us;       // event_wait / event_synchronize / synchronize on dst (both of them on the bounce path)
+        int64_t t_src_sync_us;       // ggml_backend_synchronize(src), bounce path only
+        int64_t t_copy_us;           // the copy itself (enqueue only on the async path)
+    };
+
+    struct ggml_backend_sched_split_stats {
+        int32_t backend;                 // ggml_backend_sched_get_backend() index
+        int32_t n_nodes;
+        int32_t n_inputs;
+        int64_t t_issue_us;              // host time inside graph_compute_async (a CPU split computes here)
+        int64_t t_issue_to_next_wait_us; // issue return -> next split's first blocking call (or its issue); -1 = last split
+    };
+
+    struct ggml_backend_sched_stats {
+        int32_t n_splits;        // splits of the graph; splits[] holds the first GGML_BACKEND_SCHED_STATS_MAX_SPLITS
+        int32_t n_copies;        // copies done; copies[] holds the first GGML_BACKEND_SCHED_STATS_MAX_COPIES
+        size_t  nbytes;          // sums over all copies, recorded or not
+        int64_t t_dst_wait_us;
+        int64_t t_src_sync_us;
+        int64_t t_copy_us;
+        int64_t t_split_sync_us; // input-less split waiting for the previous backend
+        int64_t t_wall_us;       // whole compute_splits
+        struct ggml_backend_sched_copy_stats  copies[GGML_BACKEND_SCHED_STATS_MAX_COPIES];
+        struct ggml_backend_sched_split_stats splits[GGML_BACKEND_SCHED_STATS_MAX_SPLITS];
+    };
+
+    GGML_API void ggml_backend_sched_set_stats_enabled(ggml_backend_sched_t sched, bool enabled);
+    // stats of the last ggml_backend_sched_graph_compute_async, NULL when disabled; valid until the next compute/disable
+    GGML_API const struct ggml_backend_sched_stats * ggml_backend_sched_get_last_stats(ggml_backend_sched_t sched);
+
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
 

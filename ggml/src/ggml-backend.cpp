@@ -981,6 +981,11 @@ struct ggml_backend_sched {
     int debug_realloc;
     int debug_graph_size;
     int debug_prev_graph_size;
+
+    // [fork, 2026-10-21] copy/split timings, see ggml_backend_sched_stats in ggml-backend.h. NULL = off
+    struct ggml_backend_sched_stats * stats;
+    int     stats_pending_split; // split whose issue_to_next_wait is still open, -1 = none
+    int64_t stats_t_issue_end;
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -1808,11 +1813,69 @@ static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t) {
         ggml_backend_buffer_is_host(t->buffer);
 }
 
-static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
+// [fork, 2026-10-21] stats helpers. Every call site is behind `if (sched->stats)` or a lap built with
+// on == false, so the instrument costs one pointer test per split/input when off and no clock reads.
+struct ggml_backend_sched_stats_lap {
+    bool    on;
+    int64_t t;
+    explicit ggml_backend_sched_stats_lap(bool on_) : on(on_), t(on_ ? ggml_time_us() : 0) {}
+    // add the time since the previous lap to acc
+    void lap(int64_t & acc) {
+        if (on) {
+            const int64_t now = ggml_time_us();
+            acc += now - t;
+            t    = now;
+        }
+    }
+};
+
+// the previous split's overlap window ends at the first blocking call (or the issue) of the next one
+static void ggml_backend_sched_stats_close_pending(ggml_backend_sched_t sched) {
+    if (sched->stats_pending_split >= 0) {
+        sched->stats->splits[sched->stats_pending_split].t_issue_to_next_wait_us = ggml_time_us() - sched->stats_t_issue_end;
+        sched->stats_pending_split = -1;
+    }
+}
+
+static void ggml_backend_sched_stats_add_copy(ggml_backend_sched_t sched, int split_id, const struct ggml_tensor * input,
+        int src_backend, int dst_backend, int path, int64_t t_dst_wait, int64_t t_src_sync, int64_t t_copy) {
+    struct ggml_backend_sched_stats * st = sched->stats;
+    const size_t nbytes = ggml_nbytes(input);
+    st->nbytes        += nbytes;
+    st->t_dst_wait_us += t_dst_wait;
+    st->t_src_sync_us += t_src_sync;
+    st->t_copy_us     += t_copy;
+    if (st->n_copies < GGML_BACKEND_SCHED_STATS_MAX_COPIES) {
+        struct ggml_backend_sched_copy_stats & c = st->copies[st->n_copies];
+        snprintf(c.name, sizeof(c.name), "%s", input->name);
+        c.split_id      = split_id;
+        c.src_backend   = src_backend;
+        c.dst_backend   = dst_backend;
+        c.path          = path;
+        c.nbytes        = nbytes;
+        c.t_dst_wait_us = t_dst_wait;
+        c.t_src_sync_us = t_src_sync;
+        c.t_copy_us     = t_copy;
+    }
+    st->n_copies++;
+}
+
+static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, int split_id, struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
     const int split_backend_id = split->backend_id;
     ggml_backend_t split_backend = sched->backends[split_backend_id];
     ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
     struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+
+    // [fork, 2026-10-21] LLAMA_DECODE_STATS hop timings: dst wait, src sync, copy, per input
+    const bool stats_on = sched->stats != NULL;
+    if (stats_on) {
+        ggml_backend_sched_stats_close_pending(sched);
+    }
+    ggml_backend_sched_stats_lap lap(stats_on);
+    int64_t t_dst_wait = 0;
+    int64_t t_src_sync = 0;
+    int64_t t_copy     = 0;
+    int     path;
 
     if (input->flags & GGML_TENSOR_FLAG_INPUT) {
         // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
@@ -1821,38 +1884,74 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
         } else {
             ggml_backend_synchronize(split_backend);
         }
+        lap.lap(t_dst_wait);
         ggml_backend_tensor_copy(input, input_cpy);
-        return;
-    }
-
-    // wait for the split backend to finish using the input before overwriting it
-    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-        ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+        lap.lap(t_copy);
+        path = GGML_BACKEND_SCHED_COPY_PATH_INPUT;
     } else {
-        ggml_backend_synchronize(split_backend);
-    }
-
-    if (sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input) &&
-        sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
-        return;
-    }
-
-    // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
-    // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
-    if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
-        ggml_backend_synchronize(input_backend);
+        // wait for the split backend to finish using the input before overwriting it
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+            ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
         } else {
             ggml_backend_synchronize(split_backend);
         }
-        ggml_backend_tensor_copy(input, input_cpy);
+        lap.lap(t_dst_wait);
+
+        if (sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input) &&
+            sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
+            lap.lap(t_copy);
+            path = GGML_BACKEND_SCHED_COPY_PATH_CB;
+        } else if (split_backend->iface.cpy_tensor_async && split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+            // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
+            // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
+            lap.lap(t_copy);
+            path = GGML_BACKEND_SCHED_COPY_PATH_ASYNC;
+        } else {
+            // a refused cpy_tensor_async attempt (Vulkan cross-device on this tree) is counted in t_copy
+            lap.lap(t_copy);
+            ggml_backend_synchronize(input_backend);
+            lap.lap(t_src_sync);
+            if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+            } else {
+                ggml_backend_synchronize(split_backend);
+            }
+            lap.lap(t_dst_wait);
+            ggml_backend_tensor_copy(input, input_cpy);
+            lap.lap(t_copy);
+            path = GGML_BACKEND_SCHED_COPY_PATH_BOUNCE;
+        }
+    }
+
+    if (stats_on) {
+        const int src_backend = input_backend ? ggml_backend_sched_backend_id(sched, input_backend) : -1;
+        ggml_backend_sched_stats_add_copy(sched, split_id, input, src_backend, split_backend_id, path, t_dst_wait, t_src_sync, t_copy);
     }
 }
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
+
+    // [fork, 2026-10-21] LLAMA_DECODE_STATS: what one cross-device hop costs. Per input copy: dst wait, src
+    // sync, copy (ggml_backend_sched_copy_input); per split: host issue time and how long the host ran on
+    // before the next blocking call, i.e. how much the split's GPU work overlapped anything. Layer split pays
+    // ~2 hops per step today, -sm tensor ~128, so this per-hop number decides whether tensor parallel can win
+    // without the async D2D copy of branch koopa-freefall. One pointer test per split when off.
+    struct ggml_backend_sched_stats * st = sched->stats;
+    int64_t t_wall_start = 0;
+    if (st) {
+        st->n_splits        = sched->n_splits;
+        st->n_copies        = 0;
+        st->nbytes          = 0;
+        st->t_dst_wait_us   = 0;
+        st->t_src_sync_us   = 0;
+        st->t_copy_us       = 0;
+        st->t_split_sync_us = 0;
+        st->t_wall_us       = 0;
+        sched->stats_pending_split = -1;
+        t_wall_start = ggml_time_us();
+    }
 
     int prev_backend_id = -1;
 
@@ -1864,10 +1963,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+            if (st) {
+                ggml_backend_sched_stats_close_pending(sched);
+            }
+            ggml_backend_sched_stats_lap lap(st != NULL);
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
                 ggml_backend_synchronize(sched->backends[prev_backend_id]);
+            }
+            if (st) {
+                lap.lap(st->t_split_sync_us);
             }
         }
 
@@ -1875,13 +1981,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             if (!ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
-                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
+                ggml_backend_sched_copy_input(sched, split_id, split, split->inputs[input_id]);
             }
         }
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             if (ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
-                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
+                ggml_backend_sched_copy_input(sched, split_id, split, split->inputs[input_id]);
             }
+        }
+
+        // a split that neither waited nor copied closes the previous window at its issue
+        int64_t t_issue_start = 0;
+        if (st) {
+            ggml_backend_sched_stats_close_pending(sched);
+            t_issue_start = ggml_time_us();
         }
 
         if (!sched->callback_eval) {
@@ -1923,12 +2036,33 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        // with callback_eval set, t_issue_us includes the per-range synchronize above
+        if (st) {
+            const int64_t now = ggml_time_us();
+            if (split_id < GGML_BACKEND_SCHED_STATS_MAX_SPLITS) {
+                struct ggml_backend_sched_split_stats & ss = st->splits[split_id];
+                ss.backend                 = split_backend_id;
+                ss.n_nodes                 = split->graph.n_nodes;
+                ss.n_inputs                = split->n_inputs;
+                ss.t_issue_us              = now - t_issue_start;
+                ss.t_issue_to_next_wait_us = -1;
+                sched->stats_pending_split = split_id;
+            }
+            sched->stats_t_issue_end = now;
+        }
+
         // record the event of this split
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
         }
 
         prev_backend_id = split_backend_id;
+    }
+
+    // the last split's window runs into the caller (llama: output extraction / synchronize), left at -1
+    if (st) {
+        sched->stats_pending_split = -1;
+        st->t_wall_us = ggml_time_us() - t_wall_start;
     }
 
     return GGML_STATUS_SUCCESS;
@@ -2032,6 +2166,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->context_buffer);
     free(sched->graph.nodes);
     free(sched->graph.leafs);
+    free(sched->stats);
     free(sched);
 }
 
@@ -2167,6 +2302,24 @@ ggml_backend_t ggml_backend_sched_get_split_backend(ggml_backend_sched_t sched, 
         return NULL;
     }
     return sched->backends[backend_id];
+}
+
+// [fork, 2026-10-21] see ggml-backend.h. Allocated only when enabled (~20 KB), so an off scheduler
+// carries one NULL pointer.
+void ggml_backend_sched_set_stats_enabled(ggml_backend_sched_t sched, bool enabled) {
+    GGML_ASSERT(sched);
+    if (enabled && sched->stats == NULL) {
+        sched->stats = (struct ggml_backend_sched_stats *) calloc(1, sizeof(struct ggml_backend_sched_stats));
+        sched->stats_pending_split = -1;
+    } else if (!enabled && sched->stats != NULL) {
+        free(sched->stats);
+        sched->stats = NULL;
+    }
+}
+
+const struct ggml_backend_sched_stats * ggml_backend_sched_get_last_stats(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->stats;
 }
 
 int ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched) {

@@ -501,6 +501,22 @@ public:
         int64_t t_mem_commit     = 0; // error-path seq_rm only, this tree has no commit phase
         int32_t n_ubatch         = 0;
         int32_t n_reused         = 0;
+        // 2026-10-21: ggml_backend_sched_stats of every graph computed in this call, summed (see dstats_fold_sched)
+        int32_t s_n_graphs       = 0;
+        int32_t s_n_splits       = 0;
+        int32_t s_n_copies       = 0;
+        int32_t s_n_copies_drop  = 0; // not in "copies" (scheduler cap per graph or line cap)
+        int32_t s_n_splits_drop  = 0;
+        int32_t s_n_copies_rec   = 0; // entries in s_copies_json / s_splits_json
+        int32_t s_n_splits_rec   = 0;
+        int64_t s_bytes          = 0;
+        int64_t s_t_dst_wait     = 0;
+        int64_t s_t_src_sync     = 0;
+        int64_t s_t_copy         = 0;
+        int64_t s_t_split_sync   = 0;
+        int64_t s_t_wall         = 0;
+        std::string s_copies_json;
+        std::string s_splits_json;
     };
 private:
     bool             dstats_on     = false;
@@ -515,6 +531,8 @@ private:
     // graphs keep the same placement), so the per-decode emit just appends it
     std::string      dstats_place_json;
     void dstats_capture_placement(ggml_cgraph * gf);
+    // 2026-10-21: folds ggml_backend_sched_get_last_stats() into dstats after each graph_compute
+    void dstats_fold_sched();
     // 2026-10-20: CPU PLACEMENT warning #3 - checked once per context on the first graph that is
     // allocated in process_ubatch, independent of LLAMA_DECODE_STATS (see llama-context.cpp)
     bool             placement_checked = false;
