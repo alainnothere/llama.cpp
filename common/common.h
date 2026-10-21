@@ -406,6 +406,14 @@ struct common_params_speculative {
     // cap for n-gram drafts, independent of draft.n_max and the auto tuner (-1 = same cap as the draft model)
     int32_t ngram_draft_n_max = -1;
 
+    // 2026-10-20 ngram-mod chain policies, both off by default for the A/B (see common_speculative_impl_ngram_mod
+    // in common/speculative.cpp for the measured numbers behind them):
+    // ngram_auto   (--spec-ngram-auto): per-seq offered chain length follows the landing history, ceiling ngram_draft_n_max
+    // ngram_resume (--spec-ngram-resume N): after a partial accept, re-offer the rest of the old chain past the
+    //              corrected token, at most N wildcards per original chain (0 = off)
+    bool    ngram_auto   = false;
+    int32_t ngram_resume = 0;
+
     // server only: append one JSON line of per-request speculative stats to this file (empty = off)
     std::string stats_file;
 

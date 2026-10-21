@@ -223,6 +223,11 @@ struct common_speculative_impl {
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
 
+    // per-seq cap on the offered draft, applied by common_speculative_draft() on top of n_max / n_max_ngram
+    // (<= 0 = none). 2026-10-20: used by ngram-mod --spec-ngram-auto; applied there and not inside the impl so the
+    // shadow "chain truth" still sees the whole built chain and n_built vs n_offered stays meaningful
+    virtual int32_t n_cap_seq(llama_seq_id /*seq_id*/) const { return 0; }
+
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
@@ -2182,6 +2187,60 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     // enable trace logging if LLAMA_TRACE is set
     const bool verbose;
 
+    // ---- 2026-10-20: chain policies --spec-ngram-auto (A) and --spec-ngram-resume N (B), both default off ----
+    //
+    // Why (production logs, Qwen3.8-27B Q8, --spec-type draft-mtp,ngram-mod, n_match 24 / n_min 48 / n_max 64):
+    //   per landed token the n-gram chain is far cheaper than the MTP head when it lands (cap 33: 230 ms verify
+    //   landing 28.5 = 8 ms/token, MTP 94 ms landing 3.7 = 25 ms/token) and far more expensive when it does not
+    //   (fresh prose, cap 64: 284 ms landing 10.7 = 27 ms/token). verify = ~55 ms + ~2.3-4 ms per row, so an
+    //   unlanded tail is pure cost.
+    //   - repetitive text (file rewrite) cap 33: 66 chains, 55 landed whole, chain truth "would land" mean 53.3,
+    //     50/66 would land 49-64 -> the cap binds. cap 48: 85 chains, 69 landed whole, would land mean 53.5,
+    //     69/85 would land 49-64, 16/85 landed partially.
+    //   - fresh prose, caps 24/32/48/64: chains land 9-12 whatever the cap; per landed token 16-19 ms at 24/32,
+    //     24 at 48, 27 at 64.
+    //   no fixed cap serves both -> (A). and after a partial landing the table goes quiet for 12-24 tokens, since
+    //   its key now holds the target's corrected token, and 3-6 MTP steps run before it fires again -> (B).
+    //
+    // (A) per seq cap, applied through n_cap_seq() by common_speculative_draft() (so chain truth still sees the
+    //     whole built chain). after every verified chain of this impl:
+    //       partial (n_acc < offered)          -> cap = n_acc + AUTO_STEP
+    //       whole and the cap cut the chain    -> cap = max(1.5 x cap, 1.5 x EMA_acc)   (multiplicative raise)
+    //       whole, the table ended the chain   -> cap = max(cap, 1.5 x EMA_acc)         (no evidence for more)
+    //     rounded up to AUTO_STEP, clamped to [auto_n_min, auto_n_max]; starts at auto_n_max/2.
+    //     auto_n_max = min(--spec-ngram-mod-n-max, --spec-ngram-draft-n-max or else --spec-draft-n-max).
+    //     auto_n_min = min(--spec-ngram-mod-n-min, 12): the spec said "n_min or 12", but production runs n_min 48
+    //     (the --spec-default build threshold) with cap 48, which would pin the auto cap to 48 and make (A) a no-op;
+    //     the prose case wants ~16. n_min stays the build threshold, the floor is only for the offered length.
+    //     the replay after a checkpoint restore calls accept() a second time with the replay's count (pre-existing
+    //     quirk shared with the backoff); on this target n_rs_seq is sized for the n-gram cap so restore is not hit.
+    //
+    // (B) remember the last offered chain as built (before any cap) and its position. on the next draft_one(),
+    //     when the table has no chain >= n_min for the true history, and the previous chain was accepted for
+    //     k tokens with 0 < k < offered, offer chain[k+1 ..) - index k is the token the target replaced, its own
+    //     token now sits there as id_last. allowed only while wildcards < N for this lineage, whole_ema >= 0.5
+    //     (judged before the failed chain) and the tail has >= RESUME_MIN tokens; a resumed tail rejected at its first token ends the lineage.
+    //     index convention verified 2026-10-20 in tools/server/server-context.cpp: n_accepted = accepted.size() - 1,
+    //     i.e. draft tokens only (the sampled target token is not counted). positions are re-checked against the
+    //     history instead of trusted from accept(): prompt[pos + i] == chain[i] for i < k, id_last != chain[k] and
+    //     prompt.size() == pos + k, which also rejects the post-restore replay and any step another impl drafted.
+    //     a resumed tail is pushed to the shadow like any n-gram chain, so it is counted in the "chain truth" line.
+    //
+    // re-measure: --spec-stats-file + llama.cpp_bench/spec_stats.py (groups on ngram_auto / ngram_resume), and the
+    // "ngram policy:" line next to "draft by impl: ngram-mod" in the slot release log. run_ngram_ab.sh has the arms.
+    static constexpr int32_t AUTO_STEP   = 4;    // cap granularity and the partial-landing headroom
+    static constexpr double  AUTO_ALPHA  = 0.25; // EMA weight of accepted tokens per chain
+    static constexpr double  WHOLE_ALPHA = 0.25; // EMA weight of the landed-whole flag (wildcard permission)
+    static constexpr double  WHOLE_INIT  = 0.5;  // a fresh request is allowed one wildcard until it has history
+    // a tail shorter than this is not worth a verify: at ~55 ms + 3 ms/row a 4-token tail that lands whole gives
+    // 5 tokens / ~70 ms = 14 ms/token vs MTP's 25; at 2 tokens it is ~21 ms/token, break-even once partial landings count
+    static constexpr int32_t RESUME_MIN  = 4;
+
+    const bool    auto_on;
+    const int32_t resume_n;
+    int32_t auto_n_min = 0;
+    int32_t auto_n_max = 0;
+
     struct seq_info {
         // the last position in the prompt that was added to the ngram container
         size_t i_last = 0;
@@ -2203,6 +2262,29 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         // alt table: last fed position, and whether draft_one ran since the last shadow_alt()
         size_t i_last_alt = 0;
         bool   tried      = false;
+
+        // (A) --spec-ngram-auto
+        int32_t cap_cur  = 0;   // cap of the next chain
+        int32_t cap_used = 0;   // cap the chain in flight was offered under
+        double  ema_acc  = 0.0; // accepted tokens per chain
+        std::vector<int32_t> cap_hist; // per request: chains offered per cap value, index 0..auto_n_max
+        int32_t n_cap_bound = 0;
+
+        // landed-whole EMA, kept whether or not (A) is on - it gates the wildcards of (B)
+        double whole_ema = WHOLE_INIT;
+        // its value before the last verified chain: the wildcard is judged on the chains before the one that just
+        // failed, otherwise the first partial landing of a request (0.5 -> 0.375) could never resume
+        double whole_ema_prior = WHOLE_INIT;
+
+        // (B) --spec-ngram-resume: the last offered chain as built, before any cap
+        llama_tokens chain;
+        size_t  chain_pos     = 0;     // index of chain[0] in prompt ++ [id_last] coordinates (prompt.size() + 1 at draft)
+        int32_t chain_n_acc   = -1;    // accepted by the target, set by accept(); -1 = not verified / lineage broken
+        int32_t chain_n_off   = 0;     // offered after the caps, set by accept()
+        int32_t chain_wild    = 0;     // wildcards used along this lineage
+        bool    chain_resumed = false; // the chain is a resumed tail
+
+        common_speculative_ngram_policy_stats st;
     };
 
     std::vector<seq_info> sinfos;
@@ -2217,8 +2299,21 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_MOD, n_seq, params.ngram_mod.n_max)
         , params(params.ngram_mod)
         , mod(params.ngram_mod.n_match, params.ngram_mod.size)
-        , verbose(std::getenv("LLAMA_TRACE") != nullptr) {
+        , verbose(std::getenv("LLAMA_TRACE") != nullptr)
+        , auto_on(params.ngram_auto)
+        , resume_n(std::max(0, params.ngram_resume)) {
         static_assert(sizeof(llama_token) == sizeof(common_ngram_mod::entry_t));
+
+        // (A) bounds, see the comment at AUTO_STEP
+        {
+            const int32_t ceil_cfg = params.ngram_draft_n_max > 0 ? params.ngram_draft_n_max : params.draft.n_max;
+            auto_n_max = std::max(1, std::min(params.ngram_mod.n_max, ceil_cfg > 0 ? ceil_cfg : params.ngram_mod.n_max));
+            auto_n_min = std::max(1, std::min(auto_n_max, std::min(params.ngram_mod.n_min > 0 ? params.ngram_mod.n_min : 12, 12)));
+        }
+        if (auto_on || resume_n > 0) {
+            SPC_INF("ngram-mod chain policies: auto %s (cap %d..%d, step %d, start %d), resume %d (min tail %d)\n",
+                    auto_on ? "on" : "off", auto_n_min, auto_n_max, AUTO_STEP, auto_cap_init(), resume_n, RESUME_MIN);
+        }
 
         SPC_TRC("%s", "adding speculative implementation 'ngram-mod'\n");
         SPC_TRC("- n_match=%d, n_max=%d, n_min=%d\n",
@@ -2347,6 +2442,18 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         sinfo.i_last_alt = 0;
         sinfo.tried      = false;
+
+        // (A)/(B): per request, like the backoff
+        sinfo.cap_cur     = auto_cap_init();
+        sinfo.cap_used    = 0;
+        sinfo.ema_acc     = sinfo.cap_cur/1.5;
+        sinfo.cap_hist.assign(auto_n_max + 1, 0);
+        sinfo.n_cap_bound = 0;
+        sinfo.whole_ema   = WHOLE_INIT;
+        sinfo.whole_ema_prior = WHOLE_INIT;
+        chain_drop(sinfo);
+        sinfo.st = {};
+
         if (alt && prompt.size() > alt->get_n()) {
             for (size_t i = 0; i < prompt.size() - alt->get_n(); ++i) {
                 alt->add(prompt.data() + i);
@@ -2435,12 +2542,14 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         }
         result[n - 1] = dparams.id_last;
 
+        bool found = true;
         for (int i = 0; i < params.n_max; ++i) {
             const llama_token token = mod.get(result.data() + i);
             if (token == common_ngram_mod::EMPTY) {
                 if (i < params.n_min) {
                     result.clear();
-                    return;
+                    found = false;
+                    break;
                 }
 
                 result.resize(n + i);
@@ -2449,13 +2558,153 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
             result[n + i] = token;
         }
 
-        // only return the m tokens that were drafted
-        for (size_t i = 0; n + i < result.size(); ++i) {
-            result[i] = result[n + i];
+        if (!found) {
+            // (B): the table does not know the corrected history - keep walking the old chain past the wildcard
+            if (!try_resume(sinfo, prompt, dparams.id_last, result)) {
+                chain_drop(sinfo);
+                return;
+            }
+        } else {
+            // only return the m tokens that were drafted
+            for (size_t i = 0; n + i < result.size(); ++i) {
+                result[i] = result[n + i];
+            }
+            result.resize(result.size() - n);
+
+            // a fresh chain from the table starts a new lineage
+            if (resume_n > 0 && !result.empty()) {
+                sinfo.chain         = result;
+                sinfo.chain_pos     = cur_len + 1;
+                sinfo.chain_n_acc   = -1;
+                sinfo.chain_n_off   = 0;
+                sinfo.chain_wild    = 0;
+                sinfo.chain_resumed = false;
+            }
         }
-        result.resize(result.size() - n);
 
         sinfo.drafted = !result.empty();
+
+        if (sinfo.drafted && auto_on) {
+            sinfo.cap_used = sinfo.cap_cur;
+            sinfo.cap_hist[std::min(sinfo.cap_cur, auto_n_max)]++;
+        }
+    }
+
+    int32_t auto_cap_init() const {
+        return auto_round(auto_n_max/2);
+    }
+
+    // round up to AUTO_STEP and clamp to [auto_n_min, auto_n_max]
+    int32_t auto_round(int32_t v) const {
+        v = ((std::max(v, 1) + AUTO_STEP - 1)/AUTO_STEP)*AUTO_STEP;
+        return std::max(auto_n_min, std::min(auto_n_max, v));
+    }
+
+    static void chain_drop(seq_info & sinfo) {
+        sinfo.chain.clear();
+        sinfo.chain_pos     = 0;
+        sinfo.chain_n_acc   = -1;
+        sinfo.chain_n_off   = 0;
+        sinfo.chain_wild    = 0;
+        sinfo.chain_resumed = false;
+    }
+
+    // (B) see the comment at AUTO_STEP. on success `result` holds the resumed tail and the lineage moves to it
+    bool try_resume(seq_info & sinfo, const llama_tokens & prompt, llama_token id_last, llama_tokens & result) {
+        result.clear();
+
+        if (resume_n <= 0 || sinfo.chain.empty() || sinfo.chain_n_acc <= 0) {
+            return false;
+        }
+
+        const size_t k   = (size_t) sinfo.chain_n_acc;
+        const size_t pos = sinfo.chain_pos;
+
+        // whole landing (k == offered) is not a wildcard case, and the history must be exactly
+        // prompt[..pos) ++ chain[0, k) with the target's token at chain index k as id_last
+        if ((int32_t) k >= sinfo.chain_n_off || k >= sinfo.chain.size() || prompt.size() != pos + k || pos == 0) {
+            return false;
+        }
+        for (size_t i = 0; i < k; ++i) {
+            if (prompt[pos + i] != sinfo.chain[i]) {
+                return false;
+            }
+        }
+        if (id_last == sinfo.chain[k]) {
+            return false;
+        }
+
+        if (sinfo.chain_wild >= resume_n) {
+            return false;
+        }
+        if (sinfo.whole_ema_prior < 0.5) {
+            sinfo.st.resume_denied++;
+            return false;
+        }
+        if (sinfo.chain.size() - (k + 1) < (size_t) RESUME_MIN) {
+            sinfo.st.resume_short++;
+            return false;
+        }
+
+        result.assign(sinfo.chain.begin() + k + 1, sinfo.chain.end());
+
+        llama_tokens tail = result;
+        sinfo.chain         = std::move(tail);
+        sinfo.chain_pos     = prompt.size() + 1;
+        sinfo.chain_n_acc   = -1;
+        sinfo.chain_n_off   = 0;
+        sinfo.chain_wild   += 1;
+        sinfo.chain_resumed = true;
+
+        sinfo.st.resume_offered++;
+
+        if (verbose) {
+            SPC_TRC("ngram-mod resume: wildcard at %zu of the old chain, tail %zu, wildcards %d/%d, whole_ema %.2f (prior)\n",
+                    k, result.size(), sinfo.chain_wild, resume_n, sinfo.whole_ema_prior);
+        }
+
+        return true;
+    }
+
+    int32_t n_cap_seq(llama_seq_id seq_id) const override {
+        return auto_on ? sinfos[seq_id].cap_cur : 0;
+    }
+
+    common_speculative_ngram_policy_stats policy_stats(llama_seq_id seq_id) const {
+        const auto & sinfo = sinfos[seq_id];
+
+        common_speculative_ngram_policy_stats res = sinfo.st;
+        res.auto_on   = auto_on;
+        res.resume_n  = resume_n;
+        res.whole_ema = sinfo.whole_ema;
+
+        if (auto_on) {
+            res.cap_cur   = sinfo.cap_cur;
+            res.cap_bound = sinfo.n_cap_bound;
+
+            int32_t n = 0;
+            for (int32_t v : sinfo.cap_hist) {
+                n += v;
+            }
+            res.cap_n = n;
+
+            int32_t seen = 0;
+            for (int32_t c = 0; c < (int32_t) sinfo.cap_hist.size(); ++c) {
+                if (sinfo.cap_hist[c] == 0) {
+                    continue;
+                }
+                if (seen == 0) {
+                    res.cap_min = c;
+                }
+                if (seen < (n + 1)/2 && seen + sinfo.cap_hist[c] >= (n + 1)/2) {
+                    res.cap_median = c;
+                }
+                seen += sinfo.cap_hist[c];
+                res.cap_max = c;
+            }
+        }
+
+        return res;
     }
 
     bool process(const common_batch & /*batch*/, const std::vector<int8_t> & /*keep*/, const std::vector<common_speculative_seed> & /*next*/) override {
@@ -2527,6 +2776,8 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
         if (is_other) {
+            // another impl drafted this step - the (B) lineage is broken
+            chain_drop(sinfos[seq_id]);
             return;
         }
 
@@ -2538,6 +2789,52 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         const int32_t n_offered = n_offered_last[seq_id];
         if (sinfo.drafted && n_offered > 0) {
             sinfo.drafted = false;
+
+            const bool whole = n_accepted >= n_offered;
+
+            sinfo.whole_ema_prior = sinfo.whole_ema;
+            sinfo.whole_ema += WHOLE_ALPHA*((whole ? 1.0 : 0.0) - sinfo.whole_ema);
+
+            // (B) bookkeeping
+            sinfo.chain_n_acc = n_accepted;
+            sinfo.chain_n_off = n_offered;
+            if (sinfo.chain_resumed) {
+                sinfo.st.resume_tok_off  += n_offered;
+                sinfo.st.resume_tok_land += n_accepted;
+                sinfo.st.resume_whole    += whole ? 1 : 0;
+                if (n_accepted == 0) {
+                    // the wildcard guess was wrong right away - stop resuming this chain
+                    sinfo.st.resume_dead++;
+                    chain_drop(sinfo);
+                }
+            }
+
+            // (A) cap update, see the comment at AUTO_STEP
+            if (auto_on) {
+                sinfo.ema_acc += AUTO_ALPHA*(n_accepted - sinfo.ema_acc);
+
+                const bool    bound = n_built_last[seq_id] > n_offered && n_offered >= sinfo.cap_used;
+                const int32_t e15   = (int32_t) std::lround(1.5*sinfo.ema_acc);
+                const int32_t prev  = sinfo.cap_cur;
+
+                sinfo.n_cap_bound += bound ? 1 : 0;
+
+                int32_t next;
+                if (!whole) {
+                    next = n_accepted + AUTO_STEP;
+                } else if (bound) {
+                    next = std::max((sinfo.cap_used*3 + 1)/2, e15);
+                } else {
+                    next = std::max(sinfo.cap_cur, e15);
+                }
+                sinfo.cap_cur = auto_round(next);
+
+                if (verbose) {
+                    SPC_TRC("ngram-mod auto: seq %d offered %d accepted %d built %d%s -> cap %d -> %d (ema %.1f)\n",
+                            seq_id, n_offered, n_accepted, n_built_last[seq_id], bound ? " (cap bound)" : "",
+                            prev, sinfo.cap_cur, sinfo.ema_acc);
+                }
+            }
 
             const double f_acc = (double)n_accepted / (double)n_offered;
             if (f_acc < 0.25) {
@@ -3755,8 +4052,16 @@ void common_speculative_draft(common_speculative * spec) {
                 }
 
                 // n-gram drafts are free to build, they get their own cap when the caller sets one
-                const int32_t cap = (is_ngram && dp.n_max_ngram > 0)
+                int32_t cap = (is_ngram && dp.n_max_ngram > 0)
                     ? dp.n_max_ngram : dp.n_max;
+
+                // the impl's own per-seq cap (ngram-mod --spec-ngram-auto) can only shorten it
+                {
+                    const int32_t cap_seq = impl->n_cap_seq(seq_id);
+                    if (cap_seq > 0) {
+                        cap = cap > 0 ? std::min(cap, cap_seq) : cap_seq;
+                    }
+                }
 
                 if (cap > 0) {
                     if ((int) result.size() > cap) {
@@ -3899,6 +4204,19 @@ common_speculative_mtp_stats common_speculative_get_mtp_stats(const common_specu
     for (const auto & impl : spec->impls) {
         if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
             return static_cast<const common_speculative_impl_draft_mtp *>(impl.get())->conf_stats[seq_id];
+        }
+    }
+    return {};
+}
+
+common_speculative_ngram_policy_stats common_speculative_get_ngram_policy_stats(const common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr) {
+        return {};
+    }
+
+    for (const auto & impl : spec->impls) {
+        if (impl->type == COMMON_SPECULATIVE_TYPE_NGRAM_MOD) {
+            return static_cast<const common_speculative_impl_ngram_mod *>(impl.get())->policy_stats(seq_id);
         }
     }
     return {};

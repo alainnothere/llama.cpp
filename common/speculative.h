@@ -245,6 +245,34 @@ void common_speculative_mtp_stats_add(common_speculative_mtp_stats & st, const s
 // zeros if there is no draft-mtp implementation
 common_speculative_mtp_stats common_speculative_get_mtp_stats(const common_speculative * spec, llama_seq_id seq_id);
 
+// 2026-10-20: per-request state of the ngram-mod chain policies (--spec-ngram-auto, --spec-ngram-resume),
+// reset by begin(). zeros if there is no ngram-mod implementation
+struct common_speculative_ngram_policy_stats {
+    bool    auto_on  = false;
+    int32_t resume_n = 0;
+
+    // --spec-ngram-auto: cap applied to the chains this impl offered (one sample per offered chain)
+    int32_t cap_cur    = 0; // cap the next chain will get
+    int32_t cap_min    = 0;
+    int32_t cap_median = 0;
+    int32_t cap_max    = 0;
+    int32_t cap_n      = 0; // chains sampled
+    int32_t cap_bound  = 0; // chains the cap cut (built longer than offered)
+
+    double whole_ema = 0.0; // landed-whole EMA that gates the wildcards
+
+    // --spec-ngram-resume
+    int32_t resume_offered  = 0; // resumed tails offered
+    int64_t resume_tok_off  = 0; // their tokens, after the cap
+    int64_t resume_tok_land = 0; // accepted tokens of those tails
+    int32_t resume_whole    = 0; // tails that landed whole
+    int32_t resume_dead     = 0; // tails rejected at their first token
+    int32_t resume_denied   = 0; // wildcard possible but the landed-whole history was below 0.5
+    int32_t resume_short    = 0; // wildcard possible but the remaining tail was too short to be worth a verify
+};
+
+common_speculative_ngram_policy_stats common_speculative_get_ngram_policy_stats(const common_speculative * spec, llama_seq_id seq_id);
+
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);

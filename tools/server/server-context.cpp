@@ -658,6 +658,10 @@ struct server_spec_stats_writer {
         config["ngram_mod_reset_occupancy"] = f2d(sp.ngram_mod.reset_occupancy);
         config["ngram_draft_n_max"] = sp.ngram_draft_n_max;
         config["shadow_n"]          = sp.ngram_mod.shadow_n;
+        // 2026-10-20: ngram-mod chain policies (--spec-ngram-auto / --spec-ngram-resume), the A/B arms of
+        // run_ngram_ab.sh; spec_stats.py lists both in CONFIG_KEYS so the arms group by themselves
+        config["ngram_auto"]        = sp.ngram_auto;
+        config["ngram_resume"]      = sp.ngram_resume;
         for (const auto & [name, m] : { std::make_pair("ngram_simple", &sp.ngram_simple), std::make_pair("ngram_map_k", &sp.ngram_map_k), std::make_pair("ngram_map_k4v", &sp.ngram_map_k4v) }) {
             config[std::string(name) + "_size_n"]   = m->size_n;
             config[std::string(name) + "_size_m"]   = m->size_m;
@@ -1362,6 +1366,21 @@ struct server_slot {
                     st.rows_str().c_str());
         }
 
+        // 2026-10-20: ngram-mod chain policies, next to its "draft by impl" line. cap = the --spec-ngram-auto cap
+        // per offered chain (min/median/max over the request, bound = chains the cap cut); resume = wildcard tails
+        // of --spec-ngram-resume (tokens landed/offered, whole, dead = rejected at the first token, denied = landed-
+        // whole history < 0.5, short = tail < 4). compare with the "chain truth" line below
+        {
+            const auto np = common_speculative_get_ngram_policy_stats(spec, id);
+            if (np.auto_on || np.resume_n > 0) {
+                SLT_INF(*this, "ngram policy: auto %s | cap now %d | cap min %d median %d max %d over %d chains | cap bound %d | whole ema %.2f | resume %d | resumes %d | tokens landed %lld/%lld | whole %d | dead %d | denied %d | short %d\n",
+                        np.auto_on ? "on" : "off", np.cap_cur, np.cap_min, np.cap_median, np.cap_max, np.cap_n, np.cap_bound,
+                        np.whole_ema, np.resume_n, np.resume_offered,
+                        (long long) np.resume_tok_land, (long long) np.resume_tok_off,
+                        np.resume_whole, np.resume_dead, np.resume_denied, np.resume_short);
+            }
+        }
+
         if (spec_n_steps_nodraft > 0) {
             SLT_INF(*this, "draft by impl: none | steps %d | step %.1f ms\n",
                     spec_n_steps_nodraft, spec_t_nodraft_us/(double) spec_n_steps_nodraft/1000.0);
@@ -1575,6 +1594,33 @@ struct server_slot {
             });
         }
         j["impls"] = impls;
+
+        // 2026-10-20: ngram-mod chain policy state of this request (see the "ngram policy:" log line)
+        {
+            const auto np = common_speculative_get_ngram_policy_stats(spec, id);
+            if (np.auto_on || np.resume_n > 0) {
+                j["ngram_policy"] = json::object({
+                    {"auto",            np.auto_on},
+                    {"cap_cur",         np.cap_cur},
+                    {"cap_min",         np.cap_min},
+                    {"cap_median",      np.cap_median},
+                    {"cap_max",         np.cap_max},
+                    {"cap_n",           np.cap_n},
+                    {"cap_bound",       np.cap_bound},
+                    {"whole_ema",       np.whole_ema},
+                    {"resume_n",        np.resume_n},
+                    {"resume_offered",  np.resume_offered},
+                    {"resume_tok_off",  np.resume_tok_off},
+                    {"resume_tok_land", np.resume_tok_land},
+                    {"resume_whole",    np.resume_whole},
+                    {"resume_dead",     np.resume_dead},
+                    {"resume_denied",   np.resume_denied},
+                    {"resume_short",    np.resume_short},
+                });
+            } else {
+                j["ngram_policy"] = nullptr;
+            }
+        }
 
         // draft-mtp confidence
         {

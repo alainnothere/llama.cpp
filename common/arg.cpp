@@ -4258,6 +4258,31 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.ngram_draft_n_max = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_NGRAM_DRAFT_N_MAX"));
+    // 2026-10-20: the two ngram-mod chain policies, default off so the fixed --spec-ngram-draft-n-max cap stays the
+    // fallback; the measurements behind them are at common_speculative_impl_ngram_mod in common/speculative.cpp
+    add_opt(common_arg(
+        {"--spec-ngram-auto"},
+        string_format("ngram-mod only: tune the offered chain length per slot from its landing history, TCP-style, with --spec-ngram-draft-n-max "
+                      "(or --spec-draft-n-max) as the ceiling and min(--spec-ngram-mod-n-min, 12) as the floor: a chain that lands whole at the cap raises it x1.5, "
+                      "a partial landing drops it to the accepted length + 4. starts at half the ceiling (default: %s)",
+                      params.speculative.ngram_auto ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.speculative.ngram_auto = true;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_NGRAM_AUTO"));
+    add_opt(common_arg(
+        {"--spec-ngram-resume"}, "N",
+        string_format("ngram-mod only: when a chain is rejected part way and the table has no chain for the corrected history, "
+                      "offer the rest of the old chain past the corrected token (a wildcard), at most N times per original chain, "
+                      "only while at least half of the slot's recent chains landed whole (default: %d, 0 = off, 1 recommended)",
+                      params.speculative.ngram_resume),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value, expected 0 or a positive number");
+            }
+            params.speculative.ngram_resume = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_NGRAM_RESUME"));
     add_opt(common_arg(
         {"--spec-stats-file"}, "FNAME",
         "append one JSON line per completed request with the speculative decoding stats printed at release "
