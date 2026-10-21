@@ -168,19 +168,16 @@ int main() {
         assert(st.resume_offered == 1 && st.resume_denied == 1 && st.resume_tok_land == 4 && st.resume_tok_off == 21);
     }
 
-    // (A): start at 32/2 = 16, raise x1.5 on a whole landing the cap cut (16 -> 24 -> 32), hold at the ceiling,
-    // drop to accepted + 4 rounded up to 4 on a partial landing (5 -> 12)
+    // (A): start at the floor (min(n_min, 12) = 4 here) as a probe, jump to the ceiling on a whole landing the cap
+    // cut (4 -> 32), hold at the ceiling while chains land whole, drop to accepted + 4 rounded up to 4 on a partial
+    // landing (9 -> 13 -> 16)
     {
-        driver d(true, 0, target_with({{290, X}})); // hist 210 -> 227 -> 252 -> 285, the 4th chain hits X at index 5
+        driver d(true, 0, target_with({{290, X}})); // hist 210 -> 215 -> 248 -> 281, the 4th chain hits X at index 9
 
-        assert(d.st().cap_cur == 16);
+        assert(d.st().cap_cur == 4);
 
-        assert(d.draft_once().size() == 16);
-        assert(d.verify() == 16);
-        assert(d.st().cap_cur == 24);
-
-        assert(d.draft_once().size() == 24);
-        assert(d.verify() == 24);
+        assert(d.draft_once().size() == 4);
+        assert(d.verify() == 4);
         assert(d.st().cap_cur == 32);
 
         assert(d.draft_once().size() == 32);
@@ -188,15 +185,57 @@ int main() {
         assert(d.st().cap_cur == 32);
 
         assert(d.draft_once().size() == 32);
-        assert(d.verify() == 5);
+        assert(d.verify() == 32);
+        assert(d.st().cap_cur == 32);
+
+        assert(d.draft_once().size() == 32);
+        assert(d.verify() == 9);
 
         const auto st = d.st();
-        assert(st.cap_cur == 12);
-        assert(st.cap_n == 4 && st.cap_min == 16 && st.cap_median == 24 && st.cap_max == 32);
-        assert(st.cap_bound == 2);
+        assert(st.cap_cur == 16);
+        assert(st.cap_n == 4 && st.cap_min == 4 && st.cap_median == 32 && st.cap_max == 32);
+        assert(st.cap_bound == 1);
 
         assert(d.draft_once().empty());
         d.verify();
+    }
+
+    // backoff: three chains in a row landing under a third of the offer -> 16 draft calls skipped, then 32, then 64
+    // and it stays at 64. runs without auto so every offer is the full 32. X replaces every 11th token of the
+    // generated text, so every chain lands 0-10 of 32 (< 1/3); while X sits inside the 4-token lookup key the table
+    // has nothing for it and the draft is empty on its own (up to 4 calls), which is why the gaps are measured as
+    // "empty calls before the next chain" and compared against cooldown .. cooldown + 4. the period is 11, not 10:
+    // 10 divides the 200-token cycle, so in the third copy every X sat at an S offset the table had already learned
+    // from the second copy and the chains landed whole through them
+    {
+        std::vector<std::pair<size_t, llama_token>> subs;
+        for (size_t p = 210; p < 600; p += 11) {
+            subs.push_back({p, X});
+        }
+        driver d(false, 0, target_with(subs));
+
+        // one chain of 32 that lands under a third, after at most `slack` empty calls (key still holding an X)
+        auto bad_round = [&](int slack) {
+            int gap = 0;
+            while (d.draft_once().empty()) {
+                d.verify();
+                gap++;
+                assert(gap <= slack);
+            }
+            assert(d.draft.size() == 32);
+            const int k = d.verify();
+            assert(3*k < 32);
+            return gap;
+        };
+
+        bad_round(0); bad_round(4); bad_round(4);     // strike 1 -> cooldown 16
+        assert(bad_round(16 + 4) >= 16);
+        bad_round(4); bad_round(4);                   // strike 2 -> cooldown 32
+        assert(bad_round(32 + 4) >= 32);
+        bad_round(4); bad_round(4);                   // strike 3 -> cooldown 64
+        assert(bad_round(64 + 4) >= 64);
+        bad_round(4); bad_round(4);                   // strike 4 -> still 64, not 128
+        assert(bad_round(64 + 4) >= 64);
     }
 
     printf("test-ngram-policy: OK\n");

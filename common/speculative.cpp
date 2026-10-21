@@ -2205,9 +2205,20 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     // (A) per seq cap, applied through n_cap_seq() by common_speculative_draft() (so chain truth still sees the
     //     whole built chain). after every verified chain of this impl:
     //       partial (n_acc < offered)          -> cap = n_acc + AUTO_STEP
-    //       whole and the cap cut the chain    -> cap = max(1.5 x cap, 1.5 x EMA_acc)   (multiplicative raise)
+    //       whole and the cap cut the chain    -> cap = auto_n_max                      (jump to the ceiling)
     //       whole, the table ended the chain   -> cap = max(cap, 1.5 x EMA_acc)         (no evidence for more)
-    //     rounded up to AUTO_STEP, clamped to [auto_n_min, auto_n_max]; starts at auto_n_max/2.
+    //     rounded up to AUTO_STEP, clamped to [auto_n_min, auto_n_max]; starts at auto_n_min.
+    //     2026-10-21 "probe" revision (was: start at auto_n_max/2, raise x1.5 per whole landing, i.e. four whole
+    //     chains to climb 12 -> 48). production spec_stats.jsonl, 768 requests, 5454 n-gram steps at cap 33-64:
+    //     landed 0: 846, 1-4: 1319, 5-8: 696, 9-16: 747, 17-32: 859, 33-48: 964, 49+: 23. bimodal: a chain is
+    //     either real or dead by token four, so one whole landing of a short probe is strong evidence and one
+    //     dead chain should cost a short verify (~85 ms at 12 rows) instead of a full one (~318 ms mean at
+    //     34 rows = three MTP steps = ~10 MTP-landed tokens). the dead chains sit inside ordinary requests
+    //     (requests with 5+ n-gram steps: 41 mostly good, 19 mostly dead, 236 mixed), so a per-request
+    //     policy is too slow and this per-step one is the right shape. the x1.5 climb was A/B'd only on
+    //     regurgitation (95% land whole, nothing to adapt) and was neutral there; the mixed case is the
+    //     owed measurement. ceiling of the whole thing: the <=4-landing steps are 3.7% of all step time.
+    //     the whole-but-table-ended rule is untouched: no evidence the text repeats further.
     //     auto_n_max = min(--spec-ngram-mod-n-max, --spec-ngram-draft-n-max or else --spec-draft-n-max).
     //     auto_n_min = min(--spec-ngram-mod-n-min, 12): the spec said "n_min or 12", but production runs n_min 48
     //     (the --spec-default build threshold) with cap 48, which would pin the auto cap to 48 and make (A) a no-op;
@@ -2249,7 +2260,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         // the offered one, n_offered_last on the base class - the common draft loop may truncate it)
         bool drafted = false;
 
-        // consecutive accept rounds with low acceptance fraction (< 0.25)
+        // consecutive accept rounds with low acceptance fraction (< 1/3)
         int n_low = 0;
 
         // draft calls to skip after a low acceptance streak - the shared table is left alone,
@@ -2591,7 +2602,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     }
 
     int32_t auto_cap_init() const {
-        return auto_round(auto_n_max/2);
+        return auto_n_min; // the probe: bet small, raise to the ceiling after one whole landing (comment at AUTO_STEP)
     }
 
     // round up to AUTO_STEP and clamp to [auto_n_min, auto_n_max]
@@ -2823,7 +2834,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
                 if (!whole) {
                     next = n_accepted + AUTO_STEP;
                 } else if (bound) {
-                    next = std::max((sinfo.cap_used*3 + 1)/2, e15);
+                    next = auto_n_max; // the probe landed whole and the cap cut it: the text repeats, go all in
                 } else {
                     next = std::max(sinfo.cap_cur, e15);
                 }
@@ -2836,11 +2847,20 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
                 }
             }
 
+            // 2026-10-21: was f_acc < 0.25, five strikes, cooldown 16 doubling to 1024. production (spec_stats
+            // 768 requests): an n-gram step is ~318 ms landing 13.2 vs MTP 95 ms landing 3.2, so break-even is
+            // ~11 of 34 offered = a third, and a quarter counted 40 ms/token chains as fine. five bad chains
+            // before reacting is ~1.5 s and ~50 tokens, the damage the backoff exists to avoid. 1024 skipped
+            // draft calls is ~3300 tokens with the table gagged and nothing wakes it early (strikes reset only
+            // on a good landing, which cannot happen in cooldown); at 44% occupancy a 12-chain of pure
+            // collisions is ~1 in 20000, so the "keeps guessing wrong forever" case the doubling defends
+            // against does not occur on this table. with --spec-ngram-auto the first chain after a cooldown
+            // is a probe, so the re-try costs ~85 ms.
             const double f_acc = (double)n_accepted / (double)n_offered;
-            if (f_acc < 0.25) {
+            if (f_acc < 1.0/3) {
                 sinfo.n_low++;
-                if (sinfo.n_low >= 5) {
-                    sinfo.cooldown = std::min(16 << std::min(sinfo.strikes, 6), 1024);
+                if (sinfo.n_low >= 3) {
+                    sinfo.cooldown = std::min(16 << std::min(sinfo.strikes, 2), 64);
 
                     if (verbose) {
                         SPC_TRC("low acceptance streak (%d) - seq %d skips %d draft calls (strike %d)\n",

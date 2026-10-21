@@ -4263,8 +4263,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--spec-ngram-auto"},
         string_format("ngram-mod only: tune the offered chain length per slot from its landing history, TCP-style, with --spec-ngram-draft-n-max "
-                      "(or --spec-draft-n-max) as the ceiling and min(--spec-ngram-mod-n-min, 12) as the floor: a chain that lands whole at the cap raises it x1.5, "
-                      "a partial landing drops it to the accepted length + 4. starts at half the ceiling (default: %s)",
+                      "(or --spec-draft-n-max) as the ceiling and min(--spec-ngram-mod-n-min, 12) as the floor: a chain that lands whole at the cap raises it to the ceiling, "
+                      "a partial landing drops it to the accepted length + 4. starts at the floor, so the first chain of a request is a cheap probe (default: %s)",
                       params.speculative.ngram_auto ? "enabled" : "disabled"),
         [](common_params & params) {
             params.speculative.ngram_auto = true;

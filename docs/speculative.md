@@ -186,7 +186,7 @@ Some characteristics:
 
 Currently, a single hash pool is shared across all server slots, so different requests can benefit from each other.
 
-The pool is never wiped by default. `--spec-ngram-mod-reset-occupancy F` restores the old behaviour of wiping it at the start of a request once more than the fraction `F` of its slots is used, and `--spec-ngram-mod-size N` sets the number of slots (4 bytes each). A slot that keeps getting its drafts rejected does not wipe the shared pool either: it stops drafting from it for a while (16 draft calls, doubling up to 1024 on repeated streaks) and lets the next speculative type take the turn.
+The pool is never wiped by default. `--spec-ngram-mod-reset-occupancy F` restores the old behaviour of wiping it at the start of a request once more than the fraction `F` of its slots is used, and `--spec-ngram-mod-size N` sets the number of slots (4 bytes each). A slot that keeps getting its drafts rejected does not wipe the shared pool either: it stops drafting from it for a while (after three chains landing under a third of what was offered: 16 draft calls, doubling up to 64 on repeated streaks) and lets the next speculative type take the turn.
 
 With `--spec-ngram-mod-cache FNAME` the pool is loaded at startup and written back on graceful shutdown, so it survives server restarts. A missing file starts an empty pool; a file built with a different `--spec-ngram-mod-n-match` or `--spec-ngram-mod-size` is ignored and replaced on shutdown.
 
