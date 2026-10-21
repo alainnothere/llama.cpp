@@ -5004,6 +5004,35 @@ bool llama_memory_seq_rm(
     return mem->seq_rm(seq_id, p0, p1);
 }
 
+// the recurrent half of a memory, nullptr when there is none (the attention half of a hybrid always removes by range)
+static const llama_memory_recurrent * llama_memory_get_recr(llama_memory_t mem) {
+    if (auto * h = dynamic_cast<const llama_memory_hybrid *>(mem)) {
+        return h->get_mem_recr();
+    }
+    if (auto * hi = dynamic_cast<const llama_memory_hybrid_iswa *>(mem)) {
+        return hi->get_mem_recr();
+    }
+    return dynamic_cast<const llama_memory_recurrent *>(mem);
+}
+
+bool llama_memory_rs_has_prebatch(llama_memory_t mem) {
+    const auto * recr = mem ? llama_memory_get_recr(mem) : nullptr;
+
+    return recr != nullptr && recr->has_rs_pre();
+}
+
+bool llama_memory_rs_can_rollback_to(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+             llama_pos p0) {
+    const auto * recr = mem ? llama_memory_get_recr(mem) : nullptr;
+    if (recr == nullptr) {
+        return false;
+    }
+
+    return recr->can_rollback_to(seq_id, p0);
+}
+
 void llama_memory_seq_cp(
         llama_memory_t mem,
           llama_seq_id seq_id_src,

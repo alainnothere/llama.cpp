@@ -406,6 +406,10 @@ struct common_params_speculative {
     // cap for n-gram drafts, independent of draft.n_max and the auto tuner (-1 = same cap as the draft model)
     int32_t ngram_draft_n_max = -1;
 
+    // recurrent rollback window (--spec-rs-depth), -1 = max(draft.n_max, ngram_draft_n_max) as before.
+    // drafts longer than the window roll back through the pre-ubatch plane plus a replay, not a host checkpoint
+    int32_t rs_depth = -1;
+
     // 2026-10-20 ngram-mod chain policies, both off by default for the A/B (see common_speculative_impl_ngram_mod
     // in common/speculative.cpp for the measured numbers behind them):
     // ngram_auto   (--spec-ngram-auto): per-seq offered chain length follows the landing history, ceiling ngram_draft_n_max
@@ -426,6 +430,10 @@ struct common_params_speculative {
     }
 
     uint32_t need_n_rs_seq() const {
+        if (rs_depth >= 0) {
+            return (uint32_t) rs_depth;
+        }
+
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });

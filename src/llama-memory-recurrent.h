@@ -70,7 +70,8 @@ public:
     uint32_t size = 0; // total number of cells, shared across all sequences
     uint32_t used = 0; // used cells (i.e. at least one seq_id)
 
-    // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
+    // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups,
+    // plus one pre-ubatch group (index n_rs_seq + 1) when n_rs_seq > 0, see rs_pre_pos
     uint32_t n_rs_seq = 0;
 
     // per-seq rollback index
@@ -86,7 +87,27 @@ public:
     // disk-cache restore would select a group still holding another prompt's state.
     std::vector<uint32_t> rs_depth;
 
+    // per-seq position of the state held by the pre-ubatch group (-1 = invalid).
+    // every ubatch copies each seq's input state (the row s_copy() selected, i.e. the state before this
+    // ubatch) into group n_rs_seq + 1, so a rollback to exactly the start of the last ubatch of a seq is a
+    // group select at any depth, also past n_rs_seq. this replaces the host checkpoint of the server for
+    // spec drafts longer than the window (2026-10-20, 27B: 157 MB blob, 66-110 ms per long verify step).
+    std::vector<llama_pos> rs_pre_pos;
+
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
+
+    // reset the pre-ubatch position of seq_id (all seqs when seq_id < 0)
+    void reset_rs_pre_pos(llama_seq_id seq_id);
+
+    // true when the pre-ubatch group is allocated and written by every graph
+    bool has_rs_pre() const;
+
+    // the rs_idx a partial rollback of seq_id to p0 (p0 > 0, p0 <= tail pos) would select, or -1 if none can serve it.
+    // no state changes - seq_rm() and can_rollback_to() share it so they cannot disagree
+    int32_t rollback_idx(llama_seq_id seq_id, llama_pos p0) const;
+
+    // true when seq_rm(seq_id, p0, -1) would succeed now
+    bool can_rollback_to(llama_seq_id seq_id, llama_pos p0) const;
 
     // set the valid rollback depth of seq_id to what the decode that just ran wrote
     void set_rs_depth(llama_seq_id seq_id, uint32_t depth);
@@ -198,6 +219,9 @@ public:
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
     ggml_tensor * get_p_l(int32_t il) const;
+
+    // first row of the pre-ubatch group in the state tensors, -1 when it does not exist
+    int64_t get_rs_pre_row() const;
 
     int32_t s_copy(int i) const;
 

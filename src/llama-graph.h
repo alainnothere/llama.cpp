@@ -1397,7 +1397,8 @@ struct llm_graph_context {
                uint32_t   rs_head,
                uint32_t   rs_size,
                 int32_t   rs_zero,
-            const llm_graph_get_rows_fn & get_state_rows = nullptr) const;
+            const llm_graph_get_rows_fn & get_state_rows = nullptr,
+                int64_t   rs_pre_row = -1) const;
 
     llm_graph_input_rs * build_rs_inp() const;
 

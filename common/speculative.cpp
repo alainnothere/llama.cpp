@@ -2223,8 +2223,13 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     //     auto_n_min = min(--spec-ngram-mod-n-min, 12): the spec said "n_min or 12", but production runs n_min 48
     //     (the --spec-default build threshold) with cap 48, which would pin the auto cap to 48 and make (A) a no-op;
     //     the prose case wants ~16. n_min stays the build threshold, the floor is only for the offered length.
-    //     the replay after a checkpoint restore calls accept() a second time with the replay's count (pre-existing
-    //     quirk shared with the backoff); on this target n_rs_seq is sized for the n-gram cap so restore is not hit.
+    //     restores (host checkpoint or pre-ubatch plane) call accept() with the REAL accepted count, before the
+    //     replay, and the replay step skips accept() (server spec_is_replay). fixed 2026-10-21: the replay used to be
+    //     the only accept(), scored with the replay's count = real + 1 (the target's correction counted as a draft
+    //     token), so a chain rejected only at its last token was taken as whole (probe jump to the ceiling) and the
+    //     backoff saw every deep landing one token better. dead while n_rs_seq covered the cap, live on every deep
+    //     partial landing once --spec-rs-depth puts the window below it. n_offered_last/n_built_last are untouched
+    //     by the replay (it does not draft), so the real count is scored against the original offer.
     //
     // (B) remember the last offered chain as built (before any cap) and its position. on the next draft_one(),
     //     when the table has no chain >= n_min for the true history, and the previous chain was accepted for

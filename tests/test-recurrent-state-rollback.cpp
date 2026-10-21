@@ -803,6 +803,232 @@ static test_status test_shared_seq_reserve(const common_params & params, llama_m
     return test_status::PASS;
 }
 
+// a context with a rollback window much shorter than the decodes below, so only the pre-ubatch plane reaches the batch start
+static llama_context_ptr make_ctx_prebatch(const common_params & params, llama_model * model, uint8_t fill, uint32_t n_seq_max) {
+    auto cparams = common_context_params_to_llama(params);
+    cparams.n_seq_max  = n_seq_max;
+    cparams.n_rs_seq   = 2;
+    cparams.n_ctx      = 128;
+    cparams.n_batch    = 128;
+    cparams.n_ubatch   = 32;
+    cparams.kv_unified = true;
+    return init_ctx(model, cparams, fill);
+}
+
+// decode tokens[p_begin, p_end) of seq as one batch, every row outputs
+static bool decode_span(llama_context * ctx, const std::vector<llama_token> & tokens, llama_pos p_begin, llama_pos p_end, llama_seq_id seq = 0) {
+    common_batch batch(ctx);
+    for (llama_pos pos = p_begin; pos < p_end; ++pos) {
+        batch.add(tokens[pos], pos, seq, true);
+    }
+    return llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
+}
+
+// compare the n rows of logits of two contexts bit-exact: both run the same batch shapes from the same state
+// (CPU and Vulkan, 2026-10-21). the dummy qwen35 barely depends on its state - without the plane write it is off
+// by only 6e-8 (nmse 5e-15) - so any tolerance would hide a missing write
+static bool compare_rows(llama_context * ctx_a, llama_context * ctx_b, int n, int n_vocab, const char * what) {
+    float  diff_max = 0.0f;
+    double nmse_max = 0.0;
+    for (int i = 0; i < n; ++i) {
+        const float * l_a = llama_get_logits_ith(ctx_a, i);
+        const float * l_b = llama_get_logits_ith(ctx_b, i);
+        if (l_a == nullptr || l_b == nullptr) {
+            LOG_ERR("%s: %s: missing logits at row %d\n", __func__, what, i);
+            return false;
+        }
+        for (int t = 0; t < n_vocab; ++t) {
+            diff_max = std::max(diff_max, logit_diff(l_a[t], l_b[t]));
+        }
+        nmse_max = std::max(nmse_max, nmse(l_a, l_b, n_vocab));
+    }
+    if (diff_max != 0.0f) {
+        LOG_ERR("%s: %s: logits mismatch (max diff %g, nmse %g)\n", __func__, what, (double) diff_max, nmse_max);
+        return false;
+    }
+    LOG_INF("%s: %s: matched (max diff %g, nmse %g)\n", __func__, what, (double) diff_max, nmse_max);
+    return true;
+}
+
+// Decode N tokens in one ubatch with n_rs_seq < N, roll back to the ubatch start (only the pre-ubatch plane can
+// serve it), replay the first k tokens and compare against a context that never went past the ubatch start.
+// Also: rollbacks inside the window keep using the per-token planes, and neither path composes with the other.
+static test_status test_prebatch_rollback(const common_params & params, llama_model * model, uint8_t fill) {
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
+    constexpr llama_pos n_pre = 6;  // first decode
+    constexpr llama_pos n_ub  = 10; // second decode, one ubatch, longer than the window
+    constexpr llama_pos k     = 4;  // replayed rows
+
+    llama_context_ptr ctx_roll = make_ctx_prebatch(params, model, fill, 1);
+    llama_context_ptr ctx_ref  = make_ctx_prebatch(params, model, fill, 1);
+    if (!ctx_roll || !ctx_ref) {
+        LOG_ERR("%s: failed to init contexts\n", __func__);
+        return test_status::FAIL;
+    }
+
+    llama_memory_t mem = llama_get_memory(ctx_roll.get());
+    const uint32_t n_rs_seq = llama_n_rs_seq(ctx_roll.get());
+    if (n_rs_seq == 0 || !llama_memory_rs_has_prebatch(mem)) {
+        LOG_INF("%s: skipping, no pre-ubatch plane (n_rs_seq = %u)\n", __func__, n_rs_seq);
+        return test_status::SKIP;
+    }
+    if ((llama_pos) n_rs_seq + 1 >= n_ub) {
+        LOG_ERR("%s: n_rs_seq %u does not leave the ubatch start outside the window\n", __func__, n_rs_seq);
+        return test_status::FAIL;
+    }
+
+    std::vector<llama_token> tokens(n_pre + n_ub);
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        tokens[i] = (llama_token) ((13*(uint32_t) i + 3) % (uint32_t) n_vocab);
+    }
+
+    if (!decode_span(ctx_roll.get(), tokens, 0, n_pre) || !decode_span(ctx_roll.get(), tokens, n_pre, n_pre + n_ub) ||
+        !decode_span(ctx_ref.get(),  tokens, 0, n_pre)) {
+        LOG_ERR("%s: prompt decode failed\n", __func__);
+        return test_status::FAIL;
+    }
+
+    // deeper than the window but not the ubatch start: nothing holds that state
+    if (llama_memory_rs_can_rollback_to(mem, 0, n_pre + 1) || llama_memory_seq_rm(mem, 0, n_pre + 1, -1)) {
+        LOG_ERR("%s: rollback to %d (inside the ubatch, past the window) was accepted\n", __func__, n_pre + 1);
+        return test_status::FAIL;
+    }
+    // the window itself still works through the per-token planes and is reported as such
+    if (!llama_memory_rs_can_rollback_to(mem, 0, n_pre + n_ub - (llama_pos) n_rs_seq)) {
+        LOG_ERR("%s: rollback of n_rs_seq is not reported as possible\n", __func__);
+        return test_status::FAIL;
+    }
+    if (!llama_memory_rs_can_rollback_to(mem, 0, n_pre)) {
+        LOG_ERR("%s: rollback to the ubatch start is not reported as possible\n", __func__);
+        return test_status::FAIL;
+    }
+    if (!llama_memory_seq_rm(mem, 0, n_pre, -1)) {
+        LOG_ERR("%s: rollback to the ubatch start (%d) was refused\n", __func__, n_pre);
+        return test_status::FAIL;
+    }
+    // a pre-ubatch select never composes with a further rollback
+    if (llama_memory_seq_rm(mem, 0, n_pre - 1, -1)) {
+        LOG_ERR("%s: rollback composed on top of a pre-ubatch select\n", __func__);
+        return test_status::FAIL;
+    }
+    if (llama_memory_seq_pos_max(mem, 0) != n_pre - 1) {
+        LOG_ERR("%s: pos_max %d after the rollback, expected %d\n", __func__, llama_memory_seq_pos_max(mem, 0), n_pre - 1);
+        return test_status::FAIL;
+    }
+
+    if (!decode_span(ctx_roll.get(), tokens, n_pre, n_pre + k) || !decode_span(ctx_ref.get(), tokens, n_pre, n_pre + k)) {
+        LOG_ERR("%s: replay decode failed\n", __func__);
+        return test_status::FAIL;
+    }
+    if (!compare_rows(ctx_roll.get(), ctx_ref.get(), k, n_vocab, "pre-ubatch replay")) {
+        return test_status::FAIL;
+    }
+
+    // the replay rewrote the plane: its own start is reachable again, and the walk continues to match
+    if (!llama_memory_seq_rm(mem, 0, n_pre, -1) ||
+        !llama_memory_seq_rm(llama_get_memory(ctx_ref.get()), 0, n_pre, -1)) {
+        LOG_ERR("%s: second rollback to %d was refused\n", __func__, n_pre);
+        return test_status::FAIL;
+    }
+    if (!decode_span(ctx_roll.get(), tokens, n_pre, n_pre + n_ub) || !decode_span(ctx_ref.get(), tokens, n_pre, n_pre + n_ub)) {
+        LOG_ERR("%s: second replay decode failed\n", __func__);
+        return test_status::FAIL;
+    }
+    if (!compare_rows(ctx_roll.get(), ctx_ref.get(), n_ub, n_vocab, "second pre-ubatch replay")) {
+        return test_status::FAIL;
+    }
+
+    // inside the window: one token back, then one more composes (per-token planes), then the ubatch start is
+    // refused because a per-token rollback is pending - so the 1-token rollbacks did not use the pre plane
+    const llama_pos p_end = n_pre + n_ub;
+    if (!llama_memory_seq_rm(mem, 0, p_end - 1, -1) || !llama_memory_seq_rm(mem, 0, p_end - 2, -1)) {
+        LOG_ERR("%s: rollback inside the window was refused\n", __func__);
+        return test_status::FAIL;
+    }
+    if (llama_memory_rs_can_rollback_to(mem, 0, n_pre) || llama_memory_seq_rm(mem, 0, n_pre, -1)) {
+        LOG_ERR("%s: pre-ubatch select composed on top of a pending per-token rollback\n", __func__);
+        return test_status::FAIL;
+    }
+
+    // reference: walk straight to p_end - 2
+    if (!llama_memory_seq_rm(llama_get_memory(ctx_ref.get()), 0, p_end - 2, -1)) {
+        // the reference is in the same state as ctx_roll was, the same 2-token rollback must be accepted
+        LOG_ERR("%s: reference rollback inside the window was refused\n", __func__);
+        return test_status::FAIL;
+    }
+    for (llama_pos pos = p_end - 2; pos < p_end; ++pos) {
+        if (!decode_one(ctx_roll.get(), tokens[pos], pos) || !decode_one(ctx_ref.get(), tokens[pos], pos)) {
+            LOG_ERR("%s: window replay failed at %d\n", __func__, pos);
+            return test_status::FAIL;
+        }
+        if (!compare_rows(ctx_roll.get(), ctx_ref.get(), 1, n_vocab, "window replay")) {
+            return test_status::FAIL;
+        }
+    }
+
+    return test_status::PASS;
+}
+
+// seq_cp makes dst share the cell of src: the rollback bounds dst had before (per-token depth and pre-ubatch
+// position) describe a state that is gone and must not be used
+static test_status test_seq_cp_resets_rollback(const common_params & params, llama_model * model, uint8_t fill) {
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
+    llama_context_ptr ctx = make_ctx_prebatch(params, model, fill, 2);
+    if (!ctx) {
+        LOG_ERR("%s: failed to init context\n", __func__);
+        return test_status::FAIL;
+    }
+
+    llama_memory_t mem = llama_get_memory(ctx.get());
+    if (llama_n_rs_seq(ctx.get()) == 0 || !llama_memory_rs_has_prebatch(mem)) {
+        LOG_INF("%s: skipping, no pre-ubatch plane\n", __func__);
+        return test_status::SKIP;
+    }
+
+    std::vector<llama_token> tok0(16), tok1(16);
+    for (size_t i = 0; i < tok0.size(); ++i) {
+        tok0[i] = (llama_token) ((7*(uint32_t) i + 1) % (uint32_t) n_vocab);
+        tok1[i] = (llama_token) ((5*(uint32_t) i + 9) % (uint32_t) n_vocab);
+    }
+
+    // seq 1: full window and a pre-ubatch plane at 5. seq 0: its last decode is one token, so its deeper groups are stale
+    bool ok = decode_span(ctx.get(), tok1, 0, 6, 1) && decode_span(ctx.get(), tok1, 6, 16, 1);
+    ok = ok && decode_span(ctx.get(), tok0, 0, 11, 0) && decode_one(ctx.get(), tok0[11], 11, 0);
+    if (!ok) {
+        LOG_ERR("%s: prompt decode failed\n", __func__);
+        return test_status::FAIL;
+    }
+
+    llama_memory_seq_cp(mem, 0, 1, -1, -1);
+    llama_memory_seq_rm(mem, 0, -1, -1); // seq 1 now owns seq 0's old cell alone
+
+    if (llama_memory_seq_pos_max(mem, 1) != 11) {
+        LOG_ERR("%s: seq 1 pos_max %d after seq_cp, expected 11\n", __func__, llama_memory_seq_pos_max(mem, 1));
+        return test_status::FAIL;
+    }
+
+    // stale per-token depth of seq 1 would allow 1, its stale pre position 5 would allow 6
+    if (llama_memory_rs_can_rollback_to(mem, 1, 11) || llama_memory_seq_rm(mem, 1, 11, -1) ||
+        llama_memory_rs_can_rollback_to(mem, 1, 6)  || llama_memory_seq_rm(mem, 1, 6,  -1)) {
+        LOG_ERR("%s: seq_cp dst kept its old rollback bounds\n", __func__);
+        return test_status::FAIL;
+    }
+
+    // a decode of the copied seq re-validates both
+    if (!decode_span(ctx.get(), tok0, 12, 16, 1)) {
+        LOG_ERR("%s: decode after seq_cp failed\n", __func__);
+        return test_status::FAIL;
+    }
+    if (!llama_memory_rs_can_rollback_to(mem, 1, 15) || !llama_memory_rs_can_rollback_to(mem, 1, 12)) {
+        LOG_ERR("%s: rollback after a fresh decode is not possible\n", __func__);
+        return test_status::FAIL;
+    }
+
+    return test_status::PASS;
+}
+
 static test_status merge_status(test_status a, test_status b) {
     if (a == test_status::FAIL || b == test_status::FAIL) {
         return test_status::FAIL;
@@ -819,6 +1045,8 @@ struct test_results {
     test_status shared   = test_status::SKIP;
     test_status composed = test_status::SKIP;
     test_status restore  = test_status::SKIP;
+    test_status prebatch = test_status::SKIP;
+    test_status seq_cp   = test_status::SKIP;
 };
 
 // Run every test for an initialized model over both cache fills.
@@ -831,13 +1059,17 @@ static test_results run_tests(const common_params & params, llama_model * model)
         const test_status ss = test_shared_seq_reserve(params, model, fill);
         const test_status cp = test_composed_partial_rollback(params, model, fill);
         const test_status rs = test_rollback_after_state_restore(params, model, fill);
+        const test_status pb = test_prebatch_rollback(params, model, fill);
+        const test_status sc = test_seq_cp_resets_rollback(params, model, fill);
         res.rollback = merge_status(res.rollback, rb);
         res.replay   = merge_status(res.replay,   rp);
         res.shared   = merge_status(res.shared,   ss);
         res.composed = merge_status(res.composed, cp);
         res.restore  = merge_status(res.restore,  rs);
+        res.prebatch = merge_status(res.prebatch, pb);
+        res.seq_cp   = merge_status(res.seq_cp,   sc);
         if (rb == test_status::FAIL || rp == test_status::FAIL || ss == test_status::FAIL ||
-            cp == test_status::FAIL || rs == test_status::FAIL) {
+            cp == test_status::FAIL || rs == test_status::FAIL || pb == test_status::FAIL || sc == test_status::FAIL) {
             break;
         }
     }
@@ -856,7 +1088,7 @@ static test_results run_tests_for_model(const std::string & model_path, const st
     if (model == nullptr) {
         LOG_ERR("%s: failed to init model '%s'\n", __func__, model_path.c_str());
         // a model that cannot be loaded is a failure, not a skip
-        return { test_status::FAIL, test_status::FAIL, test_status::FAIL, test_status::FAIL, test_status::FAIL };
+        return { test_status::FAIL, test_status::FAIL, test_status::FAIL, test_status::FAIL, test_status::FAIL, test_status::FAIL, test_status::FAIL };
     }
 
     if (!llama_model_is_recurrent(model) && !llama_model_is_hybrid(model)) {
@@ -942,10 +1174,10 @@ int main(int argc, char ** argv) {
         // silence everything but the table itself (LOG has verbosity LOG_LEVEL_OUTPUT = 0)
         common_log_set_verbosity_thold(0);
 
-        LOG("%-*s  %-8s  %-11s  %-10s  %-8s  %s\n", (int) name_width, "Model", "rollback", "split replay", "shared seq", "composed", "after restore");
+        LOG("%-*s  %-8s  %-11s  %-10s  %-8s  %-13s  %-8s  %s\n", (int) name_width, "Model", "rollback", "split replay", "shared seq", "composed", "after restore", "prebatch", "seq_cp");
         common_log_flush(common_log_main());
 
-        constexpr int n_tests = 5;
+        constexpr int n_tests = 7;
         size_t n_pass[n_tests] = {};
         size_t n_skip[n_tests] = {};
         size_t n_fail[n_tests] = {};
@@ -958,12 +1190,12 @@ int main(int argc, char ** argv) {
 
             // all status strings have the same raw length, so the columns line up;
             // pad the first status to the width of the "rollback" header + separator
-            LOG("  %s      %s         %s        %s      %s", test_status_str(res.rollback), test_status_str(res.replay), test_status_str(res.shared),
-                    test_status_str(res.composed), test_status_str(res.restore));
+            LOG("  %s      %s         %s        %s      %s           %s      %s", test_status_str(res.rollback), test_status_str(res.replay), test_status_str(res.shared),
+                    test_status_str(res.composed), test_status_str(res.restore), test_status_str(res.prebatch), test_status_str(res.seq_cp));
             LOG("\n");
             common_log_flush(common_log_main());
 
-            const test_status all[n_tests] = { res.rollback, res.replay, res.shared, res.composed, res.restore };
+            const test_status all[n_tests] = { res.rollback, res.replay, res.shared, res.composed, res.restore, res.prebatch, res.seq_cp };
             for (int t = 0; t < n_tests; ++t) {
                 switch (all[t]) {
                     case test_status::PASS: n_pass[t]++; break;
@@ -986,6 +1218,10 @@ int main(int argc, char ** argv) {
                 __func__, n_pass[3], n_skip[3], n_fail[3], models.size());
         LOG_INF("%s: restore:      %zu passed, %zu skipped, %zu failed (of %zu)\n",
                 __func__, n_pass[4], n_skip[4], n_fail[4], models.size());
+        LOG_INF("%s: prebatch:     %zu passed, %zu skipped, %zu failed (of %zu)\n",
+                __func__, n_pass[5], n_skip[5], n_fail[5], models.size());
+        LOG_INF("%s: seq_cp:       %zu passed, %zu skipped, %zu failed (of %zu)\n",
+                __func__, n_pass[6], n_skip[6], n_fail[6], models.size());
 
         size_t n_fail_all = 0;
         for (int t = 0; t < n_tests; ++t) {
@@ -998,5 +1234,6 @@ int main(int argc, char ** argv) {
     const test_results res = run_tests_for_model(params.model.path, params);
 
     return (res.rollback == test_status::FAIL || res.replay   == test_status::FAIL || res.shared == test_status::FAIL ||
-            res.composed == test_status::FAIL || res.restore  == test_status::FAIL) ? 1 : 0;
+            res.composed == test_status::FAIL || res.restore  == test_status::FAIL || res.prebatch == test_status::FAIL ||
+            res.seq_cp   == test_status::FAIL) ? 1 : 0;
 }

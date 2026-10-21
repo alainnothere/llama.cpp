@@ -401,6 +401,11 @@ struct server_slot_stats {
     uint64_t n_draft_accepted    = 0;
     uint64_t n_draft_verif_steps = 0;
 
+    // speculative rollbacks past the per-token recurrent window
+    uint64_t n_spec_ckpt         = 0; // host checkpoints taken before a verify step
+    uint64_t n_spec_ckpt_restore = 0; // ... and restored after a deep partial landing
+    uint64_t n_prebatch_restore  = 0; // deep partial landings served by the pre-ubatch plane instead
+
     // these are absolute timestamps (in us)
     // note: must be signed - they are subtracted before the later ones are set
     int64_t t_start       = 0;

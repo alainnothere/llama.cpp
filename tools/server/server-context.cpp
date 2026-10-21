@@ -657,6 +657,7 @@ struct server_spec_stats_writer {
         config["ngram_mod_size"]    = sp.ngram_mod.size;
         config["ngram_mod_reset_occupancy"] = f2d(sp.ngram_mod.reset_occupancy);
         config["ngram_draft_n_max"] = sp.ngram_draft_n_max;
+        config["rs_depth"]          = sp.rs_depth;
         config["shadow_n"]          = sp.ngram_mod.shadow_n;
         // 2026-10-20: ngram-mod chain policies (--spec-ngram-auto / --spec-ngram-resume), the A/B arms of
         // run_ngram_ab.sh; spec_stats.py lists both in CONFIG_KEYS so the arms group by themselves
@@ -843,6 +844,13 @@ struct server_slot {
     }
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+
+    // the verify batch in flight skipped the host checkpoint: a rollback past n_rs_seq goes through the
+    // pre-ubatch plane of the recurrent memory (llama_memory_rs_has_prebatch) to the batch start.
+    // the start is recorded here, not read from spec_ckpt: no update_tgt() runs on this path
+    bool      spec_prebatch          = false;
+    llama_pos spec_prebatch_pos      = -1; // first position of the verify batch
+    int64_t   spec_prebatch_n_tokens = -1; // prompt length before the verify batch, for keep_first()
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated`, `has_new_line`) to task_results_state
@@ -969,6 +977,9 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
+        spec_prebatch  = false;
+        spec_prebatch_pos      = -1;
+        spec_prebatch_n_tokens = -1;
 
         last_nl_pos    = 0;
         generated      = {};
@@ -1386,6 +1397,12 @@ struct server_slot {
                     spec_n_steps_nodraft, spec_t_nodraft_us/(double) spec_n_steps_nodraft/1000.0);
         }
 
+        // rollbacks past the recurrent window (--spec-rs-depth): pre-ubatch plane selects vs host checkpoints
+        if (stats.n_prebatch_restore + stats.n_spec_ckpt + stats.n_spec_ckpt_restore > 0) {
+            SLT_INF(*this, "spec rollback: prebatch restores %d | host checkpoints %d | checkpoint restores %d\n",
+                    (int) stats.n_prebatch_restore, (int) stats.n_spec_ckpt, (int) stats.n_spec_ckpt_restore);
+        }
+
         // shadow chains: what the n-gram chains would have landed without the cap, and how far an
         // ngram-mod extension of the draft-model drafts would have gone
         {
@@ -1527,6 +1544,9 @@ struct server_slot {
         j["draft_acc_rate"]      = stats.n_draft_tokens > 0 ? (double) stats.n_draft_accepted/stats.n_draft_tokens : 0.0;
         j["draft_mean_len"]      = stats.n_draft_verif_steps > 0 ? 1.0 + (double) stats.n_draft_accepted/stats.n_draft_verif_steps : 1.0;
         j["acc_per_pos"]         = arr(n_accepted_per_pos.data(), (int) n_accepted_per_pos.size()); // counts; divide by n_draft_verif_steps for the logged rates
+        j["n_prebatch_restore"]  = stats.n_prebatch_restore;
+        j["n_spec_ckpt"]         = stats.n_spec_ckpt;
+        j["n_spec_ckpt_restore"] = stats.n_spec_ckpt_restore;
 
         // --spec-draft-auto tuner state at the end of the request
         if (spec_auto_enabled) {
@@ -4660,34 +4680,35 @@ private:
                 }
             }
 
+            slot.spec_prebatch = false;
+
             if (!draft.empty()) {
+                const bool rs_deep = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_tgt);
+
+                // a draft longer than the recurrent window skips the host checkpoint when the verify decode writes
+                // the pre-ubatch plane for it: a deep partial landing then rolls back to the batch start with a plane
+                // select and replays the accepted rows. measured 2026-10-20 (27B, LLAMA_SERVER_UBATCH_STATS): the
+                // blob is 157 MB and costs 66-110 ms on EVERY long step, while ~90% of long n-gram chains land whole,
+                // so the replay (one extra decode) is paid on the rare deep partial landing only. this is what lets
+                // --spec-rs-depth stay far below the n-gram cap (n_rs_seq 64 = 202 MB per GDN layer).
+                // the plane holds the start of the LAST ubatch of the seq, so the rows must be one ubatch: guarded
+                // here by n_ubatch, and in decode() by "only this seq in the view" (else the checkpoint is taken there)
+                const bool use_prebatch = rs_deep &&
+                    llama_memory_rs_has_prebatch(llama_get_memory(ctx_tgt)) &&
+                    draft.size() + 1 <= (size_t) llama_n_ubatch(ctx_tgt);
+
                 const bool use_ckpt_tgt =
-                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-                   (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_tgt));
+                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL || (rs_deep && !use_prebatch);
 
                 const bool use_ckpt_dft =
                    (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft));
 
+                slot.spec_prebatch          = use_prebatch;
+                slot.spec_prebatch_pos      = use_prebatch ? slot.prompt.tokens.pos_next() : -1;
+                slot.spec_prebatch_n_tokens = use_prebatch ? (int64_t) slot.prompt.n_tokens() : -1;
+
                 if (use_ckpt_tgt) {
-                    //const int64_t t_start = ggml_time_us();
-
-                    {
-                        // [LLAMA_SERVER_UBATCH_STATS] speculative checkpoint, counted with the context checkpoints
-                        server_ustats_timer ut(server_ustats().t_checkpoint);
-                        ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                    }
-                    if (server_ustats().on) {
-                        server_ustats().n_checkpoints    += 1;
-                        server_ustats().checkpoint_bytes += (int64_t) ckpt.size();
-                    }
-
-                    //const int64_t t_total = ggml_time_us() - t_start;
-                    //printf("checkpoint total: %f ms\n", t_total / 1000.0);
-
-                    SLT_DBG(slot, "created speculative checkpoint (pos_min = %d, pos_max = %d, n_tokens = %d, size = %.3f MiB, draft = %.3f MiB)\n",
-                            ckpt.pos_min, ckpt.pos_max, slot.prompt.n_tokens(),
-                            (float) ckpt.size() / 1024 / 1024,
-                            (float) ckpt.data_dft.size() / 1024 / 1024);
+                    spec_ckpt_take_tgt(slot);
                 }
 
                 if (use_ckpt_dft) {
@@ -5471,12 +5492,59 @@ private:
         return true;
     }
 
+    // host checkpoint of the target state before a speculative verify decode
+    void spec_ckpt_take_tgt(server_slot & slot) {
+        auto & ckpt = slot.spec_ckpt;
+
+        {
+            // [LLAMA_SERVER_UBATCH_STATS] speculative checkpoint, counted with the context checkpoints
+            server_ustats_timer ut(server_ustats().t_checkpoint);
+            ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        }
+        if (server_ustats().on) {
+            server_ustats().n_checkpoints    += 1;
+            server_ustats().checkpoint_bytes += (int64_t) ckpt.size();
+        }
+
+        slot.stats.n_spec_ckpt += 1;
+
+        SLT_DBG(slot, "created speculative checkpoint (pos_min = %d, pos_max = %d, n_tokens = %d, size = %.3f MiB, draft = %.3f MiB)\n",
+                ckpt.pos_min, ckpt.pos_max, slot.prompt.n_tokens(),
+                (float) ckpt.size() / 1024 / 1024,
+                (float) ckpt.data_dft.size() / 1024 / 1024);
+    }
+
     // returns true = success ; false = retry with smaller batch size
     // throw std::runtime_error on fatal error
     bool decode(int32_t & n_batch, int32_t off) {
         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
 
         metrics_pre_decode();
+
+        // a slot that skipped its checkpoint (spec_prebatch) needs its verify rows to be one ubatch of the recurrent
+        // memory. split_equal() cuts a seq when other seqs share the view, so in that case take the checkpoint now:
+        // nothing has touched the target state of the slot since the skip
+        for (auto & slot : slots) {
+            if (!slot.spec_prebatch || slot.spec_i_batch.empty()) {
+                continue;
+            }
+
+            const int32_t i0 = slot.spec_i_batch.front();
+            if (i0 < off || i0 >= off + batch.view.size()) {
+                continue;
+            }
+
+            bool alone = batch.view.size() <= (int32_t) llama_n_ubatch(ctx_tgt);
+            for (int32_t i = off; alone && i < off + batch.view.size(); ++i) {
+                alone = batch.tokens[i].id_slot == slot.id;
+            }
+
+            if (!alone) {
+                SLT_DBG(slot, "verify rows share the batch with other sequences (%d rows), taking the checkpoint after all\n", batch.view.size());
+                spec_ckpt_take_tgt(slot);
+                slot.spec_prebatch = false;
+            }
+        }
 
         if (batch.size() == 0) {
             SRV_WRN("%s", "no tokens to decode\n");
@@ -5639,6 +5707,9 @@ private:
             size_t n_draft;
             size_t n_accepted;
             bool   restore; // partial acceptance not supported by the context -> rollback to the checkpoint
+            bool   prebatch; // ... served by the pre-ubatch plane of the recurrent memory, no checkpoint was taken
+            llama_pos prebatch_pos;      // batch start, the rollback target of the prebatch path
+            int64_t   prebatch_n_tokens; // prompt length at the batch start
             common_sampler_ptr smpl_save;
         };
 
@@ -5714,11 +5785,17 @@ private:
 
             const uint32_t n_rollback = n_draft + 1 - accepted.size();
 
-            const bool use_ckpt_tgt =
-                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-                (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt));
+            const bool rs_deep = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt);
 
-            const bool restore = n_rollback > 0 && use_ckpt_tgt;
+            // past the window: the host checkpoint, or the pre-ubatch plane when the checkpoint was skipped for it
+            const bool restore_prebatch = n_rollback > 0 && rs_deep && slot.spec_prebatch;
+
+            const bool use_ckpt_tgt =
+                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL || (rs_deep && !slot.spec_prebatch);
+
+            const bool restore = n_rollback > 0 && (use_ckpt_tgt || restore_prebatch);
+
+            slot.spec_prebatch = false;
 
             // note: on the rollback path the whole draft state is restored from the checkpoint right
             //       below, so the rows are left in - dropping them would only change which of two
@@ -5733,7 +5810,8 @@ private:
                 }
             }
 
-            spec_verified.push_back({ slot.id, n_draft, accepted.size() - 1, restore, std::move(smpl_save) });
+            spec_verified.push_back({ slot.id, n_draft, accepted.size() - 1, restore, restore_prebatch,
+                    slot.spec_prebatch_pos, slot.spec_prebatch_n_tokens, std::move(smpl_save) });
 
             // the restore path reloads the draft state from the checkpoint, so it gets no seed row;
             // draft() then falls back to the 1-row decode of id_last
@@ -5918,14 +5996,44 @@ private:
                         SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", it->n_accepted, n_draft);
                     }
 
+                    // score the chain with the REAL landing before the replay hides it: on the replay the draft is the
+                    // accepted prefix, so its accept() would report the landing one token longer (the target's
+                    // correction counted as a draft token), as whole when only the last draft token was rejected, and one
+                    // step late. with --spec-rs-depth below the n-gram cap this runs on every deep partial landing, so
+                    // ngram-mod's auto cap and backoff must see it here. n_offered_last/n_built_last still describe this
+                    // draft: the replay step does not draft. the replay step skips accept() (spec_is_replay)
+                    if (!slot.spec_is_replay) {
+                        common_speculative_accept(spec.get(), slot.id, it->n_accepted);
+                    }
+
                     // partial acceptance is not supported by the context -> truncate the draft and restore the state
                     slot.spec_is_replay = true;
 
                     const auto & ckpt = slot.spec_ckpt;
 
-                    SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
+                    llama_pos p_keep   = ckpt.pos_max + 1;
+                    int64_t   n_keep   = ckpt.n_tokens;
 
-                    ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    if (it->prebatch) {
+                        // the verify batch started at prebatch_pos and was one ubatch, so the plane holds the state just
+                        // before it: the seq_rm below is a plane select on the target, no blob, no D2H/H2D copy
+                        p_keep = it->prebatch_pos;
+                        n_keep = it->prebatch_n_tokens;
+
+                        GGML_ASSERT(p_keep > 0 && n_keep >= 0);
+                        GGML_ASSERT(llama_memory_rs_can_rollback_to(llama_get_memory(slot.ctx_tgt), slot.id, p_keep));
+
+                        SLT_DBG(slot, "rolling back to the pre-ubatch plane (pos = %d, n_tokens = %lld, n_accepted = %zu, n_draft = %zu)\n",
+                                p_keep - 1, (long long) n_keep, it->n_accepted, n_draft);
+
+                        slot.stats.n_prebatch_restore += 1;
+                    } else {
+                        SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
+
+                        ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+                        slot.stats.n_spec_ckpt_restore += 1;
+                    }
 
                     if (slot.ctx_dft) {
                         // note: this waits for the draft batch submitted by common_speculative_process()
@@ -5935,9 +6043,9 @@ private:
                         ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                     }
 
-                    slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
+                    slot.mem.seq_rm(slot.id, p_keep, -1);
 
-                    slot.prompt.tokens.keep_first(ckpt.n_tokens);
+                    slot.prompt.tokens.keep_first(n_keep);
 
                     // taken only when `may_restore` was true in the verification pass
                     GGML_ASSERT(it->smpl_save);
@@ -5950,7 +6058,10 @@ private:
                     SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", it->n_accepted, n_draft);
                 }
 
-                common_speculative_accept(spec.get(), slot.id, it->n_accepted);
+                // a replay was already scored by the restore that caused it, with the real landing
+                if (!slot.spec_is_replay) {
+                    common_speculative_accept(spec.get(), slot.id, it->n_accepted);
+                }
             }
 
             const auto ids = std::move(slot.spec_draft);

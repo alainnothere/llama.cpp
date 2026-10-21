@@ -4258,6 +4258,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.ngram_draft_n_max = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_NGRAM_DRAFT_N_MAX"));
+    add_opt(common_arg(
+        {"--spec-rs-depth"}, "N",
+        string_format("recurrent rollback window of a hybrid/recurrent target, in tokens, independent of the draft caps. "
+                      "VRAM: 1 + N state planes per recurrent layer, plus 1 pre-ubatch plane when N > 0 "
+                      "(Qwen3.8-27B: ~3 MB per plane per GatedDeltaNet layer x 48 layers, so N = 64 costs ~9.8 GB, N = 12 ~2.1 GB). "
+                      "a draft that is rejected more than N tokens deep is rolled back with the pre-ubatch plane and the accepted "
+                      "tokens are decoded again (replay), instead of taking a host checkpoint before every long verify step. "
+                      "0 = no planes (every rollback uses a checkpoint), -1 = max(--spec-draft-n-max, --spec-ngram-draft-n-max) (default: %d)",
+                      params.speculative.rs_depth),
+        [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("invalid value, expected -1 or a non-negative number");
+            }
+            params.speculative.rs_depth = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_RS_DEPTH"));
     // 2026-10-20: the two ngram-mod chain policies, default off so the fixed --spec-ngram-draft-n-max cap stays the
     // fallback; the measurements behind them are at common_speculative_impl_ngram_mod in common/speculative.cpp
     add_opt(common_arg(

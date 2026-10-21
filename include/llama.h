@@ -821,6 +821,20 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
+    // [EXPERIMENTAL] Returns true if the recurrent memory keeps a pre-ubatch state plane (allocated when n_rs_seq > 0):
+    // after a decode in which all tokens of seq_id landed in one ubatch, starting at position p, the
+    // call llama_memory_seq_rm(mem, seq_id, p, -1) succeeds at any depth, also past n_rs_seq
+    // Returns false for memories without a recurrent part
+    LLAMA_API bool llama_memory_rs_has_prebatch(llama_memory_t mem);
+
+    // [EXPERIMENTAL] Returns true if llama_memory_seq_rm(mem, seq_id, p0, -1) would succeed now
+    // (within the per-token rollback window, or via the pre-ubatch plane), without changing any state
+    // Returns false for memories without a recurrent part
+    LLAMA_API bool llama_memory_rs_can_rollback_to(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos p0);
+
     //
     // State / sessions
     //

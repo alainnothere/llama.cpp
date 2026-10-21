@@ -3679,7 +3679,8 @@ ggml_tensor * llm_graph_context::build_rs(
            uint32_t   rs_head,
            uint32_t   rs_size,
             int32_t   rs_zero,
-        const llm_graph_get_rows_fn & get_state_rows) const {
+        const llm_graph_get_rows_fn & get_state_rows,
+            int64_t   rs_pre_row) const {
 
     GGML_UNUSED(rs_size);
     ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
@@ -3696,6 +3697,25 @@ ggml_tensor * llm_graph_context::build_rs(
     const int64_t i0 = n_rs - state_copy->ne[0];
 
     ggml_tensor * states_all = ggml_get_rows(ctx0, states, state_copy);
+
+    // pre-ubatch plane (llama_memory_recurrent::rs_pre_pos): keep the input state of every seq of this ubatch,
+    // so the caller can roll back to the start of the ubatch at any depth without a host checkpoint.
+    // written on every ubatch, so the graph shape does not depend on the batch size.
+    // cost: n_seqs rows of state_size per state tensor per layer, one cpy (plus one get_rows when a custom getter
+    // reads the cache directly). Qwen3.8-27B: ~3 MB per GDN layer, ~150 MB D2D per decode over 48 layers.
+    // the custom-getter gather is emitted before the getter, so it reads the rows before the state write that
+    // follows the getter (node order; same base tensor, so ggml-vulkan graph_optimize keeps the order)
+    if (rs_pre_row >= 0) {
+        GGML_ASSERT(states->ne[1] >= rs_pre_row + (int64_t) rs_head + n_seqs);
+
+        ggml_tensor * pre_src = get_state_rows ?
+            ggml_get_rows(ctx0, states, state_copy_main) :
+            ggml_view_2d(ctx0, states_all, state_size, n_seqs, states_all->nb[1], 0);
+
+        ggml_build_forward_expand(gf,
+            ggml_cpy(ctx0, pre_src,
+                ggml_view_2d(ctx0, states, state_size, n_seqs, states->nb[1], (rs_pre_row + rs_head)*states->nb[1])));
+    }
 
     ggml_tensor * output_states = get_state_rows ?
         get_state_rows(ctx0, states, state_copy_main) :
@@ -3757,7 +3777,7 @@ ggml_tensor * llm_graph_context::build_rs(
 
     return build_rs(s, state_copy, inp->s_copy_main, state_size, n_seqs,
                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
-                    get_state_rows);
+                    get_state_rows, kv_state->get_rs_pre_row());
 }
 
 ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(

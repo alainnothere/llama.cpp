@@ -35,6 +35,7 @@ llama_memory_recurrent::llama_memory_recurrent(
     this->n_rs_seq = n_rs_seq;
     rs_idx.assign(n_seq_max, 0);
     rs_depth.assign(n_seq_max, 0);
+    rs_pre_pos.assign(n_seq_max, -1);
 
     cells.clear();
     cells.resize(mem_size);
@@ -103,7 +104,10 @@ llama_memory_recurrent::llama_memory_recurrent(
         }
         buft_layers[buft].push_back(i); // for the CPU PLACEMENT warning below
 
-        const uint32_t n_rows = mem_size * (1 + n_rs_seq);
+        // groups: 0 = current state, 1..n_rs_seq = per-token snapshots, n_rs_seq + 1 = pre-ubatch plane (see rs_pre_pos).
+        // the pre-ubatch plane is one extra group, the same size as group 0: on Qwen3.8-27B (48 GDN layers) ~3 MB
+        // per layer, ~150 MB total, vs 65 groups (202 MB per layer, 9.7 GB) when n_rs_seq is sized for an n-gram cap of 64
+        const uint32_t n_rows = mem_size * (n_rs_seq > 0 ? 2 + n_rs_seq : 1);
         ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
         ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
         ggml_format_name(r, "cache_r_l%d", i);
@@ -175,6 +179,12 @@ llama_memory_recurrent::llama_memory_recurrent(
                 ggml_type_name(type_r), (float)memory_size_r / (1024.0f * 1024.0f),
                 ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f),
                 ggml_type_name(type_r), (float)memory_size_p / (1024.0f * 1024.0f));
+
+        if (has_rs_pre()) {
+            const uint32_t n_groups = 2 + n_rs_seq;
+            LLAMA_LOG_INFO("%s: pre-ubatch rollback plane = %7.2f MiB (1 of %u groups per layer)\n", __func__,
+                    (float)(memory_size_r + memory_size_s + memory_size_p) / n_groups / (1024.0f * 1024.0f), n_groups);
+        }
     }
 }
 
@@ -197,6 +207,7 @@ void llama_memory_recurrent::clear(bool data) {
 
     std::fill(rs_idx.begin(), rs_idx.end(), 0);
     std::fill(rs_depth.begin(), rs_depth.end(), 0);
+    reset_rs_pre_pos(-1);
 }
 
 bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -221,6 +232,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
 
         // the sequence restarts from scratch - nothing left to roll back to
         reset_rs_depth(seq_id);
+        reset_rs_pre_pos(seq_id);
     }
 
     // models like Mamba or RWKV can't have a state partially erased at the end
@@ -245,26 +257,27 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                     cell.pos = p0 - 1;
                     return true;
                 }
-                const llama_pos rollback = cell.pos - (p0 - 1);
-
-                // a pending rollback composes with the new one instead of refusing it: no decode has
-                // run since it was requested, so the snapshot groups have not moved and group
-                // (pending + rollback) is exactly `rollback` tokens further back than group `pending`.
-                // this happens when the server drops rejected draft tokens, stops on EOG without
-                // decoding again, and the next request then rewinds the tail once more.
-                const llama_pos pending = (llama_pos) rs_idx[seq_id];
-                const llama_pos budget  = (llama_pos) get_rs_budget(seq_id);
-
-                if (rollback >= 1 && pending + rollback <= budget) {
-                    set_rs_idx(seq_id, (uint32_t) (pending + rollback));
-                    cell.pos = p0 - 1;
-                    return true;
+                const int32_t idx = rollback_idx(seq_id, p0);
+                if (idx < 0) {
+                    return false;
                 }
-                return false;
+
+                set_rs_idx(seq_id, (uint32_t) idx);
+                cell.pos = p0 - 1;
+
+                if ((uint32_t) idx == n_rs_seq + 1) {
+                    // the plane is consumed: the per-token groups describe the old tail, and the next
+                    // decode rewrites the pre-ubatch plane from the state selected here
+                    reset_rs_depth(seq_id);
+                    reset_rs_pre_pos(seq_id);
+                }
+                return true;
             }
             // invalidate tails which will be cleared
             if (p0 <= cell.pos && cell.pos < p1) {
                 tail_id = -1;
+                reset_rs_depth(seq_id);
+                reset_rs_pre_pos(seq_id);
             }
         }
     } else {
@@ -340,11 +353,22 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
             cell_src.seq_id.insert(seq_id_dst);
             tail_dst.tail = tail_src.tail;
         }
+
+        // dst now shares the cell of src: its old rollback bounds describe a state that is gone.
+        // the pending index must follow src, s_copy() and state_write() read one index per shared cell
+        if ((uint32_t) seq_id_dst < n_seq_max) {
+            rs_idx[seq_id_dst] = tail_src.tail >= 0 && (uint32_t) seq_id_src < n_seq_max ? rs_idx[seq_id_src] : 0;
+            reset_rs_depth(seq_id_dst);
+            reset_rs_pre_pos(seq_id_dst);
+        }
     }
 }
 
 void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
     uint32_t new_head = size;
+
+    // conservative: seq_keep is rare, re-validated by the next decode
+    reset_rs_pre_pos(-1);
 
     for (uint32_t i = 0; i < size; ++i) {
         if ((llama_seq_id) i != seq_id) {
@@ -393,6 +417,9 @@ void llama_memory_recurrent::seq_add(llama_seq_id seq_id, llama_pos p0, llama_po
         return;
     }
 
+    // the pre-ubatch position is not shifted along, a shifted seq waits for its next decode
+    reset_rs_pre_pos(seq_id);
+
     // for Mamba-like or RWKV models, only the pos needs to be shifted
     if (0 <= seq_id && seq_id < (int64_t) size) {
         const int32_t tail_id = cells[seq_id].tail;
@@ -422,6 +449,8 @@ void llama_memory_recurrent::seq_div(llama_seq_id seq_id, llama_pos p0, llama_po
     if (p0 == p1) {
         return;
     }
+
+    reset_rs_pre_pos(seq_id);
 
     // for Mamba-like or RWKV models, only the pos needs to be changed
     if (0 <= seq_id && seq_id < (int64_t) size) {
@@ -472,9 +501,87 @@ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
     assert(n_seq_max == rs_idx.size());
 
     GGML_ASSERT((uint32_t) seq_id < n_seq_max);
-    GGML_ASSERT(idx <= n_rs_seq);
+    // n_rs_seq + 1 is the pre-ubatch group
+    GGML_ASSERT(idx <= n_rs_seq + (has_rs_pre() ? 1 : 0));
 
     rs_idx[seq_id] = idx;
+}
+
+void llama_memory_recurrent::reset_rs_pre_pos(llama_seq_id seq_id) {
+    if (seq_id < 0) {
+        std::fill(rs_pre_pos.begin(), rs_pre_pos.end(), -1);
+        return;
+    }
+
+    if ((size_t) seq_id < rs_pre_pos.size()) {
+        rs_pre_pos[seq_id] = -1;
+    }
+}
+
+bool llama_memory_recurrent::has_rs_pre() const {
+    return n_rs_seq > 0 && !is_empty();
+}
+
+int32_t llama_memory_recurrent::rollback_idx(llama_seq_id seq_id, llama_pos p0) const {
+    if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max || (uint32_t) seq_id >= size) {
+        return -1;
+    }
+
+    const int32_t tail_id = cells[seq_id].tail;
+    if (tail_id < 0) {
+        return -1;
+    }
+
+    const llama_pos rollback = cells[tail_id].pos - (p0 - 1);
+    if (rollback < 1) {
+        return -1;
+    }
+
+    // a pending rollback composes with the new one instead of refusing it: no decode has
+    // run since it was requested, so the snapshot groups have not moved and group
+    // (pending + rollback) is exactly `rollback` tokens further back than group `pending`.
+    // this happens when the server drops rejected draft tokens, stops on EOG without
+    // decoding again, and the next request then rewinds the tail once more.
+    // a pending pre-ubatch select (n_rs_seq + 1) is always past the budget, so it never composes
+    const llama_pos pending = (llama_pos) rs_idx[seq_id];
+    const llama_pos budget  = (llama_pos) get_rs_budget(seq_id);
+
+    if (pending + rollback <= budget) {
+        return (int32_t) (pending + rollback);
+    }
+
+    // past the per-token window: only the exact start of the last ubatch is held, in the pre-ubatch group.
+    // the per-token groups win whenever they reach, so a rollback inside the budget never depends on this plane
+    if (pending == 0 && has_rs_pre() && rs_pre_pos[seq_id] >= 0 && p0 - 1 == rs_pre_pos[seq_id]) {
+        return (int32_t) (n_rs_seq + 1);
+    }
+
+    return -1;
+}
+
+bool llama_memory_recurrent::can_rollback_to(llama_seq_id seq_id, llama_pos p0) const {
+    // mirrors the branches of seq_rm(seq_id, p0, -1)
+    if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max || (uint32_t) seq_id >= size) {
+        return false;
+    }
+    if (p0 <= 0) {
+        return true;
+    }
+
+    const int32_t tail_id = cells[seq_id].tail;
+    if (tail_id < 0 || p0 > cells[tail_id].pos) {
+        return true;
+    }
+
+    const auto & cell = cells[tail_id];
+    if (cell.seq_id.size() > 1) {
+        return false;
+    }
+    if (is_empty()) {
+        return true;
+    }
+
+    return rollback_idx(seq_id, p0) >= 0;
 }
 
 void llama_memory_recurrent::set_rs_depth(llama_seq_id seq_id, uint32_t depth) {
@@ -724,6 +831,14 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             std::swap(dst_cell.src, src_cell.src);
             std::swap(dst_cell.seq_id, src_cell.seq_id);
 
+            // the seqs moved out of dst_id keep their current state (the extra-state gather of build_rs moves
+            // it via src), but their snapshot and pre-ubatch groups stay behind at dst_id and this ubatch
+            // overwrites them. the seqs of this ubatch are re-validated by apply() after find_slot()
+            for (const llama_seq_id moved : src_cell.seq_id) {
+                reset_rs_depth(moved);
+                reset_rs_pre_pos(moved);
+            }
+
             // swap tails
             for (uint32_t j = 0; j < size; ++j) {
                 int32_t & tail = cells[j].tail;
@@ -969,6 +1084,7 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
         // only group 0 is restored by state_read_data(), groups 1..n_rs_seq still hold whatever
         // this context had before - refuse rollbacks until decodes have refreshed them
         reset_rs_depth(seq_id);
+        reset_rs_pre_pos(seq_id);
     }
 }
 
@@ -1399,22 +1515,39 @@ bool llama_memory_recurrent_context::apply() {
 
     const llama_ubatch & ubatch = ubatches[i_next];
 
+    // per seq of the ubatch: token count and the position of its state before this ubatch
+    std::map<llama_seq_id, std::pair<uint32_t, llama_pos>> seq_info;
+
+    if (mem->n_rs_seq != 0) {
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            for (int32_t s = 0; s < ubatch.n_seq_id[i]; ++s) {
+                const llama_seq_id seq_id = ubatch.seq_id[i][s];
+
+                auto it = seq_info.find(seq_id);
+                if (it == seq_info.end()) {
+                    llama_pos pos_pre = -1;
+                    if (seq_id >= 0 && (uint32_t) seq_id < mem->size && mem->cells[seq_id].tail >= 0) {
+                        pos_pre = mem->cells[mem->cells[seq_id].tail].pos;
+                    }
+                    it = seq_info.emplace(seq_id, std::make_pair(0u, pos_pre)).first;
+                }
+                it->second.first++;
+            }
+        }
+    }
+
     mem->find_slot(ubatch);
 
     // a decode of N tokens for a seq rewrites its snapshot groups [0, N) relative to the new tail
     // and leaves deeper groups holding states relative to the OLD tail, so afterwards it can be
-    // rolled back by at most N - 1 tokens - the bound is overwritten, never raised (see rs_depth)
-    if (mem->n_rs_seq != 0) {
-        std::map<llama_seq_id, uint32_t> n_tokens_seq;
+    // rolled back by at most N - 1 tokens - the bound is overwritten, never raised (see rs_depth).
+    // the graph of this ubatch also copies the input state of each seq into the pre-ubatch group,
+    // so a rollback to the start of this ubatch (state at pos_pre) is valid at any depth
+    for (const auto & [seq_id, info] : seq_info) {
+        mem->set_rs_depth(seq_id, info.first - 1);
 
-        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-            for (int32_t s = 0; s < ubatch.n_seq_id[i]; ++s) {
-                n_tokens_seq[ubatch.seq_id[i][s]]++;
-            }
-        }
-
-        for (const auto & [seq_id, n_tokens] : n_tokens_seq) {
-            mem->set_rs_depth(seq_id, n_tokens - 1);
+        if (mem->has_rs_pre() && seq_id >= 0 && (size_t) seq_id < mem->rs_pre_pos.size()) {
+            mem->rs_pre_pos[seq_id] = info.second;
         }
     }
 
@@ -1459,6 +1592,10 @@ ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
     return mem->p_l[il];
 }
 
+int64_t llama_memory_recurrent_context::get_rs_pre_row() const {
+    return mem->has_rs_pre() ? (int64_t) (mem->n_rs_seq + 1) * mem->size : -1;
+}
+
 int32_t llama_memory_recurrent_context::s_copy(int i) const {
     const uint32_t cell_idx = i + mem->head;
     const int32_t  src0     = mem->cells[cell_idx].src0;
@@ -1472,8 +1609,13 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
         const llama_seq_id seq = *mem->cells[cell_idx].seq_id.begin();
         if (seq >= 0 && (size_t) seq < mem->rs_idx.size()) {
             idx = mem->rs_idx[seq];
-            // reset rollback idx
-            mem->rs_idx[seq] = 0;
+        }
+        // reset rollback idx of every seq of the cell: they share the state this gather consumes
+        // (seq_cp copies the pending index to dst, and a coupled ubatch decodes one cell for several seqs)
+        for (const llama_seq_id s : mem->cells[cell_idx].seq_id) {
+            if (s >= 0 && (size_t) s < mem->rs_idx.size()) {
+                mem->rs_idx[s] = 0;
+            }
         }
     }
     return (int32_t)(idx * mem->size) + src0;
