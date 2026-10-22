@@ -388,3 +388,34 @@ def test_disk_cache_identical_replay_appends_tail():
     assert fl == (conv, len(saved), len(toks_new), (len(toks_new) - len(saved) + SEG - 1) // SEG, "append")
     assert toks_new[:len(saved)] == saved
     _check_kept(conv, segs_old, ino_old, kv_old, segs_old[-1][5])
+
+
+# [TAG_RELEASE_FLUSH] the slot is flushed to the disk tier right after its final response, so the
+# next request of the conversation finds it "already flushed" at prompt_save and pays nothing
+@pytest.mark.parametrize("idle_slots", [False, True])
+def test_slot_release_flush_makes_next_prompt_save_a_noop(idle_slots: bool):
+    server.no_cache_idle_slots = not idle_slots
+    server.n_ctx = 2048
+    server.start()
+    log = LogReader(server.log_path)
+
+    first = _tok(PROMPTS[0], add_special=True)
+    body = _complete(first)
+    gen = [t["id"] if isinstance(t, dict) else t for t in body["tokens"]]
+
+    # the release flush runs after the response was queued: wait for it and for the writer
+    text, fl = _wait_flush(log)
+    conv, base, end, _, _ = fl
+    assert base == 0
+    assert "flushing released slot to the disk tier" in text
+    # the last sampled token is never decoded, so the slot holds the prompt plus n_predict - 1
+    assert end == len(first) + len(gen) - 1
+
+    # next turn of the same conversation: the client echoes the cached tokens exactly
+    second = first + gen + _tok(" User: and then what happened?", add_special=False)
+    _complete(second)
+    text, _ = _wait_log(log, lambda t: "prompt processing batch" in t)
+    # the request's own prompt_save is a no-op
+    head = text[:text.index("prompt processing batch")]
+    assert f"disk cache: '{conv}' already flushed ({end} tokens)" in head
+    assert not FLUSH_RE.search(head), "the next request flushed the previous turn again"

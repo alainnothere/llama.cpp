@@ -2325,6 +2325,104 @@ bool common_prompt_batch_decode(
     return true;
 }
 
+//
+// [TAG_STATE_BLOB] shared state blobs, see common.h
+//
+
+struct common_state_pool_deleter {
+    std::weak_ptr<common_state_pool> pool;
+
+    void operator()(common_state_buf * buf) const {
+        if (auto p = pool.lock()) {
+            p->give_back(buf);
+        } else {
+            delete buf;
+        }
+    }
+};
+
+std::shared_ptr<common_state_buf> common_state_pool::acquire(size_t n) {
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        for (auto it = free_bufs.begin(); it != free_bufs.end(); ++it) {
+            const size_t cap = (*it)->capacity;
+            if (cap >= n && cap - n <= n / 8) {
+                common_state_buf * buf = it->release();
+                free_bufs.erase(it);
+                buf->size = n;
+                n_reuse_++;
+                return std::shared_ptr<common_state_buf>(buf, common_state_pool_deleter{ weak_from_this() });
+            }
+        }
+    }
+
+    // default-init: no zero fill, the pages are faulted in by the producer's single write
+    auto * buf = new common_state_buf;
+    buf->data.reset(new uint8_t[std::max<size_t>(n, 1)]);
+    buf->size     = n;
+    buf->capacity = n;
+    n_alloc_++;
+    return std::shared_ptr<common_state_buf>(buf, common_state_pool_deleter{ weak_from_this() });
+}
+
+void common_state_pool::give_back(common_state_buf * buf) {
+    std::unique_ptr<common_state_buf> owned(buf);
+    std::lock_guard<std::mutex> lock(mtx);
+    if (free_bufs.size() < max_free) {
+        free_bufs.push_back(std::move(owned));
+    }
+    // else: owned frees it here
+}
+
+static std::shared_ptr<common_state_buf> common_state_buf_alloc(size_t n) {
+    auto buf = std::make_shared<common_state_buf>();
+    buf->data.reset(new uint8_t[std::max<size_t>(n, 1)]);
+    buf->size     = n;
+    buf->capacity = n;
+    return buf;
+}
+
+uint8_t * common_state_data::reserve_for_write(size_t n, common_state_pool * pool) {
+    // in place: nobody else can observe the bytes (use_count 1 cannot grow behind our back, every other
+    // holder would have been made by copying this reference)
+    if (buf && buf.use_count() == 1 && buf->capacity >= n && buf->capacity - n <= n / 8) {
+        buf->size = n;
+        return buf->data.get();
+    }
+    buf.reset(); // release before acquiring, so the pool can hand the same buffer back
+    buf = pool ? pool->acquire(n) : common_state_buf_alloc(n);
+    return buf->data.get();
+}
+
+void common_state_data::assign(const uint8_t * p, size_t n) {
+    uint8_t * dst = reserve_for_write(n);
+    if (n > 0) {
+        memcpy(dst, p, n);
+    }
+}
+
+void common_state_data::assign(size_t n, uint8_t v) {
+    uint8_t * dst = reserve_for_write(n);
+    if (n > 0) {
+        memset(dst, v, n);
+    }
+}
+
+bool operator==(const common_state_data & a, const std::vector<uint8_t> & b) {
+    return a.size() == b.size() && (b.empty() || memcmp(a.data(), b.data(), b.size()) == 0);
+}
+
+void common_state_capture(common_state_data & out, llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags, common_state_pool * pool) {
+    const size_t sz = llama_state_seq_get_size_ext(ctx, seq_id, flags);
+
+    uint8_t * dst = out.reserve_for_write(sz, pool);
+
+    const size_t n = llama_state_seq_get_data_ext(ctx, dst, sz, seq_id, flags);
+    if (n != sz) {
+        GGML_ABORT("state capture size mismatch: expected %zu, got %zu\n", sz, n);
+    }
+}
+
 size_t common_prompt_checkpoint::size() const {
     return data_tgt.size() + data_dft.size() + data_spec.size();
 }
@@ -2356,49 +2454,37 @@ void common_prompt_checkpoint::update_pos(
 void common_prompt_checkpoint::update_tgt(
         llama_context * ctx,
         llama_seq_id seq_id,
-        llama_state_seq_flags flags) {
+        llama_state_seq_flags flags,
+        common_state_pool * pool) {
     if (ctx == nullptr) {
         return;
     }
 
-    const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
-
-    data_tgt.resize(ckpt_size);
-
-    const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
-    if (n != ckpt_size) {
-        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
-    }
+    common_state_capture(data_tgt, ctx, seq_id, flags, pool);
 }
 
 void common_prompt_checkpoint::update_dft(
         llama_context * ctx,
         llama_seq_id seq_id,
-        llama_state_seq_flags flags) {
+        llama_state_seq_flags flags,
+        common_state_pool * pool) {
     if (ctx == nullptr) {
         return;
     }
 
-    const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
-
-    data_dft.resize(ckpt_size);
-
-    const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
-    if (n != ckpt_size) {
-        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
-    }
+    common_state_capture(data_dft, ctx, seq_id, flags, pool);
 }
 
 // read a disk-backed checkpoint blob ([off, off+sz) of src_path) into buf.
 // returns false if the file is missing / truncated (e.g. spilled file evicted).
-static bool load_checkpoint_blob_from_disk(const std::string & src_path, uint64_t off, uint64_t sz, std::vector<uint8_t> & buf) {
+static bool load_checkpoint_blob_from_disk(const std::string & src_path, uint64_t off, uint64_t sz, common_state_data & buf) {
     std::ifstream f(src_path, std::ios::binary);
     if (!f) {
         return false;
     }
     f.seekg(static_cast<std::streamoff>(off));
-    buf.resize(static_cast<size_t>(sz));
-    f.read(reinterpret_cast<char *>(buf.data()), static_cast<std::streamsize>(sz));
+    uint8_t * dst = buf.reserve_for_write(static_cast<size_t>(sz)); // no zero fill before the read
+    f.read(reinterpret_cast<char *>(dst), static_cast<std::streamsize>(sz));
     return static_cast<bool>(f);
 }
 
@@ -2421,7 +2507,7 @@ bool common_prompt_checkpoint::load_tgt(
 
     // disk-backed (lazy) blob — fault in on demand, restore, then discard
     if (!src_path.empty() && sz_tgt > 0) {
-        std::vector<uint8_t> buf;
+        common_state_data buf;
         if (!load_checkpoint_blob_from_disk(src_path, off_tgt, sz_tgt, buf)) {
             return false;
         }
@@ -2452,7 +2538,7 @@ bool common_prompt_checkpoint::load_dft(
 
     // disk-backed (lazy) blob — fault in on demand, restore, then discard
     if (!src_path.empty() && sz_dft > 0) {
-        std::vector<uint8_t> buf;
+        common_state_data buf;
         if (!load_checkpoint_blob_from_disk(src_path, off_dft, sz_dft, buf)) {
             return false;
         }

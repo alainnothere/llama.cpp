@@ -86,14 +86,16 @@ static common_prompt_checkpoint make_ckpt(int32_t pos_min, int32_t pos_max, int6
     cp.pos_max           = pos_max;
     cp.n_tokens          = n_tokens;
     cp.token_prefix_hash = hash_token_prefix(timeline(), static_cast<size_t>(n_tokens));
-    cp.data_tgt.resize(tgt_n);
+    std::vector<uint8_t> tgt(tgt_n);
     for (size_t i = 0; i < tgt_n; ++i) {
-        cp.data_tgt[i] = static_cast<uint8_t>(seed + i * 3 + 1);
+        tgt[i] = static_cast<uint8_t>(seed + i * 3 + 1);
     }
-    cp.data_dft.resize(dft_n);
+    std::vector<uint8_t> dft(dft_n);
     for (size_t i = 0; i < dft_n; ++i) {
-        cp.data_dft[i] = static_cast<uint8_t>(seed * 2 + i * 5 + 7);
+        dft[i] = static_cast<uint8_t>(seed * 2 + i * 5 + 7);
     }
+    cp.data_tgt.assign(tgt.data(), tgt.size());
+    cp.data_dft.assign(dft.data(), dft.size());
     return cp;
 }
 
@@ -648,14 +650,9 @@ static void test_drop_stale_checkpoint_spills() {
     const uint32_t arch = 0x71u, vocab = 0x72u;
     server_prompt_cache cache(64, 0, dir, 16, -1, arch, vocab);
 
-    const std::string cid = "conv_drop";
-    for (int32_t p : {100, 500, 900, 1300}) {
-        cache.spill_checkpoint(make_ckpt(p, p + 5, p + 6, 64, 0, static_cast<uint8_t>(p / 100)), cid);
-    }
-    cache.spill_checkpoint(make_ckpt(1000, 1010, 1011, 64, 0, 77), "conv_other");
-    cache.wait_idle();
-
-    // a file this build cannot read is dead weight in the spill budget as well
+    // a file this build cannot read is dead weight in the spill budget as well. it is left over from an
+    // older build, so it is on disk before the first write of the conversation: the cp_ index
+    // ([TAG_CP_INDEX]) is seeded by one scan then, files added from outside afterwards are not seen
     {
         std::ofstream f(fs::path(dir) / "cp_conv_drop_2000.bin", std::ios::binary);
         auto put_u32 = [&f](uint32_t v) { f.write(reinterpret_cast<const char *>(&v), sizeof(v)); };
@@ -664,6 +661,13 @@ static void test_drop_stale_checkpoint_spills() {
         put_u32(arch);
         put_u32(vocab);
     }
+
+    const std::string cid = "conv_drop";
+    for (int32_t p : {100, 500, 900, 1300}) {
+        cache.spill_checkpoint(make_ckpt(p, p + 5, p + 6, 64, 0, static_cast<uint8_t>(p / 100)), cid);
+    }
+    cache.spill_checkpoint(make_ckpt(1000, 1010, 1011, 64, 0, 77), "conv_other");
+    cache.wait_idle();
 
     // no conversation_id -> nothing to scan for
     {
@@ -735,6 +739,77 @@ static void test_spill_all_noop_without_disk() {
     CHECK(cache.states.size() == 1);
 }
 
+// [TAG_STATE_BLOB] shared state blobs: copies share bytes, the pool hands faulted-in buffers back,
+// an unshared buffer is overwritten in place, a shared one never is
+static void test_state_blob_pool() {
+    std::printf("test_state_blob_pool\n");
+    auto pool = std::make_shared<common_state_pool>();
+    pool->max_free = 2;
+
+    common_state_data a;
+    uint8_t * pa = a.reserve_for_write(4096, pool.get());
+    std::memset(pa, 0x11, 4096);
+    CHECK(pool->n_alloc() == 1);
+
+    // unshared, same size: in place, no new buffer
+    CHECK(a.reserve_for_write(4096, pool.get()) == pa);
+    CHECK(pool->n_alloc() == 1);
+
+    // shared: a producer must not scribble over bytes another holder reads
+    common_state_data b = a;
+    CHECK(b.shares_with(a));
+    CHECK(a.use_count() == 2);
+    uint8_t * pa2 = a.reserve_for_write(4096, pool.get());
+    CHECK(pa2 != pa);
+    std::memset(pa2, 0x22, 4096);
+    CHECK(b.data()[0] == 0x11);
+    CHECK(pool->n_alloc() == 2);
+
+    // the last reference returns the buffer to the pool, the next acquire reuses it
+    b.clear();
+    common_state_data c;
+    CHECK(c.reserve_for_write(4096, pool.get()) == pa);
+    CHECK(pool->n_reuse() == 1);
+    CHECK(pool->n_alloc() == 2);
+
+    // a much smaller request does not take a big buffer (capacity window n..n+n/8)
+    c.clear();
+    common_state_data d;
+    CHECK(d.reserve_for_write(128, pool.get()) != pa);
+
+    // the free list is bounded
+    {
+        std::vector<common_state_data> many(5);
+        for (auto & m : many) {
+            m.reserve_for_write(1024, pool.get());
+        }
+    }
+    CHECK(pool->n_alloc() <= 2 + 1 + 5);
+
+    // a blob outliving its pool is freed, not returned
+    common_state_data e;
+    {
+        auto p2 = std::make_shared<common_state_pool>();
+        e.reserve_for_write(64, p2.get());
+    }
+    e.clear();
+
+    // spill_checkpoint takes a reference, not a copy
+    const std::string dir = make_temp_dir("blobshare");
+    {
+        server_prompt_cache cache(64, 0, dir, 16, -1, 0x51u, 0x52u);
+        common_prompt_checkpoint cp = make_ckpt(10, 20, 21, 256, 0, 5);
+        const long before = cp.data_tgt.use_count();
+        common_prompt_checkpoint copy = cp;
+        CHECK(copy.data_tgt.shares_with(cp.data_tgt));
+        CHECK(cp.data_tgt.use_count() == before + 1);
+        cache.spill_checkpoint(cp, "conv_blobshare");
+        cache.wait_idle();
+        CHECK(cp.data_tgt.use_count() == before + 1); // the job dropped its reference after the write
+    }
+    fs::remove_all(dir);
+}
+
 int main() {
     test_lazy_registration_roundtrip();
     test_hash_mismatch_rejected();
@@ -753,6 +828,7 @@ int main() {
     test_over_budget_reflects_ram_limit();
     test_spill_all_frees_ram();
     test_spill_all_noop_without_disk();
+    test_state_blob_pool();
 
     if (g_failures == 0) {
         std::printf("All prompt-cache disk tests passed\n");

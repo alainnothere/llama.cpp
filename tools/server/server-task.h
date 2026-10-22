@@ -670,6 +670,24 @@ struct server_prompt {
     }
 };
 
+// [TAG_REC_REUSE] the hybrid .rec snapshot taken by a slot's last flush_from_context(): the PARTIAL_ONLY
+// (recurrent-only) state of ctx_tgt for the slot's sequence, valid at n_tokens. create_checkpoint()
+// (server-context.cpp) publishes it as the next checkpoint's data_tgt instead of reading the same 157 MB
+// back from the GPU again, when nothing touched the sequence in between (server_slot::state_gen).
+struct server_rec_snapshot {
+    common_state_data blob;
+    int64_t   n_tokens          = -1;
+    uint64_t  token_prefix_hash = 0; // hash_token_prefix(tokens, n_tokens)
+    llama_pos pos_min           = -1;
+    llama_pos pos_max           = -1;
+    uint64_t  state_gen         = 0; // server_slot::state_gen at capture, set by the slot
+
+    void clear() {
+        blob.clear();
+        n_tokens = -1;
+    }
+};
+
 struct server_prompt_data {
     std::vector<uint8_t> main;
     std::vector<uint8_t> drft;
@@ -739,7 +757,11 @@ struct server_prompt_cache {
     // segments and enqueue them for append to the conversation's .kv/.drft files. models whose
     // serialized state is windowed (SWA / hybrid / recurrent) get a single full-state segment
     // rewrite instead. called from server_slot::prompt_save() while the sequence is still live.
-    bool flush_from_context(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    // pool: where the .rec snapshot buffer comes from (the slot's pool, [TAG_STATE_BLOB]).
+    // rec_out: receives a shared reference to the .rec snapshot when one is captured ([TAG_REC_REUSE]);
+    // untouched when the flush is a no-op ("already flushed") or the model is not hybrid.
+    bool flush_from_context(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+                            common_state_pool * pool = nullptr, server_rec_snapshot * rec_out = nullptr);
 
     // write a single checkpoint to its own cp_ file (async). called from create_checkpoint()
     // in server-context.cpp the moment the checkpoint is captured. no-op if disk_path is empty.
@@ -752,11 +774,15 @@ struct server_prompt_cache {
     // block until the async writer has drained everything currently queued
     void wait_idle();
 
-    // scan disk_path for checkpoint spill files belonging to the prompt's conversation
-    // and merge any that fill gaps in prompt.checkpoints.  called after every successful
+    // register the prompt's conversation's checkpoint spill files that fill gaps in prompt.checkpoints,
+    // from the in-memory cp_ index ([TAG_CP_INDEX]; one directory scan per conversation per process).  called after every successful
     // RAM or disk cache match in load(), and also directly from get_available_slot() when
     // a slot is reused without a cache save/load cycle (f_keep >= 0.5).
     void merge_checkpoint_spills(server_prompt & prompt);
+
+    // forget one cp_ file of the conversation in the in-memory index ([TAG_CP_INDEX]) - called when a
+    // disk-backed checkpoint failed to load (the file vanished under us, e.g. the external cache sweep)
+    void forget_checkpoint_spill(const std::string & conversation_id, int32_t pos_min);
 
     // delete this conversation's checkpoint spill files that are bound to more than n_valid
     // tokens. after a rollback those files sit on an abandoned branch: merge always rejects
@@ -784,8 +810,8 @@ private:
         // segment flush: self-contained state blob covering pos [p0, p1)
         llama_pos p0 = 0;
         llama_pos p1 = 0;
-        std::vector<uint8_t> kv;
-        std::vector<uint8_t> drft;
+        common_state_data kv;   // [TAG_STATE_BLOB] no zero fill before the range readback
+        common_state_data drft;
         std::vector<llama_token> tokens; // tokens covered once this job commits ([0, p1))
         bool rewrite = false;            // first segment of a from-scratch write: truncate the files
 
@@ -793,9 +819,11 @@ private:
         // position (it is always a committed segment end) before appending. -1 = no truncate.
         int32_t truncate_to = -1;
 
-        // hybrid models only: recurrent-state snapshot ([u32 n_tok][PARTIAL_ONLY blob]),
-        // carried by the last segment of a flush and written to the .rec file (overwrite)
-        std::vector<uint8_t> rec;
+        // hybrid models only: recurrent-state snapshot (PARTIAL_ONLY blob, valid at rec_n_tok),
+        // carried by the last segment of a flush and written to the .rec file as [u32 n_tok][blob]
+        // (overwrite). shared with the slot's server_rec_snapshot ([TAG_REC_REUSE]), never copied.
+        common_state_data rec;
+        uint32_t          rec_n_tok = 0;
 
         // checkpoint write (when set, the segment fields are unused)
         std::shared_ptr<common_prompt_checkpoint> ckpt;
@@ -835,9 +863,55 @@ public:
         bool broken = false;
     };
 
+    // [TAG_CP_INDEX] one cp_{conv}_{pos_min}.bin file as merge_checkpoint_spills() needs it: the header
+    // fields plus the blob offsets/sizes, so registering a disk-backed checkpoint opens nothing
+    struct cp_file_entry {
+        enum status_t : uint8_t {
+            CP_OK,        // readable by this build
+            CP_BAD_MAGIC, // wrong magic/version or a short header: dead weight, drop_stale removes it
+            CP_BAD_HASH,  // another model / cache type wrote it: skipped by merge, kept by drop_stale
+            CP_TRUNCATED, // header ok, blobs cut short: skipped by merge
+        };
+
+        std::string path;
+        int32_t     pos_min           = 0;
+        int32_t     pos_max           = 0;
+        int64_t     n_tokens          = 0;
+        uint64_t    token_prefix_hash = 0;
+        uint64_t    off_tgt           = 0;
+        uint64_t    sz_tgt            = 0;
+        uint64_t    off_dft           = 0;
+        uint64_t    sz_dft            = 0;
+        status_t    status            = CP_OK;
+    };
+
+private:
+    // [TAG_CP_INDEX] per conversation: every cp_ file the server knows of, keyed by pos_min (the file
+    // name). seeded by one directory scan the first time a conversation is touched in this process
+    // (cp_index_seed), then maintained by the writer: added after the rename commits a file, removed when
+    // the spill limit evicts one or drop_stale_checkpoint_spills deletes one. files deleted from outside
+    // (the operator's sweep cron, every 4 h on grtFxMax) stay listed until a load fails on them: load_tgt
+    // returns false, update_slots falls back to an older checkpoint and calls forget_checkpoint_spill().
+    // that is the same fallback a vanished file always took. measured 2026-10-22 (27B, 919 entries in
+    // the cache dir, ~50 cp_ files per conversation): the scan + 50 opens + a 150 MB seek per file to read
+    // an 8-byte draft size ran on every turn inside merge_checkpoint_spills, 10-100 ms.
+    struct cp_conv_index {
+        bool seeded = false;
+        std::map<int32_t, cp_file_entry> files;
+    };
+    std::unordered_map<std::string, cp_conv_index> cp_index; // guarded by mtx
+
+    // scan disk_path once for the conversation's cp_ files and merge them into cp_index (entries already
+    // there win: the writer knows its own files exactly). the scan runs without the mutex
+    void cp_index_seed(const std::string & conversation_id);
+
+public:
+    // read the header of one cp_ file into an index entry (sizes from the header and the file size)
+    bool read_checkpoint_file_entry(const std::string & path, cp_file_entry & e) const;
+
 private:
     std::deque<disk_job>    queue;
-    std::mutex              mtx;     // protects queue, queue_bytes, disk_convs, writer_active_conv
+    std::mutex              mtx;     // protects queue, queue_bytes, disk_convs, writer_active_conv, cp_index
     std::condition_variable cv;
     std::thread             worker;
     std::atomic<bool>       stop_flag{false};

@@ -9,6 +9,9 @@
 #include "llama.h"
 
 #include <array>
+#include <atomic>
+#include <memory>
+#include <mutex>
 #include <list>
 #include <set>
 #include <sstream>
@@ -1321,6 +1324,89 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // prompt utils
 //
 
+// [TAG_STATE_BLOB] host copy of one llama_state_seq_* blob (a checkpoint, a speculative checkpoint, the
+// hybrid .rec snapshot, a disk segment). measured 2026-10-22 (27B hybrid Qwen3.8, 270k ctx, three Vulkan
+// GPUs): the recurrent plane is 156894364 bytes, and a 597-token turn spent t_checkpoint 2188 ms +
+// t_prompt_cache 1580 ms on the request thread for 2.3 s of compute. three readbacks of that plane per
+// turn, each into a fresh std::vector: resize() value-initializes, so every page of 150 MB is faulted
+// in and zeroed before get_data overwrites it (allocstall 31k during the writer's segment writes), the
+// spill job then copied it again, and clear_tgt() kept the capacity (9 dead 150 MiB blocks, 727 MiB
+// in swap). this type fixes the three at once:
+//   - storage is never zero-filled (new uint8_t[], default-init); the producer always writes all of it
+//   - the bytes are immutable once published and shared by reference: checkpoint copies (clone(),
+//     the RAM cache), the spill job and the .rec flush job hold the same buffer, so checkpoint A can
+//     be the .rec snapshot (server-context.cpp create_checkpoint, [TAG_REC_REUSE]) without a readback
+//   - clear() drops the reference; the last reference returns the buffer to its common_state_pool
+//     (already faulted in, reused by the next capture) or frees it (a 150 MB new[] is mmap-backed in
+//     glibc, the delete is a real munmap)
+// the only in-place write is common_state_capture() into a buffer nobody else references (use_count 1),
+// which keeps the speculative checkpoint (overwritten every long verify step) allocation-free as before.
+struct common_state_buf {
+    std::unique_ptr<uint8_t[]> data;
+    size_t size     = 0;
+    size_t capacity = 0;
+};
+
+// per-slot free list of faulted-in buffers. thread-safe: the last reference to a blob can drop on the
+// disk writer thread (a spill job) as well as on the main thread. buffers live in plain host memory.
+// follow-up: a Vulkan host-pinned pool (ggml_backend_dev_host_buffer_type) would let the readback skip
+// the staging memcpy, but pinned memory is per device in ggml-vulkan (ggml_vk_host_get) and the
+// recurrent state is layer-split over three GPUs, so one pinned buffer helps at most a third of the
+// planes and falls back (and logs "VULKAN FALLBACK") for the rest; not done here.
+struct common_state_pool : std::enable_shared_from_this<common_state_pool> {
+    // free buffers kept for reuse. 2 x 157 MB idle on the 27B; the steady state per turn needs one for
+    // checkpoint B, one for the speculative checkpoint ping-pong and one fresh .rec snapshot at release
+    size_t max_free = 2;
+
+    // a buffer of exactly n bytes, contents undefined. reuses a free buffer of capacity n..n+n/8
+    std::shared_ptr<common_state_buf> acquire(size_t n);
+
+    size_t n_alloc() const { return n_alloc_.load(); }
+    size_t n_reuse() const { return n_reuse_.load(); }
+
+private:
+    friend struct common_state_pool_deleter;
+    void give_back(common_state_buf * buf);
+
+    std::mutex mtx;
+    std::vector<std::unique_ptr<common_state_buf>> free_bufs;
+    std::atomic<size_t> n_alloc_{0};
+    std::atomic<size_t> n_reuse_{0};
+};
+
+// value type over a shared, immutable common_state_buf. the API mirrors the std::vector<uint8_t> it
+// replaces for the readers (data/size/empty/clear); producers go through common_state_capture()
+class common_state_data {
+public:
+    const uint8_t * data()  const { return buf ? buf->data.get() : nullptr; }
+    size_t          size()  const { return buf ? buf->size : 0; }
+    bool            empty() const { return size() == 0; }
+
+    // drop this reference (the buffer goes back to its pool or is freed with the last one)
+    void clear() { buf.reset(); }
+
+    // private copy of [p, p + n) (tests, small blobs)
+    void assign(const uint8_t * p, size_t n);
+    void assign(size_t n, uint8_t v);
+
+    // true when both refer to the same buffer (no copy was made)
+    bool shares_with(const common_state_data & other) const { return buf && buf == other.buf; }
+
+    long use_count() const { return buf.use_count(); }
+
+    // writable buffer of exactly n bytes for a producer. reuses the current buffer in place when nobody
+    // else references it and the size matches, else takes one from the pool (or a fresh allocation).
+    // the returned pointer is valid until the next clear()/reserve_for_write()/assignment
+    uint8_t * reserve_for_write(size_t n, common_state_pool * pool = nullptr);
+
+
+private:
+    std::shared_ptr<common_state_buf> buf;
+};
+
+bool operator==(const common_state_data & a, const std::vector<uint8_t> & b);
+inline bool operator==(const std::vector<uint8_t> & a, const common_state_data & b) { return b == a; }
+
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
@@ -1335,8 +1421,9 @@ struct common_prompt_checkpoint {
     // the conversation is rejected instead of being restored into a diverged prompt.
     uint64_t token_prefix_hash = 0;
 
-    std::vector<uint8_t> data_tgt;
-    std::vector<uint8_t> data_dft;
+    // shared, immutable once captured ([TAG_STATE_BLOB]); copies of the checkpoint share the bytes
+    common_state_data data_tgt;
+    common_state_data data_dft;
 
     // disk-backed (lazy) source. When src_path is non-empty and the matching
     // data_* vector is empty, the KV blob lives on disk at [off, off+sz) and is
@@ -1362,15 +1449,19 @@ struct common_prompt_checkpoint {
             llama_pos pos_min,
             llama_pos pos_max);
 
+    // read the live state into data_tgt / data_dft. pool: where a new buffer comes from (nullptr =
+    // fresh allocation); the current buffer is overwritten in place when nobody else references it
     void update_tgt(
             llama_context * ctx,
             llama_seq_id seq_id,
-            llama_state_seq_flags flags);
+            llama_state_seq_flags flags,
+            common_state_pool * pool = nullptr);
 
     void update_dft(
             llama_context * ctx,
             llama_seq_id seq_id,
-            llama_state_seq_flags flags);
+            llama_state_seq_flags flags,
+            common_state_pool * pool = nullptr);
 
     // returns true on success (restored, or genuinely empty no-op); false if a
     // disk-backed blob could not be read (caller should fall back to reprocess).
@@ -1384,6 +1475,10 @@ struct common_prompt_checkpoint {
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;
 
+    // drop the resident blobs: the buffers go back to their pool (or are freed) with the last reference
     void clear_tgt();
     void clear_dft();
 };
+
+// read the seq's state into out (llama_state_seq_get_size_ext + get_data_ext), see common_state_data::reserve_for_write
+void common_state_capture(common_state_data & out, llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags, common_state_pool * pool = nullptr);

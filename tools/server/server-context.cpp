@@ -94,6 +94,8 @@ struct server_ubatch_stats {
     int64_t t_batch_build   = 0;
     int64_t t_spec_process  = 0;
     int64_t t_post_decode   = 0;
+    int64_t n_ckpt_rec_reuse = 0; // [TAG_REC_REUSE] checkpoints published from the .rec snapshot (no readback)
+    int64_t t_release_flush  = 0; // [TAG_RELEASE_FLUSH] flush_from_context run at slot release, off the request path
 
     server_ubatch_stats() {
         const char * v = getenv("LLAMA_SERVER_UBATCH_STATS");
@@ -130,13 +132,16 @@ struct server_ubatch_stats {
         snprintf(buf, sizeof(buf),
                 "{\"t\":%.6f,\"slot\":%d,\"n_tokens\":%d,\"n_past\":%d,\"t_decode_us\":%" PRId64 ",\"t_spec_process_us\":%" PRId64 ","
                 "\"t_post_decode_us\":%" PRId64 ",\"t_checkpoint_us\":%" PRId64 ",\"n_checkpoints_created\":%" PRId64 ",\"checkpoint_bytes\":%" PRId64 ","
-                "\"t_prompt_cache_us\":%" PRId64 ",\"t_batch_build_us\":%" PRId64 ",\"t_since_prev_us\":%" PRId64 ",\"t_other_us\":%" PRId64 "}\n",
+                "\"t_prompt_cache_us\":%" PRId64 ",\"t_batch_build_us\":%" PRId64 ",\"t_since_prev_us\":%" PRId64 ",\"t_other_us\":%" PRId64 ","
+                "\"n_ckpt_rec_reuse\":%" PRId64 ",\"t_release_flush_us\":%" PRId64 "}\n",
                 t_unix, slot, n_tokens, n_past, t_decode, t_spec_process,
                 t_post_decode, t_checkpoint, n_checkpoints, checkpoint_bytes,
-                t_prompt_cache, t_batch_build, since, t_prev_end > 0 ? since - named : 0);
+                t_prompt_cache, t_batch_build, since, t_prev_end > 0 ? since - named - t_release_flush : 0,
+                n_ckpt_rec_reuse, t_release_flush);
         write(buf);
 
         t_checkpoint = n_checkpoints = checkpoint_bytes = 0;
+        n_ckpt_rec_reuse = t_release_flush = 0;
         t_prompt_cache = t_batch_build = t_spec_process = t_post_decode = 0;
         t_prev_end = ggml_time_us();
     }
@@ -1147,8 +1152,35 @@ struct server_slot {
 
     server_prompt prompt;
 
-    bool prompt_save(server_prompt_cache & prompt_cache) const {
-        server_ustats_timer ut(server_ustats().t_prompt_cache); // [LLAMA_SERVER_UBATCH_STATS]
+    // [TAG_STATE_BLOB] faulted-in buffers for this slot's recurrent-state captures (checkpoints, the
+    // speculative checkpoint, the .rec snapshot). shared_ptr: blobs held by the disk writer return to it
+    std::shared_ptr<common_state_pool> state_pool = std::make_shared<common_state_pool>();
+
+    // [TAG_REC_REUSE] state generation of this slot's sequence in ctx_tgt. bumped by every operation that
+    // can change the bytes llama_state_seq_get_data_ext(ctx_tgt, id, PARTIAL_ONLY) returns: a target
+    // decode with tokens of this slot (update_slots, after llama_process), seq_rm that removes a cell
+    // (prompt_clear, context shift, cache reuse shift, tail rewind, the truncation before the prompt
+    // batch when it is not past the tail, the speculative trims), checkpoint / spec-checkpoint /
+    // plane restores, prompt_load (RAM or disk restore), copy_prompt_to / copy_state_to (the target),
+    // slot restore from file and erase. a site that mutates ctx_tgt for this sequence and does not
+    // call state_changed() makes rec_snap stale, and create_checkpoint would then publish a recurrent
+    // state from another point in time: keep the list complete when adding one. ctx_dft is not
+    // covered - rec_snap only ever stands in for data_tgt.
+    uint64_t state_gen = 0;
+
+    // [TAG_REC_REUSE] the .rec snapshot of the last flush of this slot (server-task.h). dropped on
+    // state_changed(), so a stale blob is never kept alive (157 MB on the 27B)
+    server_rec_snapshot rec_snap;
+
+    void state_changed() {
+        ++state_gen;
+        rec_snap.clear();
+    }
+
+    // at_release: called by server_context::release_and_flush() after the final response ([TAG_RELEASE_FLUSH]);
+    // only changes which LLAMA_SERVER_UBATCH_STATS accumulator gets the time
+    bool prompt_save(server_prompt_cache & prompt_cache, bool at_release = false) {
+        server_ustats_timer ut(at_release ? server_ustats().t_release_flush : server_ustats().t_prompt_cache); // [LLAMA_SERVER_UBATCH_STATS]
         if (prompt.tokens.size() == 0) {
             return false;
         }
@@ -1158,7 +1190,14 @@ struct server_slot {
         // mtmd prompts cannot be serialized and stay on the RAM path below.
         if (!prompt_cache.disk_path.empty() && !prompt.tokens.has_mtmd) {
             SRV_INF("prompt_save: flushing conversation_id=%s to disk\n", prompt.conversation_id.c_str());
-            return prompt_cache.flush_from_context(prompt, ctx_tgt, ctx_dft, id);
+
+            server_rec_snapshot snap;
+            const bool ok = prompt_cache.flush_from_context(prompt, ctx_tgt, ctx_dft, id, state_pool.get(), &snap);
+            if (snap.n_tokens >= 0) {
+                rec_snap           = std::move(snap);
+                rec_snap.state_gen = state_gen;
+            }
+            return ok;
         }
 
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
@@ -1186,6 +1225,7 @@ struct server_slot {
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, const std::string & conversation_id) {
         server_ustats_timer ut(server_ustats().t_prompt_cache); // [LLAMA_SERVER_UBATCH_STATS]
+        state_changed(); // [TAG_REC_REUSE] a RAM or disk restore rewrites the sequence (or may have, on failure)
         bool res = prompt_cache.load(prompt, tokens, conversation_id, ctx_tgt, ctx_dft, id);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
@@ -1198,6 +1238,7 @@ struct server_slot {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
         mem.seq_rm(id, -1, -1);
+        state_changed();
 
         prompt.clear();
     }
@@ -2086,6 +2127,7 @@ struct server_slot {
     void copy_prompt_to(server_slot & other) const {
         mem.seq_rm(other.id,     -1, -1);
         mem.seq_cp(id, other.id, -1, -1);
+        other.state_changed();
 
         other.prompt = prompt.clone();
     }
@@ -2095,6 +2137,7 @@ struct server_slot {
 
         mem.seq_rm(other.id,     -1, -1);
         mem.seq_cp(id, other.id, -1, -1);
+        other.state_changed();
 
         other.i_batch = i_batch;
 
@@ -2386,6 +2429,38 @@ private:
 
         mtmd_free(mctx);
         mctx = nullptr;
+    }
+
+    // [TAG_RELEASE_FLUSH] release the slot after its final response, then flush its state to the disk tier
+    // right away instead of at the next request's prompt_save(). measured 2026-10-22 (27B hybrid, 270k ctx):
+    // that flush (KV range readback + the 157 MB .rec readback + enqueue) cost 270-551 ms of every turn's
+    // t_prompt_cache, 1.4-4.3 s in spikes, all of it on the next request's path. here it overlaps with the
+    // client reading the response (the result is already queued for the HTTP thread), and the next
+    // prompt_save() finds "already flushed" (flush_from_context: scheduled tokens == live tokens) and returns.
+    //
+    // no race with a request arriving for the same slot: this runs synchronously on the main loop thread,
+    // the same thread that will run the next task's prompt_save(), and flush_from_context() updates
+    // disk_convs[].scheduled_* under the cache mutex before it returns. what is still in flight is only the
+    // writer's file I/O, and every reader of the files already waits for it: load_from_disk() blocks until
+    // no job of the conversation is queued or active, merge_checkpoint_spills() only sees committed files.
+    // the next prompt_save() therefore never starts a second flush of the same tokens.
+    //
+    // only for normal completion (the stop paths that send the final response). error/cancel releases keep
+    // flushing lazily: a failed decode can leave tokens and memory out of step. stateless and child tasks
+    // clear their state in release(), mtmd prompts never reach the disk tier, RAM-only mode would copy the
+    // whole state into the RAM cache for nothing (alloc() dedups it on the next save anyway).
+    void release_and_flush(server_slot & slot) {
+        const bool reusable = slot.task && !slot.task->is_child() && !slot.task->is_stateless();
+
+        slot.release();
+
+        if (!reusable || !prompt_cache || prompt_cache->disk_path.empty() ||
+                slot.prompt.tokens.has_mtmd || slot.prompt.n_tokens() == 0 || slot.prompt.conversation_id.empty()) {
+            return;
+        }
+
+        SLT_DBG(slot, "%s", "flushing released slot to the disk tier\n");
+        slot.prompt_save(*prompt_cache, /*at_release =*/ true);
     }
 
     void slot_save_and_clear(server_slot & slot) {
@@ -4107,14 +4182,59 @@ private:
         // needs the token list
         cur.token_prefix_hash = hash_token_prefix(slot.prompt.tokens, (size_t) cur.n_tokens);
 
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        // [TAG_REC_REUSE] checkpoint A of a follow-up turn is taken before the first prompt batch, at the
+        // position the previous turn ended - where prompt_save() (or the release flush, [TAG_RELEASE_FLUSH])
+        // just read the recurrent state for the .rec file. measured 2026-10-22 (27B hybrid, 270k ctx,
+        // 157 MB plane): that second readback cost 840-2700 ms per turn for identical bytes. publish the
+        // .rec buffer instead when all of these hold:
+        //   - same token count and the same token prefix (the hash binds the new prompt to the flushed one)
+        //   - same pos_min/pos_max of the sequence (defense in depth for the generation check)
+        //   - state_gen unchanged since the capture: no decode / seq_rm / restore touched the sequence
+        //     (server_slot::state_gen lists the sites)
+        //   - PARTIAL_ONLY on ctx_tgt for slot.id is what both captures read (flush_from_context .rec)
+        // the cp_ file is still written from the shared buffer (spill_checkpoint takes a reference).
+        // the non-consuming load path is unaffected: the blob is immutable, the .rec job, the slot and
+        // the checkpoint each hold a reference, and lazify/clear only drop theirs.
+        const auto & snap = slot.rec_snap;
+        if (!snap.blob.empty() &&
+                snap.state_gen         == slot.state_gen &&
+                snap.n_tokens          == cur.n_tokens &&
+                snap.token_prefix_hash == cur.token_prefix_hash &&
+                snap.pos_min           == pos_min &&
+                snap.pos_max           == pos_max) {
+            cur.data_tgt = snap.blob;
+            if (ust.on) {
+                ust.n_ckpt_rec_reuse += 1;
+            }
+            SLT_DBG(slot, "checkpoint at n_tokens = %" PRId64 " reuses the .rec snapshot (%.1f MiB, no GPU readback)\n",
+                    cur.n_tokens, snap.blob.size() / (1024.0 * 1024.0));
+
+            // LLAMA_SERVER_VERIFY_REC_REUSE=1: read the state back anyway and compare. for validating the
+            // state_gen site list on a new model / backend; costs exactly the readback the reuse saves
+            static const bool verify = [] { const char * v = getenv("LLAMA_SERVER_VERIFY_REC_REUSE"); return v && *v && *v != '0'; }();
+            if (verify) {
+                common_state_data chk;
+                common_state_capture(chk, ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                if (chk.size() == cur.data_tgt.size() && memcmp(chk.data(), cur.data_tgt.data(), chk.size()) == 0) {
+                    SLT_WRN(slot, "rec reuse verify: identical (%zu bytes)\n", chk.size());
+                } else {
+                    SLT_ERR(slot, "rec reuse verify: MISMATCH (%zu vs %zu bytes) - a state_gen site is missing, using the readback\n",
+                            chk.size(), cur.data_tgt.size());
+                    cur.data_tgt = chk;
+                }
+            }
+        } else {
+            cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, slot.state_pool.get());
+        }
+        // A holds its own reference now; the snapshot's job is done either way
+        slot.rec_snap.clear();
 
         // a range-truncatable draft (PART) is rolled back by the seq_rm that follows every
         // checkpoint restore, so serializing it here would only duplicate the .drft segment
         // data. FULL/RS drafts cannot be truncated to an arbitrary position, so they still
         // need the blob.
         if (ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
-            cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, slot.state_pool.get());
         }
 
         // stash the draft's speculative state with the checkpoint
@@ -4418,6 +4538,7 @@ private:
                     try {
                         size_t n_packed = 0;
                         llama_tokens packed;
+                        slot->state_changed(); // [TAG_REC_REUSE] the file replaces the sequence
                         nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &n_packed);
                         if (nread != 0) {
                             packed.resize(std::max<size_t>(1, n_packed));
@@ -4871,6 +4992,7 @@ private:
 
                 slot.mem.seq_rm (slot.id, n_keep            , n_keep + n_discard);
                 slot.mem.seq_add(slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
+                slot.state_changed(); // [TAG_REC_REUSE]
 
                 // add generated tokens to cache
                 // ref: https://github.com/ggml-org/llama.cpp/pull/16818#discussion_r2473269481
@@ -4956,7 +5078,7 @@ private:
                             //       overlap window opened by the previous iteration's
                             //       common_speculative_process() [TAG_SPEC_OVERLAP]. only recurrent
                             //       draft models take this path
-                            slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, slot.state_pool.get());
                         }
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
@@ -5056,7 +5178,7 @@ private:
 
                 if (use_ckpt_dft) {
                     server_ustats_timer ut(server_ustats().t_checkpoint);
-                    ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, slot.state_pool.get());
                 }
             }
         });
@@ -5264,6 +5386,7 @@ private:
 
                                             slot.mem.seq_rm (slot.id, head_p, head_c);
                                             slot.mem.seq_add(slot.id, head_c, head_c + n_match, kv_shift);
+                                            slot.state_changed(); // [TAG_REC_REUSE]
 
                                             for (size_t i = 0; i < n_match; i++) {
                                                 slot.prompt.tokens.set_token(head_p + i, slot.prompt.tokens[head_c + i]);
@@ -5332,6 +5455,7 @@ private:
                                     // [TAG_PROMPT_LOGITS] lowers n_past by one - that extra one-token
                                     // rewind composes with the one performed here.
                                     needs_tail_rewind = !llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, pos_next, -1);
+                                    slot.state_changed(); // [TAG_REC_REUSE] pos_tail >= pos_next: a cell moves back (or the attempt failed)
 
                                     if (!needs_tail_rewind && ctx_dft &&
                                             !llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, pos_next, -1)) {
@@ -5441,13 +5565,19 @@ private:
                                         // checkpoints the KV blob is faulted in from disk here; a
                                         // read failure (e.g. the spill file was evicted under us)
                                         // returns false and we keep searching older checkpoints.
+                                        slot.state_changed(); // [TAG_REC_REUSE] a restore, or a partial one on failure
                                         const bool ok_tgt = it->load_tgt(ctx_tgt,       slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         const bool ok_dft = it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                                         if (!ok_tgt || !ok_dft) {
                                             SLT_WRN(slot, "failed to load context checkpoint from disk (pos_min = %d, pos_max = %d) - falling back to an older checkpoint\n", it->pos_min, it->pos_max);
 
-                                            // the file is gone - drop the entry, else every future rollback retries it
+                                            // the file is gone - drop the entry, else every future rollback retries it.
+                                            // the cp_ index keeps listing a file deleted from outside (the sweep cron)
+                                            // until this point, see [TAG_CP_INDEX]
+                                            if (prompt_cache && !it->src_path.empty()) {
+                                                prompt_cache->forget_checkpoint_spill(slot.prompt.conversation_id, it->pos_min);
+                                            }
                                             const auto next = slot.prompt.checkpoints.erase(std::next(it).base());
                                             it = std::make_reverse_iterator(next);
                                             continue;
@@ -5528,6 +5658,13 @@ private:
                     const llama_pos p0 = slot.prompt.tokens.pos_next();
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
+
+                    // [TAG_REC_REUSE] p0 past the tail removes nothing: the normal follow-up turn (the client
+                    // echoes every cached token) lands here with p0 == pos_max + 1, and that must keep the
+                    // .rec snapshot valid for checkpoint A below. anything at or below the tail is a change
+                    if (p0 <= llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id)) {
+                        slot.state_changed();
+                    }
                     // for recurrent/hybrid memory the tail was already rewound at [TAG_SERVER_TAIL_REWIND],
                     // so this is a no-op there unless [TAG_PROMPT_LOGITS] lowered n_past by one
                     if (!llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, p0, -1)) {
@@ -5852,7 +5989,7 @@ private:
         {
             // [LLAMA_SERVER_UBATCH_STATS] speculative checkpoint, counted with the context checkpoints
             server_ustats_timer ut(server_ustats().t_checkpoint);
-            ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, slot.state_pool.get());
         }
         slot.spec_ckpt_tgt_pos = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
         if (server_ustats().on) {
@@ -5954,6 +6091,15 @@ private:
         bool has_output = false;
         for (int i = off; i < off + batch.view.size(); ++i) {
             has_output |= batch.tokens[i].output;
+        }
+
+        // [TAG_REC_REUSE] every slot with tokens in this view gets a new state (also on failure: a failed
+        // decode can leave a partially applied ubatch behind)
+        for (int i = off; i < off + batch.view.size(); ++i) {
+            const int32_t sid = batch.tokens[i].id_slot;
+            if (sid >= 0 && sid < (int32_t) slots.size()) {
+                slots[sid].state_changed();
+            }
         }
 
         // yield to the queue, so we can still handle metrics tasks while decoding
@@ -6353,7 +6499,7 @@ private:
                 // release slot because of stop condition
                 slot.print_timings();
                 send_final_response(slot);
-                slot.release();
+                release_and_flush(slot); // [TAG_RELEASE_FLUSH]
 
                 return;
             }
@@ -6440,6 +6586,7 @@ private:
                     }
 
                     slot.mem.seq_rm(slot.id, p_keep, -1);
+                    slot.state_changed(); // [TAG_REC_REUSE] plane select or host checkpoint restore + trim
 
                     slot.prompt.tokens.keep_first(n_keep);
 
@@ -6508,6 +6655,7 @@ private:
                     common_speculative_seed_drop(slot.spec, slot.id);
                 }
 
+                slot.state_changed(); // [TAG_REC_REUSE] the trim below (and the verify decode before it)
                 if (slot.ctx_dft && pos_seed == pos_next) {
                     if (!llama_memory_seq_rm(llama_get_memory(slot.ctx_tgt), slot.id, pos_next,     -1) ||
                         !llama_memory_seq_rm(llama_get_memory(slot.ctx_dft), slot.id, pos_next + 1, -1)) {
@@ -6532,7 +6680,7 @@ private:
                 if (!process_token(result, slot)) {
                     slot.print_timings();
                     send_final_response(slot);
-                    slot.release();
+                    release_and_flush(slot); // [TAG_RELEASE_FLUSH]
 
                     return;
                 }

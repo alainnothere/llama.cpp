@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import tempfile
 import pytest
@@ -153,3 +154,107 @@ def test_follow_up_turn_rewinds_recurrent_tail():
     # the rewind must have landed inside the first prompt, not at its end: the
     # divergence position itself is re-processed from the checkpoint
     assert res.body["timings"]["cache_n"] < n_first
+
+
+def _tokens_raw(text: str, add_special: bool) -> list[int]:
+    res = server.make_request("POST", "/tokenize", data={"content": text, "add_special": add_special})
+    assert res.status_code == 200
+    return res.body["tokens"]
+
+
+def _completion_tokens(tokens: list[int], n_predict: int) -> ServerResponse:
+    return server.make_request("POST", "/completion", data={
+        "prompt": tokens,
+        "n_predict": n_predict,
+        "cache_prompt": True,
+        "temperature": 0.0,
+        "return_tokens": True,
+        "message_delimiters": DELIMITERS,
+    })
+
+
+def _follow_up_tokens(t1: list[int], gen: list[int], tag: str) -> list[int]:
+    # the client echoes the previous answer token-exactly (prompt as token ids), so the
+    # cached tokens are a strict prefix and the new turn starts right at the flushed position
+    tail = "<|im_end|>\n<|im_start|>user\n" + _sentences(tag, 2) + "<|im_end|>\n<|im_start|>assistant\n"
+    return t1 + gen + _tokens_raw(tail, add_special=False)
+
+
+# [TAG_REC_REUSE] a short follow-up turn takes checkpoint A before its first prompt batch, at the
+# position the previous turn ended. that is the state prompt_save() just read for the .rec file,
+# so A must publish the .rec buffer instead of reading the recurrent state back a second time.
+# LLAMA_SERVER_VERIFY_REC_REUSE makes the server read it back anyway and compare the bytes.
+def test_follow_up_checkpoint_reuses_rec_snapshot(monkeypatch):
+    monkeypatch.setenv("LLAMA_SERVER_VERIFY_REC_REUSE", "1")
+    # production runs --no-cache-idle-slots: the slot keeps its state between turns. with the
+    # idle-slot clear the next turn is a disk restore, which rewrites the state (no reuse there)
+    server.no_cache_idle_slots = True
+    server.start()
+    log = LogReader(server.log_path)
+
+    t1 = _tokens_raw(_ask(_conversation(2), "q1"), add_special=True)
+    res = _completion_tokens(t1, n_predict=4)
+    assert res.status_code == 200
+    gen = [t["id"] if isinstance(t, dict) else t for t in res.body["tokens"]]
+    log.drain()
+
+    t2 = _follow_up_tokens(t1, gen, "q2")
+    res = _completion_tokens(t2, n_predict=4)
+    assert res.status_code == 200
+    out = log.drain()
+
+    assert "reuses the .rec snapshot" in out, "checkpoint A read the recurrent state back from the device"
+    assert "rec reuse verify: identical" in out
+    assert "MISMATCH" not in out
+    # the whole cached prefix was kept, only the new turn was processed
+    assert res.body["timings"]["prompt_n"] < len(t2) - len(t1)
+
+
+# a turn that diverges inside the cached prefix restores a checkpoint first: the state moved,
+# so the stale .rec snapshot must not be published as the next checkpoint
+def test_rec_snapshot_not_reused_after_state_change(monkeypatch):
+    monkeypatch.setenv("LLAMA_SERVER_VERIFY_REC_REUSE", "1")
+    server.no_cache_idle_slots = True
+    server.start()
+    log = LogReader(server.log_path)
+
+    t1 = _tokens_raw(_ask(_conversation(2), "q1"), add_special=True)
+    res = _completion_tokens(t1, n_predict=4)
+    assert res.status_code == 200
+    gen = [t["id"] if isinstance(t, dict) else t for t in res.body["tokens"]]
+
+    t2 = _follow_up_tokens(t1, gen, "q2")
+    assert _completion_tokens(t2, n_predict=4).status_code == 200
+    log.drain()
+
+    # rewind into the first turn: diverge 40 tokens before its end
+    t3 = t1[:-40] + _tokens_raw("<|im_start|>user\n" + _sentences("q3", 2) + "<|im_end|>\n<|im_start|>assistant\n", add_special=False)
+    res = _completion_tokens(t3, n_predict=4)
+    assert res.status_code == 200
+    out = log.drain()
+
+    assert "restored context checkpoint" in out
+    assert "created context checkpoint" in out
+    assert "MISMATCH" not in out
+    assert "reuses the .rec snapshot" not in out
+
+
+# [TAG_CP_INDEX] the cp_ files of a conversation are listed once per process; every later merge
+# reads the writer-maintained index (no directory scan, no opens)
+def test_checkpoint_index_seeded_once():
+    server.no_cache_idle_slots = True
+    server.start()
+    log = LogReader(server.log_path)
+
+    toks = _tokens_raw(_ask(_conversation(2), "q1"), add_special=True)
+    for i in range(3):
+        res = _completion_tokens(toks, n_predict=4)
+        assert res.status_code == 200
+        gen = [t["id"] if isinstance(t, dict) else t for t in res.body["tokens"]]
+        toks = _follow_up_tokens(toks, gen, f"q{i + 2}")
+
+    out = log.drain()
+    seeded = re.findall(r"checkpoint index: seeded '(\w+)'", out)
+    assert len(seeded) == len(set(seeded)) == 1, f"index seeded more than once: {seeded}"
+    merges = [int(n) for n in re.findall(r"checkpoint merge: scanned (\d+)", out)]
+    assert merges and max(merges) > 0
