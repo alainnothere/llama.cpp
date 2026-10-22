@@ -14730,7 +14730,7 @@ static void ggml_backend_vk_get_tensor_async(ggml_backend_t backend, const ggml_
     ggml_backend_vk_get_tensor_2d_async(backend, tensor, data, offset, size, 1, size, size);
 }
 
-// [fork, 2026-10-21] Async cross-device copy (GGML_VK_D2D_ASYNC, default off until the multi-GPU ppl gate passes).
+// [fork, 2026-10-21] Async cross-device copy (GGML_VK_D2D_ASYNC, default ON since 2026-10-22; history at the constants below).
 //
 // Without it ggml_backend_vk_cpy_tensor_async refuses a copy between two devices and the scheduler takes the
 // bounce: host-sync the source, host-sync (or event-sync) the destination, then a blocking staging copy. Measured
@@ -14819,7 +14819,29 @@ static void ggml_backend_vk_get_tensor_async(ggml_backend_t backend, const ggml_
 // Not closed: amdgpu userptr pages are not pinned, so compaction / page migration can still invalidate the
 // range; that path is the driver's normal job, but if this kernel's notifier is broken (7.1.3-zen4-p2p carries
 // the explicit-sync dma-buf patch) only a stock-kernel run separates "our munmap" from "any invalidation".
-static constexpr bool   VK_D2D_ASYNC_DEFAULT = false;
+//
+// CLOSED 2026-10-22 06:40: it was the kernel. Oops at amdgpu_hmm.c:70, `bo->vm_bo->vm->root.bo`, a line new in
+// 7.1 (not in 6.18.8): a userptr BO has vm_bo == NULL between GEM creation and its VM map and again between VM
+// unmap and free, and amdgpu registers the mmu notifier at creation, so any invalidation touching the range in
+// either window (THP split by a neighbouring munmap, kcompactd migration) dereferences NULL. Hypothesis 2 was
+// the trigger, the driver was the bug: hypothesis 1 (use-after-free on regrowth) never happened. Upstream fix
+// "drm/amdgpu: fix check in amdgpu_hmm_invalidate_gfx" (Christian Koenig, amd-gfx 2026-06-26, Fixes 5cd5f99b7b9b,
+// CVE-2026-68101) keeps bo->parent = vm.root.bo and waits on that; applied in ~/gitSrc/linux/kernel-build/
+// patches/amdgpu-hmm-invalidate-gfx-null-vm_bo.patch, module rebuilt and installed 06:45, loaded after reboot
+// (symbol offsets verified). The ring rewrite above stays: on a stock kernel it keeps the ring out of every
+// window the bug lives in, and on a fixed one it costs nothing. Same-vendor reports of the same oops from
+// RADV host imports: ublue-os/bazzite#5285, mathiasbourgoin/Sarek#503.
+//
+// DEFAULT ON 2026-10-22 07:20, gate passed on the fixed kernel: llama-perplexity, Qwen3.8-27B Q8, three cards
+// (Vulkan2,Vulkan3,Vulkan1 -ts 16,26,24, -sm layer), -c 4096 -b 2048 -ub 2048, 24 chunks (two ubatches and
+// several 40 MiB hops per chunk, so the ring grew 16 -> 256 MiB on the first hop): ppl 3.0725 +- 0.02792 on both
+// arms, every one of the 24 per-chunk values identical to the last printed digit; prompt eval 921.5 -> 1135.1 t/s
+// (+23%), wall 131.1 -> 114.2 s; no fallback warning, journal clean. Production the same morning (server, env var
+// on, 23k..37k contexts, checkpoint saves and the 150 MiB blob munmaps that killed it the night before): 611 ->
+// 711 t/s on the first 2k batch at 23k, 568 -> 677 at 31k, 850 on a fresh 11k prompt; two hours, no oops.
+// GGML_VK_D2D_ASYNC=0 restores the bounce path. On an unpatched 7.1 kernel this knob is a crash risk under
+// memory pressure whatever the ring does, because any host import is; that is the kernel's bug to carry.
+static constexpr bool   VK_D2D_ASYNC_DEFAULT = true;
 static constexpr size_t VK_D2D_RING_MIN      = 16u * 1024 * 1024;
 static constexpr size_t VK_D2D_HOP_MAX       = 128u * 1024 * 1024;   // larger hops take the bounce
 static constexpr size_t VK_D2D_ALIGN         = 256;
