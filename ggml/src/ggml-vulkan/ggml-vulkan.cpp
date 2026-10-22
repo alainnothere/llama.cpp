@@ -15275,14 +15275,18 @@ static bool ggml_vk_d2d_async_enabled() {
 static int32_t ggml_vk_d2d_ring_pref() {
     static const int32_t kind = [] {
         const char * v = getenv("GGML_VK_D2D_RING");
-        if (v == nullptr || strcmp(v, "export") == 0) {
-            return (int32_t) GGML_BACKEND_D2D_RING_EXPORT;
-        }
-        if (strcmp(v, "userptr") == 0) {
+        // [2026-10-22 18:30 after reboot] DEFAULT userptr until the exported ring passes the gate: ppl 13326.86 with
+        // export vs 2.8989 with userptr (deterministic, identical digits across two export runs, with either submit
+        // rule), -c 8192 -b 8192 -ub 2048, 12 chunks. Host-side submit cost of the exported ring was right (issue
+        // 0.76/0.81/0.73 ms vs 8/16.6/8); its data is not. Bisection: bounce path, one ubatch per batch.
+        if (v == nullptr || strcmp(v, "userptr") == 0) {
             return (int32_t) GGML_BACKEND_D2D_RING_USERPTR;
         }
-        GGML_LOG_WARN("ggml_vulkan: GGML_VK_D2D_RING=%s not understood (export | userptr), using export\n", v);
-        return (int32_t) GGML_BACKEND_D2D_RING_EXPORT;
+        if (strcmp(v, "export") == 0) {
+            return (int32_t) GGML_BACKEND_D2D_RING_EXPORT;
+        }
+        GGML_LOG_WARN("ggml_vulkan: GGML_VK_D2D_RING=%s not understood (export | userptr), using userptr\n", v);
+        return (int32_t) GGML_BACKEND_D2D_RING_USERPTR;
     }();
     return kind;
 }
@@ -17171,7 +17175,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     // way. Raising amdgpu.sched_jobs (modprobe.d, power of two, needs a reboot) is the other half.
     static const uint32_t submits_per_graph = [] {
         const char * e = getenv("GGML_VK_SUBMITS_PER_GRAPH");
-        const long v = e ? atol(e) : 12;
+        // [2026-10-22 18:30 after reboot] DEFAULT 256 (= the old 40-submit rule wins): the ppl gate on the 27B gave
+        // 1383.57 with 12 vs 2.8989 with 256 (userptr ring, -c 8192 -b 8192 -ub 2048, 12 chunks). Fewer submissions per
+        // graph corrupt results somewhere (suspects: sched event/copy ordering across ubatches, almost_ready fence,
+        // scratch hazards inside one submission); bisection in progress. Set 12 only to reproduce.
+        const long v = e ? atol(e) : 256;
         return (uint32_t) (v < 1 ? 1 : v > 256 ? 256 : v);
     }();
     // the cap (TDR guard for weak cards) and the node bound below must not undo the per-graph count: 110k paste,
