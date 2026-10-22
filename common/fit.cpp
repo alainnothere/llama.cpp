@@ -964,11 +964,21 @@ static void common_params_fit_impl(
         const uint32_t align   = 256 * n_streams;
         const uint32_t n_ctx_cap = n_ctx_max / align * align;
         if (n_layers_assigned == hp_ngl + 1 && cparams->n_ctx < n_ctx_cap) {
+            // [fork, 2026-10-22 14:15] grow slack. The first grow-back landed the XT at 1026 MiB free vs a 1024 target
+            // (2 MiB to spare) measured against the "free" read before the probes; the fit summary's fresh probe at the
+            // end read 243 MiB less free (RADV heapUsage drifts during the fit's own loads), so the chosen 289024 was
+            // really 240 MiB UNDER the margin, and the kernel evicted the 1.13 GB mask-op output off the XT at the
+            // first prompt (GTT WATCH: +1503 MiB at graph 16, 6.6-8.6 ms/tok vs 0.8-2.9 on the replay). The grow
+            // therefore stops GROW_SLACK short of the margin, and the result is re-checked below against a fresh free
+            // reading. Cross-module: the margin itself (1024 default) is the user's headroom for the lazy per-graph
+            // allocations and the kernel's own placement; 2873 MiB free (270k) ran clean, 783 did not; the threshold in
+            // between is not known, so the slack is a floor, not the answer (ledger 2026-10-22 14:15).
+            const int64_t GROW_SLACK = 256 * MiB;
             auto fits_at = [&](uint32_t n_ctx_test, std::vector<int64_t> & mem_test) -> bool {
                 cparams->n_ctx = n_ctx_test;
                 mem_test = get_memory_for_layers(__func__, ngl_per_device, overflow_bufts);
                 for (size_t id = 0; id < nd; id++) {
-                    if (mem_test[id] > targets[id]) {
+                    if (mem_test[id] > targets[id] - GROW_SLACK) {
                         return false;
                     }
                 }
@@ -1031,6 +1041,37 @@ static void common_params_fit_impl(
 
             cparams->n_ctx = lo;
             mem            = mem_lo;
+
+            // re-check against a FRESH free reading (see GROW_SLACK above: the reading drifted 243 MiB during one fit);
+            // step down one align at a time, at most 8 times, until every device keeps its margin against it
+            {
+                std::vector<int64_t> free_now(nd, 0);
+                for (size_t id = 0; id < nd; id++) {
+                    size_t f = 0, t = 0;
+                    ggml_backend_dev_memory(devs[id], &f, &t);
+                    free_now[id] = int64_t(f);
+                }
+                int n_down = 0;
+                for (; n_down < 8 && lo > n_ctx_start; n_down++) {
+                    bool ok = true;
+                    for (size_t id = 0; id < nd; id++) {
+                        if (free_now[id] - mem[id] < margins[id]) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if (ok) {
+                        break;
+                    }
+                    lo = std::max(n_ctx_start, (lo - align) / align * align);
+                    cparams->n_ctx = lo;
+                    mem = get_memory_for_layers(__func__, ngl_per_device, overflow_bufts);
+                    n_probe++;
+                }
+                if (n_down > 0) {
+                    LOG_TRC("%s: grow-back stepped down %d x %" PRIu32 " cells after a fresh free reading\n", __func__, n_down, align);
+                }
+            }
             LOG_TRC("%s: context grown from %" PRIu32 " to %" PRIu32 " with the layer split fixed (%d probes, cap %" PRIu32 "):\n",
                 __func__, n_ctx_start, lo, n_probe, n_ctx_cap);
             for (size_t id = 0; id < nd; id++) {
