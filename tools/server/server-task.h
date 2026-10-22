@@ -789,6 +789,10 @@ private:
         std::vector<llama_token> tokens; // tokens covered once this job commits ([0, p1))
         bool rewrite = false;            // first segment of a from-scratch write: truncate the files
 
+        // first segment of a truncate-then-append flush: drop the committed segments above this
+        // position (it is always a committed segment end) before appending. -1 = no truncate.
+        int32_t truncate_to = -1;
+
         // hybrid models only: recurrent-state snapshot ([u32 n_tok][PARTIAL_ONLY blob]),
         // carried by the last segment of a flush and written to the .rec file (overwrite)
         std::vector<uint8_t> rec;
@@ -825,6 +829,7 @@ public:
         // scheduled by the main thread - committed state plus everything still in the queue
         uint32_t scheduled_n_tok = 0;
         std::vector<llama_token> scheduled_tokens;
+        std::vector<uint32_t>    scheduled_seg_ends; // p1 of every scheduled segment, ascending
 
         // a write failed or the files are inconsistent: the next flush must rewrite from scratch
         bool broken = false;

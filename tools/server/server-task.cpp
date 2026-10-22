@@ -48,8 +48,12 @@ constexpr uint32_t DISK_CACHE_VERSION = 6;
 constexpr uint32_t DISK_SEGMENT_TOKENS = 8192;
 
 // backpressure for the async writer: enqueueing blocks while this many payload bytes
-// are already in flight, so a huge flush cannot pile up unbounded in host RAM
-constexpr size_t DISK_QUEUE_MAX_BYTES = 1ull << 30; // 1 GiB
+// are already in flight, so a huge flush cannot pile up unbounded in host RAM.
+// sized to 4 segments (~512 MiB each at ~64 KB/token on the 27B): at 1 GiB the request thread
+// stalled after two queued segments and waited for the disk (~200 ms per segment write). a 286k
+// conversation flushed as a 35-segment rewrite then blocked the prompt for ~9 s. the normal
+// 1-2 segment append must never wait here.
+constexpr size_t DISK_QUEUE_MAX_BYTES = 2ull << 30; // 2 GiB
 
 // checkpoint files - written by spill_checkpoint() the moment create_checkpoint() captures a
 // checkpoint. format: magic, version, arch_hash, vocab_hash, state_hash,
@@ -2240,42 +2244,74 @@ bool server_prompt_cache::flush_from_context(const server_prompt & prompt, llama
         }
     }
 
-    // decide append-from-high-water-mark vs rewrite-from-scratch
-    uint32_t base    = 0;
-    bool     rewrite = true;
+    // decide append-from-high-water-mark vs truncate-then-append vs rewrite-from-scratch.
+    // the saved list includes the generated reply, so a divergence below the high-water mark is
+    // common: a UI rewind/edit, or a client that resends the previous reply slightly differently
+    // (seen at f_sim 0.998). a full rewrite there cost a 286k conversation 35 x 512 MiB segment
+    // writes (~200 ms each, ~9 s) on the request path. instead keep every segment that ends at or
+    // below the divergence point and rewrite only from that segment end.
+    uint32_t base        = 0;
+    bool     rewrite     = true;
+    int32_t  truncate_to = -1;
+    uint32_t old_n_tok   = 0;
     {
         std::lock_guard<std::mutex> lock(mtx);
         auto & st = disk_convs[conv_id];
 
-        const bool prefix_ok = !st.broken &&
-                               st.scheduled_n_tok > 0 &&
-                               st.scheduled_n_tok <= n_tok &&
-                               std::equal(st.scheduled_tokens.begin(), st.scheduled_tokens.end(), toks.begin());
+        // longest common prefix of the scheduled tokens and the live tokens
+        const size_t n_cmp = std::min<size_t>(std::min<size_t>(st.scheduled_n_tok, st.scheduled_tokens.size()), n_tok);
+        const uint32_t lcp = (uint32_t) (std::mismatch(st.scheduled_tokens.begin(), st.scheduled_tokens.begin() + n_cmp, toks.begin()).first - st.scheduled_tokens.begin());
 
-        if (prefix_ok && st.scheduled_n_tok == n_tok) {
+        const bool usable = !st.broken && st.scheduled_n_tok > 0;
+
+        if (usable && lcp == st.scheduled_n_tok && n_tok == lcp) {
             SRV_INF("disk cache: '%s' already flushed (%u tokens) - nothing to write\n", conv_id.c_str(), n_tok);
             return true;
         }
-        if (prefix_ok && delta_capable) {
-            base    = st.scheduled_n_tok;
-            rewrite = false;
+        if (usable && delta_capable) {
+            if (lcp == st.scheduled_n_tok) {
+                base    = st.scheduled_n_tok;
+                rewrite = false;
+            } else if (!st.scheduled_seg_ends.empty() && st.scheduled_seg_ends.back() == st.scheduled_n_tok) {
+                // segment ends are not multiples of DISK_SEGMENT_TOKENS (appends start at the old
+                // high-water mark), so take them from the scheduled list. st.segments is not used:
+                // it is the writer's committed view and lags the queue. keep < n_tok so at least
+                // one segment is written (the hybrid .rec snapshot rides on the last one).
+                uint32_t keep = 0;
+                for (const uint32_t p1 : st.scheduled_seg_ends) {
+                    if (p1 <= lcp && p1 < n_tok) {
+                        keep = p1;
+                    }
+                }
+                if (keep > 0) {
+                    base        = keep;
+                    rewrite     = false;
+                    truncate_to = (int32_t) keep;
+                    old_n_tok   = st.scheduled_n_tok;
+                }
+            }
         }
     }
 
     const uint32_t chunk = delta_capable ? DISK_SEGMENT_TOKENS : n_tok - base;
+    const uint32_t n_seg = (n_tok - base + chunk - 1) / chunk;
 
-    SRV_WRN("disk cache: flushing '%s' tokens [%u, %u) as %u segment(s) (%s)\n",
-            conv_id.c_str(), base, n_tok,
-            (n_tok - base + chunk - 1) / chunk,
-            rewrite ? "rewrite" : "append");
+    if (truncate_to >= 0) {
+        SRV_WRN("disk cache: flushing '%s' tokens [%u, %u) as %u segment(s) (truncate from %u to %u, append)\n",
+                conv_id.c_str(), base, n_tok, n_seg, old_n_tok, base);
+    } else {
+        SRV_WRN("disk cache: flushing '%s' tokens [%u, %u) as %u segment(s) (%s)\n",
+                conv_id.c_str(), base, n_tok, n_seg, rewrite ? "rewrite" : "append");
+    }
 
-    bool first = rewrite;
+    bool first = true;
     for (uint32_t p0 = base; p0 < n_tok; p0 += chunk) {
         const uint32_t p1 = std::min(p0 + chunk, n_tok);
 
         disk_job job;
-        job.conv_id = conv_id;
-        job.rewrite = first;
+        job.conv_id     = conv_id;
+        job.rewrite     = first && rewrite;
+        job.truncate_to = first ? truncate_to : -1;
         first = false;
         job.p0 = (llama_pos) p0;
         job.p1 = (llama_pos) p1;
@@ -2350,6 +2386,13 @@ bool server_prompt_cache::flush_from_context(const server_prompt & prompt, llama
             auto & st = disk_convs[conv_id];
             st.scheduled_n_tok  = p1;
             st.scheduled_tokens = job.tokens;
+            if (job.rewrite) {
+                st.scheduled_seg_ends.clear();
+            }
+            while (job.truncate_to >= 0 && !st.scheduled_seg_ends.empty() && st.scheduled_seg_ends.back() > (uint32_t) job.truncate_to) {
+                st.scheduled_seg_ends.pop_back();
+            }
+            st.scheduled_seg_ends.push_back(p1);
 
             queue_bytes += job.bytes();
             queue.push_back(std::move(job));
@@ -2403,6 +2446,32 @@ void server_prompt_cache::process_disk_job(const disk_job & job) {
         std::filesystem::remove(drft_path, ec);
         std::filesystem::remove(rec_path, ec);
     } else {
+        if (job.truncate_to >= 0) {
+            // divergence below the high-water mark: drop the segments above truncate_to. the
+            // resize below cuts their bytes off .kv/.drft; lower segments are not touched.
+            // a crash before the header commit leaves the old header bigger than the files,
+            // so read_disk_state rejects it (cache miss, not corruption).
+            while (!st.segments.empty() && st.segments.back().p1 > job.truncate_to) {
+                st.segments.pop_back();
+            }
+            if (st.segments.empty() || st.segments.back().p1 != job.truncate_to) {
+                fail("truncate boundary");
+                return;
+            }
+            const auto & last = st.segments.back();
+            st.kv_size   = last.kv_off + last.kv_size;
+            st.drft_size = last.drft_off + last.drft_size;
+            st.n_tok     = (uint32_t) job.truncate_to;
+
+            // .rec is overwrite-only and valid at the old n_tok only. remove it as a rewrite
+            // does: the last job of this flush writes the new one. a stale .rec could match the
+            // n_tok of an intermediate header (old n_tok == base + k * DISK_SEGMENT_TOKENS).
+            if (st.rec_size > 0) {
+                std::filesystem::remove(rec_path, ec);
+                st.rec_size = 0;
+            }
+        }
+
         // crash-orphan cleanup: the data files must be at least as large as the committed
         // sizes; extra tail bytes come from an append whose header never committed
         const uint64_t kv_actual = (uint64_t) std::filesystem::file_size(kv_path, ec);
@@ -2642,6 +2711,11 @@ bool server_prompt_cache::read_disk_state(const std::string & conversation_id, d
     st.scheduled_n_tok  = n_tok;
     st.scheduled_tokens = std::move(toks);
     st.broken           = false;
+
+    st.scheduled_seg_ends.clear();
+    for (const auto & s : st.segments) {
+        st.scheduled_seg_ends.push_back((uint32_t) s.p1);
+    }
 
     return true;
 }
