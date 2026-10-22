@@ -16866,7 +16866,23 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         }
     }
     const uint64_t flops_basis = vk_submit_flops_prev ? ctx->last_total_flops : graph_flops;
-    uint64_t flops_per_submit = std::min(flops_cap, flops_basis / 40u);
+    // [fork, 2026-10-22 19:10] submits per graph vs the kernel's per-context job cap. amdgpu queues at most
+    // amdgpu.sched_jobs (default 32, /sys/module/amdgpu/parameters/sched_jobs) submissions per context; the 33rd
+    // sleeps inside the CS ioctl until the oldest retires (amdgpu_cs_ioctl -> amdgpu_ctx_wait_prev_fence ->
+    // dma_fence_wait, caught by sampling the main thread's kernel stack during a 65k paste). ~40 submits per
+    // graph was fine with one graph in flight per device; with pipeline parallelism (-b 8192 -ub 2048, four
+    // ubatches in flight) the second graph on a card overflows the cap and the host blocks for the previous
+    // graph's whole duration: on the 110k-paste tape at 115k ctx every ubatch's V3 and V1 split issue took
+    // 4.2 s (= the previous graph on that card), V2 idled 5.6 s per batch, span 31.3 s vs 20.0 s of work on
+    // the slowest card. GGML_VK_SUBMITS_PER_GRAPH (default 12): two graphs in flight = 24 < 32. The first
+    // three submissions still double up from small (submit_after warm-up), so the GPU starts early either
+    // way. Raising amdgpu.sched_jobs (modprobe.d, power of two, needs a reboot) is the other half.
+    static const uint32_t submits_per_graph = [] {
+        const char * e = getenv("GGML_VK_SUBMITS_PER_GRAPH");
+        const long v = e ? atol(e) : 12;
+        return (uint32_t) (v < 1 ? 1 : v > 256 ? 256 : v);
+    }();
+    uint64_t flops_per_submit = std::min(flops_cap, flops_basis / submits_per_graph);
     if (vk_mmvq_slope_stats) {
         ctx->slope_graph_flops = graph_flops;
         ctx->slope_flops_prev = ctx->last_total_flops;
