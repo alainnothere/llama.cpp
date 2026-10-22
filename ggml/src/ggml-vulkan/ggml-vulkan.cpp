@@ -912,11 +912,22 @@ static vk_command_buffer* ggml_vk_create_cmd_buffer(vk_device& device, vk_comman
     return &p.cmd_buffers[p.cmd_buffers.size()-1];
 }
 
+// [fork, 2026-10-22] host time inside vkQueueSubmit itself, summed into *sink while it is set (thread local, so
+// only the thread that set it is timed). Set by ggml_vk_d2d_copy_async around the hop 1 submit when
+// LLAMA_DECODE_STATS is on: the 93k -b 8192 -ub 2048 tape (ledger 2026-10-22 17:30) had the host blocked 5117 ms and
+// 1194 ms in t_hop_submit_us, and that field also covers the transfer-ctx end + in_memcpys + submit-info building;
+// this splits the driver call (Mesa vk_queue / RADV winsys / amdgpu CS ioctl) from our bookkeeping around it.
+static thread_local int64_t * vk_queue_submit_time_sink = nullptr;
+
 void ggml_vk_submit(vk_context& ctx, vk::Fence fence) {
     vk_slope_timer slope_t(VK_SLOPE_SUBMIT);   // GGML_VK_MMVQ_SLOPE_STATS t_submit_us / n_submit (fence-only submits too)
     if (ctx->seqs.empty()) {
         if (fence) {
+            const int64_t t_q0 = vk_queue_submit_time_sink ? ggml_time_us() : 0;
             ctx->p->q->handle->submit({}, fence);
+            if (vk_queue_submit_time_sink) {
+                *vk_queue_submit_time_sink += ggml_time_us() - t_q0;
+            }
         }
         return;
     }
@@ -985,7 +996,11 @@ void ggml_vk_submit(vk_context& ctx, vk::Fence fence) {
         }
     }
 
+    const int64_t t_q0 = vk_queue_submit_time_sink ? ggml_time_us() : 0;
     ctx->p->q->handle->submit(submit_infos, fence);
+    if (vk_queue_submit_time_sink) {
+        *vk_queue_submit_time_sink += ggml_time_us() - t_q0;
+    }
 
     ctx->seqs.clear();
     ctx->n_submits++;
@@ -15150,6 +15165,26 @@ static void ggml_backend_vk_get_tensor_async(ggml_backend_t backend, const ggml_
 static constexpr bool   VK_D2D_ASYNC_DEFAULT = true;
 static constexpr size_t VK_D2D_RING_MIN      = 16u * 1024 * 1024;
 static constexpr size_t VK_D2D_HOP_MAX       = 128u * 1024 * 1024;   // larger hops take the bounce
+// [fork, 2026-10-22] ring sizing by in-flight depth. The tape (ledger "2026-10-22 17:30 | THE TAPE NAMES THE
+// PIPELINE STALL", production 93k ctx, -b 8192 -ub 2048, 4 ubatches per decode, one 40 MiB l_out hop per link per
+// ubatch = 2048 x 5120 x f32): the old "2x hop" rule left the rings at 128 MiB = 3 regions, 4 ubatches in flight
+// wrap every ubatch onto a live region, every hop had n_bwd_gpu_wait=1 and the host sat 5117 / 1194 ms inside the
+// hop 1 vkQueueSubmit; batch span 45.7 s vs 30.5 s of work on the slowest card. Decode steps (one ubatch, 20 KiB
+// hops) never wait: 0.23 / 0.44 ms per hop.
+// Depth: the scheduler keeps at most GGML_SCHED_MAX_COPIES ubatches in flight (its input copies rotate through
+// that many slots, ggml-backend.cpp), so a link has at most that many hop 2s outstanding plus the one being placed:
+// (GGML_SCHED_MAX_COPIES + 1) x hop, rounded up to a power of two from VK_D2D_RING_MIN. Here 5 x 40 MiB = 200 MiB
+// -> 256 MiB (6 regions), reached on the FIRST hop (16 -> 256 directly) so the first wait never happens.
+// Cap: VK_D2D_RING_MAX = 512 MiB = 4 x VK_D2D_HOP_MAX, so every hop the async path accepts keeps >= 4 regions even
+// at the cap, and the 5-deep target fits for every hop <= 102 MiB. A ring at the cap that still finds an unsignaled
+// region waits (counted, deadlock-rule pre-submit intact). Host cost: pinned pages imported into both cards, retired
+// rings stay mapped until link destroy (ring rewrite rule), so worst case per link = 16 + 256 + 512 = 784 MiB; this
+// config = 16 + 256 = 272 MiB per link (was 16 + 64 + 128 = 208).
+#ifndef GGML_SCHED_MAX_COPIES
+#define GGML_SCHED_MAX_COPIES 4   // ggml/src/CMakeLists.txt passes the real value to every ggml target
+#endif
+static constexpr size_t VK_D2D_RING_DEPTH    = GGML_SCHED_MAX_COPIES + 1;
+static constexpr size_t VK_D2D_RING_MAX      = 4 * VK_D2D_HOP_MAX;     // 512 MiB per link
 static constexpr size_t VK_D2D_ALIGN         = 256;
 static constexpr size_t VK_D2D_HUGE          = 2u * 1024 * 1024;     // PMD size: ring alignment and guard size
 
@@ -15190,6 +15225,11 @@ struct vk_d2d_link {
     uint64_t       bwd_submitted    = 0;
     vk_context_ref bwd_pending_ctx;
     uint64_t       bwd_pending_mark = 0;
+
+    // [fork, 2026-10-22] highest bwd value seen reached by vkGetSemaphoreCounterValue(bwd_src): a region whose bwd is
+    // <= this is free (its hop 2 finished reading), so hop 1 carries no wait for it and the ring does not grow for it
+    uint64_t bwd_signaled_seen = 0;
+    size_t   cap_limit         = 0;   // 0: VK_D2D_RING_MAX; else a wait-driven grow failed at this size, stop trying
 
     uint32_t n_grow_log = 0;   // [fork] rate limit of the ring's SCRATCH GROW lines
     int32_t  why_code   = 0;   // [fork, 2026-10-22] ggml_backend_d2d_bounce_reason of a refused setup (LLAMA_DECODE_STATS)
@@ -15410,31 +15450,64 @@ static vk_d2d_link * ggml_vk_d2d_get_link(ggml_backend_vk_context * dst_ctx, con
     return l;
 }
 
-// ring of at least 2x the hop, so consecutive hops rarely wrap onto their own unflushed batch
-// [fork, 2026-10-22] rec (LLAMA_DECODE_STATS, may be NULL): bounce reason on refusal, n_ring_grow / t_ring_grow_us
-static bool ggml_vk_d2d_ensure_cap(vk_d2d_link * l, size_t size_al, struct ggml_backend_d2d_copy_stats * rec) {
-    if (size_al * 2 <= l->cap) {
+// [fork, 2026-10-22] ring of at least VK_D2D_RING_DEPTH x the hop (was 2x: the 4-ubatch stall, see VK_D2D_RING_MAX)
+static size_t ggml_vk_d2d_ring_target(size_t size_al) {
+    size_t cap = VK_D2D_RING_MIN;
+    while (cap < VK_D2D_RING_DEPTH * size_al && cap < VK_D2D_RING_MAX) {
+        cap *= 2;
+    }
+    return std::min(cap, VK_D2D_RING_MAX);
+}
+
+// true when every hop 2 up to `value` has finished on the dst GPU (the region it read is free). One
+// vkGetSemaphoreCounterValue (a syncobj query ioctl, a few us) only when the cached value is behind.
+static bool ggml_vk_d2d_bwd_reached(vk_d2d_link * l, uint64_t value) {
+    if (value <= l->bwd_signaled_seen) {
         return true;
     }
+    l->bwd_signaled_seen = std::max(l->bwd_signaled_seen, l->src_dev->device.getSemaphoreCounterValue(l->bwd_src));
+    return value <= l->bwd_signaled_seen;
+}
+
+// grow_for_wait = false: make the ring hold VK_D2D_RING_DEPTH hops (the steady-state sizing, before any wrap).
+// grow_for_wait = true: the region picked for this hop overlaps a live region whose hop 2 has not finished, i.e.
+// hop 1 would carry a GPU wait on bwd (and, on the 2026-10-22 tape, block the host inside vkQueueSubmit): double
+// (at least) up to the cap. Returns false only for a bounce (hop too large, or a sizing grow failed); a refused or
+// failed wait-driven grow returns true and the hop waits on the current ring.
+// rec (LLAMA_DECODE_STATS, may be NULL): bounce reason on refusal, n_ring_grow / n_ring_grow_wait / t_ring_grow_us
+static bool ggml_vk_d2d_ensure_cap(vk_d2d_link * l, size_t size_al, struct ggml_backend_d2d_copy_stats * rec, bool grow_for_wait = false) {
     if (size_al > VK_D2D_HOP_MAX) {
         if (rec) {
             rec->bounce_reason = GGML_BACKEND_D2D_BOUNCE_HOP_TOO_LARGE;
         }
         return false;
     }
+    const size_t limit = l->cap_limit ? l->cap_limit : VK_D2D_RING_MAX;
+    size_t want = ggml_vk_d2d_ring_target(size_al);
+    if (grow_for_wait) {
+        want = std::max(want, std::min(l->cap * 2, limit));
+    }
+    if (want <= l->cap) {
+        return true;   // also: wait-driven at the cap (or at a failed size), the hop waits
+    }
     const int64_t t_grow0 = rec ? ggml_time_us() : 0;
     struct grow_timer {   // every exit below is a grow attempt, failed or not
-        struct ggml_backend_d2d_copy_stats * rec; int64_t t0;
-        ~grow_timer() { if (rec) { rec->n_ring_grow = 1; rec->t_ring_grow_us += ggml_time_us() - t0; } }
-    } grow_timer_{ rec, t_grow0 };
-    // jump to >= 4x the old ring so a link retires at most two (16 -> 64 -> 256 MiB at the 128 MiB hop limit)
-    size_t cap = std::max(VK_D2D_RING_MIN, l->cap * 4);
-    while (cap < size_al * 2) {
-        cap *= 2;
-    }
+        struct ggml_backend_d2d_copy_stats * rec; int64_t t0; bool wait;
+        ~grow_timer() { if (rec) { rec->n_ring_grow = 1; rec->n_ring_grow_wait = wait ? 1 : 0; rec->t_ring_grow_us += ggml_time_us() - t0; } }
+    } grow_timer_{ rec, t_grow0, grow_for_wait };
+    // jump to >= 4x the old ring so a link retires at most two (16 -> 256 at a 40 MiB hop, then 512 if it still
+    // waits), never above the cap
+    const size_t cap = std::min(std::max(want, l->cap * 4), std::max(want, limit));
     // no drain: the old ring is retired with its imports, hops still queued on it complete against it
     const size_t old_cap = l->cap;
     if (!ggml_vk_d2d_ring_alloc(l, cap)) {
+        if (grow_for_wait) {
+            // the current ring is untouched (ring_alloc swaps only on success): keep the link, wait on it, and do
+            // not retry this size on every hop (each attempt maps + populates + imports up to 512 MiB)
+            GGML_LOG_WARN("ggml_vulkan: async D2D %s -> %s: host ring grow to %zu MiB failed, staying at %zu MiB (hops may wait)\n", l->src_dev->name.c_str(), l->dst_dev->name.c_str(), cap >> 20, l->cap >> 20);
+            l->cap_limit = l->cap;
+            return true;
+        }
         GGML_LOG_WARN("ggml_vulkan: async D2D %s -> %s: host ring grow to %zu MiB failed, using the host bounce\n", l->src_dev->name.c_str(), l->dst_dev->name.c_str(), cap >> 20);
         l->ok = false;
         l->why_code = GGML_BACKEND_D2D_BOUNCE_GROW_FAILED;
@@ -15472,6 +15545,12 @@ static bool ggml_vk_d2d_ensure_cap(vk_d2d_link * l, size_t size_al, struct ggml_
 //                    hiding inside "async")
 //   n_bwd_gpu_wait   hop 1 carries a wait on bwd (ring WAR). That wait is on the GPU (src queue), the host never
 //                    calls vkWaitSemaphores here (only link destroy does), so there is no host time to report.
+//                    [2026-10-22 evening] that was the assumption; the 93k tape showed 1.2-5.1 s of host time inside
+//                    the hop 1 vkQueueSubmit on exactly the waiting hops. Since the in-flight-depth sizing it counts
+//                    only waits on an UNREACHED bwd (the ring is at VK_D2D_RING_MAX); n_bwd_wait_elided counts
+//                    overlaps whose bwd was already reached (no wait recorded), n_ring_grow_wait the grows a would-be
+//                    wait triggered. The at-submit fields (bwd_*_at_submit, bwd_lag, src_*) and the
+//                    t_hop_queue_submit_us split are documented at the hop 1 submit below.
 // t_copy_us (scheduler) - the four t_* = command recording, live-region scan and the get_compute_ctx allocations.
 static bool ggml_vk_d2d_copy_async(ggml_backend_vk_context * src_ctx, ggml_backend_vk_context * dst_ctx,
                                    vk_buffer & src_buf, size_t src_offset, vk_buffer & dst_buf, size_t dst_offset, size_t size) {
@@ -15495,24 +15574,51 @@ static bool ggml_vk_d2d_copy_async(ggml_backend_vk_context * src_ctx, ggml_backe
     }
 
     // ring region, and the last hop 2 that read any part of it
-    if (l->head + size_al > l->cap) {
-        l->head = 0;
-    }
-    const size_t off = l->head;
-    l->head += size_al;
+    // [fork, 2026-10-22] picked without committing first: if it overlaps a live region whose hop 2 has not finished
+    // (bwd counter behind), hop 1 would carry a GPU wait on bwd, and on the 93k 4-ubatch tape that wait came with
+    // 1.2-5.1 s of host time inside vkQueueSubmit. So grow the ring instead (ggml_vk_d2d_ensure_cap grow_for_wait,
+    // bounded by VK_D2D_RING_MAX), re-pick on the new (empty) ring, and only wait when the ring is at its cap.
+    // A live region whose bwd is already reached costs nothing and is dropped (no wait, no grow, no pre-submit): live
+    // entries are only pruned on overlap, so after the first wrap EVERY pick overlaps something, and before this
+    // change n_bwd_gpu_wait=1 meant "overlapped", not "would stall".
+    size_t   off      = 0;
     uint64_t wait_bwd = 0;
+    int32_t  n_elided = 0;
+    for (int attempt = 0; ; attempt++) {
+        off = l->head + size_al > l->cap ? 0 : l->head;
+        wait_bwd = 0;
+        for (const auto & r : l->live) {
+            if (r.begin < off + size_al && off < r.end) {
+                wait_bwd = std::max(wait_bwd, r.bwd);
+            }
+        }
+        if (wait_bwd > 0 && ggml_vk_d2d_bwd_reached(l, wait_bwd)) {
+            wait_bwd = 0;
+            n_elided = 1;
+        }
+        if (wait_bwd == 0 || attempt > 0) {
+            break;
+        }
+        const size_t cap0 = l->cap;
+        if (!ggml_vk_d2d_ensure_cap(l, size_al, rec, /*grow_for_wait =*/ true)) {
+            return false;   // not reached: a wait-driven grow never bounces (hop size was checked above)
+        }
+        if (l->cap == cap0) {
+            break;   // at the cap (or a failed size): the hop waits, counted below
+        }
+    }
+    l->head = off + size_al;
     {
         auto & live = l->live;
         size_t n = 0;
         for (size_t i = 0; i < live.size(); i++) {
-            if (live[i].begin < off + size_al && off < live[i].end) {
-                wait_bwd = std::max(wait_bwd, live[i].bwd);
-            } else {
+            if (!(live[i].begin < off + size_al && off < live[i].end)) {
                 live[n++] = live[i];
             }
         }
         live.resize(n);
     }
+    // deadlock rule (unchanged): hop 1 never waits on a bwd whose hop 2 is still unsubmitted in the dst context
     if (wait_bwd > l->bwd_submitted) {
         const int64_t t0 = rec ? ggml_time_us() : 0;
         const bool was_submitted = ggml_vk_d2d_bwd_all_submitted(l);
@@ -15523,10 +15629,18 @@ static bool ggml_vk_d2d_copy_async(ggml_backend_vk_context * src_ctx, ggml_backe
         }
     }
     if (rec) {
-        rec->n_bwd_gpu_wait = wait_bwd > 0 ? 1 : 0;
+        rec->n_bwd_gpu_wait    = wait_bwd > 0 ? 1 : 0;
+        rec->n_bwd_wait_elided = n_elided;
+        rec->ring_cap_mib      = (int32_t) (l->cap >> 20);
     }
 
     // hop 1: after everything queued on the src context, on its compute queue
+    // [fork, 2026-10-22] t_hop_queue_submit_us = host time inside the vkQueueSubmit calls only (transfer ctx + hop 1),
+    // the rest of t_hop_submit_us is our bookkeeping (ctx_end, in_memcpys, submit-info building)
+    int64_t t_queue_submit = 0;
+    if (rec) {
+        vk_queue_submit_time_sink = &t_queue_submit;
+    }
     const int64_t t_sub0 = rec ? ggml_time_us() : 0;
     ggml_vk_submit_transfer_ctx(src_ctx);
     if (rec) {
@@ -15554,11 +15668,49 @@ static bool ggml_vk_d2d_copy_async(ggml_backend_vk_context * src_ctx, ggml_backe
     sc->s->signal_semaphores.push_back({ l->fwd_src, ++l->fwd_value });
     if (rec) {
         rec->n_hop_submit_sync = sc->out_memcpys.empty() ? 0 : 1;   // ggml_vk_submit_compute_ctx_nowait syncs then
+        // [fork, 2026-10-22] the state the driver sees at the hop 1 vkQueueSubmit, read just before the call. The
+        // question (ledger 17:30): did the 5117 ms block sit on an UNSIGNALED imported timeline point (GPU-side
+        // wait the driver materializes on the host: Mesa vk_queue wait-before-signal), on an UNSUBMITTED one (the
+        // deadlock rule failing), or on neither (then it is not the semaphore: CS ioctl / userptr validation).
+        //   bwd_signaled_at_submit      1/0: src handle's counter >= wait_bwd; -1: hop 1 carries no bwd wait
+        //   bwd_dst_signaled_at_submit  the same payload read through the dst handle (should equal the src one)
+        //   bwd_submitted_at_submit     1/0: ggml_vk_d2d_bwd_all_submitted (after the deadlock rule: 0 is a bug)
+        //   bwd_lag                     wait_bwd - src counter: hop 2s still outstanding on the waited point
+        //   src_submit_pending          the src context already had unsynchronized submits (submit_pending);
+        //                               the ctx does not count them, so this is 0/1, not a depth
+        //   n_src_submit_infos          VkSubmitInfos in this vkQueueSubmit (the src graph's batches + hop 1)
+        //   n_src_wait_sems             wait semaphores across them
+        if (wait_bwd > 0) {
+            const uint64_t v_src = l->src_dev->device.getSemaphoreCounterValue(l->bwd_src);
+            const uint64_t v_dst = l->dst_dev->device.getSemaphoreCounterValue(l->bwd_dst);
+            l->bwd_signaled_seen = std::max(l->bwd_signaled_seen, v_src);
+            rec->bwd_signaled_at_submit     = v_src >= wait_bwd ? 1 : 0;
+            rec->bwd_dst_signaled_at_submit = v_dst >= wait_bwd ? 1 : 0;
+            rec->bwd_submitted_at_submit    = ggml_vk_d2d_bwd_all_submitted(l) ? 1 : 0;
+            rec->bwd_lag                    = v_src >= wait_bwd ? 0 : (int64_t) (wait_bwd - v_src);
+        } else {
+            rec->bwd_signaled_at_submit     = -1;
+            rec->bwd_dst_signaled_at_submit = -1;
+            rec->bwd_submitted_at_submit    = -1;
+            rec->bwd_lag                    = 0;
+        }
+        rec->src_submit_pending = src_ctx->submit_pending ? 1 : 0;
+        int32_t n_infos = 0, n_waits = 0;
+        for (const auto & seq : sc->seqs) {
+            for (const auto & sub : seq) {
+                n_infos++;
+                n_waits += (int32_t) sub.wait_semaphores.size();
+            }
+        }
+        rec->n_src_submit_infos = n_infos;
+        rec->n_src_wait_sems    = n_waits;
     }
     const int64_t t_sub1 = rec ? ggml_time_us() : 0;
     ggml_vk_submit_compute_ctx_nowait(src_ctx);
     if (rec) {
         rec->t_hop_submit_us += ggml_time_us() - t_sub1;
+        vk_queue_submit_time_sink = nullptr;
+        rec->t_hop_queue_submit_us = t_queue_submit;
     }
 
     // hop 2: into the dst compute context, flushed by the next graph_compute (or the deadlock rule)

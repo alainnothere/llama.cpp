@@ -2469,6 +2469,14 @@ void llama_context::dstats_fold_sched() {
     d.s_t_d2d_presubmit       += st->t_d2d_presubmit_us;
     d.s_t_d2d_ring_grow       += st->t_d2d_ring_grow_us;
     d.s_t_d2d_hop_submit      += st->t_d2d_hop_submit_us;
+    d.s_n_d2d_bwd_wait_elided              += st->n_d2d_bwd_wait_elided;
+    d.s_n_d2d_ring_grow_wait               += st->n_d2d_ring_grow_wait;
+    d.s_n_d2d_bwd_unsignaled_at_submit     += st->n_d2d_bwd_unsignaled_at_submit;
+    d.s_n_d2d_bwd_dst_unsignaled_at_submit += st->n_d2d_bwd_dst_unsignaled_at_submit;
+    d.s_n_d2d_bwd_unsubmitted_at_submit    += st->n_d2d_bwd_unsubmitted_at_submit;
+    d.s_n_d2d_src_submit_pending           += st->n_d2d_src_submit_pending;
+    d.s_d2d_bwd_lag                        += st->d2d_bwd_lag;
+    d.s_t_d2d_hop_queue_submit             += st->t_d2d_hop_queue_submit_us;
 
     // 2026-10-22 (design-kq-mask-on-device.md 3.6b): one re-plan per pp ubatch is the expected state before the
     // device-built mask; the reason names the first node that outgrew its planned slot
@@ -2498,7 +2506,7 @@ void llama_context::dstats_fold_sched() {
             break;
         }
         const auto & c = st->copies[i];
-        char buf[640];
+        char buf[1024]; // 2026-10-22 evening: 640 -> 1024 for the hop 1 at-submit fields (~330 chars)
         int n = snprintf(buf, sizeof(buf),
                 ",\"path\":\"%s\",\"bytes\":%zu,\"t_dst_wait_us\":%" PRId64 ",\"t_src_sync_us\":%" PRId64 ",\"t_copy_us\":%" PRId64,
                 (c.path >= 0 && c.path < 4) ? path_names[c.path] : "?", c.nbytes, c.t_dst_wait_us, c.t_src_sync_us, c.t_copy_us);
@@ -2513,6 +2521,17 @@ void llama_context::dstats_fold_sched() {
                     c.d2d.t_presubmit_us, c.d2d.t_ring_grow_us, c.d2d.t_hop_submit_us, c.d2d.t_link_setup_us,
                     c.d2d.n_presubmit, c.d2d.n_ring_grow, c.d2d.n_hop_submit_sync, c.d2d.n_bwd_gpu_wait,
                     r != 0 ? 1 : 0, (r >= 0 && r < 8) ? reason_names[r] : "?");
+            // 2026-10-22 evening: hop 1 at-submit state (ggml-backend.h ggml_backend_d2d_copy_stats), only on the
+            // async path: a bounce never reached the hop 1 submit
+            if (r == 0 && n > 0 && n < (int) sizeof(buf)) {
+                n += snprintf(buf + n, sizeof(buf) - n,
+                        ",\"t_hop_queue_submit_us\":%" PRId64 ",\"n_bwd_wait_elided\":%d,\"n_ring_grow_wait\":%d,\"ring_cap_mib\":%d"
+                        ",\"bwd_signaled_at_submit\":%d,\"bwd_dst_signaled_at_submit\":%d,\"bwd_submitted_at_submit\":%d"
+                        ",\"bwd_lag\":%" PRId64 ",\"src_submit_pending\":%d,\"n_src_submit_infos\":%d,\"n_src_wait_sems\":%d",
+                        c.d2d.t_hop_queue_submit_us, c.d2d.n_bwd_wait_elided, c.d2d.n_ring_grow_wait, c.d2d.ring_cap_mib,
+                        c.d2d.bwd_signaled_at_submit, c.d2d.bwd_dst_signaled_at_submit, c.d2d.bwd_submitted_at_submit,
+                        c.d2d.bwd_lag, c.d2d.src_submit_pending, c.d2d.n_src_submit_infos, c.d2d.n_src_wait_sems);
+            }
         }
         if (n > 0 && n < (int) sizeof(buf) - 1) {
             buf[n] = '}';
@@ -2660,19 +2679,25 @@ void llama_context::dstats_emit(int ret, int64_t t_start_us, uint32_t n_tokens, 
     }
     // scheduler hop timings (dstats_fold_sched), absent when no graph was computed in this call
     if (d.s_n_graphs > 0) {
-        char sb[512];
+        char sb[1536]; // 2026-10-22 evening: 512 -> 1536, the D2D sums alone are ~700 chars of keys
         snprintf(sb, sizeof(sb),
                 ",\"sched\":{\"n_graphs\":%d,\"n_splits\":%d,\"n_cross_copies\":%d,\"n_copies_dropped\":%d,\"n_splits_dropped\":%d,"
                 "\"bytes\":%" PRId64 ",\"t_dst_wait_us\":%" PRId64 ",\"t_src_sync_us\":%" PRId64 ",\"t_copy_us\":%" PRId64 ","
                 "\"t_split_sync_us\":%" PRId64 ",\"t_wall_us\":%" PRId64 ","
                 "\"n_realloc\":%d,\"t_realloc_sync_us\":%" PRId64 ",\"t_realloc_reserve_us\":%" PRId64 ","
                 "\"n_d2d_bounce\":%d,\"n_hop_presubmit\":%d,\"n_hop_submit_sync\":%d,\"n_bwd_gpu_wait\":%d,\"n_ring_grow\":%d,"
-                "\"t_hop_presubmit_us\":%" PRId64 ",\"t_ring_grow_us\":%" PRId64 ",\"t_hop_submit_us\":%" PRId64 ",\"t_link_setup_us\":%" PRId64 "}",
+                "\"t_hop_presubmit_us\":%" PRId64 ",\"t_ring_grow_us\":%" PRId64 ",\"t_hop_submit_us\":%" PRId64 ",\"t_link_setup_us\":%" PRId64 ","
+                "\"t_hop_queue_submit_us\":%" PRId64 ",\"n_bwd_wait_elided\":%d,\"n_ring_grow_wait\":%d,"
+                "\"n_bwd_unsignaled_at_submit\":%d,\"n_bwd_dst_unsignaled_at_submit\":%d,\"n_bwd_unsubmitted_at_submit\":%d,"
+                "\"n_src_submit_pending\":%d,\"bwd_lag\":%" PRId64 "}",
                 d.s_n_graphs, d.s_n_splits, d.s_n_copies, d.s_n_copies_drop, d.s_n_splits_drop,
                 d.s_bytes, d.s_t_dst_wait, d.s_t_src_sync, d.s_t_copy, d.s_t_split_sync, d.s_t_wall,
                 d.s_n_realloc, d.s_t_realloc_sync, d.s_t_realloc_reserve,
                 d.s_n_d2d_bounce, d.s_n_d2d_presubmit, d.s_n_d2d_hop_submit_sync, d.s_n_d2d_bwd_gpu_wait, d.s_n_d2d_ring_grow,
-                d.s_t_d2d_presubmit, d.s_t_d2d_ring_grow, d.s_t_d2d_hop_submit, d.s_t_d2d_link_setup);
+                d.s_t_d2d_presubmit, d.s_t_d2d_ring_grow, d.s_t_d2d_hop_submit, d.s_t_d2d_link_setup,
+                d.s_t_d2d_hop_queue_submit, d.s_n_d2d_bwd_wait_elided, d.s_n_d2d_ring_grow_wait,
+                d.s_n_d2d_bwd_unsignaled_at_submit, d.s_n_d2d_bwd_dst_unsignaled_at_submit, d.s_n_d2d_bwd_unsubmitted_at_submit,
+                d.s_n_d2d_src_submit_pending, d.s_d2d_bwd_lag);
         line += sb;
         line += ",\"realloc\":[" + d.s_realloc_json + "]";
         line += ",\"copies\":[" + d.s_copies_json + "]";

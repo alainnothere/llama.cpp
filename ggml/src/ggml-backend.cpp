@@ -1903,6 +1903,18 @@ static void ggml_backend_sched_stats_add_copy(ggml_backend_sched_t sched, int sp
         st->t_d2d_presubmit_us    += d2d.t_presubmit_us;
         st->t_d2d_ring_grow_us    += d2d.t_ring_grow_us;
         st->t_d2d_hop_submit_us   += d2d.t_hop_submit_us;
+        // [fork, 2026-10-22 evening] at-submit state of the hop 1 vkQueueSubmit (ggml_vk_d2d_copy_async); a bounce
+        // copy never reached it, its zeros must not count as "unsignaled"
+        if (d2d.bounce_reason == GGML_BACKEND_D2D_BOUNCE_NONE) {
+            st->n_d2d_bwd_wait_elided              += d2d.n_bwd_wait_elided;
+            st->n_d2d_ring_grow_wait               += d2d.n_ring_grow_wait;
+            st->n_d2d_bwd_unsignaled_at_submit     += d2d.bwd_signaled_at_submit == 0;
+            st->n_d2d_bwd_dst_unsignaled_at_submit += d2d.bwd_dst_signaled_at_submit == 0;
+            st->n_d2d_bwd_unsubmitted_at_submit    += d2d.bwd_submitted_at_submit == 0;
+            st->n_d2d_src_submit_pending           += d2d.src_submit_pending;
+            st->d2d_bwd_lag                        += d2d.bwd_lag;
+            st->t_d2d_hop_queue_submit_us          += d2d.t_hop_queue_submit_us;
+        }
     }
     if (st->n_copies < GGML_BACKEND_SCHED_STATS_MAX_COPIES) {
         struct ggml_backend_sched_copy_stats & c = st->copies[st->n_copies];
@@ -2035,6 +2047,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         st->t_d2d_presubmit_us    = 0;
         st->t_d2d_ring_grow_us    = 0;
         st->t_d2d_hop_submit_us   = 0;
+        st->n_d2d_bwd_wait_elided              = 0;
+        st->n_d2d_ring_grow_wait               = 0;
+        st->n_d2d_bwd_unsignaled_at_submit     = 0;
+        st->n_d2d_bwd_dst_unsignaled_at_submit = 0;
+        st->n_d2d_bwd_unsubmitted_at_submit    = 0;
+        st->n_d2d_src_submit_pending           = 0;
+        st->d2d_bwd_lag                        = 0;
+        st->t_d2d_hop_queue_submit_us          = 0;
         sched->realloc_pending.n_realloc            = 0;
         sched->realloc_pending.t_realloc_sync_us    = 0;
         sched->realloc_pending.t_realloc_reserve_us = 0;

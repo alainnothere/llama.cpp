@@ -537,6 +537,15 @@ public:
         int64_t s_t_d2d_presubmit       = 0;
         int64_t s_t_d2d_ring_grow       = 0;
         int64_t s_t_d2d_hop_submit      = 0;
+        // 2026-10-22 evening: hop 1 at-submit state (ggml_backend_sched_stats n_d2d_*_at_submit etc.)
+        int32_t s_n_d2d_bwd_wait_elided              = 0;
+        int32_t s_n_d2d_ring_grow_wait               = 0;
+        int32_t s_n_d2d_bwd_unsignaled_at_submit     = 0;
+        int32_t s_n_d2d_bwd_dst_unsignaled_at_submit = 0;
+        int32_t s_n_d2d_bwd_unsubmitted_at_submit    = 0;
+        int32_t s_n_d2d_src_submit_pending           = 0;
+        int64_t s_d2d_bwd_lag                        = 0;
+        int64_t s_t_d2d_hop_queue_submit             = 0;
     };
 private:
     bool             dstats_on     = false;

@@ -391,6 +391,21 @@ extern "C" {
         int64_t t_presubmit_us;     // ggml_vk_d2d_flush_bwd (submit of the dst compute context)
         int64_t t_ring_grow_us;     // ggml_vk_d2d_ensure_cap when it allocated (map + populate + two imports)
         int64_t t_hop_submit_us;    // src transfer-ctx submit + hop 1 vkQueueSubmit (ggml_vk_submit_compute_ctx_nowait)
+        // [fork, 2026-10-22 evening] the 93k -b 8192 -ub 2048 tape had 5117 / 1194 ms of host time inside the hop 1
+        // submit on hops that all carried a bwd wait (ring 128 MiB = 3 x 40 MiB regions, 4 ubatches in flight).
+        // Ring sizing by in-flight depth (VK_D2D_RING_DEPTH, ggml-vulkan.cpp) should make the waits go away; these
+        // say what the driver saw if one is left. *_at_submit: read just before the hop 1 vkQueueSubmit, -1 = no wait.
+        int32_t n_bwd_wait_elided;          // 1: region overlapped a live one whose bwd was already reached (no wait)
+        int32_t n_ring_grow_wait;           // 1: the ring grew because this hop would have waited (n_ring_grow too)
+        int32_t ring_cap_mib;               // ring size after this copy's sizing/growth
+        int32_t bwd_signaled_at_submit;     // 1/0/-1: bwd counter (src handle) >= the waited value
+        int32_t bwd_dst_signaled_at_submit; // 1/0/-1: the same payload through the dst handle
+        int32_t bwd_submitted_at_submit;    // 1/0/-1: every hop 2 signal is on the dst queue (0 = deadlock-rule bug)
+        int32_t src_submit_pending;         // 1: the src context already had unsynchronized submits (not a depth)
+        int32_t n_src_submit_infos;         // VkSubmitInfos in the hop 1 vkQueueSubmit (src graph batches + hop 1)
+        int32_t n_src_wait_sems;            // wait semaphores across them
+        int64_t bwd_lag;                    // waited bwd value - src counter (hop 2s outstanding), 0 if reached
+        int64_t t_hop_queue_submit_us;      // the vkQueueSubmit calls alone inside t_hop_submit_us
     };
 
     struct ggml_backend_sched_copy_stats {
@@ -446,6 +461,15 @@ extern "C" {
         int64_t t_d2d_presubmit_us;
         int64_t t_d2d_ring_grow_us;
         int64_t t_d2d_hop_submit_us;
+        // [fork, 2026-10-22 evening] sums of the at-submit fields above, async copies only
+        int32_t n_d2d_bwd_wait_elided;
+        int32_t n_d2d_ring_grow_wait;
+        int32_t n_d2d_bwd_unsignaled_at_submit;     // bwd_signaled_at_submit == 0
+        int32_t n_d2d_bwd_dst_unsignaled_at_submit; // bwd_dst_signaled_at_submit == 0
+        int32_t n_d2d_bwd_unsubmitted_at_submit;    // bwd_submitted_at_submit == 0
+        int32_t n_d2d_src_submit_pending;
+        int64_t d2d_bwd_lag;
+        int64_t t_d2d_hop_queue_submit_us;
         struct ggml_backend_sched_copy_stats  copies[GGML_BACKEND_SCHED_STATS_MAX_COPIES];
         struct ggml_backend_sched_split_stats splits[GGML_BACKEND_SCHED_STATS_MAX_SPLITS];
     };
