@@ -362,6 +362,37 @@ extern "C" {
         GGML_BACKEND_SCHED_COPY_PATH_CB     = 3, // host weight taken by the copy callback (llama: MoE expert copy)
     };
 
+    // [fork, 2026-10-22] host-side pieces of one cross-device copy, filled by the destination backend inside
+    // cpy_tensor_async while the scheduler has stats on (Vulkan: ggml_vk_d2d_copy_async, ggml-vulkan.cpp). Why: in
+    // the context-parallel arms (LLAMA_CP_LAYER, ~/ai/claude_scratch/cp_overlap/arm_{A..E}, 2026-10-21/22) every hop
+    // cost a flat 2.1-2.5 ms of t_copy_us vs 0.16-0.77 ms in production on the same rings, and t_copy_us alone could
+    // not say whether that was a deadlock-rule pre-submit, a ring regrowth or the hop 1 submit. t_copy_us - (the
+    // t_* below) = command recording + bookkeeping. filled = 0: the backend did not see a cross-device copy (same
+    // device, host source, non-Vulkan dst), all other fields 0.
+    enum ggml_backend_d2d_bounce_reason {
+        GGML_BACKEND_D2D_BOUNCE_NONE          = 0, // took the async path (or not a cross-device copy)
+        GGML_BACKEND_D2D_BOUNCE_DISABLED      = 1, // GGML_VK_D2D_ASYNC=0
+        GGML_BACKEND_D2D_BOUNCE_SRC_NOT_VK    = 2, // source backend is not a Vulkan context on the tensor's device
+        GGML_BACKEND_D2D_BOUNCE_UNAVAILABLE   = 3, // link setup refused: drivers / extensions / sync submissions
+        GGML_BACKEND_D2D_BOUNCE_SHARE_FAILED  = 4, // timeline semaphore export/import failed
+        GGML_BACKEND_D2D_BOUNCE_IMPORT_FAILED = 5, // initial host ring import failed
+        GGML_BACKEND_D2D_BOUNCE_HOP_TOO_LARGE = 6, // hop > VK_D2D_HOP_MAX (128 MiB)
+        GGML_BACKEND_D2D_BOUNCE_GROW_FAILED   = 7, // ring regrowth failed (link is then off for good)
+    };
+
+    struct ggml_backend_d2d_copy_stats {
+        int32_t filled;
+        int32_t bounce_reason;      // enum ggml_backend_d2d_bounce_reason
+        int32_t n_bwd_gpu_wait;     // 1: hop 1 carries a GPU-side wait on bwd (ring WAR); never a host wait on this tree
+        int32_t n_presubmit;        // 1: deadlock rule submitted the dst compute context before hop 1
+        int32_t n_hop_submit_sync;  // 1: the hop 1 submit found device->host staging reads and ran a full synchronize
+        int32_t n_ring_grow;        // 1: ring regrown (or link set up) inside this copy
+        int64_t t_link_setup_us;    // first copy on a (src device, dst context) pair: semaphore share + first ring
+        int64_t t_presubmit_us;     // ggml_vk_d2d_flush_bwd (submit of the dst compute context)
+        int64_t t_ring_grow_us;     // ggml_vk_d2d_ensure_cap when it allocated (map + populate + two imports)
+        int64_t t_hop_submit_us;    // src transfer-ctx submit + hop 1 vkQueueSubmit (ggml_vk_submit_compute_ctx_nowait)
+    };
+
     struct ggml_backend_sched_copy_stats {
         char    name[GGML_MAX_NAME]; // the input tensor (not the "<backend>#name#copy" duplicate)
         int32_t split_id;
@@ -372,6 +403,7 @@ extern "C" {
         int64_t t_dst_wait_us;       // event_wait / event_synchronize / synchronize on dst (both of them on the bounce path)
         int64_t t_src_sync_us;       // ggml_backend_synchronize(src), bounce path only
         int64_t t_copy_us;           // the copy itself (enqueue only on the async path)
+        struct ggml_backend_d2d_copy_stats d2d; // [fork, 2026-10-22] see above
     };
 
     struct ggml_backend_sched_split_stats {
@@ -380,6 +412,10 @@ extern "C" {
         int32_t n_inputs;
         int64_t t_issue_us;              // host time inside graph_compute_async (a CPU split computes here)
         int64_t t_issue_to_next_wait_us; // issue return -> next split's first blocking call (or its issue); -1 = last split
+        // [fork, 2026-10-22] GPU timeline ticket: the backend wrote a start/end timestamp pair around this split's
+        // command buffers; resolve with ggml_backend_sched_split_ts_read once the backend has been synchronized.
+        // -1 = no timer (non-Vulkan backend, callback_eval set, or the backend's ring was full: n_ts_dropped)
+        int64_t ts_ticket;
     };
 
     struct ggml_backend_sched_stats {
@@ -399,6 +435,17 @@ extern "C" {
         int64_t t_realloc_sync_us;
         int64_t t_realloc_reserve_us;
         char    realloc_reason[128];
+        // [fork, 2026-10-22] split GPU timeline and D2D hop pieces (sums over every split / copy of the graph)
+        int32_t n_ts_dropped;        // splits on a timed backend whose timestamp pair the backend's ring refused
+        int32_t n_d2d_bounce;        // cross-device copies the backend refused (copies[].d2d.bounce_reason says why)
+        int32_t n_d2d_presubmit;
+        int32_t n_d2d_hop_submit_sync;
+        int32_t n_d2d_bwd_gpu_wait;
+        int32_t n_d2d_ring_grow;
+        int64_t t_d2d_link_setup_us;
+        int64_t t_d2d_presubmit_us;
+        int64_t t_d2d_ring_grow_us;
+        int64_t t_d2d_hop_submit_us;
         struct ggml_backend_sched_copy_stats  copies[GGML_BACKEND_SCHED_STATS_MAX_COPIES];
         struct ggml_backend_sched_split_stats splits[GGML_BACKEND_SCHED_STATS_MAX_SPLITS];
     };
@@ -411,6 +458,17 @@ extern "C" {
     GGML_API void ggml_backend_sched_set_split_sync_relax(ggml_backend_sched_t sched, bool relax);
     // stats of the last ggml_backend_sched_graph_compute_async, NULL when disabled; valid until the next compute/disable
     GGML_API const struct ggml_backend_sched_stats * ggml_backend_sched_get_last_stats(ggml_backend_sched_t sched);
+
+    // [fork, 2026-10-22] split GPU timeline (LLAMA_DECODE_STATS splits[].t_gpu_start_us / t_gpu_end_us).
+    // Resolve a splits[].ts_ticket of backend backend_id into host CLOCK_MONOTONIC microseconds (ggml_time_us base).
+    // Never waits: returns 1 = ok, 0 = the GPU has not written both timestamps yet, -1 = no timer on that backend or
+    // the ticket's slot was reused (the reader fell more than the ring behind). Call it after the backend was
+    // synchronized (llama: in llama_context::synchronize, after ggml_backend_sched_synchronize) to get 1.
+    GGML_API int ggml_backend_sched_split_ts_read(ggml_backend_sched_t sched, int backend_id, int64_t ticket, int64_t * t_start_us, int64_t * t_end_us);
+    // clock conversion of backend backend_id: -1 = no timer, 0 = calibrated (VK_EXT/KHR_calibrated_timestamps,
+    // *max_dev_ns = largest deviation the driver reported over the calibrations so far), 1 = approx (timestampPeriod
+    // plus a one-time host offset, *max_dev_ns = -1)
+    GGML_API int ggml_backend_sched_split_ts_calib(ggml_backend_sched_t sched, int backend_id, int64_t * max_dev_ns);
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);

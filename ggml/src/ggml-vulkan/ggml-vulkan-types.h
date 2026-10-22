@@ -815,6 +815,16 @@ struct vk_device_struct {
     bool device_fault {};
     PFN_vkGetDeviceFaultInfoEXT pfn_vkGetDeviceFaultInfoEXT {};
 
+    // [fork, 2026-10-22] LLAMA_DECODE_STATS split GPU timeline (ggml_vk_dts_*, ggml-vulkan.cpp). Device ticks ->
+    // host CLOCK_MONOTONIC: VK_EXT/KHR_calibrated_timestamps when the device lists both the DEVICE and the
+    // CLOCK_MONOTONIC time domain (pfn set), else timestampPeriod + a one-time host offset ("approx").
+    // timestamp_valid_bits of the compute queue family (0 = no timestamps there: the timer stays off).
+    // host_query_reset: VkPhysicalDeviceVulkan12Features::hostQueryReset (the feature struct is passed through as
+    // queried, so supported = enabled); the timer resets its slots from the host and stays off without it.
+    PFN_vkGetCalibratedTimestampsEXT pfn_vkGetCalibratedTimestampsEXT {};
+    uint32_t timestamp_valid_bits {};
+    bool host_query_reset {};
+
     bool serialize_submissions {};
 
     const ggml_cgraph * diag_cgraph {};
@@ -1443,6 +1453,32 @@ struct ggml_backend_vk_context {
 
     // async cross-device copy links into this (destination) context, one per source device (GGML_VK_D2D_ASYNC)
     std::vector<vk_d2d_link *> d2d_links;
+
+    // [fork, 2026-10-22] LLAMA_DECODE_STATS hooks (ggml_backend_fork_stats_i, ggml-backend-impl.h), both inert unless
+    // the scheduler has stats on. Split timeline: ring of VK_DTS_RING start/end timestamp pairs in dts_pool; ticket t
+    // lives in slot t % VK_DTS_RING. dts_floor: every ticket below it has completed on the GPU (set when
+    // ggml_vk_synchronize waited the fence); a slot is only reset for a new ticket when its old one is below the
+    // floor, so a reset never races a GPU write, and the ring refuses a ticket (-2, n_ts_dropped) when it would.
+    bool         dts_armed {};          // set by ts_arm, consumed by the next graph_compute
+    bool         dts_end_pending {};    // start written, end not yet
+    int64_t      dts_ticket {-1};       // what ts_take hands back
+    int64_t      dts_next {};
+    int64_t      dts_floor {};
+    vk::QueryPool dts_pool;
+    bool         dts_init_done {};
+    bool         dts_ok {};             // pool exists and the device can timestamp + host reset
+    std::vector<int64_t> dts_host_arm_us;   // per slot: host time of the start write, for the approx offset
+    double       dts_period_ns {};
+    uint64_t     dts_mask {};
+    bool         dts_calibrated {};     // last calibration succeeded
+    uint64_t     dts_cal_dev {};
+    int64_t      dts_cal_host_ns {};
+    int64_t      dts_cal_max_dev_ns {-1};
+    uint32_t     dts_reads_since_cal {};
+    bool         dts_approx_set {};
+    int64_t      dts_approx_off_ns {};
+    // D2D hop pieces of the copy in flight (scheduler copy_arm), NULL = off
+    struct ggml_backend_d2d_copy_stats * d2d_stats {};
 
     std::vector<vk::DescriptorPool> descriptor_pools;
     std::vector<vk::DescriptorSet> descriptor_sets;

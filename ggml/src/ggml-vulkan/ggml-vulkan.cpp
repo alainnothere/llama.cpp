@@ -4736,6 +4736,9 @@ vk_device ggml_vk_get_device(size_t idx) {
         bool dot2_f16_support = false;
         bool ocp_microscaling_extension = false;
         bool shader_float8_extension = false;
+        // [fork, 2026-10-22] LLAMA_DECODE_STATS split GPU timeline clock conversion (ggml_vk_dts_calibrate); the KHR
+        // name wins when both are listed, the entry point is the same
+        const char * calibrated_ts_ext = nullptr;
 
         for (const auto& properties : ext_props) {
             if (strcmp("VK_KHR_maintenance4", properties.extensionName) == 0) {
@@ -4798,6 +4801,10 @@ vk_device ggml_vk_get_device(size_t idx) {
                 device->external_memory_host = true;
             } else if (strcmp("VK_KHR_external_semaphore_fd", properties.extensionName) == 0) {
                 device->external_semaphore_fd = true;
+            } else if (strcmp("VK_KHR_calibrated_timestamps", properties.extensionName) == 0) {
+                calibrated_ts_ext = "VK_KHR_calibrated_timestamps";
+            } else if (strcmp("VK_EXT_calibrated_timestamps", properties.extensionName) == 0 && calibrated_ts_ext == nullptr) {
+                calibrated_ts_ext = "VK_EXT_calibrated_timestamps";
 #if defined(VK_EXT_shader_64bit_indexing)
             } else if (strcmp("VK_EXT_shader_64bit_indexing", properties.extensionName) == 0) {
                 device->shader_64b_indexing = true;
@@ -5153,6 +5160,30 @@ vk_device ggml_vk_get_device(size_t idx) {
             // VK_KHR_external_semaphore is core in 1.1; only the fd entry points need enabling
             device_extensions.push_back("VK_KHR_external_semaphore_fd");
         }
+        // [fork, 2026-10-22] split GPU timeline: enabled only when the device can calibrate DEVICE against
+        // CLOCK_MONOTONIC (the base of ggml_time_us on Linux). No feature struct, no cost unless called.
+        bool calibrated_ts_enable = false;
+        if (calibrated_ts_ext != nullptr) {
+            const bool khr = strcmp(calibrated_ts_ext, "VK_KHR_calibrated_timestamps") == 0;
+            auto pfn_domains = (PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsEXT)
+                vkGetInstanceProcAddr(vk_instance.instance, khr ? "vkGetPhysicalDeviceCalibrateableTimeDomainsKHR" : "vkGetPhysicalDeviceCalibrateableTimeDomainsEXT");
+            uint32_t n_domains = 0;
+            if (pfn_domains && pfn_domains(device->physical_device, &n_domains, nullptr) == VK_SUCCESS && n_domains > 0) {
+                std::vector<VkTimeDomainEXT> domains(n_domains);
+                if (pfn_domains(device->physical_device, &n_domains, domains.data()) == VK_SUCCESS) {
+                    bool has_dev = false, has_mono = false;
+                    for (uint32_t i = 0; i < n_domains; i++) {
+                        has_dev  |= domains[i] == VK_TIME_DOMAIN_DEVICE_EXT;
+                        has_mono |= domains[i] == VK_TIME_DOMAIN_CLOCK_MONOTONIC_EXT;
+                    }
+                    calibrated_ts_enable = has_dev && has_mono;
+                }
+            }
+            if (calibrated_ts_enable) {
+                device_extensions.push_back(calibrated_ts_ext);
+            }
+        }
+        device->timestamp_valid_bits = queue_family_props[compute_queue_family_index].timestampValidBits;
 
 #if defined(VK_EXT_shader_64bit_indexing)
         VkPhysicalDeviceShader64BitIndexingFeaturesEXT shader_64bit_indexing_features {};
@@ -5472,6 +5503,12 @@ vk_device ggml_vk_get_device(size_t idx) {
             device->pfn_vkGetDeviceFaultInfoEXT = (PFN_vkGetDeviceFaultInfoEXT)
                 vkGetDeviceProcAddr(device->device, "vkGetDeviceFaultInfoEXT");
         }
+        if (calibrated_ts_enable) {
+            const bool khr = strcmp(calibrated_ts_ext, "VK_KHR_calibrated_timestamps") == 0;
+            device->pfn_vkGetCalibratedTimestampsEXT = (PFN_vkGetCalibratedTimestampsEXT)
+                vkGetDeviceProcAddr(device->device, khr ? "vkGetCalibratedTimestampsKHR" : "vkGetCalibratedTimestampsEXT");
+        }
+        device->host_query_reset = vk12_features.hostQueryReset;
 
         // Queues
         device->compute_queue = ggml_vk_create_queue(device, compute_queue_family_index, 0, { vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer }, false);
@@ -13613,6 +13650,204 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
     }
 }
 
+// [fork, 2026-10-22] LLAMA_DECODE_STATS split GPU timeline (splits[].t_gpu_start_us / t_gpu_end_us).
+//
+// Why. The context-parallel one-layer prototype (LLAMA_CP_LAYER / LLAMA_CP_DEV) exists to run the owner card's and
+// the helper card's halves of one attention layer at the same time. Two measurement attempts (2026-10-21 and
+// 2026-10-22, ~/ai/claude_scratch/cp_overlap/arm_{A..E}, ledger row "2026-10-22 14:30-15:05") could not say whether
+// the cards overlapped: the sched instrument times the host (t_issue_us ~25 ms per split in the CP arms vs 4.5-9 ms
+// in production, per-hop copies a flat 2.1-2.5 ms vs 0.16-0.77 ms), not when each device executed, and
+// GGML_VK_MMVQ_SLOPE_STATS has GPU timestamps but waits on every graph, so it serializes the cards by construction.
+//
+// What. While the scheduler has stats on it arms each Vulkan split (ggml_backend_fork_stats_i::ts_arm, see
+// ggml-backend-impl.h); graph_compute then writes one timestamp before the split's first command and one after its
+// last, on this context's compute queue, into slot (ticket % VK_DTS_RING) of a per-context query pool. Nothing
+// waits for them: ts_read (vkGetQueryPoolResults WITH_AVAILABILITY, never WAIT) is called by llama after its own
+// synchronize, when the fence has already been waited, and reports "not yet" otherwise.
+//   - both timestamps are ALL_COMMANDS (= bottom of pipe): the start latches when everything submitted before it on
+//     this queue has finished, i.e. the previous split on this card and the hop-2 copies into this split's inputs
+//     (they are recorded into the compute context ahead of graph_compute, ggml_vk_d2d_copy_async). TOP_OF_PIPE would
+//     latch when the command processor reaches it, while the previous split may still run, and the busy intervals
+//     of one card would overlap each other. So busy = this split's own kernels, the hops are in the gaps.
+//   - semaphore waits on this queue are submission-level on RADV (the kernel holds the IB until the timeline
+//     reaches the value), so a hop-2 wait gates the start timestamp too; the wait's dstStageMask
+//     (COMPUTE|TRANSFER) alone would not promise that on other drivers.
+//   - the end is recorded into the command buffer the last node submits (ggml_vk_build_graph), so it adds no
+//     submit; only a graph with no enqueued node pays one extra vkQueueSubmit for the end (rare: copy-only splits).
+//   - cost when on, per split: 2 queries (16 B of pool), one host vkResetQueryPool of 2 queries, two
+//     vkCmdWriteTimestamp, one vkGetQueryPoolResults of 32 B (2 x {value, availability}) at read time, plus one
+//     vkGetCalibratedTimestamps per VK_DTS_RECAL reads. ALL_COMMANDS timestamps drain the queue at that point, which
+//     a split boundary does anyway (the next split's first dispatch barriers on the previous one's outputs).
+//   - cost when off: ctx->dts_armed is false, one bool test per graph_compute and one per submit in build_graph.
+// Clock: device ticks -> host CLOCK_MONOTONIC ns through vkGetCalibratedTimestamps(DEVICE, CLOCK_MONOTONIC) every
+// VK_DTS_RECAL reads (max deviation kept, reported as calib_max_dev_ns); without the extension timestampPeriod plus
+// the offset that puts the first read ticket's start at its host arm time (later than the truth by the queue
+// latency, so every interval reads early by the same amount; overlap between cards is then only approximate, the
+// row says calib "approx").
+// Ring: ticket t is refused (-2) when t - dts_floor >= VK_DTS_RING, dts_floor = dts_next at every
+// ggml_vk_synchronize (fence waited, every earlier ticket is on the GPU's past). So a slot is host-reset only when
+// its previous write has landed; a ticket older than dts_next - VK_DTS_RING reads -1 (slot reused).
+static constexpr int64_t  VK_DTS_RING  = 256;
+static constexpr uint32_t VK_DTS_RECAL = 64;
+
+static bool ggml_vk_dts_init(ggml_backend_vk_context * ctx) {
+    if (ctx->dts_init_done) {
+        return ctx->dts_ok;
+    }
+    ctx->dts_init_done = true;
+    const vk_device & dev = ctx->device;
+    if (dev->timestamp_valid_bits == 0 || !dev->host_query_reset) {
+        GGML_LOG_WARN("ggml_vulkan: %s: split GPU timeline off (%s)\n", ctx->name.c_str(),
+                      dev->timestamp_valid_bits == 0 ? "no timestamps on the compute queue" : "no hostQueryReset");
+        return false;
+    }
+    vk::QueryPoolCreateInfo qci;
+    qci.queryType  = vk::QueryType::eTimestamp;
+    qci.queryCount = (uint32_t)(2 * VK_DTS_RING);
+    ctx->dts_pool  = dev->device.createQueryPool(qci);
+    dev->device.resetQueryPool(ctx->dts_pool, 0, qci.queryCount);
+    ctx->dts_host_arm_us.assign(VK_DTS_RING, 0);
+    ctx->dts_period_ns = dev->properties.limits.timestampPeriod;
+    ctx->dts_mask      = dev->timestamp_valid_bits >= 64 ? ~0ull : ((1ull << dev->timestamp_valid_bits) - 1);
+    ctx->dts_ok        = true;
+    return true;
+}
+
+// signed tick distance a - b under the valid-bits mask
+static int64_t ggml_vk_dts_delta(const ggml_backend_vk_context * ctx, uint64_t a, uint64_t b) {
+    if (ctx->dts_mask == ~0ull) {
+        return (int64_t)(a - b);
+    }
+    const uint64_t d    = (a - b) & ctx->dts_mask;
+    const uint64_t sign = (ctx->dts_mask >> 1) + 1;
+    return (d & sign) ? (int64_t)(d | ~ctx->dts_mask) : (int64_t)d;
+}
+
+static void ggml_vk_dts_calibrate(ggml_backend_vk_context * ctx) {
+    ctx->dts_reads_since_cal = 0;
+    PFN_vkGetCalibratedTimestampsEXT pfn = ctx->device->pfn_vkGetCalibratedTimestampsEXT;
+    if (!pfn) {
+        return;
+    }
+    VkCalibratedTimestampInfoEXT info[2] = {};
+    info[0].sType      = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT;
+    info[0].timeDomain = VK_TIME_DOMAIN_DEVICE_EXT;
+    info[1].sType      = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT;
+    info[1].timeDomain = VK_TIME_DOMAIN_CLOCK_MONOTONIC_EXT;
+    uint64_t ts[2]   = {};
+    uint64_t max_dev = 0;
+    if (pfn((VkDevice)ctx->device->device, 2, info, ts, &max_dev) != VK_SUCCESS) {
+        return;   // keep the previous calibration (or approx) rather than nothing
+    }
+    ctx->dts_cal_dev        = ts[0] & ctx->dts_mask;
+    ctx->dts_cal_host_ns    = (int64_t)ts[1];
+    ctx->dts_cal_max_dev_ns = std::max<int64_t>(ctx->dts_cal_max_dev_ns, (int64_t)max_dev);
+    ctx->dts_calibrated     = true;
+}
+
+static int64_t ggml_vk_dts_to_host_us(ggml_backend_vk_context * ctx, uint64_t ticks) {
+    ticks &= ctx->dts_mask;
+    if (ctx->dts_calibrated) {
+        return (ctx->dts_cal_host_ns + (int64_t)((double)ggml_vk_dts_delta(ctx, ticks, ctx->dts_cal_dev) * ctx->dts_period_ns)) / 1000;
+    }
+    return ((int64_t)((double)ticks * ctx->dts_period_ns) + ctx->dts_approx_off_ns) / 1000;
+}
+
+// graph_compute entry: consume the arm, reset the slot from the host, write the start timestamp
+static void ggml_vk_dts_begin(ggml_backend_vk_context * ctx) {
+    ctx->dts_armed  = false;
+    ctx->dts_ticket = -1;
+    if (!ggml_vk_dts_init(ctx)) {
+        return;
+    }
+    if (ctx->dts_next - ctx->dts_floor >= VK_DTS_RING) {
+        ctx->dts_ticket = -2;   // the slot's previous write may not have landed yet
+        return;
+    }
+    const int64_t ticket = ctx->dts_next++;
+    const uint32_t slot  = (uint32_t)(ticket % VK_DTS_RING);
+    ctx->device->device.resetQueryPool(ctx->dts_pool, 2 * slot, 2);
+    vk_context cc = ggml_vk_get_compute_ctx(ctx);
+    cc->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->dts_pool, 2 * slot);
+    ctx->dts_host_arm_us[slot] = ggml_time_us();
+    ctx->dts_ticket      = ticket;
+    ctx->dts_end_pending = true;
+}
+
+// the end timestamp, into the command buffer about to be ended and submitted
+static void ggml_vk_dts_write_end(ggml_backend_vk_context * ctx, vk_context & cc) {
+    const uint32_t slot = (uint32_t)(ctx->dts_ticket % VK_DTS_RING);
+    cc->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->dts_pool, 2 * slot + 1);
+    ctx->dts_end_pending = false;
+}
+
+static void ggml_backend_vk_fork_ts_arm(ggml_backend_t backend) {
+    ((ggml_backend_vk_context *)backend->context)->dts_armed = true;
+}
+
+static int64_t ggml_backend_vk_fork_ts_take(ggml_backend_t backend) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    const int64_t t = ctx->dts_ticket;
+    ctx->dts_armed  = false;
+    ctx->dts_ticket = -1;
+    return t;
+}
+
+static int ggml_backend_vk_fork_ts_read(ggml_backend_t backend, int64_t ticket, int64_t * t_start_us, int64_t * t_end_us) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    if (!ctx->dts_ok || ticket < 0 || ticket >= ctx->dts_next || ctx->dts_next - ticket > VK_DTS_RING) {
+        return -1;
+    }
+    const uint32_t slot = (uint32_t)(ticket % VK_DTS_RING);
+    uint64_t r[4] = {};   // {start, avail, end, avail}
+    const VkResult res = vkGetQueryPoolResults((VkDevice)ctx->device->device, (VkQueryPool)ctx->dts_pool, 2 * slot, 2, sizeof(r), r,
+                                               2 * sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+    if (res != VK_SUCCESS && res != VK_NOT_READY) {
+        return -1;
+    }
+    if (r[1] == 0 || r[3] == 0) {
+        return 0;
+    }
+    if (ctx->device->pfn_vkGetCalibratedTimestampsEXT && (!ctx->dts_calibrated || ctx->dts_reads_since_cal >= VK_DTS_RECAL)) {
+        ggml_vk_dts_calibrate(ctx);
+    }
+    ctx->dts_reads_since_cal++;
+    if (!ctx->dts_calibrated && !ctx->dts_approx_set) {
+        ctx->dts_approx_off_ns = ctx->dts_host_arm_us[slot] * 1000 - (int64_t)((double)(r[0] & ctx->dts_mask) * ctx->dts_period_ns);
+        ctx->dts_approx_set    = true;
+    }
+    *t_start_us = ggml_vk_dts_to_host_us(ctx, r[0]);
+    *t_end_us   = ggml_vk_dts_to_host_us(ctx, r[2]);
+    return 1;
+}
+
+static int ggml_backend_vk_fork_ts_calib(ggml_backend_t backend, int64_t * max_dev_ns) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    if (!ctx->dts_ok) {
+        *max_dev_ns = -1;
+        return -1;
+    }
+    *max_dev_ns = ctx->dts_calibrated ? ctx->dts_cal_max_dev_ns : -1;
+    return ctx->dts_calibrated ? 0 : 1;
+}
+
+static void ggml_backend_vk_fork_copy_arm(ggml_backend_t backend_dst, struct ggml_backend_d2d_copy_stats * rec) {
+    ((ggml_backend_vk_context *)backend_dst->context)->d2d_stats = rec;
+}
+
+static const struct ggml_backend_fork_stats_i ggml_backend_vk_fork_stats_i = {
+    /* .ts_arm   = */ ggml_backend_vk_fork_ts_arm,
+    /* .ts_take  = */ ggml_backend_vk_fork_ts_take,
+    /* .ts_read  = */ ggml_backend_vk_fork_ts_read,
+    /* .ts_calib = */ ggml_backend_vk_fork_ts_calib,
+    /* .copy_arm = */ ggml_backend_vk_fork_copy_arm,
+};
+
+// GGML_BACKEND_FORK_STATS_PROC, via ggml_backend_vk_reg_get_proc_address
+static const struct ggml_backend_fork_stats_i * ggml_backend_vk_fork_stats(ggml_backend_t backend) {
+    return (backend && ggml_backend_is_vk(backend)) ? &ggml_backend_vk_fork_stats_i : nullptr;
+}
+
 bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int node_idx, ggml_tensor *node_begin, int node_idx_begin, bool last_node, bool almost_ready, bool submit){
     ggml_tensor * node = cgraph->nodes[node_idx];
     if (ggml_is_empty(node) || ggml_op_is_empty(node->op) || !node->buffer) {
@@ -14185,6 +14420,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 #endif
 
     if (submit || last_node) {
+        // [fork, 2026-10-22] split GPU timeline end, into the graph's final command buffer (comment at VK_DTS_RING).
+        // GGML_VULKAN_CHECK_RESULTS forces last_node on every node; there the end lands after the first node
+        if (ctx->dts_end_pending && last_node) {
+            ggml_vk_dts_write_end(ctx, compute_ctx);
+        }
         ggml_vk_ctx_end(compute_ctx);
 
         // TODO probably it'd be better to pass a exit_node flag to ggml_vk_compute_forward
@@ -14313,6 +14553,13 @@ void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     }
 #endif
     ctx->d2d_links.clear();
+
+    if (ctx->dts_pool) {
+        ctx->device->device.destroyQueryPool(ctx->dts_pool);
+        ctx->dts_pool = nullptr;
+        ctx->dts_ok = false;
+        ctx->dts_init_done = false;
+    }
 
     ggml_vk_destroy_buffer(ctx->prealloc_x);
     ggml_vk_destroy_buffer(ctx->prealloc_y);
@@ -14945,6 +15192,7 @@ struct vk_d2d_link {
     uint64_t       bwd_pending_mark = 0;
 
     uint32_t n_grow_log = 0;   // [fork] rate limit of the ring's SCRATCH GROW lines
+    int32_t  why_code   = 0;   // [fork, 2026-10-22] ggml_backend_d2d_bounce_reason of a refused setup (LLAMA_DECODE_STATS)
 };
 
 static bool ggml_vk_d2d_timeline_shareable(const vk_device & dev) {
@@ -15135,6 +15383,7 @@ static vk_d2d_link * ggml_vk_d2d_get_link(ggml_backend_vk_context * dst_ctx, con
     dst_ctx->d2d_links.push_back(l);
 
     const char * why = nullptr;
+    l->why_code = GGML_BACKEND_D2D_BOUNCE_UNAVAILABLE;
     if (l->src_dev->driver_id != l->dst_dev->driver_id) {
         why = "different drivers";
     } else if (!l->src_dev->external_memory_host || !l->dst_dev->external_memory_host) {
@@ -15146,26 +15395,38 @@ static vk_d2d_link * ggml_vk_d2d_get_link(ggml_backend_vk_context * dst_ctx, con
     } else if (!ggml_vk_d2d_share_timeline(l->src_dev, l->dst_dev, l->fwd_src, l->fwd_dst) ||
                !ggml_vk_d2d_share_timeline(l->dst_dev, l->src_dev, l->bwd_dst, l->bwd_src)) {
         why = "semaphore share failed";
+        l->why_code = GGML_BACKEND_D2D_BOUNCE_SHARE_FAILED;
     } else if (!ggml_vk_d2d_ring_alloc(l, VK_D2D_RING_MIN)) {
         why = "host ring import failed";
+        l->why_code = GGML_BACKEND_D2D_BOUNCE_IMPORT_FAILED;
     }
     if (why) {
         GGML_LOG_WARN("ggml_vulkan: async D2D %s -> %s unavailable (%s), using the host bounce\n", l->src_dev->name.c_str(), l->dst_dev->name.c_str(), why);
         return l;
     }
     l->ok = true;
+    l->why_code = GGML_BACKEND_D2D_BOUNCE_NONE;
     GGML_LOG_DEBUG("ggml_vulkan: async D2D %s -> %s: host ring %zu MiB, timeline sync\n", l->src_dev->name.c_str(), l->dst_dev->name.c_str(), l->cap >> 20);
     return l;
 }
 
 // ring of at least 2x the hop, so consecutive hops rarely wrap onto their own unflushed batch
-static bool ggml_vk_d2d_ensure_cap(vk_d2d_link * l, size_t size_al) {
+// [fork, 2026-10-22] rec (LLAMA_DECODE_STATS, may be NULL): bounce reason on refusal, n_ring_grow / t_ring_grow_us
+static bool ggml_vk_d2d_ensure_cap(vk_d2d_link * l, size_t size_al, struct ggml_backend_d2d_copy_stats * rec) {
     if (size_al * 2 <= l->cap) {
         return true;
     }
     if (size_al > VK_D2D_HOP_MAX) {
+        if (rec) {
+            rec->bounce_reason = GGML_BACKEND_D2D_BOUNCE_HOP_TOO_LARGE;
+        }
         return false;
     }
+    const int64_t t_grow0 = rec ? ggml_time_us() : 0;
+    struct grow_timer {   // every exit below is a grow attempt, failed or not
+        struct ggml_backend_d2d_copy_stats * rec; int64_t t0;
+        ~grow_timer() { if (rec) { rec->n_ring_grow = 1; rec->t_ring_grow_us += ggml_time_us() - t0; } }
+    } grow_timer_{ rec, t_grow0 };
     // jump to >= 4x the old ring so a link retires at most two (16 -> 64 -> 256 MiB at the 128 MiB hop limit)
     size_t cap = std::max(VK_D2D_RING_MIN, l->cap * 4);
     while (cap < size_al * 2) {
@@ -15176,6 +15437,10 @@ static bool ggml_vk_d2d_ensure_cap(vk_d2d_link * l, size_t size_al) {
     if (!ggml_vk_d2d_ring_alloc(l, cap)) {
         GGML_LOG_WARN("ggml_vulkan: async D2D %s -> %s: host ring grow to %zu MiB failed, using the host bounce\n", l->src_dev->name.c_str(), l->dst_dev->name.c_str(), cap >> 20);
         l->ok = false;
+        l->why_code = GGML_BACKEND_D2D_BOUNCE_GROW_FAILED;
+        if (rec) {
+            rec->bounce_reason = GGML_BACKEND_D2D_BOUNCE_GROW_FAILED;
+        }
         return false;
     }
     // [fork, 2026-10-22] SCRATCH GROW line per side (see ggml_vk_scratch_grow_log): the ring is pinned host memory
@@ -15194,14 +15459,38 @@ static bool ggml_vk_d2d_ensure_cap(vk_d2d_link * l, size_t size_al) {
     return true;
 }
 
+// [fork, 2026-10-22] LLAMA_DECODE_STATS D2D hop pieces. dst_ctx->d2d_stats (the scheduler's copy record, NULL when
+// stats are off: one pointer test per copy) gets the host-side blocking pieces of this copy, separately, because in
+// the CP arms (2026-10-21/22) every hop cost a flat 2.1-2.5 ms of t_copy_us vs 0.16-0.77 ms in production on the
+// same rings and nothing said which piece it was. The pieces:
+//   t_link_setup_us  first copy on the pair: semaphore export/import + the 16 MiB ring map/populate/import
+//   t_ring_grow_us   ggml_vk_d2d_ensure_cap regrowing (map + MADV_POPULATE_WRITE + two imports), n_ring_grow
+//   t_presubmit_us   deadlock rule, ggml_vk_d2d_flush_bwd: submits the dst compute context before hop 1, n_presubmit
+//   t_hop_submit_us  ggml_vk_submit_transfer_ctx(src) + ggml_vk_submit_compute_ctx_nowait(src) = hop 1's
+//                    vkQueueSubmit; n_hop_submit_sync = 1 when that found device->host staging reads in the src
+//                    compute context and ran a full ggml_vk_synchronize(src) instead (a host wait on the src card
+//                    hiding inside "async")
+//   n_bwd_gpu_wait   hop 1 carries a wait on bwd (ring WAR). That wait is on the GPU (src queue), the host never
+//                    calls vkWaitSemaphores here (only link destroy does), so there is no host time to report.
+// t_copy_us (scheduler) - the four t_* = command recording, live-region scan and the get_compute_ctx allocations.
 static bool ggml_vk_d2d_copy_async(ggml_backend_vk_context * src_ctx, ggml_backend_vk_context * dst_ctx,
                                    vk_buffer & src_buf, size_t src_offset, vk_buffer & dst_buf, size_t dst_offset, size_t size) {
+    struct ggml_backend_d2d_copy_stats * rec = dst_ctx->d2d_stats;
+    const int64_t t_link0 = rec ? ggml_time_us() : 0;
+    const size_t n_links0 = dst_ctx->d2d_links.size();
     vk_d2d_link * l = ggml_vk_d2d_get_link(dst_ctx, src_buf->device);
+    if (rec && dst_ctx->d2d_links.size() != n_links0) {
+        rec->t_link_setup_us = ggml_time_us() - t_link0;
+        rec->n_ring_grow     = 1;
+    }
     if (!l->ok) {
+        if (rec) {
+            rec->bounce_reason = l->why_code != GGML_BACKEND_D2D_BOUNCE_NONE ? l->why_code : GGML_BACKEND_D2D_BOUNCE_UNAVAILABLE;
+        }
         return false;
     }
     const size_t size_al = ggml_vk_align_size(size, VK_D2D_ALIGN);
-    if (!ggml_vk_d2d_ensure_cap(l, size_al)) {
+    if (!ggml_vk_d2d_ensure_cap(l, size_al, rec)) {
         return false;
     }
 
@@ -15225,11 +15514,24 @@ static bool ggml_vk_d2d_copy_async(ggml_backend_vk_context * src_ctx, ggml_backe
         live.resize(n);
     }
     if (wait_bwd > l->bwd_submitted) {
+        const int64_t t0 = rec ? ggml_time_us() : 0;
+        const bool was_submitted = ggml_vk_d2d_bwd_all_submitted(l);
         ggml_vk_d2d_flush_bwd(dst_ctx, l);   // deadlock rule
+        if (rec) {
+            rec->n_presubmit    = was_submitted ? 0 : 1;
+            rec->t_presubmit_us = ggml_time_us() - t0;
+        }
+    }
+    if (rec) {
+        rec->n_bwd_gpu_wait = wait_bwd > 0 ? 1 : 0;
     }
 
     // hop 1: after everything queued on the src context, on its compute queue
+    const int64_t t_sub0 = rec ? ggml_time_us() : 0;
     ggml_vk_submit_transfer_ctx(src_ctx);
+    if (rec) {
+        rec->t_hop_submit_us += ggml_time_us() - t_sub0;
+    }
     const bool src_fresh = src_ctx->compute_ctx.expired();
     vk_context sc = ggml_vk_get_compute_ctx(src_ctx);
     if (!src_fresh) {
@@ -15250,7 +15552,14 @@ static bool ggml_vk_d2d_copy_async(ggml_backend_vk_context * src_ctx, ggml_backe
     }
     ggml_vk_sync_buffers(nullptr, sc);
     sc->s->signal_semaphores.push_back({ l->fwd_src, ++l->fwd_value });
+    if (rec) {
+        rec->n_hop_submit_sync = sc->out_memcpys.empty() ? 0 : 1;   // ggml_vk_submit_compute_ctx_nowait syncs then
+    }
+    const int64_t t_sub1 = rec ? ggml_time_us() : 0;
     ggml_vk_submit_compute_ctx_nowait(src_ctx);
+    if (rec) {
+        rec->t_hop_submit_us += ggml_time_us() - t_sub1;
+    }
 
     // hop 2: into the dst compute context, flushed by the next graph_compute (or the deadlock rule)
     ggml_vk_d2d_bwd_all_submitted(l);   // retire the previous pending context before tracking a new one
@@ -15305,8 +15614,19 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
         ggml_backend_vk_buffer_context * src_buf_ctx = (ggml_backend_vk_buffer_context *)src->buffer->context;
 
         if (src_buf_ctx->dev_buffer->device != dst_buf->device) {
+            // [fork, 2026-10-22] LLAMA_DECODE_STATS D2D record (NULL when off); the reason is overwritten by the
+            // async path's own refusal codes, see ggml_vk_d2d_copy_async
+            if (ctx->d2d_stats) {
+                ctx->d2d_stats->filled        = 1;
+                ctx->d2d_stats->bounce_reason = GGML_BACKEND_D2D_BOUNCE_UNAVAILABLE;
+            }
 #ifdef __linux__
             // cross-device: GPU-timeline copy through a host ring (comment above ggml_vk_d2d_copy_async)
+            if (ctx->d2d_stats) {
+                ctx->d2d_stats->bounce_reason = !ggml_vk_d2d_async_enabled() ? GGML_BACKEND_D2D_BOUNCE_DISABLED :
+                    (!ggml_backend_is_vk(backend_src) || ((ggml_backend_vk_context *)backend_src->context)->device != src_buf_ctx->dev_buffer->device)
+                        ? GGML_BACKEND_D2D_BOUNCE_SRC_NOT_VK : GGML_BACKEND_D2D_BOUNCE_NONE;
+            }
             if (ggml_vk_d2d_async_enabled() && ggml_backend_is_vk(backend_src)) {
                 ggml_backend_vk_context * src_ctx = (ggml_backend_vk_context *)backend_src->context;
                 if (src_ctx->device == src_buf_ctx->dev_buffer->device &&
@@ -15444,6 +15764,10 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
         }
         ctx->compute_ctx.reset();
     }
+    // [fork, 2026-10-22] split GPU timeline: everything submitted on this context is done, its slots may be reused.
+    // A sync from inside graph_compute (staging reads, ggml_vk_submit_compute_ctx_nowait) leaves the current ticket's
+    // end unsubmitted: that ticket stays above the floor
+    ctx->dts_floor = ctx->dts_end_pending ? ctx->dts_next - 1 : ctx->dts_next;
 }
 
 static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
@@ -16233,6 +16557,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     ggml_vk_submit_transfer_ctx(ctx);
 
+    // [fork, 2026-10-22] split GPU timeline start (LLAMA_DECODE_STATS, comment at VK_DTS_RING); one bool test when off
+    if (ctx->dts_armed) {
+        ggml_vk_dts_begin(ctx);
+    }
+
     vk_context compute_ctx;
     const int64_t perf_t0_us = (vk_perf_logger_enabled || vk_mmvq_slope_stats) ? ggml_time_us() : 0;
     // GGML_VK_MMVQ_SLOPE_STATS CPU phases: accumulate into this context from here to the end of recording
@@ -16756,6 +17085,18 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ctx->last_total_flops = total_flops;
     if (vk_mmvq_slope_stats) {
         ctx->slope_flops_per_submit_final = flops_per_submit;
+    }
+    // [fork, 2026-10-22] split GPU timeline: no node submitted the end (nothing enqueued, e.g. a copy-only split).
+    // The perf logger keeps its context open for its own final submit; otherwise this costs one extra submit
+    if (ctx->dts_end_pending) {
+        vk_context cc = ggml_vk_get_compute_ctx(ctx);
+        ggml_vk_dts_write_end(ctx, cc);
+        if (!vk_perf_logger_enabled) {
+            ggml_vk_ctx_end(cc);
+            ggml_vk_submit(cc, {});
+            ctx->submit_pending = true;
+            ctx->compute_ctx.reset();
+        }
     }
     vk_slope_phases_cur = nullptr;   // recording done: freeze the phase sums (collect reads them)
 
@@ -18333,11 +18674,20 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+// [fork, 2026-10-22] only the LLAMA_DECODE_STATS hooks (ggml_backend_fork_stats_i, ggml-backend-impl.h)
+static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    GGML_UNUSED(reg);
+    if (strcmp(name, GGML_BACKEND_FORK_STATS_PROC) == 0) {
+        return (void *)ggml_backend_vk_fork_stats;
+    }
+    return NULL;
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {

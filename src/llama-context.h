@@ -521,7 +521,22 @@ public:
         int64_t s_t_realloc_reserve = 0;
         std::string s_realloc_json; // [{g, reason}], first 16 per line
         std::string s_copies_json;
-        std::string s_splits_json;
+        // 2026-10-22: split entries are kept open (no closing brace) until the line is flushed, so the GPU timeline
+        // fields (t_gpu_start_us / t_gpu_end_us) can be appended once the timestamps exist (dstats_flush)
+        std::vector<std::string> s_split_frags;
+        struct split_ts { int32_t backend; int64_t ticket; int32_t frag; }; // frag -1: entry over the line cap
+        std::vector<split_ts> s_split_ts;
+        int32_t s_n_ts_dropped          = 0; // the backend's ring refused the pair (scheduler n_ts_dropped)
+        // 2026-10-22: D2D hop pieces, sums over the copies (ggml_backend_sched_stats n_d2d_* / t_d2d_*)
+        int32_t s_n_d2d_bounce          = 0;
+        int32_t s_n_d2d_presubmit       = 0;
+        int32_t s_n_d2d_hop_submit_sync = 0;
+        int32_t s_n_d2d_bwd_gpu_wait    = 0;
+        int32_t s_n_d2d_ring_grow       = 0;
+        int64_t s_t_d2d_link_setup      = 0;
+        int64_t s_t_d2d_presubmit       = 0;
+        int64_t s_t_d2d_ring_grow       = 0;
+        int64_t s_t_d2d_hop_submit      = 0;
     };
 private:
     bool             dstats_on     = false;
@@ -544,5 +559,16 @@ private:
     void check_cpu_placement(ggml_cgraph * gf);
     void dstats_emit_ctx_create() const;
     void dstats_emit(int ret, int64_t t_start_us, uint32_t n_tokens, uint32_t n_outputs);
+    // 2026-10-22: lines whose splits carry GPU timestamp tickets wait here until the timestamps can be read without
+    // a new sync (dstats_flush): all at the next synchronize(), the leading resolved ones at the next decode()
+    struct dstats_pending_line {
+        std::string head;                                   // the line up to and excluding ",\"splits\":["
+        std::vector<std::string> split_frags;
+        std::vector<decode_stats_acc::split_ts> split_ts;
+        int32_t n_ts_dropped;
+        int64_t t_call_start_us;                            // ggml_time_us() at decode() entry
+    };
+    std::vector<dstats_pending_line> dstats_pending;
+    void dstats_flush(bool synced);
     int  decode_impl(const llama_batch_ext & batch_inp); // decode() body, decode() wraps it for the stats line
 };

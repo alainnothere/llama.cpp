@@ -992,6 +992,9 @@ struct ggml_backend_sched {
     int     stats_pending_split; // split whose issue_to_next_wait is still open, -1 = none
     int64_t stats_t_issue_end;
     struct ggml_backend_sched_stats realloc_pending; // only the n_realloc/t_realloc_*/realloc_reason fields are used
+    // [fork, 2026-10-22] per backend: split GPU timeline + D2D hop pieces (ggml_backend_fork_stats_i in
+    // ggml-backend-impl.h), looked up when stats are enabled, NULL for backends without it (CPU, BLAS, ...)
+    const struct ggml_backend_fork_stats_i * fork_stats[GGML_SCHED_MAX_BACKENDS];
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -1882,13 +1885,25 @@ static void ggml_backend_sched_stats_close_pending(ggml_backend_sched_t sched) {
 }
 
 static void ggml_backend_sched_stats_add_copy(ggml_backend_sched_t sched, int split_id, const struct ggml_tensor * input,
-        int src_backend, int dst_backend, int path, int64_t t_dst_wait, int64_t t_src_sync, int64_t t_copy) {
+        int src_backend, int dst_backend, int path, int64_t t_dst_wait, int64_t t_src_sync, int64_t t_copy,
+        const struct ggml_backend_d2d_copy_stats & d2d) {
     struct ggml_backend_sched_stats * st = sched->stats;
     const size_t nbytes = ggml_nbytes(input);
     st->nbytes        += nbytes;
     st->t_dst_wait_us += t_dst_wait;
     st->t_src_sync_us += t_src_sync;
     st->t_copy_us     += t_copy;
+    if (d2d.filled) {
+        st->n_d2d_bounce          += d2d.bounce_reason != GGML_BACKEND_D2D_BOUNCE_NONE;
+        st->n_d2d_presubmit       += d2d.n_presubmit;
+        st->n_d2d_hop_submit_sync += d2d.n_hop_submit_sync;
+        st->n_d2d_bwd_gpu_wait    += d2d.n_bwd_gpu_wait;
+        st->n_d2d_ring_grow       += d2d.n_ring_grow;
+        st->t_d2d_link_setup_us   += d2d.t_link_setup_us;
+        st->t_d2d_presubmit_us    += d2d.t_presubmit_us;
+        st->t_d2d_ring_grow_us    += d2d.t_ring_grow_us;
+        st->t_d2d_hop_submit_us   += d2d.t_hop_submit_us;
+    }
     if (st->n_copies < GGML_BACKEND_SCHED_STATS_MAX_COPIES) {
         struct ggml_backend_sched_copy_stats & c = st->copies[st->n_copies];
         snprintf(c.name, sizeof(c.name), "%s", input->name);
@@ -1900,6 +1915,7 @@ static void ggml_backend_sched_stats_add_copy(ggml_backend_sched_t sched, int sp
         c.t_dst_wait_us = t_dst_wait;
         c.t_src_sync_us = t_src_sync;
         c.t_copy_us     = t_copy;
+        c.d2d           = d2d;
     }
     st->n_copies++;
 }
@@ -1920,6 +1936,9 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, int split_
     int64_t t_src_sync = 0;
     int64_t t_copy     = 0;
     int     path;
+    // [fork, 2026-10-22] the dst backend fills d2d inside cpy_tensor_async (cross-device only); off = one pointer test
+    struct ggml_backend_d2d_copy_stats d2d = {};
+    const struct ggml_backend_fork_stats_i * dst_fs = stats_on ? sched->fork_stats[split_backend_id] : NULL;
 
     if (input->flags & GGML_TENSOR_FLAG_INPUT) {
         // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
@@ -1945,7 +1964,16 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, int split_
             sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
             lap.lap(t_copy);
             path = GGML_BACKEND_SCHED_COPY_PATH_CB;
-        } else if (split_backend->iface.cpy_tensor_async && split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+        } else if (split_backend->iface.cpy_tensor_async && [&] {
+                    if (dst_fs) {
+                        dst_fs->copy_arm(split_backend, &d2d);
+                    }
+                    const bool ok = split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy);
+                    if (dst_fs) {
+                        dst_fs->copy_arm(split_backend, NULL);
+                    }
+                    return ok;
+                }()) {
             // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
             // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
             lap.lap(t_copy);
@@ -1969,7 +1997,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, int split_
 
     if (stats_on) {
         const int src_backend = input_backend ? ggml_backend_sched_backend_id(sched, input_backend) : -1;
-        ggml_backend_sched_stats_add_copy(sched, split_id, input, src_backend, split_backend_id, path, t_dst_wait, t_src_sync, t_copy);
+        ggml_backend_sched_stats_add_copy(sched, split_id, input, src_backend, split_backend_id, path, t_dst_wait, t_src_sync, t_copy, d2d);
     }
 }
 
@@ -1997,6 +2025,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         st->t_realloc_sync_us    = sched->realloc_pending.t_realloc_sync_us;
         st->t_realloc_reserve_us = sched->realloc_pending.t_realloc_reserve_us;
         memcpy(st->realloc_reason, sched->realloc_pending.realloc_reason, sizeof(st->realloc_reason));
+        st->n_ts_dropped          = 0;
+        st->n_d2d_bounce          = 0;
+        st->n_d2d_presubmit       = 0;
+        st->n_d2d_hop_submit_sync = 0;
+        st->n_d2d_bwd_gpu_wait    = 0;
+        st->n_d2d_ring_grow       = 0;
+        st->t_d2d_link_setup_us   = 0;
+        st->t_d2d_presubmit_us    = 0;
+        st->t_d2d_ring_grow_us    = 0;
+        st->t_d2d_hop_submit_us   = 0;
         sched->realloc_pending.n_realloc            = 0;
         sched->realloc_pending.t_realloc_sync_us    = 0;
         sched->realloc_pending.t_realloc_reserve_us = 0;
@@ -2046,8 +2084,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // a split that neither waited nor copied closes the previous window at its issue
         int64_t t_issue_start = 0;
+        // [fork, 2026-10-22] split GPU timeline: the backend timestamps this one graph_compute (start/end pair on its
+        // compute queue). Not with callback_eval: that issues one graph_compute per node range, a single pair would
+        // cover only the first. Cost when stats are off: the st test above, nothing else.
+        const struct ggml_backend_fork_stats_i * split_fs = (st && !sched->callback_eval) ? sched->fork_stats[split_backend_id] : NULL;
         if (st) {
             ggml_backend_sched_stats_close_pending(sched);
+            if (split_fs) {
+                split_fs->ts_arm(split_backend);
+            }
             t_issue_start = ggml_time_us();
         }
 
@@ -2093,6 +2138,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // with callback_eval set, t_issue_us includes the per-range synchronize above
         if (st) {
             const int64_t now = ggml_time_us();
+            int64_t ticket = split_fs ? split_fs->ts_take(split_backend) : -1;
+            if (ticket == -2) {
+                st->n_ts_dropped++;
+                ticket = -1;
+            }
             if (split_id < GGML_BACKEND_SCHED_STATS_MAX_SPLITS) {
                 struct ggml_backend_sched_split_stats & ss = st->splits[split_id];
                 ss.backend                 = split_backend_id;
@@ -2100,6 +2150,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ss.n_inputs                = split->n_inputs;
                 ss.t_issue_us              = now - t_issue_start;
                 ss.t_issue_to_next_wait_us = -1;
+                ss.ts_ticket               = ticket;
                 sched->stats_pending_split = split_id;
             }
             sched->stats_t_issue_end = now;
@@ -2370,10 +2421,41 @@ void ggml_backend_sched_set_stats_enabled(ggml_backend_sched_t sched, bool enabl
     if (enabled && sched->stats == NULL) {
         sched->stats = (struct ggml_backend_sched_stats *) calloc(1, sizeof(struct ggml_backend_sched_stats));
         sched->stats_pending_split = -1;
+        // [fork, 2026-10-22] the backends that can timestamp their splits / describe their D2D hops
+        for (int i = 0; i < sched->n_backends; i++) {
+            sched->fork_stats[i] = NULL;
+            ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[i]);
+            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : NULL;
+            if (reg && reg->iface.get_proc_address) {
+                auto fn = (ggml_backend_fork_stats_iface_t) reg->iface.get_proc_address(reg, GGML_BACKEND_FORK_STATS_PROC);
+                if (fn) {
+                    sched->fork_stats[i] = fn(sched->backends[i]);
+                }
+            }
+        }
     } else if (!enabled && sched->stats != NULL) {
         free(sched->stats);
         sched->stats = NULL;
+        for (int i = 0; i < sched->n_backends; i++) {
+            sched->fork_stats[i] = NULL;
+        }
     }
+}
+
+int ggml_backend_sched_split_ts_read(ggml_backend_sched_t sched, int backend_id, int64_t ticket, int64_t * t_start_us, int64_t * t_end_us) {
+    GGML_ASSERT(sched);
+    if (backend_id < 0 || backend_id >= sched->n_backends || ticket < 0 || !sched->fork_stats[backend_id]) {
+        return -1;
+    }
+    return sched->fork_stats[backend_id]->ts_read(sched->backends[backend_id], ticket, t_start_us, t_end_us);
+}
+
+int ggml_backend_sched_split_ts_calib(ggml_backend_sched_t sched, int backend_id, int64_t * max_dev_ns) {
+    GGML_ASSERT(sched);
+    if (backend_id < 0 || backend_id >= sched->n_backends || !sched->fork_stats[backend_id]) {
+        return -1;
+    }
+    return sched->fork_stats[backend_id]->ts_calib(sched->backends[backend_id], max_dev_ns);
 }
 
 const struct ggml_backend_sched_stats * ggml_backend_sched_get_last_stats(ggml_backend_sched_t sched) {

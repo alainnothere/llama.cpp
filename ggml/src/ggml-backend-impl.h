@@ -287,6 +287,29 @@ extern "C" {
 #    define GGML_BACKEND_DL_SCORE_IMPL(score_fn)
 #endif
 
+    // [fork, 2026-10-22] LLAMA_DECODE_STATS split GPU timeline + D2D hop pieces (not in upstream ggml).
+    // A backend that can timestamp its own work exports, through its reg's get_proc_address, the name
+    // GGML_BACKEND_FORK_STATS_PROC returning a ggml_backend_fork_stats_iface_t. The scheduler looks it up once per
+    // backend when stats are enabled (ggml_backend_sched_set_stats_enabled) and only calls it while they are on, so a
+    // scheduler with stats off never touches it. Implemented by ggml-vulkan only (ggml_backend_vk_fork_stats).
+    // Preconditions the scheduler relies on:
+    //   - ts_arm before one graph_compute(_async) on that backend, ts_take right after it, same thread; the backend
+    //     consumes the arm in that graph_compute only.
+    //   - ts_read never waits on the device; 0 means "not yet", the caller decides when to give up.
+    //   - copy_arm(dst, rec) before cpy_tensor_async on the destination backend and copy_arm(dst, NULL) after: the
+    //     backend writes rec only between the two.
+    struct ggml_backend_d2d_copy_stats;
+    struct ggml_backend_fork_stats_i {
+        void    (*ts_arm)  (ggml_backend_t backend);
+        // ticket >= 0, -1 nothing armed/recorded, -2 the ring was full (dropped)
+        int64_t (*ts_take) (ggml_backend_t backend);
+        int     (*ts_read) (ggml_backend_t backend, int64_t ticket, int64_t * t_start_us, int64_t * t_end_us);
+        int     (*ts_calib)(ggml_backend_t backend, int64_t * max_dev_ns);
+        void    (*copy_arm)(ggml_backend_t backend_dst, struct ggml_backend_d2d_copy_stats * rec);
+    };
+    #define GGML_BACKEND_FORK_STATS_PROC "ggml_backend_fork_stats"
+    typedef const struct ggml_backend_fork_stats_i * (*ggml_backend_fork_stats_iface_t)(ggml_backend_t backend);
+
 #ifdef  __cplusplus
 }
 #endif

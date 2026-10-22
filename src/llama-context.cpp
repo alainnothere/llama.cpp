@@ -1053,6 +1053,10 @@ void llama_context::synchronize() {
     // barrier (output_reserve, embd_seq drain, sched_reserve) must not make this a
     // no-op: the output copies for the current batch are enqueued after it
     if (synced_gen == async_gen) {
+        // [LLAMA_DECODE_STATS] nothing in flight: every pending line's timestamps are readable
+        if (dstats_on && !dstats_pending.empty()) {
+            dstats_flush(true);
+        }
         return;
     }
 
@@ -1066,6 +1070,11 @@ void llama_context::synchronize() {
     if (dstats_on) {
         // [LLAMA_DECODE_STATS] reported as t_sync_prev_us on the next line of this context
         dstats_t_sync += ggml_time_us() - t_sync_start;
+        // 2026-10-22: the fences are waited, the split GPU timestamps can be read (dstats_flush); after the
+        // t_sync_prev_us lap so the flush's own string work is not billed as GPU wait
+        if (!dstats_pending.empty()) {
+            dstats_flush(true);
+        }
     }
     n_sync_total++;
     synced_gen = async_gen;
@@ -2128,6 +2137,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     dstats = {};
 
+    // 2026-10-22: lines of earlier calls whose GPU timestamps already landed go out first (no sync here: the host
+    // runs ahead of the cards between decodes, a line still waiting is flushed by the next synchronize())
+    if (!dstats_pending.empty()) {
+        dstats_flush(false);
+    }
+
     const int64_t t_start_us = ggml_time_us();
     const int     ret        = decode_impl(batch_inp);
 
@@ -2444,6 +2459,17 @@ void llama_context::dstats_fold_sched() {
     d.s_t_split_sync += st->t_split_sync_us;
     d.s_t_wall       += st->t_wall_us;
 
+    d.s_n_ts_dropped          += st->n_ts_dropped;
+    d.s_n_d2d_bounce          += st->n_d2d_bounce;
+    d.s_n_d2d_presubmit       += st->n_d2d_presubmit;
+    d.s_n_d2d_hop_submit_sync += st->n_d2d_hop_submit_sync;
+    d.s_n_d2d_bwd_gpu_wait    += st->n_d2d_bwd_gpu_wait;
+    d.s_n_d2d_ring_grow       += st->n_d2d_ring_grow;
+    d.s_t_d2d_link_setup      += st->t_d2d_link_setup_us;
+    d.s_t_d2d_presubmit       += st->t_d2d_presubmit_us;
+    d.s_t_d2d_ring_grow       += st->t_d2d_ring_grow_us;
+    d.s_t_d2d_hop_submit      += st->t_d2d_hop_submit_us;
+
     // 2026-10-22 (design-kq-mask-on-device.md 3.6b): one re-plan per pp ubatch is the expected state before the
     // device-built mask; the reason names the first node that outgrew its planned slot
     if (st->n_realloc > 0) {
@@ -2472,10 +2498,26 @@ void llama_context::dstats_fold_sched() {
             break;
         }
         const auto & c = st->copies[i];
-        char buf[256];
-        snprintf(buf, sizeof(buf),
-                ",\"path\":\"%s\",\"bytes\":%zu,\"t_dst_wait_us\":%" PRId64 ",\"t_src_sync_us\":%" PRId64 ",\"t_copy_us\":%" PRId64 "}",
+        char buf[640];
+        int n = snprintf(buf, sizeof(buf),
+                ",\"path\":\"%s\",\"bytes\":%zu,\"t_dst_wait_us\":%" PRId64 ",\"t_src_sync_us\":%" PRId64 ",\"t_copy_us\":%" PRId64,
                 (c.path >= 0 && c.path < 4) ? path_names[c.path] : "?", c.nbytes, c.t_dst_wait_us, c.t_src_sync_us, c.t_copy_us);
+        // 2026-10-22: the dst backend's view of a cross-device copy (Vulkan only, ggml_vk_d2d_copy_async): absent
+        // for graph inputs, same-device copies and non-Vulkan destinations
+        if (c.d2d.filled && n > 0 && n < (int) sizeof(buf)) {
+            static const char * reason_names[] = { "none", "disabled", "src_not_vk", "unavailable", "share_failed", "import_failed", "hop_too_large", "grow_failed" };
+            const int r = c.d2d.bounce_reason;
+            n += snprintf(buf + n, sizeof(buf) - n,
+                    ",\"t_hop_presubmit_us\":%" PRId64 ",\"t_ring_grow_us\":%" PRId64 ",\"t_hop_submit_us\":%" PRId64 ",\"t_link_setup_us\":%" PRId64
+                    ",\"n_hop_presubmit\":%d,\"n_ring_grow\":%d,\"n_hop_submit_sync\":%d,\"n_bwd_gpu_wait\":%d,\"n_bounce\":%d,\"bounce_reason\":\"%s\"",
+                    c.d2d.t_presubmit_us, c.d2d.t_ring_grow_us, c.d2d.t_hop_submit_us, c.d2d.t_link_setup_us,
+                    c.d2d.n_presubmit, c.d2d.n_ring_grow, c.d2d.n_hop_submit_sync, c.d2d.n_bwd_gpu_wait,
+                    r != 0 ? 1 : 0, (r >= 0 && r < 8) ? reason_names[r] : "?");
+        }
+        if (n > 0 && n < (int) sizeof(buf) - 1) {
+            buf[n] = '}';
+            buf[n + 1] = '\0';
+        }
         if (!d.s_copies_json.empty()) {
             d.s_copies_json += ',';
         }
@@ -2488,19 +2530,23 @@ void llama_context::dstats_fold_sched() {
 
     const int n_splits_rec = std::min<int>(st->n_splits, GGML_BACKEND_SCHED_STATS_MAX_SPLITS);
     for (int i = 0; i < n_splits_rec; ++i) {
-        if (d.s_n_splits_rec >= max_splits_line) {
-            d.s_n_splits_drop += n_splits_rec - i;
-            break;
-        }
         const auto & sp = st->splits[i];
+        if (d.s_n_splits_rec >= max_splits_line) {
+            // over the line cap: no entry, but its GPU interval still counts in gpu_busy_us / gpu_span_us
+            if (sp.ts_ticket >= 0) {
+                d.s_split_ts.push_back({ sp.backend, sp.ts_ticket, -1 });
+            }
+            d.s_n_splits_drop++;
+            continue;
+        }
         char buf[192];
         snprintf(buf, sizeof(buf),
-                ",\"n_nodes\":%d,\"n_inputs\":%d,\"t_issue_us\":%" PRId64 ",\"t_issue_to_next_wait_us\":%" PRId64 "}",
+                ",\"n_nodes\":%d,\"n_inputs\":%d,\"t_issue_us\":%" PRId64 ",\"t_issue_to_next_wait_us\":%" PRId64,
                 sp.n_nodes, sp.n_inputs, sp.t_issue_us, sp.t_issue_to_next_wait_us);
-        if (!d.s_splits_json.empty()) {
-            d.s_splits_json += ',';
+        if (sp.ts_ticket >= 0) {
+            d.s_split_ts.push_back({ sp.backend, sp.ts_ticket, (int32_t) d.s_split_frags.size() });
         }
-        d.s_splits_json += "{\"g\":" + std::to_string(g) + ",\"backend\":" + dstats_json_str(bname(sp.backend)) + buf;
+        d.s_split_frags.push_back("{\"g\":" + std::to_string(g) + ",\"backend\":" + dstats_json_str(bname(sp.backend)) + buf);
         d.s_n_splits_rec++;
     }
     d.s_n_splits_drop += st->n_splits - n_splits_rec;
@@ -2619,18 +2665,190 @@ void llama_context::dstats_emit(int ret, int64_t t_start_us, uint32_t n_tokens, 
                 ",\"sched\":{\"n_graphs\":%d,\"n_splits\":%d,\"n_cross_copies\":%d,\"n_copies_dropped\":%d,\"n_splits_dropped\":%d,"
                 "\"bytes\":%" PRId64 ",\"t_dst_wait_us\":%" PRId64 ",\"t_src_sync_us\":%" PRId64 ",\"t_copy_us\":%" PRId64 ","
                 "\"t_split_sync_us\":%" PRId64 ",\"t_wall_us\":%" PRId64 ","
-                "\"n_realloc\":%d,\"t_realloc_sync_us\":%" PRId64 ",\"t_realloc_reserve_us\":%" PRId64 "}",
+                "\"n_realloc\":%d,\"t_realloc_sync_us\":%" PRId64 ",\"t_realloc_reserve_us\":%" PRId64 ","
+                "\"n_d2d_bounce\":%d,\"n_hop_presubmit\":%d,\"n_hop_submit_sync\":%d,\"n_bwd_gpu_wait\":%d,\"n_ring_grow\":%d,"
+                "\"t_hop_presubmit_us\":%" PRId64 ",\"t_ring_grow_us\":%" PRId64 ",\"t_hop_submit_us\":%" PRId64 ",\"t_link_setup_us\":%" PRId64 "}",
                 d.s_n_graphs, d.s_n_splits, d.s_n_copies, d.s_n_copies_drop, d.s_n_splits_drop,
                 d.s_bytes, d.s_t_dst_wait, d.s_t_src_sync, d.s_t_copy, d.s_t_split_sync, d.s_t_wall,
-                d.s_n_realloc, d.s_t_realloc_sync, d.s_t_realloc_reserve);
+                d.s_n_realloc, d.s_t_realloc_sync, d.s_t_realloc_reserve,
+                d.s_n_d2d_bounce, d.s_n_d2d_presubmit, d.s_n_d2d_hop_submit_sync, d.s_n_d2d_bwd_gpu_wait, d.s_n_d2d_ring_grow,
+                d.s_t_d2d_presubmit, d.s_t_d2d_ring_grow, d.s_t_d2d_hop_submit, d.s_t_d2d_link_setup);
         line += sb;
         line += ",\"realloc\":[" + d.s_realloc_json + "]";
         line += ",\"copies\":[" + d.s_copies_json + "]";
-        line += ",\"splits\":[" + d.s_splits_json + "]";
     }
-    line += "}\n";
 
-    llama_decode_stats().write(line);
+    // 2026-10-22: a line with GPU timestamp tickets waits for dstats_flush; so does any line behind one (file order
+    // = call order per context). Without tickets (CPU-only, stats-less sched) it goes out now, as before.
+    if (d.s_split_ts.empty() && d.s_n_ts_dropped == 0 && dstats_pending.empty()) {
+        if (d.s_n_graphs > 0) {
+            line += ",\"splits\":[";
+            for (size_t i = 0; i < d.s_split_frags.size(); ++i) {
+                if (i > 0) {
+                    line += ',';
+                }
+                line += d.s_split_frags[i];
+                line += '}';
+            }
+            line += ']';
+        }
+        line += "}\n";
+        llama_decode_stats().write(line);
+        return;
+    }
+
+    dstats_pending_line pl;
+    pl.head            = std::move(line);
+    pl.split_frags     = std::move(dstats.s_split_frags);
+    pl.split_ts        = std::move(dstats.s_split_ts);
+    pl.n_ts_dropped    = d.s_n_ts_dropped;
+    pl.t_call_start_us = t_start_us;
+    if (d.s_n_graphs == 0) {
+        pl.split_frags.clear();
+        pl.n_ts_dropped = -1; // marks "no sched block": no splits array, no GPU fields
+    }
+    dstats_pending.push_back(std::move(pl));
+}
+
+// [LLAMA_DECODE_STATS] 2026-10-22 - split GPU timeline: when each split actually ran on its card
+//
+// Why. The context-parallel one-layer prototype (LLAMA_CP_LAYER / LLAMA_CP_DEV, llama-kv-cache.cpp ~303-360, this
+// file ~160-260) is meant to run the owner card's and the helper card's halves of one attention layer at the same
+// time. Two measurement attempts (2026-10-21, 2026-10-22, ~/ai/claude_scratch/cp_overlap/arm_{A..E}, ledger row
+// "2026-10-22 14:30-15:05" in ~/Documents/contextFiles/llamacpp-perf-experiments-ledger.md) could not say whether
+// the cards overlapped: "splits" had host issue times only (t_issue_us ~25 ms per split in the CP arms vs 4.5-9 ms in
+// production) and "copies" host copy times (a flat 2.1-2.5 ms per hop vs 0.16-0.77 ms in production, same rings),
+// and GGML_VK_MMVQ_SLOPE_STATS, the only GPU-timestamped instrument, waits on every graph and so serializes the cards.
+//
+// What. The scheduler arms every split on a backend that exports ggml_backend_fork_stats_i (Vulkan only); the
+// backend writes a start/end timestamp pair around that split's command buffers on its compute queue and hands back
+// a ticket (splits[i].ts_ticket, ggml-backend.h). The ticket can only be read once the card has run the split, and
+// this line is built when decode() returns, i.e. before the host synchronized, so the line waits in dstats_pending:
+//   - synchronize(): right after ggml_backend_sched_synchronize (every fence waited) every pending line is resolved
+//     and written. Reads never wait (ggml_backend_sched_split_ts_read is availability-only): no new sync anywhere.
+//   - decode() entry: the leading pending lines whose tickets all resolve are written; more than 8 pending lines
+//     force the oldest out with whatever is readable (n_ts_unavail counts the rest).
+//   - ~llama_context: its synchronize() flushes.
+// The line's "t" stays the decode() return time, so a line can be written later than its "t" says.
+// Fields (absent when no split had a ticket, i.e. CPU-only or non-Vulkan backends):
+//   splits[i].t_gpu_start_us / t_gpu_end_us  absolute, unix epoch microseconds (the base of "t" x 1e6): device
+//       ticks -> CLOCK_MONOTONIC (calibrated per backend, see VK_DTS_RING in ggml-vulkan.cpp) -> + (system_clock -
+//       ggml_time_us) taken at flush. Absent on a split whose pair was dropped or not yet available.
+//   "t_call_start_us"  decode() entry on the same base, to line the host timeline up with the cards
+//   "gpu_busy_us": {backend: sum of its split durations}, "gpu_span_us": last end - first start over all backends,
+//   so overlap = sum(gpu_busy_us) - gpu_span_us (> 0 only if two cards ran at once; idle gaps make it negative).
+//   "gpu_n_ts", "n_ts_dropped" (ring refused / slot reused / over a cap), "n_ts_unavail" (not written yet at flush),
+//   "calib": "exact" (every timed backend calibrated) | "approx" (one used timestampPeriod + a one-time offset),
+//   "calib_max_dev_ns": the largest calibration deviation any backend reported (-1 approx).
+// Busy intervals exclude the hops: hop 2 is recorded ahead of the dst split's start timestamp and hop 1 after the
+// src split's end, so a hop shows up as the gap between the two cards' bars.
+//
+// Re-measure: LLAMA_DECODE_STATS=/path/ds.jsonl, then
+//   python3 ~/Documents/contextFiles/llama.cpp_bench/decode_stats.py --timeline /path/ds.jsonl [--rows N] [--ctx N] [--ntok 1-12]
+// (per step one text bar per card on a common axis, busy / span / overlap, summary median overlap + hop pieces).
+void llama_context::dstats_flush(bool synced) {
+    static constexpr size_t max_pending = 8;
+    ggml_backend_sched_t s = sched.get();
+    const int n_backends = s ? ggml_backend_sched_get_n_backends(s) : 0;
+
+    while (!dstats_pending.empty()) {
+        dstats_pending_line & pl = dstats_pending.front();
+
+        struct res { int rc; int64_t t0, t1; };
+        std::vector<res> rs(pl.split_ts.size(), res{ -1, 0, 0 });
+        bool all_ready = true;
+        for (size_t i = 0; i < pl.split_ts.size(); ++i) {
+            const auto & ts = pl.split_ts[i];
+            rs[i].rc = s ? ggml_backend_sched_split_ts_read(s, ts.backend, ts.ticket, &rs[i].t0, &rs[i].t1) : -1;
+            all_ready = all_ready && rs[i].rc != 0;
+        }
+        if (!synced && !all_ready && dstats_pending.size() <= max_pending) {
+            break; // keep order: this one and everything behind it waits for the sync
+        }
+
+        std::string line = std::move(pl.head);
+        if (pl.n_ts_dropped >= 0) {
+            const int64_t mono_to_unix = (int64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count() - ggml_time_us();
+
+            std::vector<std::string> gpu_frag(pl.split_frags.size());
+            std::map<std::string, int64_t> busy;
+            int64_t t_first = INT64_MAX;
+            int64_t t_last  = INT64_MIN;
+            int n_ts = 0;
+            int n_dropped = pl.n_ts_dropped;
+            int n_unavail = 0;
+            bool approx = false;
+            int64_t max_dev = -1;
+            std::vector<bool> calib_seen(n_backends, false);
+            for (size_t i = 0; i < pl.split_ts.size(); ++i) {
+                const auto & ts = pl.split_ts[i];
+                if (rs[i].rc < 0) {
+                    n_dropped++;
+                    continue;
+                }
+                if (rs[i].rc == 0) {
+                    n_unavail++;
+                    continue;
+                }
+                n_ts++;
+                const int64_t a = rs[i].t0 + mono_to_unix;
+                const int64_t b = rs[i].t1 + mono_to_unix;
+                t_first = std::min(t_first, a);
+                t_last  = std::max(t_last, b);
+                busy[ggml_backend_name(ggml_backend_sched_get_backend(s, ts.backend))] += b - a;
+                if (ts.frag >= 0 && ts.frag < (int32_t) gpu_frag.size()) {
+                    gpu_frag[ts.frag] = ",\"t_gpu_start_us\":" + std::to_string(a) + ",\"t_gpu_end_us\":" + std::to_string(b);
+                }
+                if (ts.backend >= 0 && ts.backend < n_backends && !calib_seen[ts.backend]) {
+                    calib_seen[ts.backend] = true;
+                    int64_t dev_ns = -1;
+                    const int c = ggml_backend_sched_split_ts_calib(s, ts.backend, &dev_ns);
+                    approx  = approx || c != 0;
+                    max_dev = std::max(max_dev, dev_ns);
+                }
+            }
+
+            line += ",\"splits\":[";
+            for (size_t i = 0; i < pl.split_frags.size(); ++i) {
+                if (i > 0) {
+                    line += ',';
+                }
+                line += pl.split_frags[i];
+                line += gpu_frag[i];
+                line += '}';
+            }
+            line += ']';
+
+            if (!pl.split_ts.empty() || pl.n_ts_dropped > 0) {
+                line += ",\"t_call_start_us\":" + std::to_string(pl.t_call_start_us + mono_to_unix);
+                line += ",\"gpu_n_ts\":" + std::to_string(n_ts);
+                line += ",\"n_ts_dropped\":" + std::to_string(n_dropped);
+                line += ",\"n_ts_unavail\":" + std::to_string(n_unavail);
+                if (n_ts > 0) {
+                    int64_t busy_sum = 0;
+                    line += ",\"gpu_busy_us\":{";
+                    bool first = true;
+                    for (const auto & [name, us] : busy) {
+                        if (!first) {
+                            line += ',';
+                        }
+                        first = false;
+                        line += dstats_json_str(name) + ":" + std::to_string(us);
+                        busy_sum += us;
+                    }
+                    line += "}";
+                    line += ",\"gpu_span_us\":" + std::to_string(t_last - t_first);
+                    line += ",\"gpu_overlap_us\":" + std::to_string(busy_sum - (t_last - t_first));
+                    line += std::string(",\"calib\":\"") + (approx ? "approx" : "exact") + "\"";
+                    line += ",\"calib_max_dev_ns\":" + std::to_string(max_dev);
+                }
+            }
+        }
+        line += "}\n";
+        llama_decode_stats().write(line);
+        dstats_pending.erase(dstats_pending.begin());
+    }
 }
 
 int llama_context::decode_impl(const llama_batch_ext & batch_inp) {
