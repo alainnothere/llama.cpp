@@ -546,6 +546,17 @@ void ggml_vk_scratch_grow_log(vk_device & device, const char * which, size_t old
     if (new_size <= old_size) {
         return;
     }
+    // size floor: the first production run (2026-10-22 12:20, 270k) printed ~60 lines of prealloc_y / split_k growing
+    // 0.01 -> 0.04 -> 0.9 MiB per card, none of which can evict anything; what matters is MiB-scale (rings 16 -> 64
+    // -> 256, prealloc_x hundreds of MiB when dequant K/V is on). GGML_VK_SCRATCH_GROW_MIB (default 4) is the floor on
+    // the new size; growths below it are not counted either, so the per-buffer rate limit stays about real growth
+    static const size_t floor_bytes = [] {
+        const char * e = getenv("GGML_VK_SCRATCH_GROW_MIB");
+        return (size_t) (e ? atof(e) : 4.0) * 1024 * 1024;
+    }();
+    if (new_size < floor_bytes) {
+        return;
+    }
     const uint32_t n = (*counter)++;
     if (n >= 8 && n % 64 != 0) {
         return;
