@@ -4816,6 +4816,8 @@ vk_device ggml_vk_get_device(size_t idx) {
                 device->external_memory_host = true;
             } else if (strcmp("VK_KHR_external_semaphore_fd", properties.extensionName) == 0) {
                 device->external_semaphore_fd = true;
+            } else if (strcmp("VK_KHR_external_memory_fd", properties.extensionName) == 0) {
+                device->external_memory_fd = true;   // [fork, 2026-10-22] D2D exported ring
             } else if (strcmp("VK_KHR_calibrated_timestamps", properties.extensionName) == 0) {
                 calibrated_ts_ext = "VK_KHR_calibrated_timestamps";
             } else if (strcmp("VK_EXT_calibrated_timestamps", properties.extensionName) == 0 && calibrated_ts_ext == nullptr) {
@@ -4891,6 +4893,9 @@ vk_device ggml_vk_get_device(size_t idx) {
         device->properties = props2.properties;
         device->vendor_id = device->properties.vendorID;
         device->driver_id = driver_props.driverID;
+        // [fork, 2026-10-22] D2D exported ring: opaque-fd memory import is only defined between matching driverUUIDs
+        std::copy(std::begin(vk11_props.driverUUID), std::end(vk11_props.driverUUID), device->driver_uuid.begin());
+        std::copy(std::begin(vk11_props.deviceUUID), std::end(vk11_props.deviceUUID), device->device_uuid.begin());
 
         if (device->driver_id == vk::DriverId::eMoltenvk) {
             // Disable external_memory_host until https://github.com/KhronosGroup/MoltenVK/pull/2622
@@ -5174,6 +5179,12 @@ vk_device ggml_vk_get_device(size_t idx) {
         if (device->external_semaphore_fd) {
             // VK_KHR_external_semaphore is core in 1.1; only the fd entry points need enabling
             device_extensions.push_back("VK_KHR_external_semaphore_fd");
+        }
+        if (device->external_memory_fd) {
+            // [fork, 2026-10-22] D2D exported ring (ggml_vk_d2d_export_alloc). VK_KHR_external_memory (the
+            // VkExportMemoryAllocateInfo / VkExternalMemoryBufferCreateInfo structs) is core in 1.1 like the semaphore
+            // half; only vkGetMemoryFdKHR and the VkImportMemoryFdInfoKHR import need the fd extension
+            device_extensions.push_back("VK_KHR_external_memory_fd");
         }
         // [fork, 2026-10-22] split GPU timeline: enabled only when the device can calibrate DEVICE against
         // CLOCK_MONOTONIC (the base of ggml_time_us on Linux). No feature struct, no cost unless called.
@@ -15196,15 +15207,80 @@ static bool ggml_vk_d2d_async_enabled() {
     return enabled;
 }
 
+// [fork, 2026-10-22 evening] EXPORTED RING (default) vs USERPTR RING (GGML_VK_D2D_RING=userptr). CPU-only build,
+// NOT yet run on the GPUs when written; first-run checks are in the report of that change (startup DEBUG line
+// "ring export", no "falling back" WARN, LLAMA_DECODE_STATS ring_kind, per-split issue, ppl gate bit-identical).
+//
+// Why: the userptr ring (host mmap imported into both devices through VK_EXT_external_memory_host) is a userptr BO
+// on each card, and amdgpu_cs.c:876-890 (kernel 7.1.3) walks EVERY userptr BO in the bo_list on EVERY CS and
+// re-faults its pages (amdgpu_ttm_tt_get_user_pages -> hmm_range_fault). Production tape 2026-10-22 18:20
+// (LLAMA_DECODE_STATS, 149k ctx, ledger row "RING FIX ON TAPE"): with 16 MiB rings hop submit 0.23 / 0.44 ms and
+// per-split issue 1.1 / 1.7 / 1.1 ms (V2 / V3 / V1); with the 256 MiB rings of a0d2761877 (needed to kill the 5 s
+// pipeline stall) hop submit 0.73 / 1.45 ms and per-split issue 7.95 / 16.6 / 7.9 ms (V3 holds two ring imports),
+// i.e. ~3 ms per 100 MiB imported per submit, plus one 957 ms and several 20-45 ms submits (fault storms). Decode at
+// 149k hides it behind the GPU bars; at short contexts (bars ~10 ms) a 16.6 ms host issue IS the critical path, the
+// CP prototype's flat 1.3 ms hops are this tax, and the userptr path is where the 2026-10-21 kernel oops lived.
+//
+// What replaces it (ggml_vk_d2d_export_alloc): the SRC device allocates the ring as its own VkDeviceMemory from a
+// HOST_VISIBLE | HOST_COHERENT, NOT DEVICE_LOCAL type (RADV: the GTT heap, system pages the kernel pins for the BO;
+// uncached preferred, the host never touches the ring and non-snooped GPU access is the cheaper PCIe read), exported
+// with VkExportMemoryAllocateInfo{OPAQUE_FD} on a VkBuffer created with VkExternalMemoryBufferCreateInfo{OPAQUE_FD};
+// vkGetMemoryFdKHR gives the fd (on RADV that fd is a dma-buf), the DST device imports a dup of it with
+// VkImportMemoryFdInfoKHR into its own VkDeviceMemory + VkBuffer (dma-buf attach: an SG BO, not userptr). Neither is
+// mapped: both hops are GPU copies. No HOST_VISIBLE non-DEVICE_LOCAL type: any HOST_VISIBLE type is taken, i.e. the
+// src card's BAR-visible VRAM, and hop 2 then reads across PCIe from the src card (still no userptr). On sysfs the
+// ring shows as GTT on the src card and as an imported dma-buf on the dst; amdgpu_gem_info lists no userptr BO.
+//
+// Cross-module preconditions:
+//   - both devices enable VK_KHR_external_memory_fd at device creation (ggml_vk_get_device, next to
+//     VK_KHR_external_semaphore_fd); VK_KHR_external_memory itself is core 1.1 and the backend requires 1.2.
+//   - spec: an OPAQUE_FD payload may only be imported by a device with the same driverUUID AND deviceUUID, and with
+//     the exporter's allocationSize and memoryTypeIndex. deviceUUID is per card on RADV (it is the PCI address), so
+//     two cards never match it; the fd semaphores already rely on RADV accepting the cross-device opaque fd (it is a
+//     DRM syncobj there, the memory fd a dma-buf), so this checks driverUUID (same Mesa build) and requires the same
+//     memoryTypeIndex with identical property flags and identical buffer requirements on the dst, else falls back.
+//   - dedicated allocation on both sides (VkMemoryDedicatedAllocateInfo, core 1.1): allowed everywhere, required by
+//     drivers that report DEDICATED_ONLY for external buffers, and it makes the import's allocationSize the buffer's
+//     own requirement, which must equal the exporter's.
+//   - fd ownership: vkGetMemoryFdKHR returns a new fd we own; the import gets a dup() whose ownership passes to the
+//     driver on a successful import (closed by us only if the import fails); our copy is closed after both sides hold
+//     their VkDeviceMemory.
+//   - lifetime: same rules as the userptr ring minus the host-page ones. A retired ring keeps both objects until link
+//     destroy (hops in flight may still use it); destroy order is dst import first, then the src export. There is no
+//     mmap, no MADV_* and no guard: the pages belong to the src BO and live exactly as long as its VkDeviceMemory and
+//     the dst attachment.
+//   - growth policy, deadlock rule, region bookkeeping, timelines: unchanged (VK_D2D_RING_DEPTH sizing of
+//     a0d2761877, would-wait growth, VK_D2D_RING_MAX cap).
+// Fallback: GGML_VK_D2D_RING=userptr forces the old ring. With the default, a link whose export/import fails at setup
+// logs ONE WARN with the reason and takes the userptr ring (not the bounce); only if that fails too does the pair
+// bounce. The kind is fixed per link at setup (a failed regrowth follows the existing grow-failure rules, it does not
+// switch kinds). LLAMA_DECODE_STATS ring_kind ("export" | "userptr") says per copy which ring the hop used.
+static int32_t ggml_vk_d2d_ring_pref() {
+    static const int32_t kind = [] {
+        const char * v = getenv("GGML_VK_D2D_RING");
+        if (v == nullptr || strcmp(v, "export") == 0) {
+            return (int32_t) GGML_BACKEND_D2D_RING_EXPORT;
+        }
+        if (strcmp(v, "userptr") == 0) {
+            return (int32_t) GGML_BACKEND_D2D_RING_USERPTR;
+        }
+        GGML_LOG_WARN("ggml_vulkan: GGML_VK_D2D_RING=%s not understood (export | userptr), using export\n", v);
+        return (int32_t) GGML_BACKEND_D2D_RING_EXPORT;
+    }();
+    return kind;
+}
+
 struct vk_d2d_link {
     vk_device src_dev;
     vk_device dst_dev;
     bool      ok = false;   // false: setup failed or was refused, the pair takes the bounce
 
-    // host ring imported into both devices (VK_EXT_external_memory_host); lifetime rules above
+    // ring_kind EXPORT: src-device GTT memory exported as an opaque fd, imported on dst (ptr stays NULL, never
+    // mapped); USERPTR: host ring imported into both devices (VK_EXT_external_memory_host). Lifetime rules above.
+    int32_t   ring_kind = GGML_BACKEND_D2D_RING_NONE;   // enum ggml_backend_d2d_ring_kind, fixed at link setup
     struct ring_t {
-        void *    ptr = nullptr;   // never unmapped once imported
-        size_t    len = 0;
+        void *    ptr = nullptr;   // userptr only: never unmapped once imported
+        size_t    len = 0;         // 0: no ring (len, not ptr, is the "exists" test since the export ring has no ptr)
         vk_buffer buf_src;
         vk_buffer buf_dst;
     };
@@ -15306,29 +15382,180 @@ static void * ggml_vk_d2d_host_map(size_t len) {
     return p;
 }
 
-// a new current ring of at least cap bytes; the previous one (if any) is retired, not freed
-static bool ggml_vk_d2d_ring_alloc(vk_d2d_link * l, size_t cap) {
-    const size_t align = std::max<size_t>({ VK_D2D_HUGE, l->src_dev->min_imported_host_pointer_alignment, l->dst_dev->min_imported_host_pointer_alignment });
-    cap = (cap + align - 1) / align * align;
-    if (cap % VK_D2D_HUGE != 0) {
-        return false;   // an import alignment that is not a divisor of 2 MiB: not worth supporting
+// [fork, 2026-10-22 evening] a vk_buffer owning (buffer, memory) made outside ggml_vk_create_buffer: the destructor
+// frees both. Not counted in mem_watch (that counts DEVICE_LOCAL only and would print a GPU PLACEMENT "sysmem
+// fallback" warning for a deliberately non-DEVICE_LOCAL ring); logged in the memory logger like any buffer.
+static vk_buffer ggml_vk_d2d_wrap_buffer(vk_device & dev, vk::Buffer b, vk::DeviceMemory m, vk::MemoryPropertyFlags flags, size_t size) {
+    vk_buffer buf = std::make_shared<vk_buffer_struct>();
+    buf->buffer                = b;
+    buf->device_memory         = m;
+    buf->memory_property_flags = flags;
+    buf->ptr                   = nullptr;   // never mapped: both hops are GPU copies
+    buf->size                  = size;
+    buf->device                = dev;
+    dev->memory_logger->log_allocation(buf, size);
+    return buf;
+}
+
+// [fork, 2026-10-22 evening] exported ring (comment at ggml_vk_d2d_ring_pref): cap bytes of src memory, exported as an
+// opaque fd and imported on dst. Returns NULL on success, else the fallback reason (static or thread-local storage).
+static const char * ggml_vk_d2d_export_alloc(vk_device & src, vk_device & dst, size_t cap, vk_buffer & out_src, vk_buffer & out_dst) {
+    static thread_local char why_buf[320];
+    if (!src->external_memory_fd || !dst->external_memory_fd) {
+        return "no VK_KHR_external_memory_fd";
     }
-    void * p = ggml_vk_d2d_host_map(cap);
-    if (p == nullptr) {
-        return false;
+    if (src->driver_uuid != dst->driver_uuid) {
+        return "driverUUID differs (opaque-fd import needs the same driver build)";
     }
+    const vk::ExternalMemoryHandleTypeFlagBits handle = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd;
+    const vk::BufferUsageFlags usage = vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst;
+    {
+        // RADV reports EXPORTABLE | IMPORTABLE, compatible OPAQUE_FD | DMA_BUF, no DEDICATED_ONLY (we go dedicated anyway)
+        const vk::PhysicalDeviceExternalBufferInfo info{ {}, usage, handle };
+        const vk::ExternalMemoryProperties ps = src->physical_device.getExternalBufferProperties(info).externalMemoryProperties;
+        const vk::ExternalMemoryProperties pd = dst->physical_device.getExternalBufferProperties(info).externalMemoryProperties;
+        if (!(ps.externalMemoryFeatures & vk::ExternalMemoryFeatureFlagBits::eExportable) || !(ps.compatibleHandleTypes & handle)) {
+            return "src cannot export opaque-fd buffer memory (vkGetPhysicalDeviceExternalBufferProperties)";
+        }
+        if (!(pd.externalMemoryFeatures & vk::ExternalMemoryFeatureFlagBits::eImportable) || !(pd.compatibleHandleTypes & handle)) {
+            return "dst cannot import opaque-fd buffer memory (vkGetPhysicalDeviceExternalBufferProperties)";
+        }
+    }
+    vk::ExternalMemoryBufferCreateInfo ebci{ handle };
+    vk::BufferCreateInfo bci{ {}, cap, usage, vk::SharingMode::eExclusive, 0, nullptr };
+    bci.setPNext(&ebci);
+
+    vk::Buffer       bs, bd;
+    vk::DeviceMemory ms, md;
+    vk::MemoryPropertyFlags flags;
+    int fd = -1, ifd = -1;
+    const char * why = nullptr;
+    try {
+        bs = src->device.createBuffer(bci);
+        bd = dst->device.createBuffer(bci);
+        const vk::MemoryRequirements rs = src->device.getBufferMemoryRequirements(bs);
+        const vk::MemoryRequirements rd = dst->device.getBufferMemoryRequirements(bd);
+        const vk::PhysicalDeviceMemoryProperties mps = src->physical_device.getMemoryProperties();
+        const vk::PhysicalDeviceMemoryProperties mpd = dst->physical_device.getMemoryProperties();
+
+        // rank 0: HOST_VISIBLE|HOST_COHERENT, not DEVICE_LOCAL, not HOST_CACHED (RADV GTT write-combined: system pages,
+        //         GPU access unsnooped); rank 1: the same, cached (GTT cached); rank 2: any HOST_VISIBLE (the src card's
+        //         BAR-visible VRAM: no userptr either, but hop 2 reads across PCIe from the src card). Skipped: AMD
+        //         device-coherent/uncached types (need VK_AMD_device_coherent_memory, not enabled), protected, lazy.
+        const vk::MemoryPropertyFlags skip = vk::MemoryPropertyFlagBits::eDeviceCoherentAMD | vk::MemoryPropertyFlagBits::eDeviceUncachedAMD |
+                                             vk::MemoryPropertyFlagBits::eProtected | vk::MemoryPropertyFlagBits::eLazilyAllocated;
+        const vk::MemoryPropertyFlags hvhc = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent;
+        uint32_t type = UINT32_MAX;
+        int      best = 3;
+        for (uint32_t i = 0; i < mps.memoryTypeCount; i++) {
+            const vk::MemoryType & mt = mps.memoryTypes[i];
+            if (!(rs.memoryTypeBits & (1u << i)) || (mt.propertyFlags & skip) || mps.memoryHeaps[mt.heapIndex].size < rs.size) {
+                continue;
+            }
+            int rank = 3;
+            if ((mt.propertyFlags & hvhc) == hvhc && !(mt.propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal)) {
+                rank = (mt.propertyFlags & vk::MemoryPropertyFlagBits::eHostCached) ? 1 : 0;
+            } else if (mt.propertyFlags & vk::MemoryPropertyFlagBits::eHostVisible) {
+                rank = 2;
+            }
+            if (rank < best) {
+                best = rank;
+                type = i;
+            }
+        }
+        if (type == UINT32_MAX) {
+            why = "src has no HOST_VISIBLE memory type for the ring";
+        } else if (type >= mpd.memoryTypeCount || !(rd.memoryTypeBits & (1u << type)) ||
+                   mpd.memoryTypes[type].propertyFlags != mps.memoryTypes[type].propertyFlags) {
+            // spec: the import must use the exporter's memoryTypeIndex; on a different layout (e.g. iGPU vs dGPU, or a
+            // card without ReBAR) that index means something else on the dst
+            snprintf(why_buf, sizeof(why_buf), "memory type layouts differ (src type %u flags 0x%x not valid on dst)",
+                     type, (unsigned) VkMemoryPropertyFlags(mps.memoryTypes[type].propertyFlags));
+            why = why_buf;
+        } else if (rd.size != rs.size) {
+            // spec: the import's allocationSize must equal the exporter's, and a dedicated import's must equal the
+            // dst buffer's own requirement
+            why = "dst buffer requirements differ from the export";
+        } else {
+            flags = mps.memoryTypes[type].propertyFlags;
+            vk::MemoryDedicatedAllocateInfo dai_s{ {}, bs };
+            vk::ExportMemoryAllocateInfo    emai{ handle };
+            emai.setPNext(&dai_s);
+            ms = src->device.allocateMemory({ rs.size, type, &emai });
+            src->device.bindBufferMemory(bs, ms, 0);
+            fd  = src->device.getMemoryFdKHR({ ms, handle });
+            ifd = dup(fd);
+            if (ifd < 0) {
+                why = "dup of the exported fd failed";
+            } else {
+                vk::MemoryDedicatedAllocateInfo dai_d{ {}, bd };
+                vk::ImportMemoryFdInfoKHR       imp{ handle, ifd };
+                imp.setPNext(&dai_d);
+                md  = dst->device.allocateMemory({ rs.size, type, &imp });
+                ifd = -1;   // a successful import owns it
+                dst->device.bindBufferMemory(bd, md, 0);
+            }
+        }
+    } catch (const vk::SystemError & e) {
+        snprintf(why_buf, sizeof(why_buf), "export/import failed: %s", e.what());
+        why = why_buf;
+    }
+    if (ifd >= 0) {
+        close(ifd);   // import never happened or failed: still ours
+    }
+    if (fd >= 0) {
+        close(fd);    // both sides hold their VkDeviceMemory (or setup failed): our copy goes
+    }
+    if (why) {
+        // dst import first, then the src export (nothing was submitted against either)
+        if (bd) { dst->device.destroyBuffer(bd); }
+        if (md) { dst->device.freeMemory(md); }
+        if (bs) { src->device.destroyBuffer(bs); }
+        if (ms) { src->device.freeMemory(ms); }
+        return why;
+    }
+    out_src = ggml_vk_d2d_wrap_buffer(src, bs, ms, flags, cap);
+    out_dst = ggml_vk_d2d_wrap_buffer(dst, bd, md, flags, cap);
+    return nullptr;
+}
+
+// a new current ring of at least cap bytes, of the link's ring_kind; the previous one (if any) is retired, not freed.
+// why (may be NULL): the export path's failure reason
+static bool ggml_vk_d2d_ring_alloc(vk_d2d_link * l, size_t cap, const char ** why = nullptr) {
     vk_d2d_link::ring_t r;
-    r.ptr     = p;
-    r.len     = cap;
-    r.buf_src = ggml_vk_buffer_from_host_ptr(l->src_dev, p, cap);
-    r.buf_dst = r.buf_src ? ggml_vk_buffer_from_host_ptr(l->dst_dev, p, cap) : vk_buffer{};
-    if (!r.buf_src || !r.buf_dst) {
-        // an import may have existed: drop it, keep the pages mapped (rule: never unmap after an import)
-        ggml_vk_destroy_buffer(r.buf_src);
-        ggml_vk_destroy_buffer(r.buf_dst);
-        return false;
+    if (l->ring_kind == GGML_BACKEND_D2D_RING_EXPORT) {
+        // same 2 MiB rounding as the userptr ring, so ring_cap_mib / SCRATCH GROW sizes compare 1:1 across kinds
+        cap = (cap + VK_D2D_HUGE - 1) / VK_D2D_HUGE * VK_D2D_HUGE;
+        const char * w = ggml_vk_d2d_export_alloc(l->src_dev, l->dst_dev, cap, r.buf_src, r.buf_dst);
+        if (w) {
+            if (why) {
+                *why = w;
+            }
+            return false;
+        }
+        r.len = cap;
+    } else {
+        const size_t align = std::max<size_t>({ VK_D2D_HUGE, l->src_dev->min_imported_host_pointer_alignment, l->dst_dev->min_imported_host_pointer_alignment });
+        cap = (cap + align - 1) / align * align;
+        if (cap % VK_D2D_HUGE != 0) {
+            return false;   // an import alignment that is not a divisor of 2 MiB: not worth supporting
+        }
+        void * p = ggml_vk_d2d_host_map(cap);
+        if (p == nullptr) {
+            return false;
+        }
+        r.ptr     = p;
+        r.len     = cap;
+        r.buf_src = ggml_vk_buffer_from_host_ptr(l->src_dev, p, cap);
+        r.buf_dst = r.buf_src ? ggml_vk_buffer_from_host_ptr(l->dst_dev, p, cap) : vk_buffer{};
+        if (!r.buf_src || !r.buf_dst) {
+            // an import may have existed: drop it, keep the pages mapped (rule: never unmap after an import)
+            ggml_vk_destroy_buffer(r.buf_dst);
+            ggml_vk_destroy_buffer(r.buf_src);
+            return false;
+        }
     }
-    if (l->ring.ptr) {
+    if (l->ring.len) {
         l->retired.push_back(std::move(l->ring));
     }
     l->ring = std::move(r);
@@ -15401,12 +15628,16 @@ static void ggml_vk_d2d_link_destroy(vk_d2d_link * l) {
     if (l->bwd_src) { l->src_dev->device.destroySemaphore(l->bwd_src); }
     if (l->fwd_dst) { l->dst_dev->device.destroySemaphore(l->fwd_dst); }
     if (l->bwd_dst) { l->dst_dev->device.destroySemaphore(l->bwd_dst); }
-    // the imports go, the pages stay mapped until exit: the kernel may release the userptr BOs later than
-    // vkFreeMemory returns, and an munmap racing that release is hypothesis 1 of the oops
-    l->retired.push_back(std::move(l->ring));
+    // userptr: the imports go, the pages stay mapped until exit: the kernel may release the userptr BOs later than
+    // vkFreeMemory returns, and an munmap racing that release is hypothesis 1 of the oops.
+    // [fork, 2026-10-22 evening] export: dst import (the dma-buf attachment) first, then the src export that owns
+    // the pages; every hop that used either is done (dst synchronized by the caller, fwd waited above)
+    if (l->ring.len) {
+        l->retired.push_back(std::move(l->ring));
+    }
     for (auto & r : l->retired) {
-        ggml_vk_destroy_buffer(r.buf_src);
         ggml_vk_destroy_buffer(r.buf_dst);
+        ggml_vk_destroy_buffer(r.buf_src);
     }
     delete l;
 }
@@ -15424,10 +15655,11 @@ static vk_d2d_link * ggml_vk_d2d_get_link(ggml_backend_vk_context * dst_ctx, con
 
     const char * why = nullptr;
     l->why_code = GGML_BACKEND_D2D_BOUNCE_UNAVAILABLE;
+    // [fork, 2026-10-22 evening] VK_EXT_external_memory_host is only needed by the userptr ring now, so it moved
+    // from the up-front checks into the ring choice below (an export-capable pair without it still goes async)
+    const char * why_export = nullptr;
     if (l->src_dev->driver_id != l->dst_dev->driver_id) {
         why = "different drivers";
-    } else if (!l->src_dev->external_memory_host || !l->dst_dev->external_memory_host) {
-        why = "no VK_EXT_external_memory_host";
     } else if (!ggml_vk_d2d_timeline_shareable(l->src_dev) || !ggml_vk_d2d_timeline_shareable(l->dst_dev)) {
         why = "no exportable timeline semaphore (VK_KHR_external_semaphore_fd)";
     } else if (l->src_dev->serialize_submissions || l->dst_dev->serialize_submissions || !l->src_dev->support_async || !l->dst_dev->support_async) {
@@ -15436,17 +15668,49 @@ static vk_d2d_link * ggml_vk_d2d_get_link(ggml_backend_vk_context * dst_ctx, con
                !ggml_vk_d2d_share_timeline(l->dst_dev, l->src_dev, l->bwd_dst, l->bwd_src)) {
         why = "semaphore share failed";
         l->why_code = GGML_BACKEND_D2D_BOUNCE_SHARE_FAILED;
-    } else if (!ggml_vk_d2d_ring_alloc(l, VK_D2D_RING_MIN)) {
-        why = "host ring import failed";
-        l->why_code = GGML_BACKEND_D2D_BOUNCE_IMPORT_FAILED;
+    } else {
+        // ring: exported device memory by default; a failed export/import falls back to the userptr ring for this
+        // link (one WARN with the reason), not to the bounce (comment at ggml_vk_d2d_ring_pref)
+        if (ggml_vk_d2d_ring_pref() == GGML_BACKEND_D2D_RING_EXPORT) {
+            l->ring_kind = GGML_BACKEND_D2D_RING_EXPORT;
+            if (!ggml_vk_d2d_ring_alloc(l, VK_D2D_RING_MIN, &why_export)) {
+                if (why_export == nullptr) {
+                    why_export = "export ring allocation failed";
+                }
+                GGML_LOG_WARN("ggml_vulkan: async D2D %s -> %s: exported ring unavailable (%s), falling back to the userptr host ring\n",
+                              l->src_dev->name.c_str(), l->dst_dev->name.c_str(), why_export);
+                l->ring_kind = GGML_BACKEND_D2D_RING_USERPTR;
+            }
+        } else {
+            l->ring_kind = GGML_BACKEND_D2D_RING_USERPTR;
+        }
+        if (l->ring_kind == GGML_BACKEND_D2D_RING_USERPTR) {
+            if (!l->src_dev->external_memory_host || !l->dst_dev->external_memory_host) {
+                why = "no VK_EXT_external_memory_host";   // why_code stays UNAVAILABLE, as before the export ring
+            } else if (!ggml_vk_d2d_ring_alloc(l, VK_D2D_RING_MIN)) {
+                why = "host ring import failed";
+                l->why_code = GGML_BACKEND_D2D_BOUNCE_IMPORT_FAILED;
+            }
+        }
     }
     if (why) {
-        GGML_LOG_WARN("ggml_vulkan: async D2D %s -> %s unavailable (%s), using the host bounce\n", l->src_dev->name.c_str(), l->dst_dev->name.c_str(), why);
+        GGML_LOG_WARN("ggml_vulkan: async D2D %s -> %s unavailable (%s%s%s), using the host bounce\n", l->src_dev->name.c_str(), l->dst_dev->name.c_str(), why,
+                      why_export ? "; export: " : "", why_export ? why_export : "");
+        l->ring_kind = GGML_BACKEND_D2D_RING_NONE;
         return l;
     }
     l->ok = true;
     l->why_code = GGML_BACKEND_D2D_BOUNCE_NONE;
-    GGML_LOG_DEBUG("ggml_vulkan: async D2D %s -> %s: host ring %zu MiB, timeline sync\n", l->src_dev->name.c_str(), l->dst_dev->name.c_str(), l->cap >> 20);
+    // first-run check (a): one of these per link at startup / first hop. DEBUG level (-lv 4 or LLAMA_LOG_VERBOSITY);
+    // the WARN above is the visible signal that a link did NOT get the exported ring
+    if (l->ring_kind == GGML_BACKEND_D2D_RING_EXPORT) {
+        GGML_LOG_DEBUG("ggml_vulkan: async D2D %s -> %s: ring export, %zu MiB of %s src memory (type flags 0x%x) imported on dst, timeline sync\n",
+                       l->src_dev->name.c_str(), l->dst_dev->name.c_str(), l->cap >> 20,
+                       (l->ring.buf_src->memory_property_flags & vk::MemoryPropertyFlagBits::eDeviceLocal) ? "BAR VRAM" : "GTT",
+                       (unsigned) VkMemoryPropertyFlags(l->ring.buf_src->memory_property_flags));
+    } else {
+        GGML_LOG_DEBUG("ggml_vulkan: async D2D %s -> %s: ring userptr, host ring %zu MiB, timeline sync\n", l->src_dev->name.c_str(), l->dst_dev->name.c_str(), l->cap >> 20);
+    }
     return l;
 }
 
@@ -15503,7 +15767,8 @@ static bool ggml_vk_d2d_ensure_cap(vk_d2d_link * l, size_t size_al, struct ggml_
     if (!ggml_vk_d2d_ring_alloc(l, cap)) {
         if (grow_for_wait) {
             // the current ring is untouched (ring_alloc swaps only on success): keep the link, wait on it, and do
-            // not retry this size on every hop (each attempt maps + populates + imports up to 512 MiB)
+            // not retry this size on every hop (each attempt maps + populates + imports up to 512 MiB, or, export
+            // ring, allocates + exports + imports it)
             GGML_LOG_WARN("ggml_vulkan: async D2D %s -> %s: host ring grow to %zu MiB failed, staying at %zu MiB (hops may wait)\n", l->src_dev->name.c_str(), l->dst_dev->name.c_str(), cap >> 20, l->cap >> 20);
             l->cap_limit = l->cap;
             return true;
@@ -15516,17 +15781,22 @@ static bool ggml_vk_d2d_ensure_cap(vk_d2d_link * l, size_t size_al, struct ggml_
         }
         return false;
     }
-    // [fork, 2026-10-22] SCRATCH GROW line per side (see ggml_vk_scratch_grow_log): the ring is pinned host memory
-    // imported into BOTH devices, no VRAM, but it may count in both cards' sysfs GTT and so explain a GTT WATCH
-    // delta that is not an eviction; the retired ring stays mapped until link destroy (live total = sum of rings)
+    // [fork, 2026-10-22] SCRATCH GROW line per side (see ggml_vk_scratch_grow_log). userptr: pinned host memory
+    // imported into BOTH devices, no VRAM, may count in both cards' sysfs GTT. export (2026-10-22 evening): the src
+    // card's own GTT BO (its sysfs GTT grows by the ring) and an imported dma-buf on the dst (or BAR VRAM on the src
+    // if the card had no GTT type, see the setup DEBUG line). Either can explain a GTT WATCH delta that is not an
+    // eviction; retired rings stay alive until link destroy (live total = sum of rings)
     {
-        char which[96];
-        snprintf(which, sizeof(which), "d2d ring %s->%s (src side, %zu retired)", l->src_dev->name.c_str(), l->dst_dev->name.c_str(), l->retired.size());
+        const bool exp = l->ring_kind == GGML_BACKEND_D2D_RING_EXPORT;
+        char which[128];
+        snprintf(which, sizeof(which), "d2d ring %s->%s (src side, %s, %zu retired)", l->src_dev->name.c_str(), l->dst_dev->name.c_str(),
+                 exp ? "exported" : "pinned host memory", l->retired.size());
         ggml_vk_scratch_grow_log(l->src_dev, which, old_cap, l->cap, &l->n_grow_log);
         if (l->cap > old_cap) {
             l->n_grow_log--;   // one growth event, two lines: count it once
         }
-        snprintf(which, sizeof(which), "d2d ring %s->%s (dst side, %zu retired)", l->src_dev->name.c_str(), l->dst_dev->name.c_str(), l->retired.size());
+        snprintf(which, sizeof(which), "d2d ring %s->%s (dst side, %s, %zu retired)", l->src_dev->name.c_str(), l->dst_dev->name.c_str(),
+                 exp ? "imported export" : "pinned host memory", l->retired.size());
         ggml_vk_scratch_grow_log(l->dst_dev, which, old_cap, l->cap, &l->n_grow_log);
     }
     return true;
@@ -15536,8 +15806,12 @@ static bool ggml_vk_d2d_ensure_cap(vk_d2d_link * l, size_t size_al, struct ggml_
 // stats are off: one pointer test per copy) gets the host-side blocking pieces of this copy, separately, because in
 // the CP arms (2026-10-21/22) every hop cost a flat 2.1-2.5 ms of t_copy_us vs 0.16-0.77 ms in production on the
 // same rings and nothing said which piece it was. The pieces:
-//   t_link_setup_us  first copy on the pair: semaphore export/import + the 16 MiB ring map/populate/import
-//   t_ring_grow_us   ggml_vk_d2d_ensure_cap regrowing (map + MADV_POPULATE_WRITE + two imports), n_ring_grow
+//   t_link_setup_us  first copy on the pair: semaphore export/import + the 16 MiB ring (userptr: map/populate/two
+//                    imports; export: src alloc + vkGetMemoryFdKHR + dst import, plus a failed export attempt if
+//                    the link fell back)
+//   t_ring_grow_us   ggml_vk_d2d_ensure_cap regrowing (userptr: map + MADV_POPULATE_WRITE + two imports; export:
+//                    src alloc + export + dst import), n_ring_grow
+//   ring_kind        GGML_BACKEND_D2D_RING_EXPORT / _USERPTR: which ring this hop used (async copies only)
 //   t_presubmit_us   deadlock rule, ggml_vk_d2d_flush_bwd: submits the dst compute context before hop 1, n_presubmit
 //   t_hop_submit_us  ggml_vk_submit_transfer_ctx(src) + ggml_vk_submit_compute_ctx_nowait(src) = hop 1's
 //                    vkQueueSubmit; n_hop_submit_sync = 1 when that found device->host staging reads in the src
@@ -15632,6 +15906,7 @@ static bool ggml_vk_d2d_copy_async(ggml_backend_vk_context * src_ctx, ggml_backe
         rec->n_bwd_gpu_wait    = wait_bwd > 0 ? 1 : 0;
         rec->n_bwd_wait_elided = n_elided;
         rec->ring_cap_mib      = (int32_t) (l->cap >> 20);
+        rec->ring_kind         = l->ring_kind;   // [fork, 2026-10-22 evening] export | userptr (first-run check b)
     }
 
     // hop 1: after everything queued on the src context, on its compute queue

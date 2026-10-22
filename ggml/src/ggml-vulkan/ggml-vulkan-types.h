@@ -737,6 +737,15 @@ struct vk_device_struct {
     bool external_memory_host {};
     // VK_KHR_external_semaphore_fd: timeline semaphores shared with a peer device (async cross-device copy)
     bool external_semaphore_fd {};
+    // [fork, 2026-10-22] VK_KHR_external_memory_fd: the async cross-device copy ring is the src device's own
+    // HOST_VISIBLE (GTT) VkDeviceMemory exported as an opaque fd and imported on the dst (ggml_vk_d2d_export_alloc),
+    // replacing the VK_EXT_external_memory_host userptr ring whose per-CS hmm re-fault cost ~3 ms per 100 MiB
+    // imported per submit (ledger 2026-10-22 18:20). driver_uuid: opaque-fd sharing needs the same driver build
+    // (VkPhysicalDeviceVulkan11Properties::driverUUID); device_uuid is per card on RADV (PCI address) and is kept
+    // only for the setup log.
+    bool external_memory_fd {};
+    std::array<uint8_t, VK_UUID_SIZE> driver_uuid {};
+    std::array<uint8_t, VK_UUID_SIZE> device_uuid {};
     bool fp16;
     bool bf16;
     bool pipeline_robustness;

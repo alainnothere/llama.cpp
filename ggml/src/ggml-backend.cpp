@@ -1914,6 +1914,8 @@ static void ggml_backend_sched_stats_add_copy(ggml_backend_sched_t sched, int sp
             st->n_d2d_src_submit_pending           += d2d.src_submit_pending;
             st->d2d_bwd_lag                        += d2d.bwd_lag;
             st->t_d2d_hop_queue_submit_us          += d2d.t_hop_queue_submit_us;
+            st->n_d2d_ring_export                  += d2d.ring_kind == GGML_BACKEND_D2D_RING_EXPORT;
+            st->n_d2d_ring_userptr                 += d2d.ring_kind == GGML_BACKEND_D2D_RING_USERPTR;
         }
     }
     if (st->n_copies < GGML_BACKEND_SCHED_STATS_MAX_COPIES) {
@@ -2055,6 +2057,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         st->n_d2d_src_submit_pending           = 0;
         st->d2d_bwd_lag                        = 0;
         st->t_d2d_hop_queue_submit_us          = 0;
+        st->n_d2d_ring_export                  = 0;
+        st->n_d2d_ring_userptr                 = 0;
         sched->realloc_pending.n_realloc            = 0;
         sched->realloc_pending.t_realloc_sync_us    = 0;
         sched->realloc_pending.t_realloc_reserve_us = 0;

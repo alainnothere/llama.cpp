@@ -2477,6 +2477,8 @@ void llama_context::dstats_fold_sched() {
     d.s_n_d2d_src_submit_pending           += st->n_d2d_src_submit_pending;
     d.s_d2d_bwd_lag                        += st->d2d_bwd_lag;
     d.s_t_d2d_hop_queue_submit             += st->t_d2d_hop_queue_submit_us;
+    d.s_n_d2d_ring_export                  += st->n_d2d_ring_export;
+    d.s_n_d2d_ring_userptr                 += st->n_d2d_ring_userptr;
 
     // 2026-10-22 (design-kq-mask-on-device.md 3.6b): one re-plan per pp ubatch is the expected state before the
     // device-built mask; the reason names the first node that outgrew its planned slot
@@ -2523,6 +2525,13 @@ void llama_context::dstats_fold_sched() {
                     r != 0 ? 1 : 0, (r >= 0 && r < 8) ? reason_names[r] : "?");
             // 2026-10-22 evening: hop 1 at-submit state (ggml-backend.h ggml_backend_d2d_copy_stats), only on the
             // async path: a bounce never reached the hop 1 submit
+            // 2026-10-22 evening: ring_kind "export" | "userptr" (ggml-backend.h ggml_backend_d2d_ring_kind): which ring
+            // the hop used; the userptr one taxes every submit ~3 ms per 100 MiB imported (ledger 18:20)
+            if (r == 0 && n > 0 && n < (int) sizeof(buf)) {
+                static const char * ring_kind_names[] = { "none", "export", "userptr" };
+                const int k = c.d2d.ring_kind;
+                n += snprintf(buf + n, sizeof(buf) - n, ",\"ring_kind\":\"%s\"", (k >= 0 && k < 3) ? ring_kind_names[k] : "?");
+            }
             if (r == 0 && n > 0 && n < (int) sizeof(buf)) {
                 n += snprintf(buf + n, sizeof(buf) - n,
                         ",\"t_hop_queue_submit_us\":%" PRId64 ",\"n_bwd_wait_elided\":%d,\"n_ring_grow_wait\":%d,\"ring_cap_mib\":%d"
@@ -2689,7 +2698,8 @@ void llama_context::dstats_emit(int ret, int64_t t_start_us, uint32_t n_tokens, 
                 "\"t_hop_presubmit_us\":%" PRId64 ",\"t_ring_grow_us\":%" PRId64 ",\"t_hop_submit_us\":%" PRId64 ",\"t_link_setup_us\":%" PRId64 ","
                 "\"t_hop_queue_submit_us\":%" PRId64 ",\"n_bwd_wait_elided\":%d,\"n_ring_grow_wait\":%d,"
                 "\"n_bwd_unsignaled_at_submit\":%d,\"n_bwd_dst_unsignaled_at_submit\":%d,\"n_bwd_unsubmitted_at_submit\":%d,"
-                "\"n_src_submit_pending\":%d,\"bwd_lag\":%" PRId64 "}",
+                "\"n_src_submit_pending\":%d,\"bwd_lag\":%" PRId64 ","
+                "\"ring_kind\":\"%s\",\"n_ring_export\":%d,\"n_ring_userptr\":%d}",
                 d.s_n_graphs, d.s_n_splits, d.s_n_copies, d.s_n_copies_drop, d.s_n_splits_drop,
                 d.s_bytes, d.s_t_dst_wait, d.s_t_src_sync, d.s_t_copy, d.s_t_split_sync, d.s_t_wall,
                 d.s_n_realloc, d.s_t_realloc_sync, d.s_t_realloc_reserve,
@@ -2697,7 +2707,11 @@ void llama_context::dstats_emit(int ret, int64_t t_start_us, uint32_t n_tokens, 
                 d.s_t_d2d_presubmit, d.s_t_d2d_ring_grow, d.s_t_d2d_hop_submit, d.s_t_d2d_link_setup,
                 d.s_t_d2d_hop_queue_submit, d.s_n_d2d_bwd_wait_elided, d.s_n_d2d_ring_grow_wait,
                 d.s_n_d2d_bwd_unsignaled_at_submit, d.s_n_d2d_bwd_dst_unsignaled_at_submit, d.s_n_d2d_bwd_unsubmitted_at_submit,
-                d.s_n_d2d_src_submit_pending, d.s_d2d_bwd_lag);
+                d.s_n_d2d_src_submit_pending, d.s_d2d_bwd_lag,
+                // 2026-10-22 evening: "export" | "userptr" | "mixed" over this call's async hops, "none" without any
+                (d.s_n_d2d_ring_export > 0 && d.s_n_d2d_ring_userptr > 0) ? "mixed" :
+                    d.s_n_d2d_ring_export > 0 ? "export" : d.s_n_d2d_ring_userptr > 0 ? "userptr" : "none",
+                d.s_n_d2d_ring_export, d.s_n_d2d_ring_userptr);
         line += sb;
         line += ",\"realloc\":[" + d.s_realloc_json + "]";
         line += ",\"copies\":[" + d.s_copies_json + "]";

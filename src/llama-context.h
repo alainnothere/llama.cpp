@@ -546,6 +546,9 @@ public:
         int32_t s_n_d2d_src_submit_pending           = 0;
         int64_t s_d2d_bwd_lag                        = 0;
         int64_t s_t_d2d_hop_queue_submit             = 0;
+        // 2026-10-22 evening: async hops per ring kind (exported GTT ring vs userptr host ring)
+        int32_t s_n_d2d_ring_export                  = 0;
+        int32_t s_n_d2d_ring_userptr                 = 0;
     };
 private:
     bool             dstats_on     = false;

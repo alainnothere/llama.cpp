@@ -380,6 +380,16 @@ extern "C" {
         GGML_BACKEND_D2D_BOUNCE_GROW_FAILED   = 7, // ring regrowth failed (link is then off for good)
     };
 
+    // [fork, 2026-10-22 evening] which ring an async hop went through (ggml-vulkan.cpp ggml_vk_d2d_ring_pref): the
+    // userptr host ring cost ~3 ms per 100 MiB imported on every CS (amdgpu per-CS hmm re-fault, ledger 18:20), the
+    // exported src-device GTT ring does not. EXPORT is the default; USERPTR = GGML_VK_D2D_RING=userptr or a link whose
+    // export/import failed at setup (one WARN). NONE: bounce / not a cross-device copy.
+    enum ggml_backend_d2d_ring_kind {
+        GGML_BACKEND_D2D_RING_NONE    = 0,
+        GGML_BACKEND_D2D_RING_EXPORT  = 1,
+        GGML_BACKEND_D2D_RING_USERPTR = 2,
+    };
+
     struct ggml_backend_d2d_copy_stats {
         int32_t filled;
         int32_t bounce_reason;      // enum ggml_backend_d2d_bounce_reason
@@ -406,6 +416,7 @@ extern "C" {
         int32_t n_src_wait_sems;            // wait semaphores across them
         int64_t bwd_lag;                    // waited bwd value - src counter (hop 2s outstanding), 0 if reached
         int64_t t_hop_queue_submit_us;      // the vkQueueSubmit calls alone inside t_hop_submit_us
+        int32_t ring_kind;                  // [fork, 2026-10-22 evening] enum ggml_backend_d2d_ring_kind, async copies
     };
 
     struct ggml_backend_sched_copy_stats {
@@ -470,6 +481,9 @@ extern "C" {
         int32_t n_d2d_src_submit_pending;
         int64_t d2d_bwd_lag;
         int64_t t_d2d_hop_queue_submit_us;
+        // [fork, 2026-10-22 evening] async copies per ring kind (ggml_backend_d2d_copy_stats ring_kind)
+        int32_t n_d2d_ring_export;
+        int32_t n_d2d_ring_userptr;
         struct ggml_backend_sched_copy_stats  copies[GGML_BACKEND_SCHED_STATS_MAX_COPIES];
         struct ggml_backend_sched_split_stats splits[GGML_BACKEND_SCHED_STATS_MAX_SPLITS];
     };
