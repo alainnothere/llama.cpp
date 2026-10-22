@@ -391,6 +391,14 @@ extern "C" {
         int64_t t_copy_us;
         int64_t t_split_sync_us; // input-less split waiting for the previous backend
         int64_t t_wall_us;       // whole compute_splits
+        // [fork, 2026-10-22] set by alloc_graph (not reset by compute_splits): 1 when the gallocr plan was invalid
+        // and the sched re-planned. t_realloc_sync_us = the drain of every backend before the re-plan,
+        // t_realloc_reserve_us = ggml_gallocr_reserve_n, realloc_reason = first node/src that failed (or
+        // "backend_ids_changed"). design-kq-mask-on-device.md 1b/3.6b: the growing KQ mask re-plans every pp ubatch
+        int32_t n_realloc;
+        int64_t t_realloc_sync_us;
+        int64_t t_realloc_reserve_us;
+        char    realloc_reason[128];
         struct ggml_backend_sched_copy_stats  copies[GGML_BACKEND_SCHED_STATS_MAX_COPIES];
         struct ggml_backend_sched_split_stats splits[GGML_BACKEND_SCHED_STATS_MAX_SPLITS];
     };

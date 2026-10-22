@@ -1863,6 +1863,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         llama_cp_check_step(sched.get(), res);
     }
 
+    // [KQ_MASK_DEV] LLAMA_KQ_MASK_DEV_CHECK=1: read every device-built mask back and compare it with the host build of
+    // the same ubatch (the cells are unchanged until the next ubatch's apply). Debug only: the sync kills the overlap.
+    if (!res->kq_build_check.empty()) {
+        ggml_backend_sched_synchronize(sched.get());
+        synced_gen = async_gen;
+        for (const auto * inp : res->kq_build_check) {
+            inp->kq_build_verify(&ubatch);
+        }
+    }
+
     ret = GGML_STATUS_SUCCESS;
 
     return res;
@@ -2434,6 +2444,20 @@ void llama_context::dstats_fold_sched() {
     d.s_t_split_sync += st->t_split_sync_us;
     d.s_t_wall       += st->t_wall_us;
 
+    // 2026-10-22 (design-kq-mask-on-device.md 3.6b): one re-plan per pp ubatch is the expected state before the
+    // device-built mask; the reason names the first node that outgrew its planned slot
+    if (st->n_realloc > 0) {
+        if (d.s_n_realloc < 16) {
+            if (!d.s_realloc_json.empty()) {
+                d.s_realloc_json += ',';
+            }
+            d.s_realloc_json += "{\"g\":" + std::to_string(g) + ",\"reason\":" + dstats_json_str(st->realloc_reason) + "}";
+        }
+        d.s_n_realloc         += st->n_realloc;
+        d.s_t_realloc_sync    += st->t_realloc_sync_us;
+        d.s_t_realloc_reserve += st->t_realloc_reserve_us;
+    }
+
     ggml_backend_sched_t s = sched.get();
     const int n_backends = ggml_backend_sched_get_n_backends(s);
     auto bname = [&](int id) -> std::string {
@@ -2594,10 +2618,13 @@ void llama_context::dstats_emit(int ret, int64_t t_start_us, uint32_t n_tokens, 
         snprintf(sb, sizeof(sb),
                 ",\"sched\":{\"n_graphs\":%d,\"n_splits\":%d,\"n_cross_copies\":%d,\"n_copies_dropped\":%d,\"n_splits_dropped\":%d,"
                 "\"bytes\":%" PRId64 ",\"t_dst_wait_us\":%" PRId64 ",\"t_src_sync_us\":%" PRId64 ",\"t_copy_us\":%" PRId64 ","
-                "\"t_split_sync_us\":%" PRId64 ",\"t_wall_us\":%" PRId64 "}",
+                "\"t_split_sync_us\":%" PRId64 ",\"t_wall_us\":%" PRId64 ","
+                "\"n_realloc\":%d,\"t_realloc_sync_us\":%" PRId64 ",\"t_realloc_reserve_us\":%" PRId64 "}",
                 d.s_n_graphs, d.s_n_splits, d.s_n_copies, d.s_n_copies_drop, d.s_n_splits_drop,
-                d.s_bytes, d.s_t_dst_wait, d.s_t_src_sync, d.s_t_copy, d.s_t_split_sync, d.s_t_wall);
+                d.s_bytes, d.s_t_dst_wait, d.s_t_src_sync, d.s_t_copy, d.s_t_split_sync, d.s_t_wall,
+                d.s_n_realloc, d.s_t_realloc_sync, d.s_t_realloc_reserve);
         line += sb;
+        line += ",\"realloc\":[" + d.s_realloc_json + "]";
         line += ",\"copies\":[" + d.s_copies_json + "]";
         line += ",\"splits\":[" + d.s_splits_json + "]";
     }

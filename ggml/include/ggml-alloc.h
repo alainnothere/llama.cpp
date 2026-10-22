@@ -70,6 +70,8 @@ GGML_API bool ggml_gallocr_reserve_n(
 // automatic reallocation if the topology changes when using a single buffer
 // returns false if using multiple buffers and a re-allocation is needed (call ggml_gallocr_reserve_n first to set the node buffers)
 GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph);
+// [fork, 2026-10-22] first reason the last alloc_graph found the plan invalid, "" when it was valid
+GGML_API const char * ggml_gallocr_get_last_realloc_reason(ggml_gallocr_t galloc);
 
 GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
 

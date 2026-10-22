@@ -12459,3 +12459,39 @@ void ggml_compute_forward_lightning_indexer(
         }
     }
 }
+
+// ggml_compute_forward_kq_mask_build
+// [fork, 2026-10-22] reference for the device-built KQ mask (design-kq-mask-on-device.md 3.1), threaded over rows.
+// Must match set_input_kq_mask_impl<f16, causal, swa=false, is_2d=false, alibi=false> for one stream bit for bit:
+// test-backend-ops compares the backends against this, LLAMA_KQ_MASK_DEV_CHECK=1 compares the host build against the devices.
+
+void ggml_compute_forward_kq_mask_build(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * cells = dst->src[0];
+    const ggml_tensor * rows  = dst->src[1];
+
+    const int32_t n_kv   = ggml_get_op_params_i32(dst, 0);
+    const int32_t n_rows = ggml_get_op_params_i32(dst, 1);
+    const bool    causal = ggml_get_op_params_i32(dst, 2) != 0;
+
+    const int32_t * c = (const int32_t *) cells->data;
+    const int64_t   cs = cells->ne[0]; // 2: {pos, seq bitmap}, 1: {pos}, every used cell in every seq
+    const int32_t * r = (const int32_t *) rows->data;
+    ggml_fp16_t   * d = (ggml_fp16_t *) dst->data;
+
+    const ggml_fp16_t keep = GGML_CPU_FP32_TO_FP16(0.0f);
+    const ggml_fp16_t drop = GGML_CPU_FP32_TO_FP16(-INFINITY);
+
+    for (int32_t ir = params->ith; ir < n_rows; ir += params->nth) {
+        const int32_t  qpos = r[2*ir + 0];
+        const uint32_t qbit = 1u << (uint32_t) r[2*ir + 1];
+        ggml_fp16_t * drow = d + (int64_t) ir*n_kv;
+        for (int32_t ic = 0; ic < n_kv; ++ic) {
+            const int32_t  pos = c[cs*ic + 0];
+            const uint32_t seq = cs == 2 ? (uint32_t) c[2*ic + 1] : 0xFFFFFFFFu;
+            const bool ok = pos >= 0 && (seq & qbit) != 0 && (!causal || pos <= qpos);
+            drow[ic] = ok ? keep : drop;
+        }
+    }
+}

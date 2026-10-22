@@ -262,6 +262,23 @@ public:
     // build the mask on the host and upload what changed since the last upload to every device tensor
     void          set_input_kq_mask_dev(const llama_ubatch * ubatch, int64_t n_kv, bool causal_attn) const;
 
+    // [KQ_MASK_DEV] device-built mask (GGML_OP_KQ_MASK_BUILD), see the comment at kq_build_state
+    bool          kq_build_enabled() const { return kq_build.enabled; }
+    bool          kq_build_check()   const { return kq_build.check; }
+    // ints per cell in the cells input: 1 = pos only (n_seq_max == 1, -np 1: 4 B/cell), 2 = pos + seq bitmap
+    int64_t       kq_build_cell_stride() const { return n_seq_max == 1 ? 1 : 2; }
+    // a cell holds a 2-D M-RoPE position that the 1-D op cannot order (see llama_kv_cells::ext_2d_any)
+    bool          kq_build_ext_2d()  const { return v_cells[0].ext_2d_any(); }
+    // the causal flag the host build would apply (non_causal_type SWA_ONLY folds into it)
+    bool          kq_build_causal(bool causal_attn) const;
+    // index of the attention device of model layer il into kq_build_anchor() (-1: no op for this layer)
+    int           kq_build_dev(int32_t il) const;
+    ggml_tensor * kq_build_anchor(int idx) const { return kq_build.anchor[idx]; }
+    // fills cells [0, n_kv) and rows [0, n_tokens) of the two fixed-size graph inputs
+    void          set_input_kq_build(ggml_tensor * cells, ggml_tensor * rows, const llama_ubatch * ubatch, int64_t n_kv) const;
+    // LLAMA_KQ_MASK_DEV_CHECK=1: host build of the same mask vs each device's op output (dense [n_kv, n_tokens]), aborts on a mismatch
+    void          kq_build_verify(const std::vector<ggml_tensor *> & outs, const llama_ubatch * ubatch, int64_t n_kv, bool causal_attn) const;
+
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
@@ -293,7 +310,61 @@ private:
 
         // [KQ_MASK_INC] the persistent mask in the same buffer as k (nullptr for shared layers)
         ggml_tensor * kq_mask_dev = nullptr;
+
+        // [KQ_MASK_DEV] index into kq_build.anchor of this layer's buffer type (-1: op off)
+        int kq_build_dev = -1;
     };
+
+    // [KQ_MASK_DEV] 2026-10-22: the KQ mask built on each attention device by GGML_OP_KQ_MASK_BUILD
+    // (design-kq-mask-on-device.md, ~/Documents/contextFiles).
+    //
+    // Why (Qwen3.8-27B Q8, 3 cards layer split, -b 8192 -ub 2048, -fa on, LLAMA_DECODE_STATS): the host-built f16 mask
+    // [n_kv, n_tokens] is a graph input the sched copies to every attention device with 4 rotating copies: per 8192 batch
+    // at 60-75k, 12 copies of 251-330 MB, 150-220 ms each, sched.t_copy 1.9-2.0 s, sched.bytes 4.0-4.4 GB; the 4 copies
+    // are reserved at kv_size x n_ubatch x 2 B (876 MiB at 224k) each, 3.5 GB per card the fit leaves out of n_ctx. Worse,
+    // the mask grows with n_kv every ubatch, so after the first pp<->tg switch the gallocr plan is too small for every pp
+    // ubatch: ggml_backend_sched_alloc_splits drains every backend, then re-plans. Step-0 measure 2026-10-22 (46.8k-token
+    // prompt, port 8090): fresh server n_realloc 0; same prompt after one generation 22 re-plans, t_sched_alloc 27.2 s of
+    // which 26.3 s the drain, prompt 78.0 s -> 94.3 s; realloc reason every time "src 0 attn_inp_kq_mask ... > planned".
+    //
+    // What: two fixed-size I32 graph inputs, cells [2, cap] {pos or -1, seq bitmap} ([1, cap] {pos} when n_seq_max == 1)
+    // and rows [2, n_ubatch] {pos, seq},
+    // and one op per attention buffer type, anchored on that buffer type's first K tensor so the sched places it there
+    // (ggml-backend.cpp, rule "1.anchor"). The op output is a fixed 1-D f16 of kv_size*n_ubatch elements (one graph
+    // intermediate per device, sized at reserve), FA reads a dense [n_kv, n_tokens] view of its start. Nothing in the
+    // graph grows with n_kv except cells, whose cap is kv_size for pp ubatches and n_kv for decode (llama-graph.cpp
+    // kq_build_cells_cap has the measured reasons).
+    //
+    // Gate (static, constructor): LLAMA_KQ_MASK_DEV != 0 (default on), FA (!v_trans, f16 mask), one stream, no SWA, no
+    // ALiBi, n_seq_max <= 32 (one bitmap word), every attention buffer type's device supports the op. When on, lever 6a
+    // (kq_mask_inc_state) is not allocated. Gate (per graph, llama-graph.cpp kq_build_decide): not training, the ubatch
+    // has no 2-D (M-RoPE) position the 1-D compare cannot order: either the ubatch is not 2-D, or every cell's ext is
+    // (pos, pos) (M-RoPE text: Qwen3.5/3.8 make EVERY ubatch is_pos_2d(), so a plain !is_pos_2d() gate would exclude the
+    // production model; llama_kv_cells::ext_2d_any). Else the host graph input exactly as before.
+    // Semantics = set_input_kq_mask_impl<f16, causal, swa=false, is_2d=false, alibi=false>, first seq id and main pos of
+    // each token. LLAMA_KQ_MASK_DEV_CHECK=1 compares the host build against every device output after each ubatch.
+    //
+    // Measured 2026-10-22 (same 46.8k prompt twice, the second after a generation, i.e. after a pp<->tg switch):
+    //   host mask (LLAMA_KQ_MASK_DEV=0, fit n_ctx 233728): 2nd prompt 88.4 s, n_realloc 22, drain 35.7 s, sched 11.65 GB,
+    //     last 8192 batch 1.93 ms/token; compute buffers 4700/4340/4340 MiB + Vulkan_Host 4052 MiB
+    //   device mask (-c 270336): 2nd prompt 55.7 s, n_realloc 1, drain 0, sched 4.87 GB, t_set_inputs 58-220 ms -> 0.1 ms
+    //     per 8192 batch, last batch 1.08 ms/token; compute buffers 2109/1748/1748 MiB + Vulkan_Host 405 MiB
+    //   fresh server (no re-plan either way) 1.09 vs 1.08 ms/token at the last batch: the win is the removed drain.
+    //   The fit then picks n_ctx 289024 and the first prompt ran 319 s (GTT spill, the known fit overcommit at ub 2048;
+    //   -c 270336 runs 57 s). Decode p50 per step 25.3 -> 26.5 ms (sched 718 -> 1023 KB/step; 6 samples, split differs).
+    //   ppl gate (-c 8192 -b 8192 -ub 2048, 12 chunks): identical per chunk (2.8989 +/- 0.02573), 1159 -> 1233 t/s.
+    struct kq_build_state {
+        bool enabled = false;
+        bool check   = false;
+
+        std::vector<ggml_tensor *> anchor; // one K tensor per attention buffer type
+
+        mutable std::vector<ggml_fp16_t> host; // LLAMA_KQ_MASK_DEV_CHECK scratch
+        mutable std::vector<ggml_fp16_t> dev;
+        mutable uint64_t n_checked = 0;
+    };
+
+    kq_build_state kq_build;
 
     // [KQ_MASK_INC] 2026-10-21: persistent per-device KQ mask with incremental upload.
     //
@@ -572,6 +643,18 @@ public:
     bool          kq_mask_dev_usable(const llama_ubatch & ubatch, int64_t n_stream, ggml_type type, bool causal_attn) const;
     ggml_tensor * get_kq_mask_dev(int32_t il) const;
     void          set_input_kq_mask_dev(const llama_ubatch * ubatch, int64_t n_kv, bool causal_attn) const;
+
+    // [KQ_MASK_DEV] see llama_kv_cache::kq_build_state
+    bool          kq_build_enabled() const;
+    bool          kq_build_check() const;
+    bool          kq_build_ext_2d() const;
+    int64_t       kq_build_cell_stride() const;
+    bool          kq_build_causal(bool causal_attn) const;
+    int           kq_build_dev(int32_t il) const;
+    ggml_tensor * kq_build_anchor(int idx) const;
+    uint32_t      kq_build_kv_size() const;
+    void          set_input_kq_build(ggml_tensor * cells, ggml_tensor * rows, const llama_ubatch * ubatch, int64_t n_kv) const;
+    void          kq_build_verify(const std::vector<ggml_tensor *> & outs, const llama_ubatch * ubatch, int64_t n_kv, bool causal_attn) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;

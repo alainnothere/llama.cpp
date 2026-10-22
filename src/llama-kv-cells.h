@@ -99,6 +99,7 @@ public:
         }
 
         has_shift = false;
+        ext_2d    = false;
 
         used.clear();
 
@@ -510,6 +511,14 @@ public:
         assert(i < ext.size());
         dirty.mark(i);
         ext[i] = p;
+        ext_2d = ext_2d || p.x != pos[i] || p.y != pos[i];
+    }
+
+    // [KQ_MASK_DEV] false while every cell ever set since the last reset() had ext (x, y) == (pos, pos), i.e. M-RoPE
+    // text tokens only: the host mask's 2-D causal tie-break (p0 == p1 && ext.is_2d_gt) is then a no-op and the
+    // device-built mask (1-D causal) is exact. Sticky (seq_rm does not clear it), set by K-shift too: conservative.
+    bool ext_2d_any() const {
+        return ext_2d;
     }
 
     // pos[i] = pos[i] + d
@@ -527,6 +536,7 @@ public:
         shift[i] += d;
 
         has_shift = true;
+        ext_2d    = ext_2d || ext[i].x != 0 || ext[i].y != 0;
 
         if (pos[i] < 0) {
             seq[i].reset();
@@ -559,6 +569,8 @@ public:
         pos[i]   /= d;
         shift[i] += p_old - pos[i];
 
+        ext_2d = ext_2d || ext[i].x != 0 || ext[i].y != 0;
+
         seq_pos_add(i);
 
         has_shift = true;
@@ -568,6 +580,7 @@ private:
     llama_kv_cells_dirty dirty;
 
     bool has_shift = false;
+    bool ext_2d    = false; // see ext_2d_any()
 
     // set of indices of used cells (i.e. pos[i] != -1, allowed to not have any seq_id)
     std::set<uint32_t> used;

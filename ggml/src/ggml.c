@@ -1099,9 +1099,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "KQ_MASK_BUILD",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1214,9 +1216,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "kq_mask_build(c,r)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6074,6 +6078,36 @@ struct ggml_tensor * ggml_unary_inplace(
         struct ggml_tensor  * a,
         enum ggml_unary_op    op) {
     return ggml_unary_impl(ctx, a, op, true);
+}
+
+// ggml_kq_mask_build
+
+struct ggml_tensor * ggml_kq_mask_build(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cells,
+        struct ggml_tensor  * rows,
+        struct ggml_tensor  * anchor,
+        int64_t               n_out,
+        int32_t               n_kv,
+        int32_t               n_rows,
+        bool                  causal) {
+    GGML_ASSERT(cells->type == GGML_TYPE_I32 && (cells->ne[0] == 1 || cells->ne[0] == 2) && ggml_is_contiguous(cells));
+    GGML_ASSERT(rows->type  == GGML_TYPE_I32 && rows->ne[0]  == 2 && ggml_is_contiguous(rows));
+    GGML_ASSERT(n_kv > 0 && n_rows > 0);
+    GGML_ASSERT(cells->ne[1] >= n_kv && rows->ne[1] >= n_rows);
+    GGML_ASSERT((int64_t) n_kv*n_rows <= n_out);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, n_out);
+
+    const int32_t params[] = { n_kv, n_rows, causal ? 1 : 0 };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_KQ_MASK_BUILD;
+    result->src[0] = cells;
+    result->src[1] = rows;
+    result->src[2] = anchor;
+
+    return result;
 }
 
 // ggml_map_custom1

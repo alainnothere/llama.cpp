@@ -1,0 +1,40 @@
+#version 450
+
+// [fork, 2026-10-22] GGML_OP_KQ_MASK_BUILD, see ggml_kq_mask_build in ggml.h. One invocation per (column, row);
+// the workgroup shape is a specialization constant (WG_X x WG_Y), picked in ggml-vulkan.cpp from a microbench.
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+layout (constant_id = 0) const uint WG_X = 256;
+layout (constant_id = 1) const uint WG_Y = 1;
+
+layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer C {int cells[];};     // {pos (-1 = empty), seq bitmap} x n, or {pos} x n (cell_stride 1)
+layout (binding = 1) readonly  buffer R {ivec2 rows[];};    // {pos, seq id}
+layout (binding = 2) writeonly buffer D {uint16_t dst[];};
+
+layout (push_constant) uniform parameter {
+    uint n_kv;
+    uint n_rows;
+    uint causal;
+    uint cell_stride; // 2: pos + seq bitmap, 1: pos only (every used cell holds every row's seq)
+} p;
+
+void main() {
+    const uint c = gl_GlobalInvocationID.x;
+    const uint r = gl_GlobalInvocationID.y;
+    if (c >= p.n_kv || r >= p.n_rows) {
+        return;
+    }
+
+    const int   pos  = cells[c*p.cell_stride];
+    const uint  seq  = p.cell_stride == 2 ? uint(cells[c*2 + 1]) : 0xFFFFFFFFu;
+    const ivec2 row  = rows[r];
+
+    const bool keep = pos >= 0 && ((seq >> uint(row.y)) & 1u) != 0u && (p.causal == 0u || pos <= row.x);
+
+    // f16 0 / -inf bit patterns: the Vulkan FA mask_opt pre-pass classifies 16-column blocks by exactly these values
+    dst[r*p.n_kv + c] = keep ? uint16_t(0x0000) : uint16_t(0xFC00);
+}

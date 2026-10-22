@@ -4164,6 +4164,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_fill_f32, "fill_f32", fill_f32_len, fill_f32_data, "main", 1, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_fill_f16, "fill_f16", fill_f16_len, fill_f16_data, "main", 1, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_kq_mask_build[0], "kq_mask_build_256x1", kq_mask_build_len, kq_mask_build_data, "main", 3, 4*sizeof(uint32_t), {256, 1, 1}, {256, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_kq_mask_build[1], "kq_mask_build_16x16", kq_mask_build_len, kq_mask_build_data, "main", 3, 4*sizeof(uint32_t), {16, 16, 1}, {16, 16}, 1);
 
 #define CREATE_GLU(name)  \
     ggml_vk_create_pipeline(device, device->pipeline_ ## name [0], #name "_f32", name ## _f32_len, name ## _f32_data, "main", 3, sizeof(vk_op_glu_push_constants), {512, 1, 1}, {}, 1, true);   \
@@ -11875,6 +11877,46 @@ void ggml_vk_arange(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tens
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { dst_buf }, pc, elements);
 }
 
+// [fork, 2026-10-22] GGML_OP_KQ_MASK_BUILD (design-kq-mask-on-device.md): the f16 KQ mask built on the device from
+// ~8 B per KV cell + 8 B per row instead of a host-built n_kv x n_rows x 2 B graph input that the sched copied to every
+// device (12 copies of 251-330 MB per 8192-token batch at 60-75k, sched.t_copy 1.9-2.0 s, ~1.4 GB/s effective).
+// Writes a dense [n_kv, n_rows] block at the start of dst (row stride n_kv): the FA shaders index the mask with row
+// stride KV and a strided mask would be copied into a dense scratch per FA call (ggml_vk_flash_attn, mask_dense).
+// Workgroup layout microbench, 7900 XTX (Vulkan1), test-backend-ops -m perf, n_rows 2048, causal (WG env = GGML_VK_KQ_MASK_WG):
+//   n_kv 65536:  256x1 298.7 us (839 GB/s), 16x16 313.3 us (800 GB/s)
+//   n_kv 229376: 256x1 1005.9 us (872 GB/s), 16x16 1099.1 us (798 GB/s); at 12 rows 8.8 vs 11.0 us
+// -> 256x1 (default 0) is write-bandwidth bound and wins at every size; 16x16 kept behind GGML_VK_KQ_MASK_WG=1 for re-measuring
+static int ggml_vk_kq_mask_wg() {
+    static const int v = [] {
+        const char * e = getenv("GGML_VK_KQ_MASK_WG");
+        return e ? std::clamp(atoi(e), 0, 1) : 0;
+    }();
+    return v;
+}
+
+static void ggml_vk_kq_mask_build(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * cells = dst->src[0];
+    const ggml_tensor * rows  = dst->src[1];
+
+    struct { uint32_t n_kv, n_rows, causal, cell_stride; } pc = {
+        (uint32_t) ggml_get_op_params_i32(dst, 0),
+        (uint32_t) ggml_get_op_params_i32(dst, 1),
+        (uint32_t) ggml_get_op_params_i32(dst, 2),
+        (uint32_t) cells->ne[0],
+    };
+
+    vk_pipeline pipeline = ctx->device->pipeline_kq_mask_build[ggml_vk_kq_mask_wg()];
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const vk_subbuffer c_buf = ggml_vk_tensor_subbuffer(ctx, cells, false);
+    const vk_subbuffer r_buf = ggml_vk_tensor_subbuffer(ctx, rows,  false);
+    const vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, dst,   false);
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { c_buf, r_buf, d_buf }, pc, { pc.n_kv, pc.n_rows, 1 });
+}
+
 void ggml_vk_fill(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_vk_fill(dst=" << dst << ", ne=" << ggml_nelements(dst) << ")");
     const uint64_t n = ggml_nelements(dst);
@@ -13777,6 +13819,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         break;
     case GGML_OP_FILL:
         ggml_vk_fill(ctx, compute_ctx, node);
+
+        break;
+    case GGML_OP_KQ_MASK_BUILD:
+        ggml_vk_kq_mask_build(ctx, compute_ctx, node);
 
         break;
     case GGML_OP_SCALE:
@@ -17845,6 +17891,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             return op->type == GGML_TYPE_F32;
         case GGML_OP_FILL:
             return op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16;
+        case GGML_OP_KQ_MASK_BUILD:
+            return op->type == GGML_TYPE_F16 &&
+                   op->src[0]->type == GGML_TYPE_I32 && ggml_is_contiguous(op->src[0]) &&
+                   op->src[1]->type == GGML_TYPE_I32 && ggml_is_contiguous(op->src[1]);
         case GGML_OP_SCALE:
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_PAD:

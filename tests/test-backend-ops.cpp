@@ -8604,6 +8604,90 @@ struct test_fill : public test_case {
     }
 };
 
+// GGML_OP_KQ_MASK_BUILD [fork, 2026-10-22]
+// cells with holes (pos -1, empty bitmap), random multi-seq bitmaps, rows of seqs that may or may not be in a cell.
+// Exact compare (f16 0 / -inf, no tolerance): the device mask replaces a host build that FA consumes bit for bit.
+struct test_kq_mask_build : public test_case {
+    const int64_t n_kv;
+    const int64_t n_rows;
+    const bool    causal;
+    const int64_t n_kv_cap;   // cells tensor length >= n_kv (the llama inputs are sized for kv_size, filled to n_kv)
+    const int64_t n_rows_cap; // rows tensor length >= n_rows (sized for n_ubatch)
+    const int64_t cell_stride; // 2: {pos, seq bitmap}, 1: {pos} (single-seq caches)
+
+    std::string vars() override { return VARS_TO_STR6(n_kv, n_rows, causal, n_kv_cap, n_rows_cap, cell_stride); }
+
+    test_kq_mask_build(int64_t n_kv = 256, int64_t n_rows = 6, bool causal = true, int64_t n_kv_cap = 0, int64_t n_rows_cap = 0, int64_t cell_stride = 2)
+        : n_kv(n_kv), n_rows(n_rows), causal(causal),
+          n_kv_cap(n_kv_cap ? n_kv_cap : n_kv), n_rows_cap(n_rows_cap ? n_rows_cap : n_rows), cell_stride(cell_stride) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cells  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, cell_stride, n_kv_cap);
+        ggml_tensor * rows   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, n_rows_cap);
+        ggml_tensor * anchor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 16);
+        ggml_set_name(cells, "cells");
+        ggml_set_name(rows, "rows");
+        ggml_set_name(anchor, "anchor");
+
+        // n_out == n_kv*n_rows: the op leaves the rest unwritten and the compare reads all of it
+        ggml_tensor * out = ggml_kq_mask_build(ctx, cells, rows, anchor, n_kv*n_rows, (int32_t) n_kv, (int32_t) n_rows, causal);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234 + (uint32_t) (n_kv*7 + n_rows*3 + causal));
+        const int32_t pos_max = (int32_t) std::max<int64_t>(n_kv, 8);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "cells") == 0) {
+                std::vector<int32_t> v(2*t->ne[1]);
+                for (int64_t i = 0; i < t->ne[1]; ++i) {
+                    const uint32_t u = rng() % 16;
+                    if (cell_stride == 1) {
+                        v[i] = u == 0 ? -1 : (int32_t) (rng() % pos_max);
+                        continue;
+                    }
+                    if (u == 0) {
+                        v[2*i] = -1; v[2*i + 1] = 0;          // empty cell
+                    } else {
+                        v[2*i] = (int32_t) (rng() % pos_max);
+                        uint32_t m = u < 12 ? 1u : (uint32_t) rng(); // mostly seq 0, some random multi-seq bitmaps
+                        if (u == 15) {
+                            m = 0;                            // used pos but no seq (must drop)
+                        }
+                        v[2*i + 1] = (int32_t) m;
+                    }
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "rows") == 0) {
+                std::vector<int32_t> v(2*t->ne[1]);
+                for (int64_t i = 0; i < t->ne[1]; ++i) {
+                    v[2*i]     = (int32_t) (rng() % pos_max);
+                    v[2*i + 1] = (rng() % 4 == 0) ? (int32_t) (rng() % 32) : 0;
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    double max_err(ggml_backend_t backend) override {
+        GGML_UNUSED(backend);
+        return 0.0;
+    }
+
+    // number of differing elements (both -inf compares equal)
+    double err(const float * a, const float * b, size_t n) override {
+        size_t bad = 0;
+        for (size_t i = 0; i < n; ++i) {
+            bad += a[i] != b[i];
+        }
+        return (double) bad;
+    }
+};
+
 // GGML_OP_SOLVE_TRI
 struct test_solve_tri : public test_case {
     const ggml_type              type;
@@ -11301,6 +11385,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_fill(-152.0f, GGML_TYPE_F16, { 800, 600, 4, 4 }));
     test_cases.emplace_back(new test_fill(3.5f, GGML_TYPE_F16, { 2048, 512, 2, 2 }));
 
+    for (bool causal : { true, false }) {
+        for (int64_t n_kv : { 256, 4096, 65536 }) {
+            for (int64_t n_rows : { 1, 6, 64, 2048 }) {
+                if (n_kv == 65536 && n_rows == 2048 && !causal) {
+                    continue;
+                }
+                test_cases.emplace_back(new test_kq_mask_build(n_kv, n_rows, causal));
+            }
+        }
+        test_cases.emplace_back(new test_kq_mask_build(4096 + 256, 13, causal, 8192, 2048)); // inputs larger than used
+        test_cases.emplace_back(new test_kq_mask_build(1000, 7, causal));                     // odd sizes
+        for (int64_t n_rows : { 1, 12, 2048 }) {
+            test_cases.emplace_back(new test_kq_mask_build(4096, n_rows, causal, 8192, 2048, 1)); // pos-only cells
+        }
+    }
+
     test_cases.emplace_back(new test_diag());
     test_cases.emplace_back(new test_diag(GGML_TYPE_F32, { 79, 1, 19, 13 }));
     test_cases.emplace_back(new test_diag(GGML_TYPE_F32, { 256, 1, 8, 16 }));
@@ -11757,6 +11857,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // [fork, 2026-10-22] device-built KQ mask at production pp shape (n_ubatch 2048) and 65k / 224k context
+    test_cases.emplace_back(new test_kq_mask_build(65536,  2048, true));
+    test_cases.emplace_back(new test_kq_mask_build(229376, 2048, true));
+    test_cases.emplace_back(new test_kq_mask_build(229376, 12,   true));
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

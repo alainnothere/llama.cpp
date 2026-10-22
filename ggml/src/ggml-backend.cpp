@@ -991,6 +991,7 @@ struct ggml_backend_sched {
     struct ggml_backend_sched_stats * stats;
     int     stats_pending_split; // split whose issue_to_next_wait is still open, -1 = none
     int64_t stats_t_issue_end;
+    struct ggml_backend_sched_stats realloc_pending; // only the n_realloc/t_realloc_*/realloc_reason fields are used
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -1099,6 +1100,17 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
         cur_backend_id = sched->n_backends - 1; // last backend (assumed CPU)
         SET_CAUSE(tensor, "1.inp");
         return cur_backend_id;
+    }
+
+    // [fork, 2026-10-22] ggml_kq_mask_build runs where its anchor (src[2], a KV cache tensor of the target device)
+    // lives: its other srcs are CPU graph inputs and the KV buffer is not a WEIGHTS buffer, so no rule below would
+    // pick the device. One op per attention device = no cross-device mask copies (design-kq-mask-on-device.md 3.3)
+    if (tensor->op == GGML_OP_KQ_MASK_BUILD && tensor->src[2] != NULL) {
+        cur_backend_id = ggml_backend_sched_backend_from_buffer(sched, tensor->src[2], tensor);
+        if (cur_backend_id != -1) {
+            SET_CAUSE(tensor, "1.anchor");
+            return cur_backend_id;
+        }
     }
 
     // operations with weights are preferably run on the same backend as the weights
@@ -1780,8 +1792,23 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         }
     }
 
+    // [fork, 2026-10-22] staged in realloc_pending and published by the next compute_splits, so a reused graph
+    // (alloc skipped) reports 0 instead of repeating the last re-plan
+    struct ggml_backend_sched_stats * st = sched->stats ? &sched->realloc_pending : NULL;
+    if (st) {
+        st->n_realloc            = 0;
+        st->t_realloc_sync_us    = 0;
+        st->t_realloc_reserve_us = 0;
+        st->realloc_reason[0]    = '\0';
+    }
+
     // allocate graph
     if (backend_ids_changed || !ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
+        if (st) {
+            st->n_realloc = 1;
+            snprintf(st->realloc_reason, sizeof(st->realloc_reason), "%s",
+                backend_ids_changed ? "backend_ids_changed" : ggml_gallocr_get_last_realloc_reason(sched->galloc));
+        }
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: failed to allocate graph, reserving (backend_ids_changed = %d)\n", __func__, backend_ids_changed);
 #endif
@@ -1799,13 +1826,21 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
         // the re-allocation may cause the split inputs to be moved to a different address
         // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
+        // [fork, 2026-10-22] this drain is the pipeline killer of design-kq-mask-on-device.md 1b: every in-flight
+        // ubatch of every backend must finish before the re-plan, timed into t_realloc_sync_us
+        const int64_t t_sync0 = st ? ggml_time_us() : 0;
         for (int i = 0; i < sched->n_backends; i++) {
             ggml_backend_synchronize(sched->backends[i]);
         }
+        const int64_t t_sync1 = st ? ggml_time_us() : 0;
 
         if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
             GGML_LOG_ERROR("%s: failed to reserve graph buffers\n", __func__);
             return false;
+        }
+        if (st) {
+            st->t_realloc_sync_us    = t_sync1 - t_sync0;
+            st->t_realloc_reserve_us = ggml_time_us() - t_sync1;
         }
         if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
@@ -1958,6 +1993,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         st->t_copy_us       = 0;
         st->t_split_sync_us = 0;
         st->t_wall_us       = 0;
+        st->n_realloc            = sched->realloc_pending.n_realloc;
+        st->t_realloc_sync_us    = sched->realloc_pending.t_realloc_sync_us;
+        st->t_realloc_reserve_us = sched->realloc_pending.t_realloc_reserve_us;
+        memcpy(st->realloc_reason, sched->realloc_pending.realloc_reason, sizeof(st->realloc_reason));
+        sched->realloc_pending.n_realloc            = 0;
+        sched->realloc_pending.t_realloc_sync_us    = 0;
+        sched->realloc_pending.t_realloc_reserve_us = 0;
+        sched->realloc_pending.realloc_reason[0]    = '\0';
         sched->stats_pending_split = -1;
         t_wall_start = ggml_time_us();
     }

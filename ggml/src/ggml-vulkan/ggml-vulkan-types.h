@@ -941,6 +941,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_add1_f32_f32;
 
     vk_pipeline pipeline_arange_f32;
+    vk_pipeline pipeline_kq_mask_build[2]; // [fork, 2026-10-22] [0] = 256x1 workgroup, [1] = 16x16, see ggml_vk_kq_mask_build
 
     vk_pipeline pipeline_fill_f32;
     vk_pipeline pipeline_fill_f16;

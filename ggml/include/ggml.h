@@ -601,6 +601,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_KQ_MASK_BUILD, // [fork, 2026-10-22] ggml_kq_mask_build
+
         GGML_OP_COUNT,
     };
 
@@ -2747,6 +2749,27 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // [fork, 2026-10-22] KQ mask built on the device that reads it (design-kq-mask-on-device.md).
+    //   cells  I32 [2, >= n_kv]   per KV cell: {pos (-1 = empty), seq bitmap (bit s = cell holds seq s, s < 32)}
+    //          or  I32 [1, >= n_kv] {pos} only: every non-empty cell is in every row's seq (single-seq caches, 4 B/cell)
+    //   rows   I32 [2, >= n_rows] per query row: {pos, seq id (0..31)}
+    //   anchor any tensor already allocated on the target device; NOT read, it only makes the scheduler place the op
+    //          on that device (ggml_backend_sched assigns this op to the backend of src[2]'s buffer)
+    //   n_out  elements of the F16 1-D result, fixed by the caller (kv_size*n_ubatch) so the allocation never depends
+    //          on n_kv / n_rows (a growing node makes ggml_gallocr re-plan, which first drains every backend)
+    // writes result[r*n_kv + c] for r < n_rows, c < n_kv: 0 if pos_c >= 0 && seq(r) in seqs_c && (!causal || pos_c <= pos_r),
+    // else -INF (f16 0xFC00); the rest of the result is left unwritten. Consumers view it as a dense [n_kv, n_rows]
+    // (row stride n_kv): the Vulkan FA indexes the mask with row stride n_kv and copies any strided mask per call.
+    GGML_API struct ggml_tensor * ggml_kq_mask_build(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cells,
+            struct ggml_tensor  * rows,
+            struct ggml_tensor  * anchor,
+            int64_t               n_out,
+            int32_t               n_kv,
+            int32_t               n_rows,
+            bool                  causal);
 
     // custom operators
 

@@ -515,6 +515,11 @@ public:
         int64_t s_t_copy         = 0;
         int64_t s_t_split_sync   = 0;
         int64_t s_t_wall         = 0;
+        // 2026-10-22: gallocr re-plans (each drains every backend first), see design-kq-mask-on-device.md 3.6b
+        int32_t s_n_realloc         = 0;
+        int64_t s_t_realloc_sync    = 0;
+        int64_t s_t_realloc_reserve = 0;
+        std::string s_realloc_json; // [{g, reason}], first 16 per line
         std::string s_copies_json;
         std::string s_splits_json;
     };

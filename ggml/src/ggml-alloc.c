@@ -493,6 +493,10 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+
+    // [fork, 2026-10-22] why the last ggml_gallocr_needs_realloc said yes ("" = it did not), read by the sched
+    // stats (LLAMA_DECODE_STATS "realloc_reason") to check which nodes grow between graphs, see design-kq-mask-on-device.md 3.6b
+    char realloc_reason[128];
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -1007,7 +1011,9 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
 }
 
 static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+    galloc->realloc_reason[0] = '\0';
     if (galloc->n_nodes != graph->n_nodes) {
+        snprintf(galloc->realloc_reason, sizeof(galloc->realloc_reason), "n_nodes %d -> %d", galloc->n_nodes, graph->n_nodes);
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: graph has different number of nodes\n", __func__);
 #endif
@@ -1015,6 +1021,7 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
     }
 
     if (galloc->n_leafs != graph->n_leafs) {
+        snprintf(galloc->realloc_reason, sizeof(galloc->realloc_reason), "n_leafs %d -> %d", galloc->n_leafs, graph->n_leafs);
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: graph has different number of leafs\n", __func__);
 #endif
@@ -1026,9 +1033,9 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
         struct node_alloc * node_alloc = &galloc->node_allocs[i];
 
         if (!ggml_gallocr_node_needs_realloc(galloc, node, &node_alloc->dst)) {
-#ifndef NDEBUG
-            GGML_LOG_DEBUG("%s: node %s is not valid\n", __func__, node->name);
-#endif
+            snprintf(galloc->realloc_reason, sizeof(galloc->realloc_reason), "node %s (%s) %zu > %zu",
+                node->name, ggml_op_desc(node), ggml_nbytes(node), node_alloc->dst.size_max);
+            GGML_LOG_DEBUG("%s: node %s is not valid (%zu B > planned %zu B)\n", __func__, node->name, ggml_nbytes(node), node_alloc->dst.size_max);
             return true;
         }
 
@@ -1038,15 +1045,19 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
                 continue;
             }
             if (!ggml_gallocr_node_needs_realloc(galloc, src, &node_alloc->src[j])) {
-#ifndef NDEBUG
-                GGML_LOG_DEBUG("%s: src %d (%s) of node %s is not valid\n", __func__, j, src->name, node->name);
-#endif
+                snprintf(galloc->realloc_reason, sizeof(galloc->realloc_reason), "src %d %s of %s %zu > %zu",
+                    j, src->name, node->name, ggml_nbytes(src), node_alloc->src[j].size_max);
+                GGML_LOG_DEBUG("%s: src %d (%s) of node %s is not valid (%zu B > planned %zu B)\n", __func__, j, src->name, node->name, ggml_nbytes(src), node_alloc->src[j].size_max);
                 return true;
             }
         }
     }
 
     return false;
+}
+
+const char * ggml_gallocr_get_last_realloc_reason(ggml_gallocr_t galloc) {
+    return galloc->realloc_reason;
 }
 
 bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {

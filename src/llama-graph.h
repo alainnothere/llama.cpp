@@ -368,6 +368,18 @@ public:
     bool kq_mask_dev_ok = false;
     std::vector<std::pair<ggml_tensor *, ggml_tensor *>> kq_mask_dev_views; // (device tensor, graph view)
 
+    // [KQ_MASK_DEV] decided at graph build, see llama_kv_cache::kq_build_state. When on, every layer that goes through
+    // get_kq_mask_il reads the dense [n_kv, n_tokens] view of its device's op output and self_kq_mask stays out of the
+    // graph (unallocated -> no host build, no sched copies) unless a model reads get_kq_mask() directly.
+    bool kq_build_on = false;
+    ggml_tensor * kq_build_cells = nullptr; // I32 [2, cap]      graph input, cap = pow2 bucket of n_kv
+    ggml_tensor * kq_build_rows  = nullptr; // I32 [2, n_ubatch] graph input
+    std::vector<ggml_tensor *> kq_build_out;  // per anchor index: op output (1-D f16 kv_size*n_ubatch), lazily built
+    std::vector<ggml_tensor *> kq_build_view; // per anchor index: the [n_kv, n_tokens, 1, 1] view FA reads
+    const llama_kv_cache_context * kq_build_mctx = nullptr; // of the last set_input, for LLAMA_KQ_MASK_DEV_CHECK
+    // LLAMA_KQ_MASK_DEV_CHECK: host build vs every built device mask, after the graph ran (llama_context::process_ubatch)
+    void kq_build_verify(const llama_ubatch * ubatch) const;
+
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
@@ -969,6 +981,9 @@ public:
     // [KQ_MASK_INC] some layer reads a persistent kv cache mask: set_inputs writes device memory directly,
     // so the previous graph must have finished (llama_context::process_ubatch synchronizes)
     bool kq_mask_dev = false;
+
+    // [KQ_MASK_DEV] inputs whose device masks LLAMA_KQ_MASK_DEV_CHECK verifies after compute (empty when the check is off)
+    std::vector<const llm_graph_input_attn_kv *> kq_build_check;
 
     // [CP] LLAMA_CP_CHECK: merged and single-card attention of the cp layer, [n_embd_head_v, n_head, n_tokens]
     ggml_tensor * t_cp_merged = nullptr;

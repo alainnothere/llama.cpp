@@ -928,6 +928,7 @@ void process_shaders() {
     string_to_spv("fa_split_k_reduce", "flash_attn_split_k_reduce.comp", {});
 
     string_to_spv("fa_mask_opt", "flash_attn_mask_opt.comp", {});
+    string_to_spv("kq_mask_build", "kq_mask_build.comp", {}); // [fork, 2026-10-22] GGML_OP_KQ_MASK_BUILD
 
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     string_to_spv("fa_decode_ph1", "flash_attn_decode_phase_1.comp", {}, true, true, false, false);

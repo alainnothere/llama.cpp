@@ -17,6 +17,7 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cinttypes>
@@ -84,6 +85,40 @@ static bool kq_mask_dev_decide(
     return !cparams.training && kq_mask && mctx->kq_mask_dev_usable(ubatch, kq_mask->ne[3], kq_mask->type, cparams.causal_attn);
 }
 
+// [KQ_MASK_DEV] per-graph part of the gate, see llama_kv_cache::kq_build_state. kq_mask is the graph input
+// (created either way: its shape keeps the graph-reuse check exact and models that read get_kq_mask() still work)
+static bool kq_build_decide(
+        const llama_kv_cache_context * mctx,
+        const llama_ubatch & ubatch,
+        const llama_cparams & cparams,
+        const ggml_tensor * kq_mask) {
+    return !cparams.training && cparams.flash_attn && kq_mask && kq_mask->type == GGML_TYPE_F16 && kq_mask->ne[3] == 1 &&
+           mctx->kq_build_enabled() && (!ubatch.is_pos_2d() || !mctx->kq_build_ext_2d());
+}
+
+// cells cap. Every n_kv-sized graph node is a re-plan + drain of all backends when it outgrows the gallocr plan (1b of
+// the design: 22 re-plans / 26.3 s of drain for one 46.8k prompt with the n_kv-sized host mask).
+// pp (n_tokens > 64): kv_size, so consecutive ubatches never re-plan (4-8 B x 288k = 1.2-2.3 MB per device per ubatch).
+//   A first version used a power-of-two bucket of n_kv here: 5 re-plans / 1.38 s of drain left per 46.8k prompt.
+// decode (<= 64 rows, the 6a row cap): exactly n_kv, a re-plan only when n_kv crosses a 256 boundary and the steps
+//   arrive synchronized anyway; the bucket version copied 2.34 MB per step at 47k (65536 x 8 B x 3 devices) vs 718 KB
+//   with 6a, t_copy p50 1.30 -> 2.01 ms, step p50 25.3 -> 26.1 ms.
+static int64_t kq_build_cells_cap(int64_t n_kv, int64_t kv_size, int64_t n_tokens) {
+    return n_tokens > 64 ? std::max<int64_t>(n_kv, kv_size) : n_kv;
+}
+
+void llm_graph_input_attn_kv::kq_build_verify(const llama_ubatch * ubatch) const {
+    std::vector<ggml_tensor *> outs;
+    for (ggml_tensor * t : kq_build_out) {
+        if (t && t->buffer) {
+            outs.push_back(t);
+        }
+    }
+    if (!outs.empty() && kq_build_mctx) {
+        kq_build_mctx->kq_build_verify(outs, ubatch, self_kq_mask->ne[0], cparams.causal_attn);
+    }
+}
+
 // impl
 
 ggml_tensor * llm_graph_input_attn_kv::get_kq_mask_dev_view(ggml_context * ctx, ggml_tensor * dev) {
@@ -108,6 +143,39 @@ ggml_tensor * llm_graph_input_attn_kv::get_kq_mask_dev_view(ggml_context * ctx, 
 }
 
 ggml_tensor * llm_graph_input_attn_kv::get_kq_mask_il(ggml_context * ctx, int il) {
+    // [KQ_MASK_DEV] one op per attention device per graph, shared by all its layers: the Vulkan FA caches mask_opt /
+    // sparse per mask tensor (ggml_vk_fa_mask_scratch), so one view per device also keeps that pre-pass at one per graph
+    if (kq_build_on && self_kq_mask_cnv == self_kq_mask) {
+        const int idx = mctx->kq_build_dev(il);
+        if (idx >= 0) {
+            if ((int) kq_build_out.size() <= idx) {
+                kq_build_out.resize(idx + 1, nullptr);
+                kq_build_view.resize(idx + 1, nullptr);
+            }
+            if (!kq_build_view[idx]) {
+                const int64_t n_kv     = self_kq_mask->ne[0];
+                const int64_t n_tokens = self_kq_mask->ne[1];
+                // fixed size: kv_size x n_ubatch whatever this graph's n_kv / n_tokens (no gallocr re-plan between ubatches);
+                // the reserve sizes it once per device (876 MiB at 224k/2048 replaces the sched's 4 input copies of that size)
+                const int64_t n_out = std::max<int64_t>((int64_t) mctx->kq_build_kv_size()*cparams.n_ubatch, n_kv*n_tokens);
+                ggml_tensor * out = ggml_kq_mask_build(ctx, kq_build_cells, kq_build_rows, mctx->kq_build_anchor(idx), n_out,
+                        (int32_t) n_kv, (int32_t) n_tokens, mctx->kq_build_causal(cparams.causal_attn));
+                ggml_format_name(out, "kq_mask_build_d%d", idx);
+                if (mctx->kq_build_check()) {
+                    ggml_set_output(out); // keep it alive past its last FA for the read-back
+                }
+                // dense view (row stride n_kv): the Vulkan FA indexes the mask with row stride KV and would copy a
+                // strided mask into a scratch per FA call (ggml_vk_flash_attn, mask_dense)
+                const size_t es = ggml_element_size(out);
+                ggml_tensor * v = ggml_view_4d(ctx, out, n_kv, n_tokens, 1, 1, n_kv*es, n_kv*n_tokens*es, n_kv*n_tokens*es, 0);
+                ggml_format_name(v, "kq_mask_build_d%d_view", idx);
+                kq_build_out[idx]  = out;
+                kq_build_view[idx] = v;
+            }
+            return kq_build_view[idx];
+        }
+    }
+
     if (kq_mask_dev_ok && self_kq_mask_cnv == self_kq_mask) {
         ggml_tensor * dev = mctx->get_kq_mask_dev(il);
         if (dev) {
@@ -119,6 +187,13 @@ ggml_tensor * llm_graph_input_attn_kv::get_kq_mask_il(ggml_context * ctx, int il
 }
 
 void llm_graph_input_attn_kv::set_input_kq_mask_any(const llama_kv_cache_context * mctx, const llama_ubatch * ubatch) {
+    // [KQ_MASK_DEV] ordinary graph inputs: the sched's pipelined input copies move them, no host write into live
+    // device memory and therefore no synchronize (the 6a path's sync is what kept it off pp ubatches)
+    if (kq_build_on && kq_build_cells && kq_build_cells->buffer) {
+        mctx->set_input_kq_build(kq_build_cells, kq_build_rows, ubatch, self_kq_mask->ne[0]);
+        kq_build_mctx = mctx;
+    }
+
     if (!kq_mask_dev_views.empty()) {
         mctx->set_input_kq_mask_dev(ubatch, self_kq_mask->ne[0], cparams.causal_attn);
     }
@@ -596,6 +671,9 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
 
     res &= kq_mask_dev_ok == kq_mask_dev_decide(mctx, params.ubatch, params.cparams, self_kq_mask);
+
+    // [KQ_MASK_DEV] the op params and the cells bucket follow (n_kv, n_tokens), which can_reuse_kq_mask pins
+    res &= kq_build_on == kq_build_decide(mctx, params.ubatch, params.cparams, self_kq_mask);
 
     return res;
 }
@@ -1235,6 +1313,11 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
         res = false;
     }
 
+    if (inp_attn->kq_build_on != kq_build_decide(attn, ub, params.cparams, inp_attn->self_kq_mask)) {
+        if (graph_reuse_log_enabled()) LLAMA_LOG_WARN("%s: no reuse: device-built kq mask decision changed\n", __func__);
+        res = false;
+    }
+
     if (!can_reuse_kq_mask(inp_attn->self_kq_mask, attn, ub, params.cparams)) {
         const auto * m = inp_attn->self_kq_mask;
         const uint32_t n_stream = params.cparams.kv_unified ? 1 : ub.n_seqs_unq;
@@ -1448,6 +1531,7 @@ int64_t llm_graph_result::get_max_nodes() const {
 
 void llm_graph_result::reset() {
     kq_mask_dev   = false;
+    kq_build_check.clear();
     t_cp_merged   = nullptr;
     t_cp_full     = nullptr;
 
@@ -3071,6 +3155,21 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_kq_mask_cnv = inp->self_kq_mask;
 
         inp->kq_mask_dev_ok = kq_mask_dev_decide(mctx_cur, ubatch, cparams, inp->self_kq_mask);
+
+        // [KQ_MASK_DEV] the two small inputs; the ops themselves are built per device on first use (get_kq_mask_il)
+        inp->kq_build_on = kq_build_decide(mctx_cur, ubatch, cparams, inp->self_kq_mask);
+        if (inp->kq_build_on) {
+            inp->kq_mask_dev_ok = false; // 6a is not allocated when the op gate is on; belt and braces
+
+            const int64_t n_kv = inp->self_kq_mask->ne[0];
+            inp->kq_build_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, mctx_cur->kq_build_cell_stride(),
+                    kq_build_cells_cap(n_kv, mctx_cur->kq_build_kv_size(), ubatch.n_tokens));
+            inp->kq_build_rows  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 2, std::max<int64_t>(cparams.n_ubatch, ubatch.n_tokens));
+            ggml_set_input(inp->kq_build_cells);
+            ggml_set_input(inp->kq_build_rows);
+            ggml_set_name(inp->kq_build_cells, "kq_build_cells");
+            ggml_set_name(inp->kq_build_rows,  "kq_build_rows");
+        }
     }
 
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
@@ -3149,8 +3248,12 @@ ggml_tensor * llm_graph_context::build_attn(
     }
 
     ggml_tensor * kq_mask = inp->get_kq_mask_il(ctx0, il);
-    if (kq_mask != inp->get_kq_mask()) {
+    if (kq_mask != inp->get_kq_mask() && !inp->kq_build_on) {
         res->kq_mask_dev = true;
+    }
+    if (inp->kq_build_on && mctx_cur->kq_build_check() &&
+            std::find(res->kq_build_check.begin(), res->kq_build_check.end(), inp) == res->kq_build_check.end()) {
+        res->kq_build_check.push_back(inp);
     }
 
     const uint32_t cp_h = cparams.training || kq_b || sinks || !cparams.flash_attn ? 0 : mctx_cur->cp_split(il);
@@ -3232,8 +3335,10 @@ ggml_tensor * llm_graph_context::build_attn_cp(
     GGML_ASSERT(h > 0 && h < n_kv);
 
     // the helper reads its own persistent mask when the owner does, else a column view of the graph input
+    // [KQ_MASK_DEV] with the device-built mask the helper reads the owner's op output (the sched copies it to B).
+    // Follow-up, not done: a second op instance anchored on the mirror's K (cp.k) so B builds its own (design 3.5)
     ggml_tensor * mask_b = kq_mask;
-    if (kq_mask != inp->get_kq_mask()) {
+    if (kq_mask != inp->get_kq_mask() && !inp->kq_build_on) {
         ggml_tensor * dev_b = mctx_cur->cp_kq_mask_dev();
         GGML_ASSERT(dev_b);
         mask_b = inp->get_kq_mask_dev_view(ctx0, dev_b);

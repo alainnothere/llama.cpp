@@ -372,6 +372,52 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    // [KQ_MASK_DEV] static gate of the device-built mask (see kq_build_state); decided before 6a so its
+    // persistent tensors are not allocated when the op replaces them. The anchors are picked after allocation.
+    {
+        const char * env_dev = getenv("LLAMA_KQ_MASK_DEV");
+        const char * env_chk = getenv("LLAMA_KQ_MASK_DEV_CHECK");
+
+        const char * why_not = nullptr;
+        if (!kq_mask_inc)                         why_not = "not read by the graphs of this cache (wrapper)";
+        else if (env_dev && atoi(env_dev) == 0)   why_not = "LLAMA_KQ_MASK_DEV=0";
+        else if (v_trans)                         why_not = "no flash attention (f32 mask)";
+        else if (n_stream != 1)                   why_not = "more than one stream";
+        else if (swa_type != LLAMA_SWA_TYPE_NONE) why_not = "SWA cache";
+        else if (hparams.use_alibi)               why_not = "ALiBi";
+        else if (n_seq_max > 32)                  why_not = "n_seq_max > 32 (one seq bitmap word per cell)";
+        else if (layers.empty())                  why_not = "no layers";
+
+        // every attention buffer type's device must run the op, else its layers would read a CPU-built mask
+        // through a cross-device copy; probed with a throwaway node (supports_op reads types/shapes only)
+        if (!why_not) {
+            ggml_init_params ip = { 4*ggml_tensor_overhead(), nullptr, true };
+            ggml_context_ptr pctx { ggml_init(ip) };
+            ggml_tensor * pc = ggml_new_tensor_2d(pctx.get(), GGML_TYPE_I32, 2, 256);
+            ggml_tensor * pr = ggml_new_tensor_2d(pctx.get(), GGML_TYPE_I32, 2, 1);
+            ggml_tensor * pa = ggml_new_tensor_1d(pctx.get(), GGML_TYPE_F32, 1);
+            ggml_tensor * op = ggml_kq_mask_build(pctx.get(), pc, pr, pa, 256, 256, 1, true);
+            for (const auto & [buft, lids] : buft_layers) {
+                ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+                if (!dev || !ggml_backend_dev_supports_op(dev, op)) {
+                    why_not = "a device holding attention layers does not support GGML_OP_KQ_MASK_BUILD";
+                    break;
+                }
+            }
+        }
+
+        kq_build.enabled = why_not == nullptr;
+        kq_build.check   = kq_build.enabled && env_chk && atoi(env_chk) != 0;
+
+        const ggml_log_level lvl = hparams.no_alloc ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_WARN;
+        if (kq_build.enabled) {
+            llama_log_internal(lvl, "%s: device-built KQ mask on (%zu attention buffer types, check %d); LLAMA_KQ_MASK_DEV=0 for the host mask\n",
+                    __func__, buft_layers.size(), kq_build.check);
+        } else if (kq_mask_inc) {
+            LLAMA_LOG_DEBUG("%s: device-built KQ mask off: %s\n", __func__, why_not);
+        }
+    }
+
     // [KQ_MASK_INC] static gate + one persistent mask per buffer type that holds attention layers
     // (see kq_mask_inc_state). !v_trans <=> flash attention, the only path with an f16 mask
     {
@@ -384,6 +430,7 @@ llama_kv_cache::llama_kv_cache(
 
         const char * why_not = nullptr;
         if (!kq_mask_inc)                         why_not = "not read by the graphs of this cache (wrapper)";
+        else if (kq_build.enabled)                why_not = "replaced by the device-built mask (LLAMA_KQ_MASK_DEV)"; // saves kv_size x 64 x 2 B per device
         else if (!on)                             why_not = "LLAMA_KQ_MASK_INCREMENTAL=0";
         else if (n_rows <= 0)                     why_not = "LLAMA_KQ_MASK_INC_ROWS <= 0";
         else if (v_trans)                         why_not = "no flash attention (f32 mask)";
@@ -474,6 +521,24 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_backend_buffer_clear(buf, 0);
         ctxs_bufs.emplace_back(std::move(ctx), buf);
+    }
+
+    // [KQ_MASK_DEV] anchor = the K tensor of the first layer in each buffer type (no_alloc fit probes: the dummy
+    // buffer still carries the buft, so the sched places the op the same way and the reserve sizes it per device)
+    if (kq_build.enabled) {
+        std::map<ggml_backend_buffer_type_t, int> idx;
+        for (auto & layer : layers) {
+            if (!layer.k || !layer.k->buffer) {
+                continue;
+            }
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(layer.k->buffer);
+            auto it = idx.find(buft);
+            if (it == idx.end()) {
+                it = idx.emplace(buft, (int) kq_build.anchor.size()).first;
+                kq_build.anchor.push_back(layer.k);
+            }
+            layer.kq_build_dev = it->second;
+        }
     }
 
     {
@@ -2111,6 +2176,107 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
 }
 
+// [KQ_MASK_DEV] see kq_build_state in llama-kv-cache.h for the measurements and the gate reasoning
+
+bool llama_kv_cache::kq_build_causal(bool causal_attn) const {
+    // same fold as set_input_kq_mask: only the SWA cache (or the SWA layers of a single cache) become non-causal
+    if (!causal_attn && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_ONLY) {
+        causal_attn = swa_type == LLAMA_SWA_TYPE_NONE;
+    }
+    return causal_attn;
+}
+
+int llama_kv_cache::kq_build_dev(int32_t il) const {
+    if (!kq_build.enabled) {
+        return -1;
+    }
+    const auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) {
+        return -1;
+    }
+    return layers[it->second].kq_build_dev;
+}
+
+// Host cost: one pass over n_kv cells + n_tokens rows (vs the n_kv x n_tokens host build, set_inputs 58 ms at 60-75k / 2048
+// rows before). Precondition: n_stream == 1 and every seq id < 32 (static gate), so seq_get_all() fits one word.
+void llama_kv_cache::set_input_kq_build(ggml_tensor * cells, ggml_tensor * rows, const llama_ubatch * ubatch, int64_t n_kv) const {
+    GGML_ASSERT(kq_build.enabled && n_stream == 1);
+    const int64_t cs = cells->ne[0];
+    GGML_ASSERT(cs == kq_build_cell_stride() && cells->ne[1] >= n_kv);
+    GGML_ASSERT(rows->ne[0] == 2 && rows->ne[1] >= (int64_t) ubatch->n_tokens);
+    GGML_ASSERT(ggml_backend_buffer_is_host(cells->buffer) && ggml_backend_buffer_is_host(rows->buffer));
+
+    const auto & c = v_cells[0];
+    GGML_ASSERT(n_kv <= (int64_t) c.size());
+
+    int32_t * dc = (int32_t *) cells->data;
+    if (cs == 1) {
+        // single seq: a used cell belongs to seq 0 (the only one), so pos alone decides
+        for (int64_t j = 0; j < n_kv; ++j) {
+            dc[j] = c.is_empty(j) ? -1 : c.pos_get(j);
+        }
+    }
+    for (int64_t j = 0; j < n_kv && cs == 2; ++j) {
+        if (c.is_empty(j)) {
+            dc[2*j + 0] = -1;
+            dc[2*j + 1] = 0;
+        } else {
+            dc[2*j + 0] = c.pos_get(j);
+            dc[2*j + 1] = (int32_t) (uint32_t) c.seq_get_all(j).to_ulong();
+        }
+    }
+
+    int32_t * dr = (int32_t *) rows->data;
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        GGML_ASSERT(ubatch->seq_id[i][0] >= 0 && ubatch->seq_id[i][0] < 32);
+        dr[2*i + 0] = ubatch->pos[i];
+        dr[2*i + 1] = ubatch->seq_id[i][0];
+    }
+}
+
+void llama_kv_cache::kq_build_verify(const std::vector<ggml_tensor *> & outs, const llama_ubatch * ubatch, int64_t n_kv, bool causal_attn) const {
+    const int64_t n_tps = ubatch->n_tokens;
+    const size_t  n     = (size_t) n_kv*n_tps;
+
+    const args_set_input_kq_mask args = {
+        /*.hparams          =*/ hparams,
+        /*.ubatch           =*/ ubatch,
+        /*.v_cells          =*/ v_cells,
+        /*.seq_to_stream    =*/ seq_to_stream,
+        /*.n_swa            =*/ n_swa,
+        /*.swa_type         =*/ swa_type,
+        /*.n_kv             =*/ n_kv,
+        /*.n_stream         =*/ 1,
+        /*.n_tps            =*/ n_tps,
+    };
+
+    kq_build.host.resize(n);
+    set_input_kq_mask_impl<ggml_fp16_t>(args, kq_build.host.data(), kq_build_causal(causal_attn));
+
+    kq_build.dev.resize(n);
+    for (ggml_tensor * t : outs) {
+        GGML_ASSERT(t->buffer && ggml_nbytes(t) >= n*sizeof(ggml_fp16_t));
+        ggml_backend_tensor_get(t, kq_build.dev.data(), 0, n*sizeof(ggml_fp16_t));
+        if (memcmp(kq_build.dev.data(), kq_build.host.data(), n*sizeof(ggml_fp16_t)) != 0) {
+            for (size_t k = 0; k < n; ++k) {
+                if (kq_build.dev[k] != kq_build.host[k]) {
+                    LLAMA_LOG_ERROR("%s: LLAMA_KQ_MASK_DEV_CHECK: device mask %s (%s) differs from the host build: row %zu col %zu (n_kv %" PRId64 ", n_tokens %" PRId64 "): host %f device %f\n",
+                            __func__, t->name, ggml_backend_buffer_name(t->buffer), k / n_kv, k % n_kv, n_kv, n_tps,
+                            ggml_fp16_to_fp32(kq_build.host[k]), ggml_fp16_to_fp32(kq_build.dev[k]));
+                    break;
+                }
+            }
+            GGML_ABORT("LLAMA_KQ_MASK_DEV_CHECK failed");
+        }
+    }
+
+    const uint64_t nc = ++kq_build.n_checked;
+    if ((nc & (nc - 1)) == 0 || nc % 1024 == 0) {
+        LLAMA_LOG_WARN("%s: LLAMA_KQ_MASK_DEV_CHECK: %" PRIu64 " ubatches match (last: %zu devices, n_kv %" PRId64 ", n_tokens %" PRId64 ")\n",
+                __func__, kq_build.n_checked, outs.size(), n_kv, n_tps);
+    }
+}
+
 // [KQ_MASK_INC] see kq_mask_inc_state in llama-kv-cache.h for the measurements and the gate reasoning
 
 bool llama_kv_cache::kq_mask_dev_usable(const llama_ubatch & ubatch, int64_t n_stream, ggml_type type, bool causal_attn) const {
@@ -3515,6 +3681,46 @@ ggml_tensor * llama_kv_cache_context::get_kq_mask_dev(int32_t il) const {
 
 void llama_kv_cache_context::set_input_kq_mask_dev(const llama_ubatch * ubatch, int64_t n_kv, bool causal_attn) const {
     kv->set_input_kq_mask_dev(ubatch, n_kv, causal_attn);
+}
+
+bool llama_kv_cache_context::kq_build_enabled() const {
+    return kv->kq_build_enabled();
+}
+
+bool llama_kv_cache_context::kq_build_check() const {
+    return kv->kq_build_check();
+}
+
+bool llama_kv_cache_context::kq_build_ext_2d() const {
+    return kv->kq_build_ext_2d();
+}
+
+int64_t llama_kv_cache_context::kq_build_cell_stride() const {
+    return kv->kq_build_cell_stride();
+}
+
+bool llama_kv_cache_context::kq_build_causal(bool causal_attn) const {
+    return kv->kq_build_causal(causal_attn);
+}
+
+int llama_kv_cache_context::kq_build_dev(int32_t il) const {
+    return kv->kq_build_dev(il);
+}
+
+ggml_tensor * llama_kv_cache_context::kq_build_anchor(int idx) const {
+    return kv->kq_build_anchor(idx);
+}
+
+uint32_t llama_kv_cache_context::kq_build_kv_size() const {
+    return kv->get_size();
+}
+
+void llama_kv_cache_context::set_input_kq_build(ggml_tensor * cells, ggml_tensor * rows, const llama_ubatch * ubatch, int64_t n_kv) const {
+    kv->set_input_kq_build(cells, rows, ubatch, n_kv);
+}
+
+void llama_kv_cache_context::kq_build_verify(const std::vector<ggml_tensor *> & outs, const llama_ubatch * ubatch, int64_t n_kv, bool causal_attn) const {
+    kv->kq_build_verify(outs, ubatch, n_kv, causal_attn);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
