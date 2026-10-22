@@ -4206,7 +4206,9 @@ private:
             if (ust.on) {
                 ust.n_ckpt_rec_reuse += 1;
             }
-            SLT_DBG(slot, "checkpoint at n_tokens = %" PRId64 " reuses the .rec snapshot (%.1f MiB, no GPU readback)\n",
+            // TRC like "created context checkpoint" next to it: visible at -lv 4 (DBG needs -lv 5, which is why
+            // the first production check saw no line at all)
+            SLT_TRC(slot, "checkpoint at n_tokens = %" PRId64 " reuses the .rec snapshot (%.1f MiB, no GPU readback)\n",
                     cur.n_tokens, snap.blob.size() / (1024.0 * 1024.0));
 
             // LLAMA_SERVER_VERIFY_REC_REUSE=1: read the state back anyway and compare. for validating the
@@ -4224,6 +4226,14 @@ private:
                 }
             }
         } else {
+            // every gate input, so a reuse that does not fire can be read off one line (-lv 4). 2026-10-22
+            // production check: the raw /completion harness sent no message_delimiters, so conversation_id
+            // was empty, the disk tier refused every flush ("conversation_id is empty, refusing to flush")
+            // and no snapshot ever existed (have_blob=0) - not a gate bug; the chat path derives the id
+            SLT_TRC(slot, "checkpoint at n_tokens = %" PRId64 " reads back: have_blob=%d gen %" PRIu64 "/%" PRIu64 " n_tokens %" PRId64 "/%" PRId64
+                    " hash %s pos_min %d/%d pos_max %d/%d (snapshot/now)\n",
+                    cur.n_tokens, (int) !snap.blob.empty(), snap.state_gen, slot.state_gen, snap.n_tokens, cur.n_tokens,
+                    snap.token_prefix_hash == cur.token_prefix_hash ? "eq" : "ne", snap.pos_min, pos_min, snap.pos_max, pos_max);
             cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, slot.state_pool.get());
         }
         // A holds its own reference now; the snapshot's job is done either way
