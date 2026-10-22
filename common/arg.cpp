@@ -3708,6 +3708,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--token-ledger"}, "PATH",
+        "JSON file with the lifetime token counts of this server (requests, prompt / cached / processed, generated, reasoning) "
+        "plus per-day (UTC) buckets; loaded at startup, written every few requests, every 60 s and at shutdown (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.token_ledger_path = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_TOKEN_LEDGER"));
+    add_opt(common_arg(
         {"--media-path"}, "PATH",
         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",
         [](common_params & params, const std::string & value) {

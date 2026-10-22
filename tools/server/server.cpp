@@ -463,6 +463,8 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
         // setup clean up function, to be called before exit
         clean_up = [&ctx_http, &ctx_server, &mcp_mgr]() {
             SRV_INF("%s: cleaning up before exit...\n", __func__);
+            // 0. Token ledger first: it is fast and must not wait on a slow cache spill.
+            ctx_server.finish_token_ledger();
             // 1. Flush live slot KV state into the prompt cache.
             //    Required for the disk-cache to capture single-conversation state at shutdown
             //    (the regular cache-idle-slots trigger only fires when a NEW task arrives).

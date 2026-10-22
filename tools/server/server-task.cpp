@@ -1752,6 +1752,23 @@ std::string server_task_result_metrics::to_metrics() {
     add_items("counter", counters);
     add_items("gauge",   gauges);
 
+    // --token-ledger: lifetime counters, they survive restarts
+    if (metrics.ledger_enabled) {
+        const auto & l = metrics.ledger;
+        add_items("counter", {
+            { "ledger_requests_total",                "Token ledger: requests since the ledger started",           (double) l.n_requests  },
+            { "ledger_prompt_tokens_total",           "Token ledger: prompt tokens received",                      (double) l.n_prompt    },
+            { "ledger_prompt_tokens_cached_total",    "Token ledger: prompt tokens served from the cache",         (double) l.n_cached    },
+            { "ledger_prompt_tokens_processed_total", "Token ledger: prompt tokens processed",                     (double) l.n_processed },
+            { "ledger_tokens_predicted_total",        "Token ledger: generated tokens",                            (double) l.n_gen       },
+            { "ledger_reasoning_tokens_total",        "Token ledger: generated tokens inside the reasoning block", (double) l.n_reasoning },
+            { "ledger_tokens_total",                  "Token ledger: prompt received plus generated tokens",       (double) l.n_total()   },
+        });
+        add_items("gauge", {
+            { "ledger_since_seconds", "Token ledger: unix time of the first ledger entry", (double) metrics.ledger_since_unix },
+        });
+    }
+
     // labeled counter: one time series per draft position
     if (!metrics.n_accepted_per_pos.empty()) {
         prometheus << "# HELP llamacpp:spec_decode_num_accepted_tokens_per_pos_total"

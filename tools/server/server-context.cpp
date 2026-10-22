@@ -747,6 +747,235 @@ struct server_spec_stats_writer {
     }
 };
 
+// --token-ledger: lifetime token counts of this server, kept in a JSON file across restarts
+// only the main loop changes it; the mutex is for the HTTP threads that read it (/props)
+struct server_token_ledger {
+    static constexpr int     SAVE_EVERY_N  = 16;
+    static constexpr int64_t SAVE_EVERY_US = 60ll*1000*1000;
+
+    std::string path;
+
+    mutable std::mutex mtx;
+
+    int64_t              since_unix = 0;
+    server_ledger_counts total;
+    std::map<std::string, server_ledger_counts> days; // key: UTC date "YYYY-MM-DD"
+
+    bool    dirty          = false;
+    int     n_unsaved      = 0;
+    int64_t t_last_save_us = 0;
+    bool    summary_done   = false;
+
+    bool enabled() const {
+        return !path.empty();
+    }
+
+    static std::string utc_fmt(int64_t t_unix, const char * fmt) {
+        const std::time_t tt = (std::time_t) t_unix;
+        std::tm tm = {};
+#if defined(_WIN32)
+        gmtime_s(&tm, &tt);
+#else
+        gmtime_r(&tt, &tm);
+#endif
+        char buf[64];
+        std::strftime(buf, sizeof(buf), fmt, &tm);
+        return buf;
+    }
+
+    static std::string utc_date(int64_t t_unix) {
+        return utc_fmt(t_unix, "%Y-%m-%d");
+    }
+
+    static std::string utc_iso(int64_t t_unix) {
+        return utc_fmt(t_unix, "%Y-%m-%dT%H:%M:%SZ");
+    }
+
+    void init(const std::string & p) {
+        path = p;
+        if (path.empty()) {
+            return;
+        }
+
+        since_unix     = (int64_t) std::time(nullptr);
+        t_last_save_us = ggml_time_us();
+
+        std::error_code ec;
+        if (!std::filesystem::exists(path, ec)) {
+            SRV_WRN("token ledger '%s' does not exist - starting a new one\n", path.c_str());
+            return;
+        }
+
+        try {
+            std::ifstream f(path, std::ios::in | std::ios::binary);
+            const std::string data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            const json j = json::parse(data);
+            if (j.at("version").get<int>() != 1) {
+                throw std::runtime_error("unknown version " + j.at("version").dump());
+            }
+            const int64_t since = j.at("since_unix").get<int64_t>();
+            const auto    tot   = server_ledger_counts::from_json(j.at("totals"));
+            std::map<std::string, server_ledger_counts> d;
+            const json jd = j.value("days", json::object());
+            for (const auto & [key, val] : jd.items()) {
+                d[key] = server_ledger_counts::from_json(val);
+            }
+            since_unix = since;
+            total      = tot;
+            days       = std::move(d);
+        } catch (const std::exception & e) {
+            // keep the bad file, the history in it may be recoverable by hand
+            const std::string bad = path + ".corrupt-" + std::to_string(since_unix);
+            std::filesystem::rename(path, bad, ec);
+            SRV_WRN("token ledger '%s' cannot be read (%s) - starting a new one, the old file %s '%s'\n",
+                    path.c_str(), e.what(), ec ? "could not be moved to" : "is moved to", bad.c_str());
+            return;
+        }
+
+        SRV_INF("token ledger '%s': since %s, %" PRIu64 " requests, %" PRIu64 " tokens\n",
+                path.c_str(), utc_iso(since_unix).c_str(), total.n_requests, total.n_total());
+    }
+
+    void add(const server_ledger_counts & req) {
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            total.add(req);
+            days[utc_date((int64_t) std::time(nullptr))].add(req);
+        }
+
+        dirty = true;
+        n_unsaved++;
+
+        if (n_unsaved >= SAVE_EVERY_N || ggml_time_us() - t_last_save_us >= SAVE_EVERY_US) {
+            save();
+        }
+    }
+
+    // write to a temp file, then rename over the old one: a crash leaves the old or the new file, never half of one
+    void save() {
+        if (!enabled() || !dirty) {
+            return;
+        }
+
+        n_unsaved      = 0;
+        t_last_save_us = ggml_time_us();
+
+        json j;
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            json jd = json::object();
+            for (const auto & [key, val] : days) {
+                jd[key] = val.to_json();
+            }
+            j = json {
+                {"version",    1},
+                {"since",      utc_iso(since_unix)},
+                {"since_unix", since_unix},
+                {"updated",    utc_iso((int64_t) std::time(nullptr))},
+                {"totals",     total.to_json()},
+                {"days",       std::move(jd)},
+            };
+        }
+
+        const std::string tmp = path + ".tmp";
+        std::error_code ec;
+        const auto parent = std::filesystem::path(path).parent_path();
+        if (!parent.empty()) {
+            std::filesystem::create_directories(parent, ec);
+        }
+        {
+            std::ofstream out(tmp, std::ios::out | std::ios::trunc | std::ios::binary);
+            out << j.dump(1) << "\n";
+            out.flush();
+            if (!out) {
+                SRV_WRN("cannot write token ledger temp file '%s' - the ledger on disk is left untouched\n", tmp.c_str());
+                std::filesystem::remove(tmp, ec);
+                return;
+            }
+        }
+        std::filesystem::rename(tmp, path, ec);
+        if (ec) {
+            SRV_WRN("cannot rename '%s' to '%s': %s - the ledger on disk is left untouched\n", tmp.c_str(), path.c_str(), ec.message().c_str());
+            return;
+        }
+
+        dirty = false;
+    }
+
+    // sum of the last n_days UTC days, today included
+    server_ledger_counts window(int n_days) const {
+        const std::string from = utc_date((int64_t) std::time(nullptr) - (int64_t) (n_days - 1)*86400);
+        server_ledger_counts res;
+        for (auto it = days.lower_bound(from); it != days.end(); ++it) {
+            res.add(it->second);
+        }
+        return res;
+    }
+
+    // current UTC month up to today
+    server_ledger_counts month() const {
+        const std::string prefix = utc_fmt((int64_t) std::time(nullptr), "%Y-%m");
+        server_ledger_counts res;
+        for (auto it = days.lower_bound(prefix); it != days.end() && it->first.compare(0, prefix.size(), prefix) == 0; ++it) {
+            res.add(it->second);
+        }
+        return res;
+    }
+
+    // for /props: the totals and the windows, the per-day buckets stay in the file
+    json to_json() const {
+        std::lock_guard<std::mutex> lock(mtx);
+        return json {
+            {"path",       path},
+            {"since",      utc_iso(since_unix)},
+            {"since_unix", since_unix},
+            {"totals",     total.to_json()},
+            {"today",      window(1).to_json()},
+            {"last_7d",    window(7).to_json()},
+            {"last_30d",   window(30).to_json()},
+            {"month",      month().to_json()},
+        };
+    }
+
+    static double pct(uint64_t a, uint64_t b) {
+        return b > 0 ? 100.0 * (double) a / (double) b : 0.0;
+    }
+
+    void print_line() const {
+        SRV_INF("token ledger: requests = %" PRIu64 ", prompt = %" PRIu64 " (cached = %" PRIu64 ", processed = %" PRIu64 "), "
+                "generated = %" PRIu64 " (reasoning = %" PRIu64 "), total = %" PRIu64 "\n",
+                total.n_requests, total.n_prompt, total.n_cached, total.n_processed, total.n_gen, total.n_reasoning, total.n_total());
+    }
+
+    void print_summary() {
+        if (!enabled() || summary_done) {
+            return;
+        }
+        summary_done = true;
+
+        std::lock_guard<std::mutex> lock(mtx);
+
+        SRV_INF("token ledger '%s': since %s\n", path.c_str(), utc_iso(since_unix).c_str());
+        SRV_INF("  requests        %14" PRIu64 "\n", total.n_requests);
+        SRV_INF("  prompt received %14" PRIu64 " (cached %" PRIu64 " = %.1f%%, processed %" PRIu64 ")\n",
+                total.n_prompt, total.n_cached, pct(total.n_cached, total.n_prompt), total.n_processed);
+        SRV_INF("  generated       %14" PRIu64 " (reasoning %" PRIu64 " = %.1f%%)\n",
+                total.n_gen, total.n_reasoning, pct(total.n_reasoning, total.n_gen));
+        SRV_INF("  grand total     %14" PRIu64 "\n", total.n_total());
+
+        const std::pair<const char *, server_ledger_counts> wins[] = {
+            { "today",    window(1)  },
+            { "last 7d",  window(7)  },
+            { "last 30d", window(30) },
+            { "month",    month()    },
+        };
+        for (const auto & [name, c] : wins) {
+            SRV_INF("  %-10s requests %8" PRIu64 ", prompt %12" PRIu64 " (cached %5.1f%%), generated %10" PRIu64 ", total %12" PRIu64 "\n",
+                    name, c.n_requests, c.n_prompt, pct(c.n_cached, c.n_prompt), c.n_gen, c.n_total());
+        }
+    }
+};
+
 struct server_slot {
     int id;
 
@@ -895,6 +1124,12 @@ struct server_slot {
     common_chat_input generated;
     std::string  debug_generated_text;
     llama_tokens generated_tokens;
+
+    // --token-ledger: generated tokens inside the reasoning block, found by the same start/end tags as the
+    // reasoning budget sampler; the end tag counts as reasoning, the start tag does not
+    bool         rsn_active = false;
+    uint64_t     n_reasoning = 0;
+    llama_tokens rsn_tail;
     size_t n_sent_text = 0; // number of sent text character (i.e. handle partial UTF-8 on streaming)
 
     std::vector<completion_token_output> generated_token_probs;
@@ -1021,6 +1256,10 @@ struct server_slot {
         generated_tokens.clear();
         generated_token_probs.clear();
         json_schema = json();
+
+        rsn_active  = false;
+        n_reasoning = 0;
+        rsn_tail.clear();
 
         task_prev = std::move(task);
         task.reset();
@@ -1229,6 +1468,64 @@ struct server_slot {
 
         prompt.tokens.push_back(sampled);
         prompt.tokens.insert(spec_draft);
+    }
+
+    // the generation prompt can already open the reasoning block (e.g. "<think>\n" at the end of the template)
+    void reasoning_init() {
+        const auto & sp = task->params.sampling;
+
+        rsn_active = false;
+        if (sp.reasoning_budget_start.empty() || sp.reasoning_budget_end.empty()) {
+            return;
+        }
+
+        const std::string & gp = sp.generation_prompt;
+        const size_t pos_start = gp.rfind(common_detokenize(ctx_tgt, sp.reasoning_budget_start, true));
+        if (pos_start == std::string::npos) {
+            return;
+        }
+        rsn_active = true;
+        for (const auto & end : sp.reasoning_budget_end) {
+            const size_t pos_end = gp.rfind(common_detokenize(ctx_tgt, end, true));
+            if (pos_end != std::string::npos && pos_end > pos_start) {
+                rsn_active = false;
+            }
+        }
+    }
+
+    void reasoning_accept(llama_token tok) {
+        const auto & sp = task->params.sampling;
+        if (sp.reasoning_budget_start.empty() || sp.reasoning_budget_end.empty()) {
+            return;
+        }
+
+        if (rsn_active) {
+            n_reasoning++;
+        }
+
+        size_t n_max = sp.reasoning_budget_start.size();
+        for (const auto & end : sp.reasoning_budget_end) {
+            n_max = std::max(n_max, end.size());
+        }
+        rsn_tail.push_back(tok);
+        if (rsn_tail.size() > n_max) {
+            rsn_tail.erase(rsn_tail.begin());
+        }
+
+        const auto ends_with = [&](const llama_tokens & seq) {
+            return !seq.empty() && rsn_tail.size() >= seq.size() && std::equal(seq.rbegin(), seq.rend(), rsn_tail.rbegin());
+        };
+
+        if (!rsn_active) {
+            rsn_active = ends_with(sp.reasoning_budget_start);
+        } else {
+            for (const auto & end : sp.reasoning_budget_end) {
+                if (ends_with(end)) {
+                    rsn_active = false;
+                    break;
+                }
+            }
+        }
     }
 
     void release() {
@@ -1981,11 +2278,17 @@ public:
 
     server_state_callback_t callback_state = [](server_state, json) -> void {};
 
+    // --token-ledger, outlives the sleeping state; to_json() is safe from any thread
+    server_token_ledger ledger;
+
     server_context_impl() {
         mtmd_helper_log_set(common_log_default_callback, nullptr);
     }
 
     ~server_context_impl() {
+        ledger.save();
+        ledger.print_summary();
+
         if (!sleeping) {
             // destroy() is already called when entering sleeping state
             // we don't call it again here to avoid double free
@@ -2068,6 +2371,8 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        ledger.save();
+
         spec.reset();
         spec_init.reset();
 
@@ -2529,6 +2834,7 @@ private:
                 if (slot.stats.n_gen > 0) {
                     metrics_on_prediction(slot);
                 }
+                ledger_on_release(slot);
             };
 
             slot.reset();
@@ -2707,6 +3013,9 @@ private:
         });
 
         metrics.init();
+
+        ledger.init(params_base.token_ledger_path);
+        metrics_on_ledger();
 
         if (params_base.cache_idle_slots) {
             if (params_base.cache_ram_mib == 0) {
@@ -3143,6 +3452,7 @@ private:
 
         slot.task = std::make_unique<const server_task>(std::move(task));
         slot.prompt.conversation_id = slot.task->conversation_id;
+        slot.reasoning_init();
 
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
@@ -3159,6 +3469,7 @@ private:
         // remember which tokens were sampled - used for repetition penalties during sampling
         const std::string token_str = result.text_to_send;
         slot.sampled = result.tok;
+        slot.reasoning_accept(result.tok);
 
         slot.generated.append(token_str, result.tok);
         if (slot.task->params.return_tokens) {
@@ -6315,6 +6626,31 @@ private:
         metrics_flush_prompt();
     }
 
+    // same numbers as the usage object of the final response; also counts cancelled tasks, which get no response
+    void ledger_on_release(const server_slot & slot) {
+        if (!ledger.enabled() || !slot.task || !slot.stats.is_set()) {
+            return;
+        }
+
+        server_ledger_counts req;
+        req.n_requests  = 1;
+        req.n_prompt    = slot.task->n_tokens();
+        req.n_cached    = slot.stats.n_prompt_cached;
+        req.n_processed = slot.stats.n_prompt_processed;
+        req.n_gen       = slot.stats.n_gen;
+        req.n_reasoning = std::min(slot.n_reasoning, slot.stats.n_gen);
+
+        ledger.add(req);
+        ledger.print_line();
+        metrics_on_ledger();
+    }
+
+    void metrics_on_ledger() {
+        metrics.ledger_enabled    = ledger.enabled();
+        metrics.ledger_since_unix = ledger.since_unix;
+        metrics.ledger            = ledger.total;
+    }
+
     void metrics_on_prediction(const server_slot & slot) {
         const uint64_t t_us    = slot.stats.t_gen_us();
         const uint64_t n       = slot.stats.n_gen;
@@ -6362,6 +6698,12 @@ void server_context::terminate() {
 void server_context::flush_slots_to_cache() {
     if (!impl) return;
     impl->flush_idle_slots_to_cache();
+}
+
+void server_context::finish_token_ledger() {
+    if (!impl) return;
+    impl->ledger.save();
+    impl->ledger.print_summary();
 }
 
 void server_context::spill_cache_to_disk() {
@@ -7028,9 +7370,17 @@ void server_routes::init_routes() {
         // note: do NOT use ctx_server here, this endpoint must be accessible during sleep
         if (queue_tasks.is_sleeping()) {
             std::unique_lock<std::mutex> lock(mutex_cache);
-            res->ok(cached_props);
+            json props = cached_props;
+            if (ctx_server.ledger.enabled()) {
+                props["token_ledger"] = ctx_server.ledger.to_json();
+            }
+            res->ok(props);
         } else {
-            res->ok(get_res_props(*meta, params, false));
+            json props = get_res_props(*meta, params, false);
+            if (ctx_server.ledger.enabled()) {
+                props["token_ledger"] = ctx_server.ledger.to_json();
+            }
+            res->ok(props);
         }
         return res;
     };

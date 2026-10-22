@@ -481,6 +481,33 @@ struct server_slot_stats {
     json to_json() const;
 };
 
+// --token-ledger: token counts of one request, one day or the whole ledger
+// the per-request values are the ones of the response usage object
+struct server_ledger_counts {
+    uint64_t n_requests  = 0;
+    uint64_t n_prompt    = 0; // usage.prompt_tokens
+    uint64_t n_cached    = 0; // usage.prompt_tokens_details.cached_tokens
+    uint64_t n_processed = 0; // prompt tokens decoded (timings.prompt_n)
+    uint64_t n_gen       = 0; // usage.completion_tokens
+    uint64_t n_reasoning = 0; // part of n_gen inside the reasoning block
+
+    uint64_t n_total() const {
+        return n_prompt + n_gen;
+    }
+
+    void add(const server_ledger_counts & o) {
+        n_requests  += o.n_requests;
+        n_prompt    += o.n_prompt;
+        n_cached    += o.n_cached;
+        n_processed += o.n_processed;
+        n_gen       += o.n_gen;
+        n_reasoning += o.n_reasoning;
+    }
+
+    json to_json() const;
+    static server_ledger_counts from_json(const json & j);
+};
+
 // shared between server_context_impl and server_task_result_*
 // unlike server_slot_stats, server_metrics is server-global and cumulative, not tied to a slot
 struct server_metrics {
@@ -524,6 +551,11 @@ struct server_metrics {
     uint64_t n_draft_accepted    = 0; // Draft tokens actually accepted
     uint64_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
     std::vector<uint64_t> n_accepted_per_pos; // Accepted tokens per draft position
+
+    // --token-ledger: lifetime counts, they survive restarts (copy of the ledger totals)
+    bool                 ledger_enabled    = false;
+    int64_t              ledger_since_unix = 0;
+    server_ledger_counts ledger;
 
     void init() {
         t_start = ggml_time_us();

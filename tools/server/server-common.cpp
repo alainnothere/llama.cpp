@@ -105,6 +105,33 @@ json server_slot_stats::to_json() const {
 }
 
 //
+// server_ledger_counts
+//
+
+json server_ledger_counts::to_json() const {
+    return json {
+        {"requests",          n_requests},
+        {"prompt_tokens",     n_prompt},
+        {"cached_tokens",     n_cached},
+        {"processed_tokens",  n_processed},
+        {"completion_tokens", n_gen},
+        {"reasoning_tokens",  n_reasoning},
+        {"total_tokens",      n_total()},
+    };
+}
+
+server_ledger_counts server_ledger_counts::from_json(const json & j) {
+    server_ledger_counts res;
+    res.n_requests  = j.at("requests").get<uint64_t>();
+    res.n_prompt    = j.at("prompt_tokens").get<uint64_t>();
+    res.n_cached    = j.at("cached_tokens").get<uint64_t>();
+    res.n_processed = j.at("processed_tokens").get<uint64_t>();
+    res.n_gen       = j.at("completion_tokens").get<uint64_t>();
+    res.n_reasoning = j.value("reasoning_tokens", (uint64_t) 0);
+    return res;
+}
+
+//
 // random string / id
 //
 

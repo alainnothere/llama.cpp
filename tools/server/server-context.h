@@ -108,6 +108,9 @@ struct server_context {
     // Call after flush_slots_to_cache(), before backend teardown. Safe to call multiple times.
     void spill_cache_to_disk();
 
+    // --token-ledger: write the file and print the lifetime summary
+    void finish_token_ledger();
+
     // get the underlaying llama_context, can return nullptr if sleeping
     // not thread-safe, should only be used from the main thread
     llama_context * get_llama_context() const;
