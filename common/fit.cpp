@@ -200,6 +200,14 @@ static void common_params_fit_impl(
     dmds_t   dmds_extra;       // memory of the extra model, laid out on the devices of the main model
     uint32_t n_ctx_extra = 0;  // context that memory was measured at
 
+    // sets llama_fit_set_assume_full_offload for a scope and restores the previous value (also on exceptions);
+    // see the step 3 comment for what the switch does
+    struct assume_full_offload_guard {
+        bool prev;
+        explicit assume_full_offload_guard(bool v) : prev(llama_fit_set_assume_full_offload(v)) {}
+        ~assume_full_offload_guard() { llama_fit_set_assume_full_offload(prev); }
+    };
+
     // the extra model competes for the same memory as the main model, add it to every measurement
     // its memory is measured again whenever the context it follows changes
     auto add_extra_memory = [&](dmds_t & dmds) {
@@ -220,6 +228,16 @@ static void common_params_fit_impl(
 
             dmds_t measured;
             try {
+                // [fork, 2026-10-22] the extra context decides pipeline parallelism by its own rule, exactly as the
+                // real one will: the step 3 fill holds llama_fit_set_assume_full_offload(true) for the TARGET's
+                // partial probes, and the extra model is re-measured inside that fill whenever the shrink / grow
+                // below changes n_ctx. An MTP context is pipeline-free anyway (ctx_type MTP gate in llama_context;
+                // production 2026-10-22 at 224256 cells: real MTP compute 1164 MiB = 1 x 876 MiB mask + 288, so the
+                // "MTP probed with 4 copies, ~3.8 GB" hypothesis measured 0 MiB of the idle 5 GB once that gate
+                // landed - before it, real and probe BOTH had 4 x 977 + 808 = 4716 MiB, also consistent). A separate
+                // draft model with -ngld below its layer count would have inherited the flag here and been measured
+                // with 4 input copies its real (partially offloaded, pipeline-free) context never allocates.
+                assume_full_offload_guard extra_guard(false);
                 measured = common_get_device_memory_data_impl(
                     extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
             } catch (const std::runtime_error & e) {
@@ -662,75 +680,269 @@ static void common_params_fit_impl(
     }
 
     std::vector<ngl_t> ngl_per_device(nd);
-    std::vector<int64_t> mem = get_memory_for_layers(__func__, ngl_per_device, overflow_bufts);
+    std::vector<int64_t> mem;
 
-    // optimize the number of layers per device using the method of false position:
-    //   - ngl_per_device has 0 layers for each device, lower bound
-    //   - try a "high" configuration where a device is given all unassigned layers
-    //   - interpolate the memory use / layer between low and high linearly to get a guess where it meets our target
-    //   - check memory use of our guess, replace either the low or high bound
-    //   - once we only have a difference of a single layer, stop and return the lower bound that just barely still fits
-    //   - the last device has the output layer, which cannot be a partial layer
-    if (hp_nex == 0) {
-        LOG_TRC("%s: filling dense layers back-to-front:\n", __func__);
-    } else {
-        LOG_TRC("%s: filling dense-only layers back-to-front:\n", __func__);
-    }
-    for (int id = nd - 1; id >= 0; id--) {
-        uint32_t n_unassigned = hp_ngl + 1;
-        for (size_t jd = id + 1; jd < nd; ++jd) {
-            assert(n_unassigned >= ngl_per_device[jd].n_layer);
-            n_unassigned -= ngl_per_device[jd].n_layer;
+    // [fork, 2026-10-22] Measure every layer-fill probe with the pipeline-parallel input copies of the final context.
+    //
+    // Why: llama_context turns pipeline parallelism on only when every layer is offloaded (llama-context.cpp,
+    // "n_gpu_layers > n_layer_all"), and then the scheduler keeps GGML_SCHED_MAX_COPIES (4) copies of every split
+    // input on every device. The fill below probes device id with the devices before it still at 0 layers, so those
+    // probes ran with 1 copy, while the context finally created (all layers on GPU) has 4. The biggest split input is
+    // the KQ mask, n_ctx x n_ubatch x f16 = 250112 x 2048 x 2 B = 977 MiB, i.e. 3 x 977 = 2931 MiB per device that the
+    // fill never saw (the step 1/2 probes run all-GPU and do count it, so n_ctx was sized right and the error landed
+    // in the per-device split). Production 2026-10-22, Qwen3.8-27B Q8, --device Vulkan2,Vulkan3,Vulkan1, -ub 2048,
+    // --spec-type draft-mtp, no -c (the Q8 script's --fit-target 6144,1536,2048 per the ledger): the log's "977.0 MiB x4" allocations are those
+    // copies (one 1 GiB suballocation chunk each); target compute 4956/4596/4596 MiB = 4 x 977 + 1048/688/688;
+    // VK_EXT_memory_budget over by 355 MiB on Vulkan3 (target only; with a 1536 margin a ~1.9 GB fill error) and
+    // 396 MiB on Vulkan1 (2048 margin -> ~2.4 GB; Vulkan1 also hosts the MTP context: KV 1007.53 MiB + compute
+    // 4716.25 MiB, the latter also 4 x 977 + 808; that context WAS counted correctly, via the extra model below,
+    // whose probe is all-GPU). Fill error = 2931 MiB minus the unused part of the last layer that did not fit. RADV parked the
+    // overflow in GTT, prompt processing ran 2x slower (5.5 vs 2.6 s per 2048 rows), and which buffer got parked was
+    // luck per start; the user capped -c 150000/180000 by hand. At -ub 512 the same miss is 3 x 244 MiB, under the
+    // margin, which is why it only bit at -ub 2048 (it scales with n_ubatch x n_ctx).
+    //
+    // What: while filling, a new context assumes full offload for the pipeline-parallel decision (the other gates,
+    // split mode / offload_kqv / no tensor overrides / async+events, still apply inside llama_context). If the fill
+    // ends with layers left on the CPU, an automatic context is first shrunk in 1/16 steps (at most 8) and refilled;
+    // if layers still do not fit, the real context will have no pipeline parallelism, so the fill is redone without
+    // the assumption (and that result is used only if it is itself partial). The MTP / draft extra model is measured with the
+    // switch cleared (see add_extra_memory), i.e. by the rule its real context uses.
+    //
+    // Precondition (cross-module): this mirrors the pipeline_parallel condition in llama_context::llama_context; if
+    // that condition changes, change llama_fit_set_assume_full_offload with it. Untested on GPU when written (GPUs
+    // owned by another job); verify with the first start: the fit trace's projected per-device use vs the
+    // GPU PLACEMENT line / mem_info_vram_used.
+    const bool pp_possible = nd > 1 && mparams->split_mode == LLAMA_SPLIT_MODE_LAYER && cparams->offload_kqv;
+    assume_full_offload_guard pp_guard(pp_possible);
+
+    auto fill_dense_back_to_front = [&](const char * func) {
+        ngl_per_device = std::vector<ngl_t>(nd);
+        mem = get_memory_for_layers(func, ngl_per_device, overflow_bufts);
+
+        // optimize the number of layers per device using the method of false position:
+        //   - ngl_per_device has 0 layers for each device, lower bound
+        //   - try a "high" configuration where a device is given all unassigned layers
+        //   - interpolate the memory use / layer between low and high linearly to get a guess where it meets our target
+        //   - check memory use of our guess, replace either the low or high bound
+        //   - once we only have a difference of a single layer, stop and return the lower bound that just barely still fits
+        //   - the last device has the output layer, which cannot be a partial layer
+        if (hp_nex == 0) {
+            LOG_TRC("%s: filling dense layers back-to-front:\n", func);
+        } else {
+            LOG_TRC("%s: filling dense-only layers back-to-front:\n", func);
         }
+        for (int id = nd - 1; id >= 0; id--) {
+            uint32_t n_unassigned = hp_ngl + 1;
+            for (size_t jd = id + 1; jd < nd; ++jd) {
+                assert(n_unassigned >= ngl_per_device[jd].n_layer);
+                n_unassigned -= ngl_per_device[jd].n_layer;
+            }
 
-        std::vector<ngl_t> ngl_per_device_high = ngl_per_device;
-        ngl_per_device_high[id].n_layer = n_unassigned;
-        if (hp_nex > 0) {
-            ngl_per_device_high[id].n_part = size_t(id) < nd - 1 ? ngl_per_device_high[id].n_layer : ngl_per_device_high[id].n_layer - 1;
-        }
-        if (ngl_per_device_high[id].n_layer > 0) {
-            std::vector<int64_t> mem_high = get_memory_for_layers(__func__, ngl_per_device_high, overflow_bufts);
-            if (mem_high[id] > targets[id]) {
-                assert(ngl_per_device_high[id].n_layer > ngl_per_device[id].n_layer);
-                uint32_t delta = ngl_per_device_high[id].n_layer - ngl_per_device[id].n_layer;
-                LOG_TRC("%s: start filling device %" PRIu32 ", delta=%" PRIu32 "\n", __func__, id, delta);
-                while (delta > 1) {
-                    uint32_t step_size = int64_t(delta) * (targets[id] - mem[id]) / (mem_high[id] - mem[id]);
-                    step_size = std::max(step_size, uint32_t(1));
-                    step_size = std::min(step_size, delta - 1);
+            std::vector<ngl_t> ngl_per_device_high = ngl_per_device;
+            ngl_per_device_high[id].n_layer = n_unassigned;
+            if (hp_nex > 0) {
+                ngl_per_device_high[id].n_part = size_t(id) < nd - 1 ? ngl_per_device_high[id].n_layer : ngl_per_device_high[id].n_layer - 1;
+            }
+            if (ngl_per_device_high[id].n_layer > 0) {
+                std::vector<int64_t> mem_high = get_memory_for_layers(func, ngl_per_device_high, overflow_bufts);
+                if (mem_high[id] > targets[id]) {
+                    assert(ngl_per_device_high[id].n_layer > ngl_per_device[id].n_layer);
+                    uint32_t delta = ngl_per_device_high[id].n_layer - ngl_per_device[id].n_layer;
+                    LOG_TRC("%s: start filling device %" PRIu32 ", delta=%" PRIu32 "\n", func, id, delta);
+                    while (delta > 1) {
+                        uint32_t step_size = int64_t(delta) * (targets[id] - mem[id]) / (mem_high[id] - mem[id]);
+                        step_size = std::max(step_size, uint32_t(1));
+                        step_size = std::min(step_size, delta - 1);
 
-                    std::vector<ngl_t> ngl_per_device_test = ngl_per_device;
-                    ngl_per_device_test[id].n_layer += step_size;
-                    if (hp_nex) {
-                        ngl_per_device_test[id].n_part += size_t(id) == nd - 1 && ngl_per_device_test[id].n_part == 0 ?
-                            step_size - 1 : step_size; // the first layer is the output layer which must always be full
+                        std::vector<ngl_t> ngl_per_device_test = ngl_per_device;
+                        ngl_per_device_test[id].n_layer += step_size;
+                        if (hp_nex) {
+                            ngl_per_device_test[id].n_part += size_t(id) == nd - 1 && ngl_per_device_test[id].n_part == 0 ?
+                                step_size - 1 : step_size; // the first layer is the output layer which must always be full
+                        }
+                        const std::vector<int64_t> mem_test = get_memory_for_layers(func, ngl_per_device_test, overflow_bufts);
+
+                        if (mem_test[id] <= targets[id]) {
+                            ngl_per_device = ngl_per_device_test;
+                            mem            = mem_test;
+                            LOG_TRC("%s: set ngl_per_device[%d].n_layer=%" PRIu32 "\n", func, id, ngl_per_device[id].n_layer);
+                        } else {
+                            ngl_per_device_high = ngl_per_device_test;
+                            mem_high            = mem_test;
+                            LOG_TRC("%s: set ngl_per_device_high[%d].n_layer=%" PRIu32 "\n", func, id, ngl_per_device_high[id].n_layer);
+                        }
+                        delta = ngl_per_device_high[id].n_layer - ngl_per_device[id].n_layer;
                     }
-                    const std::vector<int64_t> mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts);
-
-                    if (mem_test[id] <= targets[id]) {
-                        ngl_per_device = ngl_per_device_test;
-                        mem            = mem_test;
-                        LOG_TRC("%s: set ngl_per_device[%d].n_layer=%" PRIu32 "\n", __func__, id, ngl_per_device[id].n_layer);
-                    } else {
-                        ngl_per_device_high = ngl_per_device_test;
-                        mem_high            = mem_test;
-                        LOG_TRC("%s: set ngl_per_device_high[%d].n_layer=%" PRIu32 "\n", __func__, id, ngl_per_device_high[id].n_layer);
-                    }
-                    delta = ngl_per_device_high[id].n_layer - ngl_per_device[id].n_layer;
+                } else {
+                    assert(ngl_per_device_high[id].n_layer == n_unassigned);
+                    ngl_per_device = ngl_per_device_high;
+                    mem            = mem_high;
+                    LOG_TRC("%s: set ngl_per_device[%d].n_layer=%" PRIu32 "\n", func, id, ngl_per_device[id].n_layer);
                 }
-            } else {
-                assert(ngl_per_device_high[id].n_layer == n_unassigned);
-                ngl_per_device = ngl_per_device_high;
-                mem            = mem_high;
-                LOG_TRC("%s: set ngl_per_device[%d].n_layer=%" PRIu32 "\n", __func__, id, ngl_per_device[id].n_layer);
+            }
+
+            const int64_t projected_margin = dmds_full[id].free - mem[id];
+            LOG_TRC(
+                "%s:   - %s: %2" PRIu32 " layers, %6" PRId64 " MiB used, %6" PRId64 " MiB free\n",
+                func, dev_names[id].c_str(), ngl_per_device[id].n_layer, mem[id]/MiB, projected_margin/MiB);
+        }
+    };
+    fill_dense_back_to_front(__func__);
+    if (pp_possible && hp_nex == 0) {
+        auto n_assigned = [&]() {
+            uint32_t n = 0;
+            for (size_t id = 0; id < nd; id++) {
+                n += ngl_per_device[id].n_layer;
+            }
+            return n;
+        };
+        // Layers left on the CPU with the copies counted. Step 2 sized an automatic context by the sum over devices
+        // with a guess of 0.5 layers of waste per device, which the 1-copy fill used to hide (it found room that was
+        // not there). A dense layer on the CPU costs ~3x per step (ledger 2026-10-20, one GDN layer on the CPU: 3.3 ->
+        // 9.2 s per 2048-token batch), worse than giving up 1/16 of the context, so shrink an automatic context first.
+        const uint32_t align = 256 * n_streams;
+        for (int i = 0; i < 8 && n_assigned() < hp_ngl + 1 && n_ctx_auto && cparams->n_ctx > n_ctx_min_total; i++) {
+            const uint32_t n_ctx_prev = cparams->n_ctx;
+            cparams->n_ctx = std::max(n_ctx_min_total, (n_ctx_prev - n_ctx_prev/16) / align * align);
+            LOG_TRC("%s: %" PRIu32 "/%" PRIu32 " layers fit with pipeline-parallel input copies, context %" PRIu32 " -> %" PRIu32 "\n",
+                __func__, n_assigned(), hp_ngl + 1, n_ctx_prev, cparams->n_ctx);
+            fill_dense_back_to_front(__func__);
+        }
+        if (n_assigned() < hp_ngl + 1) {
+            // still partial: the real context then runs without pipeline parallelism, so refill with 1 input copy;
+            // if that refill reaches full offload it is not valid (full offload turns the copies back on), keep the
+            // partial result measured with copies, which overestimates the real (copy-free) use and is safe
+            LOG_TRC("%s: %" PRIu32 "/%" PRIu32 " layers fit, refilling without pipeline-parallel input copies\n",
+                __func__, n_assigned(), hp_ngl + 1);
+            const std::vector<ngl_t>   ngl_pp = ngl_per_device;
+            const std::vector<int64_t> mem_pp = mem;
+            llama_fit_set_assume_full_offload(false);
+            fill_dense_back_to_front(__func__);
+            if (n_assigned() == hp_ngl + 1) {
+                ngl_per_device = ngl_pp;
+                mem            = mem_pp;
             }
         }
-
-        const int64_t projected_margin = dmds_full[id].free - mem[id];
-        LOG_TRC(
-            "%s:   - %s: %2" PRIu32 " layers, %6" PRId64 " MiB used, %6" PRId64 " MiB free\n",
-            __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, mem[id]/MiB, projected_margin/MiB);
     }
+
+    // [fork, 2026-10-22] Grow an automatic context back into what the fill left over, with the layer split fixed.
+    //
+    // Why: the context reaching the fill is either the step 2 guess (a sum over devices minus a 0.5-layer waste
+    // guess per device) or a 1/16 shrink of it, and the fill only ever moves n_ctx DOWN. Production 2026-10-22,
+    // Qwen3.8-27B Q8, --device Vulkan2,Vulkan3,Vulkan1, -b 8192 -ub 2048, --spec-type draft-mtp, margin 1024, no -c:
+    // the start landed on n_ctx 224256 (one 1/16 step below 239360, the only aligned predecessor) with the
+    // cards' logged buffers at V1 21314 (model 9432 KV 4407 RS 1216 compute 4192 + MTP KV 903 compute 1164),
+    // V3 21444 (9634/6159/1459/4192), V2 16636 (7337/3531/1216/4552) MiB, i.e. 2185 / 2056 / 2768 MiB above
+    // free - margin at the idle budgets 24523/24524/20428. What each suspect is worth at that point:
+    //   - shrink granularity: one 1/16 step = 15104 cells x (V1 45182 B: 5 attn layers x 4096 + MTP KV ~4222 +
+    //     4 x 4096 mask + 1 x 4096 MTP mask; V3 45056 B: 7 x 4096 + 4 x 4096; V2 32768 B: 4 x 4096 + 4 x 4096)
+    //     = 651 + 649 + 472 = 1772 MiB in total, up to that much left over once the fill succeeds;
+    //   - whole-layer rounding: the next layer V1 could have taken (43, attention) costs 377 model + 876 KV =
+    //     1253 MiB, V3's next (18, GDN) 377 + 81 RS = 458 MiB, V2 holds the remainder; a whole layer is never
+    //     placed in a partial gap, but context growth fills that gap on every card at once;
+    //   - margin: applied once per device (targets[] = free - margin, computed once), 0 MiB;
+    //   - host compute (Vulkan_Host 3904 + 956): goes to the host slot of the breakdown, never compared with a
+    //     device target, 0 MiB;
+    //   - MTP probed with 4 copies: 0 MiB since the ctx_type MTP gate in llama_context (see add_extra_memory).
+    // With the fit's per-device estimates equal to those logged buffers this grow lands near 271872 (V3 binds:
+    // 2056 MiB / 45056 B = 47.8k cells; V1 would allow 50.7k, V2 88.6k). The fill at 224256 did not give V3 layer
+    // 18 (458 MiB) although the logged buffers show 2056 MiB of room, so the fit's view of V3 that start was >= 1.6
+    // GB tighter than the buffers (lower budget at fit time, or a probe estimate above the real reserve); with that
+    // view the grow is capped near 234752 (< 458 MiB / 45056 B = 10.6k cells). The fit trace (-lv 4: "target=",
+    // "memory for test allocation by device", "context grown") tells which; read it before trusting either number.
+    //
+    // What: a probe one 1/64 step up gives each device's bytes per cell (KV + mask copies are linear in n_ctx), a
+    // secant step jumps to the predicted limit, then bisection in 256 x n_streams units closes on the largest n_ctx
+    // whose estimate keeps every device within its margin. 3 probes when the secant is exact (each probe = one
+    // no_alloc load + context; the extra model is re-measured at every new n_ctx), at most 16 + 7. The split stays
+    // fixed: a back-to-front refill at the larger context gives the last devices their greedy maximum again, which
+    // is what made 239360 fail although the 224256 split has room above it on every card. Moving one boundary
+    // layer to the neighbour does not help this config (V3 -> V2 layer 19: V2 binds at 43k cells; V3 -> V1 layer
+    // 43: V1 binds at 19.8k), so no rebalance is attempted.
+    if (hp_nex == 0 && n_ctx_auto && nd > 0) {
+        uint32_t n_layers_assigned = 0;
+        for (size_t id = 0; id < nd; id++) {
+            n_layers_assigned += ngl_per_device[id].n_layer;
+        }
+        const uint32_t align   = 256 * n_streams;
+        const uint32_t n_ctx_cap = n_ctx_max / align * align;
+        if (n_layers_assigned == hp_ngl + 1 && cparams->n_ctx < n_ctx_cap) {
+            auto fits_at = [&](uint32_t n_ctx_test, std::vector<int64_t> & mem_test) -> bool {
+                cparams->n_ctx = n_ctx_test;
+                mem_test = get_memory_for_layers(__func__, ngl_per_device, overflow_bufts);
+                for (size_t id = 0; id < nd; id++) {
+                    if (mem_test[id] > targets[id]) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+
+            const uint32_t n_ctx_start = cparams->n_ctx;
+            uint32_t             lo      = n_ctx_start;
+            std::vector<int64_t> mem_lo  = mem;
+            uint32_t             lo_prev = 0; // previous fitting point for the secant, 0 = none yet
+            std::vector<int64_t> mem_lo_prev;
+            uint32_t             hi      = 0; // smallest known failing context, 0 = none yet
+            int                  n_probe = 0;
+
+            // phase 1: walk up until a probe fails or the cap fits
+            for (; n_probe < 16 && hi == 0 && lo < n_ctx_cap; n_probe++) {
+                uint32_t n_ctx_test;
+                if (lo_prev == 0) {
+                    n_ctx_test = lo + std::max(align, lo / 64 / align * align);
+                } else {
+                    int64_t cells = INT64_MAX;
+                    for (size_t id = 0; id < nd; id++) {
+                        const int64_t rate = (mem_lo[id] - mem_lo_prev[id]) / int64_t(lo - lo_prev);
+                        if (rate > 0) {
+                            cells = std::min(cells, (targets[id] - mem_lo[id]) / rate);
+                        }
+                    }
+                    const int64_t pred = cells == INT64_MAX ? int64_t(n_ctx_cap) : int64_t(lo) + cells;
+                    n_ctx_test = uint32_t(std::min<int64_t>(pred, n_ctx_cap)) / align * align;
+                    n_ctx_test = std::max(n_ctx_test, lo + align);
+                }
+                n_ctx_test = std::min(n_ctx_test, n_ctx_cap);
+
+                std::vector<int64_t> mem_test;
+                if (fits_at(n_ctx_test, mem_test)) {
+                    lo_prev     = lo;
+                    mem_lo_prev = mem_lo;
+                    lo          = n_ctx_test;
+                    mem_lo      = mem_test;
+                } else {
+                    hi = n_ctx_test;
+                }
+            }
+            // phase 2: bisect (lo fits, hi fails)
+            while (hi != 0 && hi - lo > align) {
+                const uint32_t mid = (lo + (hi - lo) / 2) / align * align;
+                if (mid <= lo || mid >= hi) {
+                    break;
+                }
+                std::vector<int64_t> mem_test;
+                n_probe++;
+                if (fits_at(mid, mem_test)) {
+                    lo     = mid;
+                    mem_lo = mem_test;
+                } else {
+                    hi = mid;
+                }
+            }
+
+            cparams->n_ctx = lo;
+            mem            = mem_lo;
+            LOG_TRC("%s: context grown from %" PRIu32 " to %" PRIu32 " with the layer split fixed (%d probes, cap %" PRIu32 "):\n",
+                __func__, n_ctx_start, lo, n_probe, n_ctx_cap);
+            for (size_t id = 0; id < nd; id++) {
+                LOG_TRC("%s:   - %s: %2" PRIu32 " layers, %6" PRId64 " MiB used, %6" PRId64 " MiB free vs. target of %6" PRId64 "\n",
+                    __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, mem[id]/MiB,
+                    (dmds_full[id].free - mem[id])/MiB, margins[id]/MiB);
+            }
+        }
+    }
+
     if (hp_nex == 0 || global_surplus_cpu_moe <= 0) {
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
         return;

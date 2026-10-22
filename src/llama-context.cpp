@@ -137,6 +137,13 @@ static llama_decode_stats_sink & llama_decode_stats() {
 
 static std::atomic<int32_t> g_llama_ctx_seq_id{0};
 
+// see llama_fit_set_assume_full_offload (llama-ext.h) and its use in common/fit.cpp
+static std::atomic<bool> g_llama_fit_assume_full_offload{false};
+
+bool llama_fit_set_assume_full_offload(bool value) {
+    return g_llama_fit_assume_full_offload.exchange(value);
+}
+
 // adds the scope's wall time to one LLAMA_DECODE_STATS accumulator; no clock read when off
 struct llama_dstats_timer {
     int64_t * t;
@@ -653,12 +660,29 @@ llama_context::llama_context(
 
         // TODO: move these checks to ggml_backend_sched
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
+        // the fit's layer-fill probes set g_llama_fit_assume_full_offload so a partially offloaded probe is measured
+        // with the input copies the final all-GPU context will have (common/fit.cpp, step 3)
+        //
+        // [fork, 2026-10-22] two extra conditions, both about the GGML_SCHED_MAX_COPIES (4) input copies the
+        // scheduler allocates per device when this is on. The biggest split input is the KQ mask, n_ctx x n_ubatch
+        // x 2 B per copy: 977 MiB at 250112 cells / ub 2048, so 4 copies = 3.9 GB per card (the 24 GB cards ran
+        // 355-396 MiB over their VK_EXT_memory_budget and the kernel parked buffers in GTT, prompt speed halved at
+        // random per start). The overlap those copies buy only exists when one llama_decode carries several
+        // ubatches (device N+1 starts ubatch k while device N runs k+1), so:
+        //   - n_batch <= n_ubatch: one ubatch per decode, nothing to overlap, the copies are pure waste
+        //     (-b 2048 -ub 2048 in production: cards strictly serial AND 3.9 GB per card gone);
+        //   - the MTP draft context (ctx_type MTP): one layer on one device, its only splits are CPU get_rows ->
+        //     that device, nothing to pipeline, yet it allocated its own 4 x 977 MiB on Vulkan1.
+        // The fit mirrors this: it builds the probe cparams from the same n_batch/n_ubatch/ctx_type, so what it
+        // measures is what the real context gets. With -b 8192 -ub 2048 the overlap is back for the target.
         bool pipeline_parallel =
             model.n_devices() > 1 &&
-            model.n_gpu_layers() > model.hparams.n_layer_all &&
+            (model.n_gpu_layers() > model.hparams.n_layer_all || g_llama_fit_assume_full_offload.load()) &&
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
-            !model.has_tensor_overrides();
+            !model.has_tensor_overrides() &&
+            cparams.n_batch > cparams.n_ubatch &&
+            cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP;
 
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {

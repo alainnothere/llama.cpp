@@ -2562,9 +2562,30 @@ private:
                 }
                 SRV_TRC("[mtmd] estimated worst-case memory usage of mmproj is %.2f MiB (took %.2f ms)\n", total / (1024.0 * 1024.0), t_elapsed / 1000.0);
                 GGML_ASSERT(!params_base.fit_params_target.empty());
-                for (auto & [dev, size] : mmproj_mem) {
+                // [fork, 2026-10-22] fit_params_target is indexed like the model's device list (common/fit.cpp:
+                // margins[id] for llama_model_get_device(model, id)), i.e. --device order, or llama's default
+                // selection (discrete GPUs in registry order, iGPUs only when there is no discrete GPU). It was
+                // indexed by the global registry index here, which with --device Vulkan2,Vulkan3,Vulkan1 (or an
+                // iGPU registered before the dGPUs) added the mmproj reserve to another card's margin. The default
+                // branch ignores RPC servers and duplicate device ids (llama.cpp default selection), as before.
+                std::vector<ggml_backend_dev_t> fit_devs = params_base.devices;
+                if (fit_devs.empty()) {
+                    std::vector<ggml_backend_dev_t> igpus;
                     for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
-                        if (ggml_backend_dev_get(i) == dev) {
+                        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+                        if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                            fit_devs.push_back(d);
+                        } else if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                            igpus.push_back(d);
+                        }
+                    }
+                    if (fit_devs.empty()) {
+                        fit_devs = igpus;
+                    }
+                }
+                for (auto & [dev, size] : mmproj_mem) {
+                    for (size_t i = 0; i < fit_devs.size(); i++) {
+                        if (fit_devs[i] == dev) {
                             if (i < params_base.fit_params_target.size()) {
                                 SRV_DBG("[mtmd] adding %.2f MiB to fit_params_target for device %s\n", size / (1024.0 * 1024.0), ggml_backend_dev_name(dev));
                                 params_base.fit_params_target[i] += size;

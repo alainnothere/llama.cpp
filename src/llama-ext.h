@@ -146,3 +146,15 @@ LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_mode
 // if out is nullptr, returns the number of tokens without writing to out
 // caller must allocate enough memory for out before calling
 LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out);
+
+//
+// memory fit (common/fit.cpp)
+//
+
+// [fork, 2026-10-22] Probe-only switch for the memory fit: while true, a new llama_context decides pipeline
+// parallelism as if every layer were offloaded (the "n_gpu_layers > n_layer_all" condition is skipped; split mode,
+// offload_kqv, tensor overrides and async/event support still gate it). The fit's layer-fill probes leave the
+// not-yet-filled devices at 0 layers, so without this they measure the scheduler with 1 input copy while the final
+// all-GPU context runs with GGML_SCHED_MAX_COPIES (4); see the comment at the use site in common/fit.cpp.
+// Global state, not thread safe, same as the logger swap the fit already does. Returns the previous value.
+LLAMA_API bool llama_fit_set_assume_full_offload(bool value);
