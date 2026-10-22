@@ -1,6 +1,7 @@
 import glob
 import re
 import struct
+import time
 import os
 import tempfile
 import pytest
@@ -209,11 +210,14 @@ def _diverge(toks: list[int], pos: int) -> list[int]:
     return out
 
 
-def _complete(prompt):
+def _complete(prompt, n_predict: int = 4):
     res = server.make_request("POST", "/completion", data={
         "prompt": prompt,
         "cache_prompt": True,
         "return_tokens": True,
+        "temperature": 0.0,
+        "seed": 42,
+        "n_predict": n_predict,
         "message_delimiters": DELIMITERS_UA,
     })
     assert res.status_code == 200
@@ -225,26 +229,44 @@ def _switch_away(i: int = 0):
     _complete(PROMPTS[i % len(PROMPTS)])
 
 
-def _flushes(text: str, conv_id: str | None = None):
-    out = []
-    for m in FLUSH_RE.finditer(text):
-        if conv_id is None or m.group(1) == conv_id:
-            out.append((m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4)), m.group(5)))
-    return out
+def _wait_log(log, pred, text: str = "", timeout: float = 120.0):
+    # the server log and the disk writer are both async: poll until pred(text) holds
+    deadline = time.time() + timeout
+    while True:
+        text += log.drain()
+        res = pred(text)
+        if res:
+            return text, res
+        assert time.time() < deadline, "timed out waiting for the server log"
+        time.sleep(0.1)
+
+
+def _wait_flush(log, conv: str | None = None, min_end: int = 0, text: str = ""):
+    # wait for one flush of conv (or of any conv ending at >= min_end) and for the writer to
+    # commit its last segment, so the .hdr/.tok/.kv files on disk match the flush
+    def find_flush(t):
+        for m in FLUSH_RE.finditer(t):
+            if (conv is None or m.group(1) == conv) and int(m.group(3)) >= min_end:
+                return (m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4)), m.group(5))
+        return None
+    text, fl = _wait_log(log, find_flush, text)
+    text, _ = _wait_log(log, lambda t: re.search(rf"wrote '{fl[0]}' segment pos \[\d+, {fl[2]}\)", t), text)
+    return text, fl
 
 
 def _read_hdr(conv_id: str):
     with open(os.path.join(_disk_dir, conv_id + ".hdr"), "rb") as f:
         hdr = f.read()
     (magic, version, fa, fv, fs, lt, n_tok, n_segs) = struct.unpack_from("<8I", hdr, 0)
-    kv_size, drft_size, rec_size = struct.unpack_from("<3Q", hdr, 32)
     segs = []
     off = 56
     for _ in range(n_segs):
         kv_off, kv_sz, d_off, d_sz, p0, p1 = struct.unpack_from("<4Q2i", hdr, off)
         segs.append((kv_off, kv_sz, d_off, d_sz, p0, p1))
         off += 40
-    return n_tok, kv_size, segs
+    with open(os.path.join(_disk_dir, conv_id + ".tok"), "rb") as f:
+        toks = list(struct.unpack(f"<{n_tok}i", f.read(4 * n_tok)))
+    return toks, segs
 
 
 def _kv_snapshot(conv_id: str):
@@ -255,10 +277,27 @@ def _kv_snapshot(conv_id: str):
     return st.st_ino, data
 
 
-def _big_conv_id(text: str, n_tok_min: int) -> str:
-    ids = {c for (c, _, p1, _, _) in _flushes(text) if p1 >= n_tok_min}
-    assert len(ids) == 1, f"expected one big conversation, got {ids}"
-    return ids.pop()
+def _lcp(a: list[int], b: list[int]) -> int:
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+def _check_kept(conv: str, segs_old, ino_old, kv_old, keep: int):
+    # segments ending at or below keep: same table entries, same bytes, same file (no remove)
+    toks_new, segs_new = _read_hdr(conv)
+    kept = [s for s in segs_old if s[5] <= keep]
+    assert len(kept) > 0
+    assert segs_new[:len(kept)] == kept
+    assert all(s[4] >= keep for s in segs_new[len(kept):])
+    kept_bytes = kept[-1][0] + kept[-1][1]
+    ino_new, kv_new = _kv_snapshot(conv)
+    assert ino_new == ino_old
+    assert kv_new[:kept_bytes] == kv_old[:kept_bytes]
+    return toks_new, segs_new
 
 
 def _run_divergence(n_tok: int, div_pos: int, restart: bool):
@@ -268,12 +307,10 @@ def _run_divergence(n_tok: int, div_pos: int, restart: bool):
     toks = _conv_tokens(n_tok)
     _complete(toks)
     _switch_away(0)
-    out = log.drain()
-    conv = _big_conv_id(out, n_tok)
-    first = _flushes(out, conv)
-    assert first[-1][4] == "rewrite" and first[-1][1] == 0
-    n_tok_old, _, segs_old = _read_hdr(conv)
-    assert len(segs_old) >= 3
+    _, (conv, base, end, _, mode) = _wait_flush(log, min_end=n_tok)
+    assert mode == "rewrite" and base == 0
+    toks_old, segs_old = _read_hdr(conv)
+    assert len(toks_old) == end and len(segs_old) >= 3
     ino_old, kv_old = _kv_snapshot(conv)
 
     if restart:
@@ -284,29 +321,19 @@ def _run_divergence(n_tok: int, div_pos: int, restart: bool):
     div = _diverge(toks, div_pos)
     ref = _complete(div)
     _switch_away(1)
-    out = log.drain()
-    assert "load_from_disk: restored '%s'" % conv in out
-    fl = _flushes(out, conv)
-    assert len(fl) == 1, fl
-    _, base, end, n_seg, mode = fl[0]
+    text, _ = _wait_log(log, lambda t: f"load_from_disk: restored '{conv}'" in t)
+    _, (_, base, end, n_seg, mode) = _wait_flush(log, conv=conv, text=text)
 
-    keep = max(s[5] for s in segs_old if s[5] <= div_pos)
+    # expected boundary from the real token lists: last committed segment end <= LCP
+    toks_new, _ = _read_hdr(conv)
+    assert len(toks_new) == end
+    lcp = _lcp(toks_old, toks_new)
+    assert lcp == div_pos
+    keep = max(s[5] for s in segs_old if s[5] <= lcp and s[5] < end)
     assert base == keep
-    assert mode == f"truncate from {n_tok_old} to {keep}, append"
-    # the saved list is prompt + reply minus the last sampled token (never decoded)
-    assert end == n_tok + len(ref["tokens"]) - 1
-    assert n_seg == (end - base + SEG - 1) // SEG
-    assert "wrote '%s' segment pos [%d, " % (conv, keep) in out
-
-    # kept segments: same table entries, same bytes, same file (no remove + recreate)
-    _, _, segs_new = _read_hdr(conv)
-    kept = [s for s in segs_old if s[5] <= keep]
-    assert segs_new[:len(kept)] == kept
-    assert all(s[4] >= keep for s in segs_new[len(kept):])
-    kept_bytes = kept[-1][0] + kept[-1][1]
-    ino_new, kv_new = _kv_snapshot(conv)
-    assert ino_new == ino_old
-    assert kv_new[:kept_bytes] == kv_old[:kept_bytes]
+    assert mode == f"truncate from {len(toks_old)} to {keep}, append"
+    assert n_seg == (end - keep + SEG - 1) // SEG
+    _check_kept(conv, segs_old, ino_old, kv_old, keep)
 
     # the truncated + appended files restore and give the same answer
     if restart:
@@ -314,8 +341,7 @@ def _run_divergence(n_tok: int, div_pos: int, restart: bool):
         server.start()
         log = LogReader(server.log_path)
     again = _complete(div)
-    out = log.drain()
-    assert "load_from_disk: restored '%s'" % conv in out
+    _wait_log(log, lambda t: f"load_from_disk: restored '{conv}'" in t)
     assert again["content"] == ref["content"]
     assert again["timings"]["cache_n"] >= keep
 
@@ -338,32 +364,27 @@ def test_disk_cache_identical_replay_appends_tail():
 
     n_tok = 2 * SEG + 500
     toks = _conv_tokens(n_tok)
-    r1 = _complete(toks)
+    _complete(toks)
     _switch_away(0)
-    out = log.drain()
-    conv = _big_conv_id(out, n_tok)
-    n_tok_old, _, segs_old = _read_hdr(conv)
-    assert n_tok_old == n_tok + len(r1["tokens"]) - 1
+    _, (conv, _, end, _, _) = _wait_flush(log, min_end=n_tok)
+    saved, segs_old = _read_hdr(conv)
+    assert len(saved) == end
     ino_old, kv_old = _kv_snapshot(conv)
 
-    # same prompt again: same reply at temperature 0 -> same token list -> nothing to write
-    r2 = _complete(toks)
-    assert r2["tokens"] == r1["tokens"]
+    # replay exactly the saved list: with n_predict = 1 the sampled token is never decoded,
+    # so the live list equals the saved list whatever the model picks -> nothing to write
+    _complete(saved, n_predict=1)
     _switch_away(1)
-    out = log.drain()
-    assert _flushes(out, conv) == []
+    _wait_log(log, lambda t: f"disk cache: '{conv}' already flushed ({len(saved)} tokens)" in t)
     ino_mid, kv_mid = _kv_snapshot(conv)
     assert ino_mid == ino_old and kv_mid == kv_old
 
-    # replay the full history plus a new turn -> append from the old high-water mark
-    ext = toks + r1["tokens"] + _conv_tokens(n_tok + 300)[n_tok:]
-    r3 = _complete(ext)
+    # replay the saved list plus a new turn -> append from the old high-water mark
+    ext = saved + _conv_tokens(n_tok + 300)[n_tok:]
+    _complete(ext)
     _switch_away(2)
-    out = log.drain()
-    fl = _flushes(out, conv)
-    assert fl == [(conv, n_tok_old, len(ext) + len(r3["tokens"]) - 1, 1, "append")]
-    _, _, segs_new = _read_hdr(conv)
-    assert segs_new[:len(segs_old)] == segs_old
-    ino_new, kv_new = _kv_snapshot(conv)
-    assert ino_new == ino_old
-    assert kv_new[:len(kv_old)] == kv_old
+    _, fl = _wait_flush(log, conv=conv)
+    toks_new, _ = _read_hdr(conv)
+    assert fl == (conv, len(saved), len(toks_new), (len(toks_new) - len(saved) + SEG - 1) // SEG, "append")
+    assert toks_new[:len(saved)] == saved
+    _check_kept(conv, segs_old, ino_old, kv_old, segs_old[-1][5])
