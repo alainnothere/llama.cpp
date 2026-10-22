@@ -86,28 +86,32 @@ static bool kq_mask_dev_decide(
 
 // impl
 
+ggml_tensor * llm_graph_input_attn_kv::get_kq_mask_dev_view(ggml_context * ctx, ggml_tensor * dev) {
+    for (const auto & [d, v] : kq_mask_dev_views) {
+        if (d == dev) {
+            return v;
+        }
+    }
+
+    const int64_t n_kv  = self_kq_mask->ne[0];
+    const int64_t n_tps = self_kq_mask->ne[1];
+    const size_t  es    = ggml_element_size(dev);
+
+    GGML_ASSERT(self_kq_mask->ne[2] == 1 && self_kq_mask->ne[3] == 1 && dev->type == self_kq_mask->type);
+
+    ggml_tensor * v = ggml_view_4d(ctx, dev, n_kv, n_tps, 1, 1, n_kv*es, n_kv*n_tps*es, n_kv*n_tps*es, 0);
+    ggml_format_name(v, "attn_inp_kq_mask_dev%zu", kq_mask_dev_views.size());
+
+    kq_mask_dev_views.emplace_back(dev, v);
+
+    return v;
+}
+
 ggml_tensor * llm_graph_input_attn_kv::get_kq_mask_il(ggml_context * ctx, int il) {
     if (kq_mask_dev_ok && self_kq_mask_cnv == self_kq_mask) {
         ggml_tensor * dev = mctx->get_kq_mask_dev(il);
         if (dev) {
-            for (const auto & [d, v] : kq_mask_dev_views) {
-                if (d == dev) {
-                    return v;
-                }
-            }
-
-            const int64_t n_kv  = self_kq_mask->ne[0];
-            const int64_t n_tps = self_kq_mask->ne[1];
-            const size_t  es    = ggml_element_size(dev);
-
-            GGML_ASSERT(self_kq_mask->ne[2] == 1 && self_kq_mask->ne[3] == 1 && dev->type == self_kq_mask->type);
-
-            ggml_tensor * v = ggml_view_4d(ctx, dev, n_kv, n_tps, 1, 1, n_kv*es, n_kv*n_tps*es, n_kv*n_tps*es, 0);
-            ggml_format_name(v, "attn_inp_kq_mask_dev%zu", kq_mask_dev_views.size());
-
-            kq_mask_dev_views.emplace_back(dev, v);
-
-            return v;
+            return get_kq_mask_dev_view(ctx, dev);
         }
     }
 
@@ -1444,6 +1448,8 @@ int64_t llm_graph_result::get_max_nodes() const {
 
 void llm_graph_result::reset() {
     kq_mask_dev   = false;
+    t_cp_merged   = nullptr;
+    t_cp_full     = nullptr;
 
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
@@ -3130,6 +3136,12 @@ ggml_tensor * llm_graph_context::build_attn(
 
             ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
             ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+
+            // [CP] every graph that writes the layer also writes the helper's mirror (even when h == 0 below), same rows
+            if (mctx_cur->cp_active(il)) {
+                ggml_build_forward_expand(gf, mctx_cur->cpy_k_mirror(ctx0, k_cur, k_idxs, il));
+                ggml_build_forward_expand(gf, mctx_cur->cpy_v_mirror(ctx0, v_cur, v_idxs, il));
+            }
         }
 
         k = mctx_cur->get_k(ctx0, il);
@@ -3141,7 +3153,11 @@ ggml_tensor * llm_graph_context::build_attn(
         res->kq_mask_dev = true;
     }
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    const uint32_t cp_h = cparams.training || kq_b || sinks || !cparams.flash_attn ? 0 : mctx_cur->cp_split(il);
+
+    ggml_tensor * cur = cp_h > 0
+        ? build_attn_cp(inp, q, kq_mask, cp_h, kq_scale, il)
+        : build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {
@@ -3166,6 +3182,126 @@ ggml_tensor * llm_graph_context::build_attn(
     }
 
     return cur;
+}
+
+// [CP] 2026-10-21 context-parallel attention prototype for one layer (llama_kv_cache::cp_state has the memory side).
+//
+// Node order is the schedule: the sched runs splits in graph order and copies a split's inputs before issuing it.
+//   A1 [... Q/K/V, store into A's cache] -> B1 [mirror store, FA_B over [h, n_kv)] -> A2 [FA_A over [0, h)]
+//   -> B2 [lse_B] -> A3 [merge, then the rest of the layer]
+// B1's inputs (Q, K_cur, V_cur, idxs) wait for A1 only, so B starts FA_B before A has FA_A queued; A2 has no input
+// copies and with ggml_backend_sched_set_split_sync_relax its issue does not wait for B either; B2 (a tiny node on B)
+// is the split boundary that keeps the merge's wait for B's partial out of A2. Every node is pinned: FLASH_ATTN_EXT
+// is excluded from the sched's weight rule and the merge's neighbours would pull it anywhere.
+// Merge (the recipe tests/test-flash-attn-merge.cpp validates): w = softmax over the two lse, O = w_a*O_a + w_b*O_b.
+ggml_tensor * llm_graph_context::build_attn_cp(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor * q,
+        ggml_tensor * kq_mask,
+           uint32_t   h,
+              float   kq_scale,
+                int   il) const {
+    const auto * mctx_cur = inp->mctx;
+
+    auto backend_of = [&](ggml_backend_dev_t dev) -> ggml_backend_t {
+        for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+            ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
+            if (ggml_backend_get_device(b) == dev) {
+                return b;
+            }
+        }
+        return nullptr;
+    };
+
+    ggml_backend_t be_a = backend_of(mctx_cur->cp_dev(false));
+    ggml_backend_t be_b = backend_of(mctx_cur->cp_dev(true));
+    GGML_ASSERT(be_a && be_b && "context-parallel attention: owner or helper device has no backend in the scheduler");
+
+    auto on = [&](ggml_tensor * t, ggml_backend_t be) {
+        ggml_backend_sched_set_tensor_backend(sched, t, be);
+        return t;
+    };
+
+    GGML_ASSERT(kq_mask->ne[2] == 1 && kq_mask->ne[3] == 1);
+
+    const uint32_t n_kv = kq_mask->ne[0];
+    const int64_t  D    = hparams.n_embd_head_v(il);
+    const int64_t  nh   = q->ne[1];
+    const int64_t  nt   = q->ne[2];
+
+    GGML_ASSERT(h > 0 && h < n_kv);
+
+    // the helper reads its own persistent mask when the owner does, else a column view of the graph input
+    ggml_tensor * mask_b = kq_mask;
+    if (kq_mask != inp->get_kq_mask()) {
+        ggml_tensor * dev_b = mctx_cur->cp_kq_mask_dev();
+        GGML_ASSERT(dev_b);
+        mask_b = inp->get_kq_mask_dev_view(ctx0, dev_b);
+    }
+
+    // a column view keeps the row stride n_kv; FA takes strided masks (ggml.h)
+    auto cols = [&](ggml_tensor * m, uint32_t c0, uint32_t c1) {
+        return ggml_view_4d(ctx0, m, c1 - c0, m->ne[1], m->ne[2], m->ne[3], m->nb[1], m->nb[2], m->nb[3], c0*ggml_element_size(m));
+    };
+
+    q = ggml_permute(ctx0, q, 0, 2, 1, 3);
+
+    auto fa = [&](uint32_t i0, uint32_t i1, bool mirror, ggml_tensor * m, bool lse) {
+        ggml_tensor * k = ggml_permute(ctx0, mctx_cur->get_k_range(ctx0, il, i0, i1, mirror), 0, 2, 1, 3);
+        ggml_tensor * v = ggml_permute(ctx0, mctx_cur->get_v_range(ctx0, il, i0, i1, mirror), 0, 2, 1, 3);
+
+        ggml_tensor * cur = ggml_flash_attn_ext(ctx0, q, k, v, m, kq_scale, hparams.f_max_alibi_bias,
+                                                hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+        ggml_prec_set_acc(cur, GGML_PREC_F32);
+        if (lse) {
+            ggml_flash_attn_ext_set_emit_lse(cur, true);
+        }
+        return cur; // [D (+4), nh, nt]
+    };
+
+    ggml_tensor * p_b = on(fa(h, n_kv, true, cols(mask_b, h, n_kv), true), be_b);
+    cb(p_b, "cp_fa_b", il);
+    ggml_build_forward_expand(gf, p_b);
+
+    ggml_tensor * p_a = on(fa(0, h, false, cols(kq_mask, 0, h), true), be_a);
+    res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, p_a, il});
+    cb(p_a, "cp_fa_a", il);
+    ggml_build_forward_expand(gf, p_a);
+
+    auto lse_of = [&](ggml_tensor * p, ggml_backend_t be) {
+        return on(ggml_cont(ctx0, ggml_view_3d(ctx0, p, 1, nh, nt, p->nb[1], p->nb[2], D*sizeof(float))), be);
+    };
+    auto o_of = [&](ggml_tensor * p) {
+        return ggml_view_3d(ctx0, p, D, nh, nt, p->nb[1], p->nb[2], 0);
+    };
+
+    ggml_tensor * lse_b = lse_of(p_b, be_b);
+    cb(lse_b, "cp_lse_b", il);
+    ggml_build_forward_expand(gf, lse_b);
+
+    ggml_tensor * lse_a = lse_of(p_a, be_a);
+    ggml_tensor * w     = on(ggml_soft_max(ctx0, on(ggml_concat(ctx0, lse_a, lse_b, 0), be_a)), be_a); // [2, nh, nt]
+    ggml_tensor * w_a   = on(ggml_cont(ctx0, ggml_view_3d(ctx0, w, 1, nh, nt, w->nb[1], w->nb[2], 0)), be_a);
+    ggml_tensor * w_b   = on(ggml_cont(ctx0, ggml_view_3d(ctx0, w, 1, nh, nt, w->nb[1], w->nb[2], sizeof(float))), be_a);
+
+    ggml_tensor * cur = on(ggml_add(ctx0,
+            on(ggml_mul(ctx0, o_of(p_a), w_a), be_a),
+            on(ggml_mul(ctx0, o_of(p_b), w_b), be_a)), be_a);
+    cb(cur, "cp_merged", il);
+    ggml_build_forward_expand(gf, cur);
+
+    if (mctx_cur->cp_check()) {
+        ggml_tensor * full = on(fa(0, n_kv, false, kq_mask, false), be_a);
+        cb(full, "cp_fa_full", il);
+        ggml_set_output(full);
+        ggml_set_output(cur);
+        ggml_build_forward_expand(gf, full);
+
+        res->t_cp_full   = full;
+        res->t_cp_merged = cur;
+    }
+
+    return ggml_reshape_2d(ctx0, cur, D*nh, nt);
 }
 
 static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(

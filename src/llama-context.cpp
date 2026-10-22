@@ -149,6 +149,100 @@ struct llama_dstats_timer {
     }
 };
 
+// [CP] context-parallel attention (LLAMA_CP_LAYER, see llama_kv_cache::cp_state): the owner's FA split has no
+// input copies, so without the relax its issue waits on the host for the helper's FA (no overlap). LLAMA_CP_SYNC_RELAX=0
+// turns it off for an A/B.
+static bool llama_cp_split_sync_relax() {
+    const char * il    = getenv("LLAMA_CP_LAYER");
+    const char * relax = getenv("LLAMA_CP_SYNC_RELAX");
+    return il && atoi(il) >= 0 && !(relax && atoi(relax) == 0);
+}
+
+// [CP] LLAMA_CP_CHECK=1: per ubatch, the merged two-card attention of the cp layer against the single-card FA over
+// [0, n_kv) on the owner, on the host. Abort: step nmse > 1e-4 (or not finite), or the running argmax-over-D agreement
+// < 0.999 once 1000 rows counted. Reference: the emit_lse merge test measured nmse 3e-6, max abs 4.9e-3 on Vulkan
+// (f32 KV). A row counts for argmax only if its reference top-2 margin exceeds 2x the row's max abs error (near ties
+// flip on rounding alone). Summary every LLAMA_CP_CHECK_EVERY (default 64) steps. Costs a sync + D2H per step.
+static void llama_cp_check_step(ggml_backend_sched_t sched, const llm_graph_result * res) {
+    struct stats {
+        uint64_t n_steps = 0;
+        uint64_t n_rows  = 0;
+        uint64_t n_count = 0;
+        uint64_t n_agree = 0;
+        double   e2      = 0.0;
+        double   r2      = 0.0;
+        double   max_abs = 0.0;
+        double   worst   = 0.0;
+    };
+    static stats st;
+    static const int every = [] {
+        const char * e = getenv("LLAMA_CP_CHECK_EVERY");
+        return e ? std::max(1, atoi(e)) : 64;
+    }();
+
+    ggml_backend_sched_synchronize(sched);
+
+    const ggml_tensor * tm = res->t_cp_merged;
+    const ggml_tensor * tf = res->t_cp_full;
+    GGML_ASSERT(ggml_are_same_shape(tm, tf) && ggml_is_contiguous(tm) && ggml_is_contiguous(tf));
+
+    std::vector<float> m(ggml_nelements(tm));
+    std::vector<float> f(ggml_nelements(tf));
+    ggml_backend_tensor_get(tm, m.data(), 0, ggml_nbytes(tm));
+    ggml_backend_tensor_get(tf, f.data(), 0, ggml_nbytes(tf));
+
+    const int64_t D = tm->ne[0];
+    const int64_t R = ggml_nrows(tm);
+
+    double e2 = 0.0, r2 = 0.0, mx = 0.0;
+    uint64_t cnt = 0, agree = 0;
+    for (int64_t r = 0; r < R; ++r) {
+        const float * a = m.data() + r*D;
+        const float * b = f.data() + r*D;
+        double rmx = 0.0;
+        int64_t ia = 0, ib = 0;
+        float b1 = -INFINITY, b2 = -INFINITY;
+        for (int64_t d = 0; d < D; ++d) {
+            const double err = (double) a[d] - b[d];
+            e2 += err*err;
+            r2 += (double) b[d]*b[d];
+            rmx = std::max(rmx, std::fabs(err));
+            if (a[d] > a[ia]) { ia = d; }
+            if (b[d] > b[ib]) { ib = d; }
+            if (b[d] > b1) { b2 = b1; b1 = b[d]; } else if (b[d] > b2) { b2 = b[d]; }
+        }
+        mx = std::max(mx, rmx);
+        if (b1 - b2 > 2.0*rmx) {
+            cnt++;
+            agree += ia == ib;
+        }
+    }
+
+    const double nmse = r2 > 0.0 ? e2/r2 : (e2 > 0.0 ? INFINITY : 0.0);
+
+    st.n_steps++;
+    st.n_rows  += R;
+    st.n_count += cnt;
+    st.n_agree += agree;
+    st.e2      += e2;
+    st.r2      += r2;
+    st.max_abs  = std::max(st.max_abs, mx);
+    st.worst    = std::max(st.worst, std::isfinite(nmse) ? nmse : INFINITY);
+
+    const double agree_all = st.n_count ? (double) st.n_agree/st.n_count : 1.0;
+    const bool   bad = !std::isfinite(nmse) || nmse > 1e-4 || (st.n_count >= 1000 && agree_all < 0.999);
+
+    if (bad || st.n_steps % every == 1 || every == 1) {
+        LLAMA_LOG_WARN("%s: cp check: steps %" PRIu64 ", rows %" PRIu64 ", this step nmse %.3e max abs %.3e (%" PRId64 " rows); "
+                "running nmse %.3e, worst step nmse %.3e, max abs %.3e, argmax agree %.5f (%" PRIu64 " of %" PRIu64 " rows counted)\n",
+                __func__, st.n_steps, st.n_rows, nmse, mx, R, st.r2 > 0.0 ? st.e2/st.r2 : 0.0, st.worst, st.max_abs,
+                agree_all, st.n_count, st.n_rows);
+    }
+    if (bad) {
+        GGML_ABORT("context-parallel attention check failed (LLAMA_CP_CHECK): nmse %.3e, argmax agree %.5f", nmse, agree_all);
+    }
+}
+
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
         case LLAMA_CONTEXT_TYPE_DEFAULT: return LLM_GRAPH_TYPE_DEFAULT;
@@ -795,6 +889,7 @@ void llama_context::sched_reserve() {
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     // [LLAMA_DECODE_STATS] per-hop copy timings from the scheduler, see dstats_fold_sched
     ggml_backend_sched_set_stats_enabled(sched.get(), dstats_on);
+    ggml_backend_sched_set_split_sync_relax(sched.get(), llama_cp_split_sync_relax());
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -836,6 +931,7 @@ void llama_context::sched_reserve() {
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
                 ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
                 ggml_backend_sched_set_stats_enabled(sched.get(), dstats_on);
+                ggml_backend_sched_set_split_sync_relax(sched.get(), llama_cp_split_sync_relax());
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -1737,6 +1833,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    if (res->t_cp_merged && res->t_cp_full) {
+        llama_cp_check_step(sched.get(), res);
     }
 
     ret = GGML_STATUS_SUCCESS;

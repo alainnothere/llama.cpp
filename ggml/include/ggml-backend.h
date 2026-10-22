@@ -396,6 +396,11 @@ extern "C" {
     };
 
     GGML_API void ggml_backend_sched_set_stats_enabled(ggml_backend_sched_t sched, bool enabled);
+
+    // [fork, 2026-10-21] context-parallel attention (llama LLAMA_CP_LAYER): a split with no input copies normally waits
+    // on the host for the previous split's backend. With relax on, that wait is skipped when neither split reads the
+    // other backend's memory in place, so the owner's FA can be issued while the helper's FA still runs. Default off.
+    GGML_API void ggml_backend_sched_set_split_sync_relax(ggml_backend_sched_t sched, bool relax);
     // stats of the last ggml_backend_sched_graph_compute_async, NULL when disabled; valid until the next compute/disable
     GGML_API const struct ggml_backend_sched_stats * ggml_backend_sched_get_last_stats(ggml_backend_sched_t sched);
 

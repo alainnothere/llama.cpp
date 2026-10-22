@@ -6870,7 +6870,8 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_SOLVE_TRI:
             return op->src[0]->ne[0] <= SYCL_SOLVE_TRI_MAX_N && op->src[1]->ne[0] <= SYCL_SOLVE_TRI_MAX_K;
         case GGML_OP_FLASH_ATTN_EXT:
-            return ggml_sycl_flash_attn_ext_supported(device, op);
+            // emit_lse (ggml_flash_attn_ext_set_emit_lse, op_params[5]) is not implemented here
+            return ggml_get_op_params_i32(op, 5) == 0 && ggml_sycl_flash_attn_ext_supported(device, op);
         default:
             return false;
     }

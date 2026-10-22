@@ -919,6 +919,8 @@ struct ggml_backend_sched_split {
     struct ggml_tensor ** inputs;
     int n_inputs;
     int inputs_capacity;
+    // a node reads a tensor of another backend in place (buffer supported, no copy)
+    bool reads_foreign;
     // graph view of this split
     struct ggml_cgraph graph;
 };
@@ -926,6 +928,9 @@ struct ggml_backend_sched_split {
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
+
+    // [fork, 2026-10-21] see ggml_backend_sched_set_split_sync_relax
+    bool split_sync_relax;
 
     int n_backends;
 
@@ -1457,6 +1462,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         }
         split->i_start = 0;
         split->n_inputs = 0;
+        split->reads_foreign = false;
         int cur_backend_id = split->backend_id;
         for (; i < graph->n_nodes; i++) {
             struct ggml_tensor * node = graph->nodes[i];
@@ -1506,6 +1512,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split->backend_id = node_backend_id;
                 split->i_start = i;
                 split->n_inputs = 0;
+                split->reads_foreign = false;
                 cur_backend_id = node_backend_id;
             }
 
@@ -1541,6 +1548,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         split->inputs[n_inputs] = src;
                     }
                     node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
+                } else if (src_backend_id != cur_backend_id) {
+                    split->reads_foreign = true;
                 }
             }
         }
@@ -1962,7 +1971,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
-        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+        // relax: skip the wait when neither split reads the other backend's memory in place (no RAW/WAR across them)
+        const bool sync_skip = sched->split_sync_relax && !split->reads_foreign && split_id > 0 && !splits[split_id - 1].reads_foreign;
+        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id && !sync_skip) {
             if (st) {
                 ggml_backend_sched_stats_close_pending(sched);
             }
@@ -2306,6 +2317,11 @@ ggml_backend_t ggml_backend_sched_get_split_backend(ggml_backend_sched_t sched, 
 
 // [fork, 2026-10-21] see ggml-backend.h. Allocated only when enabled (~20 KB), so an off scheduler
 // carries one NULL pointer.
+void ggml_backend_sched_set_split_sync_relax(ggml_backend_sched_t sched, bool relax) {
+    GGML_ASSERT(sched);
+    sched->split_sync_relax = relax;
+}
+
 void ggml_backend_sched_set_stats_enabled(ggml_backend_sched_t sched, bool enabled) {
     GGML_ASSERT(sched);
     if (enabled && sched->stats == NULL) {

@@ -351,6 +351,8 @@ public:
     // [KQ_MASK_INC] the mask for layer il: a view of the kv cache's persistent mask on the layer's device
     // when kq_mask_dev_ok (one view per device tensor per graph), else the graph input
     ggml_tensor * get_kq_mask_il(ggml_context * ctx, int il);
+    // the [n_kv, n_tokens] view of one device mask tensor (one per tensor per graph)
+    ggml_tensor * get_kq_mask_dev_view(ggml_context * ctx, ggml_tensor * dev);
 
     // fill whichever masks the graph uses (persistent views and/or the allocated graph input)
     // mctx is passed explicitly: the hybrid input does not refresh this->mctx on graph reuse
@@ -968,6 +970,10 @@ public:
     // so the previous graph must have finished (llama_context::process_ubatch synchronizes)
     bool kq_mask_dev = false;
 
+    // [CP] LLAMA_CP_CHECK: merged and single-card attention of the cp layer, [n_embd_head_v, n_head, n_tokens]
+    ggml_tensor * t_cp_merged = nullptr;
+    ggml_tensor * t_cp_full   = nullptr;
+
     std::vector<ggml_tensor *> t_sampled;
     std::vector<ggml_tensor *> t_sampled_probs;
     std::vector<ggml_tensor *> t_sampled_logits;
@@ -1269,6 +1275,16 @@ struct llm_graph_context {
             ggml_tensor * sinks,   // [n_head_q]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
+                  float   kq_scale,
+                    int   il) const;
+
+    // [CP] context-parallel attention for one layer, see llama_kv_cache::cp_state. Replaces get_k/get_v + build_attn_mha
+    // of build_attn (the K/V store into the owner's cache is done by the caller). Returns [n_embd_head_v*n_head, n_tokens]
+    ggml_tensor * build_attn_cp(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]
+            ggml_tensor * kq_mask, // what build_attn_mha would get
+               uint32_t   h,
                   float   kq_scale,
                     int   il) const;
 

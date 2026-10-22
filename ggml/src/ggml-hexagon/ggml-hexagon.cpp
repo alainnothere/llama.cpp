@@ -8778,7 +8778,8 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
             break;
 
         case GGML_OP_FLASH_ATTN_EXT:
-            supp = ggml_hexagon_supported_flash_attn_ext(sess, op);
+            // emit_lse (ggml_flash_attn_ext_set_emit_lse, op_params[5]) is not implemented here
+            supp = ggml_get_op_params_i32(op, 5) == 0 && ggml_hexagon_supported_flash_attn_ext(sess, op);
             break;
 
         case GGML_OP_SET_ROWS:

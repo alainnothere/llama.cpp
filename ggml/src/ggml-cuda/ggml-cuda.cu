@@ -5736,7 +5736,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                 op->type == GGML_TYPE_F32;
         case GGML_OP_FLASH_ATTN_EXT:
-            return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
+            // emit_lse (ggml_flash_attn_ext_set_emit_lse, op_params[5]) is not implemented here
+            return ggml_get_op_params_i32(op, 5) == 0 && ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:

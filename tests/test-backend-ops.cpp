@@ -8119,6 +8119,10 @@ struct test_flash_attn_ext : public test_case {
     const bool v_is_view_of_k;
     const int64_t n_kv_max;
 
+    // > 0: the mask is the column view [mask_col_off, mask_col_off + kv) of a wider mask (context-parallel attention
+    // passes mask[:, h:n] for the KV range [h, n)); set by test_flash_attn_ext_lse, not part of vars() here
+    int64_t mask_col_off = 0;
+
     std::string vars() override {
         return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max);
     }
@@ -8187,8 +8191,12 @@ struct test_flash_attn_ext : public test_case {
 
         ggml_tensor * m = nullptr;
         if (mask) {
-            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr23[1]);
+            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv + mask_col_off, nb, 1, nr23[1]);
             ggml_set_name(m, "m");
+            if (mask_col_off > 0) {
+                m = ggml_view_4d(ctx, m, kv, nb, 1, nr23[1], m->nb[1], m->nb[2], m->nb[3], mask_col_off*ggml_element_size(m));
+                ggml_set_name(m, "m_view");
+            }
         }
 
         ggml_tensor * s = nullptr;
@@ -8217,6 +8225,8 @@ struct test_flash_attn_ext : public test_case {
                 } else {
                     init_tensor_kq_mask(t);
                 }
+            } else if (strcmp(t->name, "m_view") == 0) {
+                // view of "m", already initialized
             } else {
                 init_tensor_uniform(t);
             }
@@ -8225,6 +8235,64 @@ struct test_flash_attn_ext : public test_case {
 
     bool grad_precise() override {
         return true;
+    }
+};
+
+// FLASH_ATTN_EXT with ggml_flash_attn_ext_set_emit_lse (context-parallel attention: partials over disjoint KV ranges
+// are merged with their lse, see ggml.h). Rows are hsv + 4: O is compared by NMSE like the plain test, the lse column
+// by max abs error (f32 logsumexp of ~log(kv) magnitude, the backend's P may be f16), the 3 padding columns must be
+// exactly 0 on both sides. GGML_TEST_FA_LSE_VERBOSE=1 prints the errors of every case.
+struct test_flash_attn_ext_lse : public test_flash_attn_ext {
+    test_flash_attn_ext_lse(int64_t hsk, int64_t hsv, int64_t nh, std::array<int64_t, 2> nr23, int64_t kv, int64_t nb,
+                            bool sinks = false, ggml_prec prec = GGML_PREC_F32, int64_t mask_col_off_ = 0)
+        : test_flash_attn_ext(hsk, hsv, nh, nr23, kv, nb, true, sinks, 0.0f, 0.0f, prec, GGML_TYPE_F16, GGML_TYPE_F16) {
+        mask_col_off = mask_col_off_;
+    }
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",emit_lse=1" + (mask_col_off > 0 ? ",mask_col_off=" + std::to_string(mask_col_off) : "");
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_flash_attn_ext::build_graph(ctx);
+        ggml_flash_attn_ext_set_emit_lse(out, true);
+        return out;
+    }
+
+    // measured on Vulkan3 (7900 XTX, cm1 + scalar) 2026-10-21: <= 1.8e-5 with f32 accumulators, 7.2e-5 with f16acc
+    static constexpr double lse_max_abs_err = 1e-3;
+
+    double err(const float * a, const float * b, size_t n) override {
+        const size_t row = hsv + 4;
+        if (n != row * nh*nr23[0] * nb * nr23[1]) {
+            return test_flash_attn_ext::err(a, b, n); // sentinels
+        }
+        double o_sq_err = 0.0, o_sq_ref = 0.0, lse_err = 0.0;
+        size_t n_pad_bad = 0, n_lse_inf = 0;
+        for (size_t r = 0; r < n / row; ++r) {
+            const float * ra = a + r*row;
+            const float * rb = b + r*row;
+            for (size_t d = 0; d < (size_t) hsv; ++d) {
+                o_sq_err += (double) (ra[d] - rb[d]) * (ra[d] - rb[d]);
+                o_sq_ref += (double) ra[d] * ra[d];
+            }
+            if (std::isinf(ra[hsv]) && std::isinf(rb[hsv]) && ra[hsv] < 0 && rb[hsv] < 0) {
+                n_lse_inf++;
+            } else {
+                lse_err = std::max(lse_err, (double) std::fabs(ra[hsv] - rb[hsv]));
+            }
+            for (size_t d = hsv + 1; d < row; ++d) {
+                n_pad_bad += ra[d] != 0.0f || rb[d] != 0.0f;
+            }
+        }
+        const double o_nmse = o_sq_err / std::max(o_sq_ref, 1e-30);
+        const bool bad = n_pad_bad > 0 || !(lse_err <= lse_max_abs_err);
+        static const bool verbose = getenv("GGML_TEST_FA_LSE_VERBOSE") != nullptr;
+        if (bad || verbose) {
+            printf("[lse: O nmse %.3e, lse max abs err %.3e (tol %.0e), rows %zu, -inf rows %zu, bad pad %zu] ",
+                   o_nmse, lse_err, lse_max_abs_err, n / row, n_lse_inf, n_pad_bad);
+        }
+        return bad ? 1e30 : o_nmse;
     }
 };
 
@@ -11442,6 +11510,35 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096,  6, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, 12, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_Q8_0));
+
+    // emit_lse (context-parallel attention partials, see ggml.h), 27B geometry: hs 256, 4 kv heads x 6, f16 KV.
+    // On Vulkan cm1 this covers the GQA fold (nb 1/6/12), the unfolded tiles (nb 33), split_k reduce (kv 32768)
+    // and the no-split store (kv 1024 at larger nb).
+    for (int64_t kv : { 1024, 32768 }) {
+        for (int64_t nb : { 1, 6, 12, 33 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_lse(256, 256, 4, {6, 1}, kv, nb));
+        }
+    }
+    // sinks (part of the lse), f16 accumulators, a strided mask (column view, with and without split_k), and
+    // non-GQA shapes (scalar path at nb 1, unfolded cm1 at nb 33)
+    test_cases.emplace_back(new test_flash_attn_ext_lse(256, 256, 4, {6, 1},  1024, 12, true));
+    test_cases.emplace_back(new test_flash_attn_ext_lse(256, 256, 4, {6, 1}, 32768,  6, true));
+    test_cases.emplace_back(new test_flash_attn_ext_lse(256, 256, 4, {6, 1},  1024, 12, false, GGML_PREC_DEFAULT));
+    test_cases.emplace_back(new test_flash_attn_ext_lse(256, 256, 4, {6, 1},  1024, 12, false, GGML_PREC_F32, 512));
+    test_cases.emplace_back(new test_flash_attn_ext_lse(256, 256, 4, {6, 1}, 16384, 33, false, GGML_PREC_F32, 16384));
+    test_cases.emplace_back(new test_flash_attn_ext_lse(128, 128, 8, {1, 1},  1024,  1));
+    test_cases.emplace_back(new test_flash_attn_ext_lse(128, 128, 8, {1, 1},  1024, 33));
+    test_cases.emplace_back(new test_flash_attn_ext_lse(128, 128, 8, {1, 1},  4096, 33, false, GGML_PREC_F32, 64));
+    // enough workgroups that split_k stays 1 (on a 96-CU card), so the kernels' own final store writes the lse:
+    // unfolded cm1 (nb 512; nb 12 over 8 sequences), GQA-folded cm1 (nb 6 over 16 sequences), scalar (32 one-row
+    // sequences); with sinks the lse must use max(M, sink)
+    test_cases.emplace_back(new test_flash_attn_ext_lse(256, 256, 4, {6, 1},  1024, 512));
+    test_cases.emplace_back(new test_flash_attn_ext_lse(256, 256, 4, {6, 8},  1024, 12));
+    test_cases.emplace_back(new test_flash_attn_ext_lse(256, 256, 4, {6, 8},  1024, 12, true));
+    test_cases.emplace_back(new test_flash_attn_ext_lse(256, 256, 4, {6, 16}, 1024,  6));
+    test_cases.emplace_back(new test_flash_attn_ext_lse(256, 256, 4, {6, 16}, 1024,  6, true));
+    test_cases.emplace_back(new test_flash_attn_ext_lse(128, 128, 8, {1, 32}, 1024,  1));
+    test_cases.emplace_back(new test_flash_attn_ext_lse(128, 128, 8, {1, 32}, 1024,  1, true));
 
     // dense-allocated (non-view) quant K/V at batch >= 64, in cache and native layouts
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));

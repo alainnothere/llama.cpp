@@ -17,6 +17,9 @@ layout (push_constant) uniform parameter {
     uint ne3;
     uint k_num;
     uint sinks;
+    // ggml_flash_attn_ext_set_emit_lse: dst rows are D + 4 floats, [D] = lse = m_max' + log(L) where m_max'
+    // is the max over the splits (and the sink when it is larger), -inf when L == 0; [D+1..D+3] = 0
+    uint emit_lse;
 } p;
 
 shared float tmpsh[BLOCK_SIZE];
@@ -76,6 +79,8 @@ void main() {
     }
     L = tmpsh[0];
 
+    // L is relative to m_ref: m_max, or the sink when the sink is larger
+    float m_ref = m_max;
     float sink;
     if (p.sinks != 0) {
         sink = data_s[n];
@@ -85,11 +90,18 @@ void main() {
 
         if (sink > m_max) {
             ms = exp(m_max - sink);
+            m_ref = sink;
         } else {
             vs = exp(sink - m_max);
         }
 
         L = L*ms + vs;
+    }
+
+    const uint D_out = p.emit_lse != 0 ? D + 4 : D;
+    if (p.emit_lse != 0 && gl_WorkGroupID.y == 0 && tid < 4) {
+        const float lse = (L == 0.0) ? uintBitsToFloat(0xFF800000) : m_ref + log(L);
+        data_d[(i3 * p.ne2 + i2) * p.ne1 * D_out + D_out * n + D + tid] = tid == 0 ? lse : 0.0;
     }
 
     L = (L == 0.0) ? 0.0 : 1.0 / L;
@@ -116,6 +128,6 @@ void main() {
         const float FLT_MAX = uintBitsToFloat(0x7F7FFFFF);
         O = clamp(O, -FLT_MAX, FLT_MAX);
 
-        data_d[(i3 * p.ne2 + i2) * p.ne1 * D + D * n + d] = O;
+        data_d[(i3 * p.ne2 + i2) * p.ne1 * D_out + D_out * n + d] = O;
     }
 }

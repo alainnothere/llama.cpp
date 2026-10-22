@@ -957,6 +957,8 @@ void main() {
             }
 
             Lf[r] = Lf[r]*ms + vs;
+            // Lf is now relative to max(Mf, sink); only the EMIT_LSE store reads Mf after this point
+            Mf[r] = max(Mf[r], sink);
         }
     }
 
@@ -975,30 +977,39 @@ void main() {
         }
     }
 
-    uint32_t o_offset = (gqa_iq1*p.ne1*HSV + iq3*p.ne2*p.ne1*HSV) / 4;
+    // final dst rows are HSV_out apart (HSV + 4 with EMIT_LSE, see flash_attn_base.glsl); the split_k partials
+    // above keep the HSV stride and flash_attn_split_k_reduce.comp writes the lse in that case
+    uint32_t o_offset = (gqa_iq1*p.ne1*HSV_out + iq3*p.ne2*p.ne1*HSV_out) / 4;
 
     if (p.gqa_ratio > 1) {
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
             const uint32_t row = tile_row(r);
             if (gqa_row_valid(row)) {
-                // O is [HSV, ne1 = heads, ne2 = tokens, ne3]
-                const uint32_t ro = (iq3 * p.ne2 * p.ne1 * HSV) / 4 + ((gqa_row_token(row) * p.ne1 + gqa_row_head(row)) * HSV) / 4;
+                // O is [HSV_out, ne1 = heads, ne2 = tokens, ne3]
+                const uint32_t ro = (iq3 * p.ne2 * p.ne1 * HSV_out) / 4 + ((gqa_row_token(row) * p.ne1 + gqa_row_head(row)) * HSV_out) / 4;
                 [[unroll]] for (uint32_t d0 = 0; d0 < HSV / 4; d0 += threads_per_rowgroup) {
                     const uint d = d0 + col_tid;
                     if (d >= HSV / 4) break;
                     const uint d_local = d0 / threads_per_rowgroup;
                     data_ov4[ro + d] = D_TYPEV4(Of[r][d_local]);
                 }
+                if (EMIT_LSE && col_tid == 0) {
+                    storeLse(ro, Mf[r], Lf[r]);
+                }
             }
         }
     } else {
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
             if (i * Br + tile_row(r) < N) {
+                const uint32_t ro = o_offset + (iq2 * HSV_out + (i * Br + tile_row(r)) * p.ne1 * HSV_out) / 4;
                 [[unroll]] for (uint32_t d0 = 0; d0 < HSV / 4; d0 += threads_per_rowgroup) {
                     const uint d = d0 + col_tid;
                     if (d >= HSV / 4) break;
                     const uint d_local = d0 / threads_per_rowgroup;
-                    data_ov4[o_offset + (iq2 * HSV + (i * Br + tile_row(r)) * p.ne1 * HSV) / 4 + d] = D_TYPEV4(Of[r][d_local]);
+                    data_ov4[ro + d] = D_TYPEV4(Of[r][d_local]);
+                }
+                if (EMIT_LSE && col_tid == 0) {
+                    storeLse(ro, Mf[r], Lf[r]);
                 }
             }
         }

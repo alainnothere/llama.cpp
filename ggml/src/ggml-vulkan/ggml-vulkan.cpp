@@ -988,6 +988,7 @@ void ggml_vk_submit(vk_context& ctx, vk::Fence fence) {
     ctx->p->q->handle->submit(submit_infos, fence);
 
     ctx->seqs.clear();
+    ctx->n_submits++;
 }
 
 uint32_t ggml_vk_find_queue_family_index(std::vector<vk::QueueFamilyProperties>& queue_family_props, const vk::QueueFlags& required, const vk::QueueFlags& avoid, int32_t compute_index, uint32_t min_num_queues) {
@@ -4793,6 +4794,8 @@ vk_device ggml_vk_get_device(size_t idx) {
                 device->memory_priority = true;
             } else if (strcmp("VK_EXT_external_memory_host", properties.extensionName) == 0) {
                 device->external_memory_host = true;
+            } else if (strcmp("VK_KHR_external_semaphore_fd", properties.extensionName) == 0) {
+                device->external_semaphore_fd = true;
 #if defined(VK_EXT_shader_64bit_indexing)
             } else if (strcmp("VK_EXT_shader_64bit_indexing", properties.extensionName) == 0) {
                 device->shader_64b_indexing = true;
@@ -5143,6 +5146,10 @@ vk_device ggml_vk_get_device(size_t idx) {
 
         if (device->external_memory_host) {
             device_extensions.push_back("VK_EXT_external_memory_host");
+        }
+        if (device->external_semaphore_fd) {
+            // VK_KHR_external_semaphore is core in 1.1; only the fd entry points need enabling
+            device_extensions.push_back("VK_KHR_external_semaphore_fd");
         }
 
 #if defined(VK_EXT_shader_64bit_indexing)
@@ -9129,7 +9136,25 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     uint32_t N = neq1;
     const uint32_t KV = nek1;
 
-    GGML_ASSERT(ne0 == HSV);
+    // ggml_flash_attn_ext_set_emit_lse (context-parallel merge, see ggml.h): dst rows are HSV + 4 floats with the
+    // lse at [HSV]. Implemented by the scalar and coopmat1 final stores and by the split_k reduce (Flags bit 8192 /
+    // pc2.emit_lse); coopmat2 is refused in supports_op and asserted below, the Intel xe decode path is skipped.
+    const bool emit_lse = ggml_get_op_params_i32(dst, 5) != 0;
+
+    // The FA shaders index the mask with row stride KV and plane stride nem1*KV (the 128-byte push constant block is
+    // full, no room for real mask strides). ggml.c now allows any row/plane stride (context-parallel attention passes
+    // mask[:, h:n] column views), so such a mask is first copied into a dense [KV, nem1, nem2, nem3] scratch in
+    // prealloc_x, which mask_opt / sparse_compact and the FA kernel then read. Every llama.cpp mask today is dense
+    // and takes no copy. The copy runs per FA call (per layer); a graph that shares one view across layers should
+    // ggml_cont it once instead.
+    const bool mask_dense = !mask || (mask->nb[1] == (size_t)KV * sizeof(ggml_fp16_t) &&
+                                      mask->nb[2] == mask->nb[1] * nem1 && mask->nb[3] == mask->nb[2] * nem2 &&
+                                      get_misalign_bytes(ctx, mask) == 0);
+    if (!mask_dense) {
+        GGML_ASSERT(nem0 == KV && "flash_attn_ext: a strided mask must have ne[0] == n_kv");
+    }
+
+    GGML_ASSERT(ne0 == HSV + (emit_lse ? 4 : 0));
     GGML_ASSERT(ne2 == N);
 
     // input tensor rows must be contiguous
@@ -9402,6 +9427,10 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
                                                                    mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff);
+    if (emit_lse) {
+        GGML_ASSERT(tuning_params.path != FA_COOPMAT2 && "flash_attn_ext emit_lse: not implemented in flash_attn_cm2.comp");
+        fa_pipeline_state.flags |= 8192; // EMIT_LSE, flash_attn_base.glsl: HSV + 4 dst row stride and the lse store
+    }
 
     vk_pipeline pipeline = nullptr;
 
@@ -9410,7 +9439,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     bool xe_fa_supported_platform =
         (ctx->device.get()->architecture == INTEL_XE2 && ctx->device.get()->properties.deviceID != 0xFD80 && ctx->device.get()->properties.deviceID != 0xFD81) ||
         (ctx->device.get()->architecture == INTEL_XE1 && ctx->device.get()->coopmat_support && ctx->device.get()->uma);
-    bool xe_fa_supported_usage = neq0 % 32 == 0 && nev0 % 16 == 0 && q->nb[1] > q->nb[2] && k->nb[1] > k->nb[2] && v->nb[1] > v->nb[2] && mask != nullptr;
+    // the xe decode path has no lse output and reads the mask with its own layout and prealloc_x use: skip it then
+    bool xe_fa_supported_usage = neq0 % 32 == 0 && nev0 % 16 == 0 && q->nb[1] > q->nb[2] && k->nb[1] > k->nb[2] && v->nb[1] > v->nb[2] && mask != nullptr &&
+                                 !emit_lse && mask_dense;
     bool xe_fa_supported_dtype = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 && (mask != nullptr && mask->type == GGML_TYPE_F16);
     std::pair<vk_pipeline, vk_pipeline> xe_fa_pipeline_dual_phases = { nullptr , nullptr };
     vk_pipeline xe_fa_pipeline = nullptr;
@@ -9590,7 +9621,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx, k);
     vk_subbuffer v_buf = ggml_vk_tensor_subbuffer(ctx, v);
     vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
-    vk_subbuffer mask_buf = mask ? ggml_vk_tensor_subbuffer(ctx, mask) : q_buf;
+    vk_subbuffer mask_buf = mask ? ggml_vk_tensor_subbuffer(ctx, mask, !mask_dense) : q_buf;
     vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
     // Mask-derived scratch: computed once per (mask, params) per graph, reused by every layer sharing the mask.
     bool mask_opt_cached = false;
@@ -9637,6 +9668,16 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     ggml_vk_mmvq_slope_path(ctx, "fa %s N=%u KV%uk Br=%u Bc=%u sk=%u",
                             xe_fa_opt ? "xe" : tuning_params.path == FA_COOPMAT2 ? "cm2" : tuning_params.path == FA_COOPMAT1 ? "cm1" : "scalar",
                             N, KV / 1024, Br, Bc, split_k);
+
+    // prealloc_x layout for this op: [K f16 scratch][V f16 scratch][dense mask scratch], sized once so no buffer is
+    // reallocated after a subbuffer of it was recorded
+    const uint64_t dq_kv_sz = use_dequant_kv ? (uint64_t)(ggml_nelements(k) + ggml_nelements(v)) * kv_scratch_ts : 0;
+    const uint64_t mask_scratch_off = mask_dense ? 0 : ROUNDUP_POW2(dq_kv_sz, (uint64_t)ctx->device->properties.limits.minStorageBufferOffsetAlignment);
+    const uint64_t mask_scratch_sz  = mask_dense ? 0 : (uint64_t)KV * nem1 * nem2 * nem3 * sizeof(ggml_fp16_t);
+    if (!mask_dense && ctx->prealloc_size_x < mask_scratch_off + mask_scratch_sz) {
+        ctx->prealloc_size_x = mask_scratch_off + mask_scratch_sz;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
 
     if (use_dequant_kv) {
         const uint64_t k_sz = (uint64_t)ggml_nelements(k) * kv_scratch_ts;
@@ -9697,15 +9738,45 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     uint32_t mask_n_head_log2 = ((sinks != nullptr) << 24) | n_head_log2;
 
+    // mask strides in elements as the kernels below see the mask (dense scratch when the mask is strided)
+    uint32_t mask_nb1 = mask ? (uint32_t)(mask->nb[1] / sizeof(ggml_fp16_t)) : 0;
+    uint32_t mask_nb2 = mask ? (uint32_t)(mask->nb[2] / sizeof(ggml_fp16_t)) : 0;
+    uint32_t mask_nb3 = mask ? (uint32_t)(mask->nb[3] / sizeof(ggml_fp16_t)) : 0;
+    if (!mask_dense) {
+        vk_subbuffer mask_dense_buf = vk_subbuffer{ ctx->prealloc_x, mask_scratch_off, mask_scratch_sz };
+        if (ctx->prealloc_x_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+        const uint32_t ne_m = KV * nem1 * nem2 * nem3;
+        vk_op_unary_push_constants mpc = vk_op_unary_push_constants_init(mask, mask, ne_m);
+        mpc.nb10 = 1;
+        mpc.nb11 = KV;
+        mpc.nb12 = KV * nem1;
+        mpc.nb13 = KV * nem1 * nem2;
+        mpc.misalign_offsets = (get_misalign_bytes(ctx, mask) / sizeof(ggml_fp16_t)) << 16;
+        init_pushconst_fastdiv(mpc);
+        const std::array<uint32_t, 3> elements = ne_m > 262144 ? std::array<uint32_t, 3>{ 512, 512, CEIL_DIV(ne_m, 262144) }
+                                               : ne_m > 512    ? std::array<uint32_t, 3>{ 512, CEIL_DIV(ne_m, 512), 1 }
+                                                               : std::array<uint32_t, 3>{ ne_m, 1, 1 };
+        ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_cpy_16, 1);
+        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_cpy_16, { mask_buf, mask_dense_buf }, mpc, elements);
+        ggml_vk_sync_buffers(ctx, subctx);
+        ggml_vk_perf_mark(ctx, subctx, "FA/mask_dense");
+        mask_buf = mask_dense_buf;
+        mask_nb1 = mpc.nb11;
+        mask_nb2 = mpc.nb12;
+        mask_nb3 = mpc.nb13;
+    }
+
     if (use_mask_opt && !mask_opt_cached)
     {
         const vk_op_flash_attn_mask_opt_push_constants opt_pc = {
             nem0,
             nem1,
             nem2,
-            (uint32_t)(mask->nb[1] / sizeof(ggml_fp16_t)),
-            (uint32_t)(mask->nb[2] / sizeof(ggml_fp16_t)),
-            (uint32_t)(mask->nb[3] / sizeof(ggml_fp16_t)),
+            mask_nb1,
+            mask_nb2,
+            mask_nb3,
             mask_opt_num_dwords,
             mask_opt_num_dwords * CEIL_DIV(nem1, Br),
             mask_opt_num_dwords * CEIL_DIV(nem1, Br) * nem2,
@@ -9724,9 +9795,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
             KV,
             nem1,
             nem2,
-            (uint32_t)(mask->nb[1] / sizeof(ggml_fp16_t)),
-            (uint32_t)(mask->nb[2] / sizeof(ggml_fp16_t)),
-            (uint32_t)(mask->nb[3] / sizeof(ggml_fp16_t)),
+            mask_nb1,
+            mask_nb2,
+            mask_nb3,
             (uint32_t)n_kv_max,
         };
 
@@ -9836,7 +9907,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
         ggml_vk_sync_buffers(ctx, subctx);
         ggml_vk_perf_mark_node(ctx, subctx, dst, "FA/split_k_reduce");
-        const vk_op_flash_attn_split_k_reduce_push_constants pc2 = { HSV, (uint32_t)ne1, (uint32_t)ne2, (uint32_t)ne3, split_k, (sinks != nullptr) };
+        const vk_op_flash_attn_split_k_reduce_push_constants pc2 = { HSV, (uint32_t)ne1, (uint32_t)ne2, (uint32_t)ne3, split_k, (sinks != nullptr), emit_lse ? 1u : 0u };
         ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_split_k_reduce,
                                     {split_k_buf, sinks_buf, dst_buf},
                                     pc2, { (uint32_t)ne1, HSV, (uint32_t)(ne2 * ne3) });
@@ -9851,7 +9922,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                                     pc, { workgroups_x, workgroups_y, workgroups_z });
     }
 
-    if (use_dequant_kv) {
+    if (use_dequant_kv || !mask_dense) {
         ctx->prealloc_x_need_sync = true;
     }
     if (use_mask_opt || use_sparse) {
@@ -13445,7 +13516,7 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
         if (ctx->prealloc_x != nullptr) {
             ggml_vk_destroy_buffer(ctx->prealloc_x);
         }
-        ctx->prealloc_x = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_x);
+        ctx->prealloc_x = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_x, "prealloc_x");
     }
     if (ctx->prealloc_y == nullptr || (ctx->prealloc_size_y > 0 && ctx->prealloc_y->size < ctx->prealloc_size_y)) {
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(y_size: " << ctx->prealloc_size_y << ")");
@@ -13453,7 +13524,7 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
         if (ctx->prealloc_y != nullptr) {
             ggml_vk_destroy_buffer(ctx->prealloc_y);
         }
-        ctx->prealloc_y = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_y);
+        ctx->prealloc_y = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_y, "prealloc_y");
         ctx->prealloc_y_last_pipeline_used = nullptr;
         ctx->prealloc_y_last_tensor_used = nullptr;
         ctx->prealloc_y_last_k_padded = false;
@@ -13464,7 +13535,7 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
         if (ctx->prealloc_mask_scratch != nullptr) {
             ggml_vk_destroy_buffer(ctx->prealloc_mask_scratch);
         }
-        ctx->prealloc_mask_scratch = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_mask_scratch);
+        ctx->prealloc_mask_scratch = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_mask_scratch, "prealloc_mask_scratch");
         // the old contents are gone, so every cached entry is invalid
         ctx->mask_scratch_entries.clear();
         ctx->mask_scratch_used = 0;
@@ -13475,7 +13546,7 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
         if (ctx->prealloc_split_k != nullptr) {
             ggml_vk_destroy_buffer(ctx->prealloc_split_k);
         }
-        ctx->prealloc_split_k = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_split_k);
+        ctx->prealloc_split_k = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_split_k, "prealloc_split_k");
     }
     if (ctx->prealloc_add_rms_partials == nullptr || (ctx->prealloc_size_add_rms_partials > 0 && ctx->prealloc_add_rms_partials->size < ctx->prealloc_size_add_rms_partials)) {
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(add_partials_size: " << ctx->prealloc_add_rms_partials << ")");
@@ -13483,7 +13554,7 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
         if (ctx->prealloc_add_rms_partials != nullptr) {
             ggml_vk_destroy_buffer(ctx->prealloc_add_rms_partials);
         }
-        ctx->prealloc_add_rms_partials = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_add_rms_partials);
+        ctx->prealloc_add_rms_partials = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_add_rms_partials, "prealloc_add_rms_partials");
     }
 }
 
@@ -14164,6 +14235,10 @@ void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
     ctx->descriptor_set_idx = 0;
 }
 
+#ifdef __linux__
+static void ggml_vk_d2d_link_destroy(vk_d2d_link * l);
+#endif
+
 void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     VK_LOG_DEBUG("ggml_vk_cleanup(" << ctx->name << ")");
     // discard any unsubmitted command buffers
@@ -14172,6 +14247,13 @@ void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ggml_vk_synchronize(ctx);
 
     ggml_vk_graph_cleanup(ctx);
+
+#ifdef __linux__
+    for (vk_d2d_link * l : ctx->d2d_links) {
+        ggml_vk_d2d_link_destroy(l);
+    }
+#endif
+    ctx->d2d_links.clear();
 
     ggml_vk_destroy_buffer(ctx->prealloc_x);
     ggml_vk_destroy_buffer(ctx->prealloc_y);
@@ -14365,7 +14447,7 @@ ggml_backend_buffer_t ggml_backend_vk_buffer_type_alloc_buffer(ggml_backend_buff
 
     vk_buffer dev_buffer = nullptr;
     try {
-        dev_buffer = ggml_vk_create_buffer_device(ctx->device, size);
+        dev_buffer = ggml_vk_create_buffer_device(ctx->device, size, "ggml backend buffer");
     } catch (const vk::SystemError& e) {
         return nullptr;
     }
@@ -14648,6 +14730,464 @@ static void ggml_backend_vk_get_tensor_async(ggml_backend_t backend, const ggml_
     ggml_backend_vk_get_tensor_2d_async(backend, tensor, data, offset, size, 1, size, size);
 }
 
+// [fork, 2026-10-21] Async cross-device copy (GGML_VK_D2D_ASYNC, default off until the multi-GPU ppl gate passes).
+//
+// Without it ggml_backend_vk_cpy_tensor_async refuses a copy between two devices and the scheduler takes the
+// bounce: host-sync the source, host-sync (or event-sync) the destination, then a blocking staging copy. Measured
+// with LLAMA_DECODE_STATS (decode_stats.py --sched) on the 27B, layer split over three cards, 120 KB residual
+// hop: dst wait 0.011 ms, src sync 0.064 (p90 0.21), copy 0.253 (XT over x1) / 0.114 (XTX->XTX), so 0.33 /
+// 0.21 ms per hop with the CPU parked for all of it. Layer split pays 2 hops per step; a context-parallel
+// attention split would pay ~64, which is what this is for. The bytes still cross PCIe twice (src -> host
+// RAM -> dst); what goes away is the host waiting on either GPU.
+//
+// History: koopa-freefall (3b09800f6c) wrote vk_d2d_path with dmabuf P2P / GTT / shared staging and timeline /
+// sync_fd sync; bowser-bar-crawl (3398795999) ported it to -sm layer and found a read-after-write hole: hop 1
+// went on the src TRANSFER queue and waited only on the slot's previous hop 2, so nothing ordered it after
+// the src COMPUTE work producing the tensor (greedy output diverged once a prompt spanned >1 ubatch; the
+// "+100% pp" it showed was the dst starting on unfinished data). bowser closed it with a host
+// ggml_backend_synchronize(src), which is exactly the wait this exists to remove. dmabuf P2P needs a patched
+// kernel and gained nothing on this topology, so only the shared host staging is kept, and the sync is
+// rebuilt on the GPU timelines:
+//
+//   hop 1, src compute queue, appended after everything already queued on the src backend context:
+//       [wait bwd >= ring region's last reader] barrier, copy src tensor -> host ring, barrier, signal fwd = n
+//     RAW on the src tensor: same queue + the leading barrier (its first scope is all earlier submissions).
+//     WAR on the src tensor (later src work overwriting it): the trailing barrier.
+//   hop 2, dst compute queue, recorded into the dst compute context the next graph_compute flushes, the same
+//   place the same-device async copy goes:
+//       wait fwd >= n, barrier, copy host ring -> dst tensor, barrier, signal bwd = m
+//     WAR on the ring (hop 1 of a later copy reusing the region before hop 2 read it): hop 1 waits on bwd.
+//
+// fwd and bwd are timeline semaphores exported as opaque fds and imported on the peer device. Both cards run
+// RADV, where an opaque fd semaphore is a DRM syncobj and imports across devices on a stock kernel; the spec
+// only promises that for devices with matching device/driver UUIDs, so setup failure of any piece leaves the
+// pair on the bounce. Two semaphores rather than koopa's single shared one: with one timeline signaled from
+// both queues, hop 1 of copy k+1 (submitted at once) can signal 2k+3 before hop 2 of copy k (still unsubmitted
+// in the dst compute context) signals 2k+2, a non-monotonic timeline signal.
+//
+// Deadlock rule: hop 1 is submitted immediately, so it must never wait on a bwd value whose hop 2 is still
+// unsubmitted in the dst compute context (a host ggml_backend_synchronize(src) in between would hang). Before
+// such a wait the dst compute context is submitted first. With the ring at >= 2x the hop size that only happens
+// on wrap-around onto a region from the same not-yet-flushed batch, i.e. rarely, and it is safe when it does.
+//
+// Links are per (source device, destination backend context): bwd is signaled from that context's submissions,
+// so two contexts on one device (target + draft) must not share a timeline.
+#ifdef __linux__
+#include <unistd.h>
+#include <sys/mman.h>
+
+// default ON since 2026-10-21: ppl gate bit-identical on/off (3.9006 / 3.9024 at ub 512 / 12, 4 chunks, three
+// cards), every GPU->GPU hop took the async path with no fallback, session tg 52.8 -> 54.5 (noise), prompt
+// processing 911.6 -> 1067.8 t/s at ub 512 (+17%) and 663.7 -> 978.8 on the 50k turn (+47%): the host no longer
+// waits on the source card between ubatches. GGML_VK_D2D_ASYNC=0 restores the bounce path.
+// DEFAULT BACK TO OFF 2026-10-22 00:40: with it on, llama-server died in the kernel on the first 2048-row
+// prompt batch of a bench arm (amdgpu_hmm_invalidate_gfx NULL deref from __x64_sys_munmap -> __split_vma,
+// unmapping 149.6 MiB; process stuck in D state holding 62 GB across three cards, reboot required). The only
+// new userptr user in the tree is this ring (posix_memalign + VK_EXT_external_memory_host import into two
+// devices, freed on regrowth). Suspect, not proven: ggml_vk_d2d_ring_free frees the host pages while an
+// in-flight context still holds the import. Stays off until the ring lifetime is fixed and a long run passes.
+//
+// Ring lifetime rewrite 2026-10-22 (CPU-only build, NOT yet run on the GPUs; the default stays off until a long
+// run passes). The oops: BUG NULL pointer dereference, RIP amdgpu_hmm_invalidate_gfx+0x37, from
+// __mmu_notifier_invalidate_range_start <- __split_huge_pmd <- __split_vma <- __vm_munmap (len 0x95a1000), on a
+// llama-server thread, right after the first 2048-row prompt batch started. amdgpu only runs that notifier for
+// userptr BOs (host pages imported by the GPU), and this ring was the only userptr user in the process
+// (caps.buffer_from_host_ptr is false, pinned host buffers are driver allocations). Two hypotheses, both closed:
+//   1. Use-after-free on regrowth. The first 40 MiB hop (2048 rows x 5120 x f32) grew the ring 16 -> 256 MiB:
+//      ggml_vk_d2d_ring_free destroyed both imports and free()d the pages. The host had waited on fwd/bwd, so
+//      the GPU work was done, but the kernel releases a userptr BO only after the scheduler drops the job's
+//      references (free_job runs after the fence signals, asynchronously), so the munmap behind free() could
+//      reach a BO that was being torn down.
+//   2. THP split by an unrelated munmap. THP is "always" here. posix_memalign'd pages come from glibc: below the
+//      dynamic mmap threshold (up to 32 MiB) out of a heap/arena shared with other allocations, above it from
+//      an anonymous mmap that the kernel merges with adjacent anonymous VMAs of the same flags. The 149.6 MiB
+//      munmap matches the recurrent checkpoint blob (llama_state_seq_get_data into a std::vector, then freed).
+//      Unmapping it out of a merged VMA splits the VMA and the huge PMD at its boundary, and the invalidation
+//      covers the whole 2 MiB, so with a ring that is not 2 MiB aligned, or shares a VMA or a huge page with
+//      neighbours, the notifier fires on the ring's BOs (on both devices). khugepaged collapsing ring pages
+//      into a THP would invalidate the range the same way.
+// What the fix guarantees (ggml_vk_d2d_host_map / ggml_vk_d2d_ring_alloc / ggml_vk_d2d_link_destroy):
+//   - the ring is its own mmap: RW range 2 MiB aligned at both ends, PROT_NONE guards of >= 2 MiB on both
+//     sides (a different protection never merges with a neighbour, and no neighbour's huge page can overlap
+//     the range), MADV_NOHUGEPAGE before the first fault (no THP inside, khugepaged skips it), MADV_DONTFORK
+//     (no copy-on-write invalidation if the process forks), populated before the import.
+//   - once a device has imported any part of it, the process never munmaps, mprotects or madvises that range
+//     again. Regrowth retires the old ring with its imports alive (hops still in flight keep using it);
+//     link destroy waits for every hop 1, destroys the imports and leaves the pages mapped until exit.
+//   - bounded: growth jumps to >= 4x the old ring and the hop limit is 128 MiB, so a link holds at most
+//     16 + 64 + 256 MiB; a backend context freed before exit leaks its rings' address space and pages.
+// Not closed: amdgpu userptr pages are not pinned, so compaction / page migration can still invalidate the
+// range; that path is the driver's normal job, but if this kernel's notifier is broken (7.1.3-zen4-p2p carries
+// the explicit-sync dma-buf patch) only a stock-kernel run separates "our munmap" from "any invalidation".
+static constexpr bool   VK_D2D_ASYNC_DEFAULT = false;
+static constexpr size_t VK_D2D_RING_MIN      = 16u * 1024 * 1024;
+static constexpr size_t VK_D2D_HOP_MAX       = 128u * 1024 * 1024;   // larger hops take the bounce
+static constexpr size_t VK_D2D_ALIGN         = 256;
+static constexpr size_t VK_D2D_HUGE          = 2u * 1024 * 1024;     // PMD size: ring alignment and guard size
+
+static bool ggml_vk_d2d_async_enabled() {
+    static const bool enabled = [] {
+        const char * v = getenv("GGML_VK_D2D_ASYNC");
+        return v ? atoi(v) != 0 : VK_D2D_ASYNC_DEFAULT;
+    }();
+    return enabled;
+}
+
+struct vk_d2d_link {
+    vk_device src_dev;
+    vk_device dst_dev;
+    bool      ok = false;   // false: setup failed or was refused, the pair takes the bounce
+
+    // host ring imported into both devices (VK_EXT_external_memory_host); lifetime rules above
+    struct ring_t {
+        void *    ptr = nullptr;   // never unmapped once imported
+        size_t    len = 0;
+        vk_buffer buf_src;
+        vk_buffer buf_dst;
+    };
+    ring_t              ring;
+    std::vector<ring_t> retired;   // outgrown rings, imports alive until link destroy
+    size_t    cap  = 0;
+    size_t    head = 0;
+    struct region { size_t begin, end; uint64_t bwd; };
+    std::vector<region> live;   // regions whose hop 2 may still be reading
+
+    // one payload each, a handle per device
+    vk::Semaphore fwd_src, fwd_dst;   // signaled by hop 1, waited by hop 2
+    vk::Semaphore bwd_src, bwd_dst;   // signaled by hop 2, waited by hop 1
+    uint64_t fwd_value = 0;
+    uint64_t bwd_value = 0;
+
+    // bwd values <= bwd_submitted are on the dst queue; the rest sit in bwd_pending_ctx until its next submit
+    uint64_t       bwd_submitted    = 0;
+    vk_context_ref bwd_pending_ctx;
+    uint64_t       bwd_pending_mark = 0;
+};
+
+static bool ggml_vk_d2d_timeline_shareable(const vk_device & dev) {
+    if (!dev->external_semaphore_fd) {
+        return false;
+    }
+    vk::SemaphoreTypeCreateInfo tci{ vk::SemaphoreType::eTimeline, 0 };
+    vk::PhysicalDeviceExternalSemaphoreInfo info{ vk::ExternalSemaphoreHandleTypeFlagBits::eOpaqueFd };
+    info.pNext = &tci;
+    const vk::ExternalSemaphoreProperties props = dev->physical_device.getExternalSemaphoreProperties(info);
+    return (props.externalSemaphoreFeatures & vk::ExternalSemaphoreFeatureFlagBits::eExportable) &&
+           (props.externalSemaphoreFeatures & vk::ExternalSemaphoreFeatureFlagBits::eImportable);
+}
+
+// timeline semaphore created on `from`, its payload imported into a new semaphore on `to`
+static bool ggml_vk_d2d_share_timeline(vk_device & from, vk_device & to, vk::Semaphore & s_from, vk::Semaphore & s_to) {
+    vk::ExportSemaphoreCreateInfo eci{ vk::ExternalSemaphoreHandleTypeFlagBits::eOpaqueFd };
+    vk::SemaphoreTypeCreateInfo tci_from{ vk::SemaphoreType::eTimeline, 0 };
+    tci_from.pNext = &eci;
+    vk::SemaphoreCreateInfo ci_from{};
+    ci_from.pNext = &tci_from;
+    vk::SemaphoreTypeCreateInfo tci_to{ vk::SemaphoreType::eTimeline, 0 };
+    vk::SemaphoreCreateInfo ci_to{};
+    ci_to.pNext = &tci_to;
+
+    int fd = -1;
+    try {
+        s_from = from->device.createSemaphore(ci_from);
+        fd     = from->device.getSemaphoreFdKHR({ s_from, vk::ExternalSemaphoreHandleTypeFlagBits::eOpaqueFd });
+        s_to   = to->device.createSemaphore(ci_to);
+        to->device.importSemaphoreFdKHR({ s_to, {}, vk::ExternalSemaphoreHandleTypeFlagBits::eOpaqueFd, fd });
+        return true;   // a successful import owns fd
+    } catch (const vk::SystemError & e) {
+        GGML_LOG_WARN("ggml_vulkan: async D2D %s -> %s: timeline semaphore share failed: %s\n", from->name.c_str(), to->name.c_str(), e.what());
+        if (fd >= 0) {
+            close(fd);
+        }
+        if (s_to) {
+            to->device.destroySemaphore(s_to);
+            s_to = nullptr;
+        }
+        if (s_from) {
+            from->device.destroySemaphore(s_from);
+            s_from = nullptr;
+        }
+        return false;
+    }
+}
+
+// dedicated RW mapping of len (a multiple of VK_D2D_HUGE), 2 MiB aligned, PROT_NONE guards >= 2 MiB both sides
+static void * ggml_vk_d2d_host_map(size_t len) {
+    const size_t span = len + 3 * VK_D2D_HUGE;
+    void * base = mmap(nullptr, span, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (base == MAP_FAILED) {
+        return nullptr;
+    }
+    uint8_t * p = (uint8_t *)(((uintptr_t)base + 2 * VK_D2D_HUGE - 1) & ~(uintptr_t)(VK_D2D_HUGE - 1));
+    // NOHUGEPAGE before the first fault, so no huge page is ever allocated inside the range
+    if (mprotect(p, len, PROT_READ | PROT_WRITE) != 0 ||
+        madvise(p, len, MADV_NOHUGEPAGE) != 0 ||
+        madvise(p, len, MADV_DONTFORK) != 0) {
+        munmap(base, span);   // nothing imported it yet
+        return nullptr;
+    }
+#ifdef MADV_POPULATE_WRITE
+    if (madvise(p, len, MADV_POPULATE_WRITE) != 0)
+#endif
+    {
+        memset(p, 0, len);
+    }
+    return p;
+}
+
+// a new current ring of at least cap bytes; the previous one (if any) is retired, not freed
+static bool ggml_vk_d2d_ring_alloc(vk_d2d_link * l, size_t cap) {
+    const size_t align = std::max<size_t>({ VK_D2D_HUGE, l->src_dev->min_imported_host_pointer_alignment, l->dst_dev->min_imported_host_pointer_alignment });
+    cap = (cap + align - 1) / align * align;
+    if (cap % VK_D2D_HUGE != 0) {
+        return false;   // an import alignment that is not a divisor of 2 MiB: not worth supporting
+    }
+    void * p = ggml_vk_d2d_host_map(cap);
+    if (p == nullptr) {
+        return false;
+    }
+    vk_d2d_link::ring_t r;
+    r.ptr     = p;
+    r.len     = cap;
+    r.buf_src = ggml_vk_buffer_from_host_ptr(l->src_dev, p, cap);
+    r.buf_dst = r.buf_src ? ggml_vk_buffer_from_host_ptr(l->dst_dev, p, cap) : vk_buffer{};
+    if (!r.buf_src || !r.buf_dst) {
+        // an import may have existed: drop it, keep the pages mapped (rule: never unmap after an import)
+        ggml_vk_destroy_buffer(r.buf_src);
+        ggml_vk_destroy_buffer(r.buf_dst);
+        return false;
+    }
+    if (l->ring.ptr) {
+        l->retired.push_back(std::move(l->ring));
+    }
+    l->ring = std::move(r);
+    l->cap  = cap;
+    l->head = 0;
+    l->live.clear();   // the new ring has no readers; in-flight hops on the retired one still have its imports
+    return true;
+}
+
+static void ggml_vk_d2d_host_wait(vk_device & dev, vk::Semaphore s, uint64_t value) {
+    if (!s || value == 0) {
+        return;
+    }
+    vk::SemaphoreWaitInfo swi{ vk::SemaphoreWaitFlags{}, s, value };
+    VK_CHECK(dev->device.waitSemaphores(swi, UINT64_MAX), "d2d waitSemaphores", dev);
+}
+
+// end and submit ctx's open compute context without waiting (what event_record does)
+static void ggml_vk_submit_compute_ctx_nowait(ggml_backend_vk_context * ctx) {
+    if (ctx->compute_ctx.expired()) {
+        return;
+    }
+    vk_context c = ctx->compute_ctx.lock();
+    if (!c->out_memcpys.empty()) {
+        // device -> host staging reads land on the host after a wait; only synchronize does that
+        ggml_vk_synchronize(ctx);
+        return;
+    }
+    ggml_vk_ctx_end(c);
+    for (auto & cpy : c->in_memcpys) {
+        memcpy(cpy.dst, cpy.src, cpy.n);
+    }
+    for (auto & mset : c->memsets) {
+        memset(mset.dst, mset.val, mset.n);
+    }
+    c->in_memcpys.clear();
+    c->memsets.clear();
+    ggml_vk_submit(c, {});
+    ctx->submit_pending = true;
+    ctx->compute_ctx.reset();
+}
+
+// true if every recorded hop 2 signal is on the dst queue
+static bool ggml_vk_d2d_bwd_all_submitted(vk_d2d_link * l) {
+    if (l->bwd_submitted == l->bwd_value) {
+        return true;
+    }
+    // a compute context is submitted before a new one is opened, so the latest one holding a bwd signal
+    // being submitted (or gone) means all of them are
+    vk_context c = l->bwd_pending_ctx.lock();
+    if (!c || c->n_submits > l->bwd_pending_mark) {
+        l->bwd_submitted = l->bwd_value;
+        return true;
+    }
+    return false;
+}
+
+static void ggml_vk_d2d_flush_bwd(ggml_backend_vk_context * dst_ctx, vk_d2d_link * l) {
+    if (!ggml_vk_d2d_bwd_all_submitted(l)) {
+        ggml_vk_submit_compute_ctx_nowait(dst_ctx);
+        l->bwd_submitted = l->bwd_value;
+    }
+}
+
+static void ggml_vk_d2d_link_destroy(vk_d2d_link * l) {
+    // the dst context was synchronized by the caller (every submitted hop 2 is done); hop 1 copies may still run
+    // on the src queue. Every hop 1 waits only on submitted hop 2 signals (deadlock rule), so this terminates.
+    ggml_vk_d2d_host_wait(l->src_dev, l->fwd_src, l->fwd_value);
+    if (l->fwd_src) { l->src_dev->device.destroySemaphore(l->fwd_src); }
+    if (l->bwd_src) { l->src_dev->device.destroySemaphore(l->bwd_src); }
+    if (l->fwd_dst) { l->dst_dev->device.destroySemaphore(l->fwd_dst); }
+    if (l->bwd_dst) { l->dst_dev->device.destroySemaphore(l->bwd_dst); }
+    // the imports go, the pages stay mapped until exit: the kernel may release the userptr BOs later than
+    // vkFreeMemory returns, and an munmap racing that release is hypothesis 1 of the oops
+    l->retired.push_back(std::move(l->ring));
+    for (auto & r : l->retired) {
+        ggml_vk_destroy_buffer(r.buf_src);
+        ggml_vk_destroy_buffer(r.buf_dst);
+    }
+    delete l;
+}
+
+static vk_d2d_link * ggml_vk_d2d_get_link(ggml_backend_vk_context * dst_ctx, const vk_device & src_dev) {
+    for (vk_d2d_link * l : dst_ctx->d2d_links) {
+        if (l->src_dev == src_dev) {
+            return l;
+        }
+    }
+    vk_d2d_link * l = new vk_d2d_link;
+    l->src_dev = src_dev;
+    l->dst_dev = dst_ctx->device;
+    dst_ctx->d2d_links.push_back(l);
+
+    const char * why = nullptr;
+    if (l->src_dev->driver_id != l->dst_dev->driver_id) {
+        why = "different drivers";
+    } else if (!l->src_dev->external_memory_host || !l->dst_dev->external_memory_host) {
+        why = "no VK_EXT_external_memory_host";
+    } else if (!ggml_vk_d2d_timeline_shareable(l->src_dev) || !ggml_vk_d2d_timeline_shareable(l->dst_dev)) {
+        why = "no exportable timeline semaphore (VK_KHR_external_semaphore_fd)";
+    } else if (l->src_dev->serialize_submissions || l->dst_dev->serialize_submissions || !l->src_dev->support_async || !l->dst_dev->support_async) {
+        why = "device runs synchronous submissions";
+    } else if (!ggml_vk_d2d_share_timeline(l->src_dev, l->dst_dev, l->fwd_src, l->fwd_dst) ||
+               !ggml_vk_d2d_share_timeline(l->dst_dev, l->src_dev, l->bwd_dst, l->bwd_src)) {
+        why = "semaphore share failed";
+    } else if (!ggml_vk_d2d_ring_alloc(l, VK_D2D_RING_MIN)) {
+        why = "host ring import failed";
+    }
+    if (why) {
+        GGML_LOG_WARN("ggml_vulkan: async D2D %s -> %s unavailable (%s), using the host bounce\n", l->src_dev->name.c_str(), l->dst_dev->name.c_str(), why);
+        return l;
+    }
+    l->ok = true;
+    GGML_LOG_DEBUG("ggml_vulkan: async D2D %s -> %s: host ring %zu MiB, timeline sync\n", l->src_dev->name.c_str(), l->dst_dev->name.c_str(), l->cap >> 20);
+    return l;
+}
+
+// ring of at least 2x the hop, so consecutive hops rarely wrap onto their own unflushed batch
+static bool ggml_vk_d2d_ensure_cap(vk_d2d_link * l, size_t size_al) {
+    if (size_al * 2 <= l->cap) {
+        return true;
+    }
+    if (size_al > VK_D2D_HOP_MAX) {
+        return false;
+    }
+    // jump to >= 4x the old ring so a link retires at most two (16 -> 64 -> 256 MiB at the 128 MiB hop limit)
+    size_t cap = std::max(VK_D2D_RING_MIN, l->cap * 4);
+    while (cap < size_al * 2) {
+        cap *= 2;
+    }
+    // no drain: the old ring is retired with its imports, hops still queued on it complete against it
+    if (!ggml_vk_d2d_ring_alloc(l, cap)) {
+        GGML_LOG_WARN("ggml_vulkan: async D2D %s -> %s: host ring grow to %zu MiB failed, using the host bounce\n", l->src_dev->name.c_str(), l->dst_dev->name.c_str(), cap >> 20);
+        l->ok = false;
+        return false;
+    }
+    return true;
+}
+
+static bool ggml_vk_d2d_copy_async(ggml_backend_vk_context * src_ctx, ggml_backend_vk_context * dst_ctx,
+                                   vk_buffer & src_buf, size_t src_offset, vk_buffer & dst_buf, size_t dst_offset, size_t size) {
+    vk_d2d_link * l = ggml_vk_d2d_get_link(dst_ctx, src_buf->device);
+    if (!l->ok) {
+        return false;
+    }
+    const size_t size_al = ggml_vk_align_size(size, VK_D2D_ALIGN);
+    if (!ggml_vk_d2d_ensure_cap(l, size_al)) {
+        return false;
+    }
+
+    // ring region, and the last hop 2 that read any part of it
+    if (l->head + size_al > l->cap) {
+        l->head = 0;
+    }
+    const size_t off = l->head;
+    l->head += size_al;
+    uint64_t wait_bwd = 0;
+    {
+        auto & live = l->live;
+        size_t n = 0;
+        for (size_t i = 0; i < live.size(); i++) {
+            if (live[i].begin < off + size_al && off < live[i].end) {
+                wait_bwd = std::max(wait_bwd, live[i].bwd);
+            } else {
+                live[n++] = live[i];
+            }
+        }
+        live.resize(n);
+    }
+    if (wait_bwd > l->bwd_submitted) {
+        ggml_vk_d2d_flush_bwd(dst_ctx, l);   // deadlock rule
+    }
+
+    // hop 1: after everything queued on the src context, on its compute queue
+    ggml_vk_submit_transfer_ctx(src_ctx);
+    const bool src_fresh = src_ctx->compute_ctx.expired();
+    vk_context sc = ggml_vk_get_compute_ctx(src_ctx);
+    if (!src_fresh) {
+        // own batch, so the semaphore wait does not hold back work recorded before it
+        ggml_vk_ctx_begin(src_ctx->device, sc);
+    }
+    if (src_ctx->device->async_use_transfer_queue && src_ctx->transfer_semaphore.value > 0) {
+        // uploads into the src tensor on the transfer queue; a wait on an already reached value is free
+        sc->s->wait_semaphores.push_back(src_ctx->transfer_semaphore);
+    }
+    if (wait_bwd > 0) {
+        sc->s->wait_semaphores.push_back({ l->bwd_src, wait_bwd });
+    }
+    ggml_vk_sync_buffers(nullptr, sc);
+    {
+        VkBufferCopy bc{ src_offset, off, size };
+        vkCmdCopyBuffer(sc->s->buffer->buf, (VkBuffer)src_buf->buffer, (VkBuffer)l->ring.buf_src->buffer, 1, &bc);
+    }
+    ggml_vk_sync_buffers(nullptr, sc);
+    sc->s->signal_semaphores.push_back({ l->fwd_src, ++l->fwd_value });
+    ggml_vk_submit_compute_ctx_nowait(src_ctx);
+
+    // hop 2: into the dst compute context, flushed by the next graph_compute (or the deadlock rule)
+    ggml_vk_d2d_bwd_all_submitted(l);   // retire the previous pending context before tracking a new one
+    const bool dst_fresh = dst_ctx->compute_ctx.expired();
+    vk_context dc = ggml_vk_get_compute_ctx(dst_ctx);
+    if (!dst_fresh) {
+        ggml_vk_ctx_begin(dst_ctx->device, dc);
+    }
+    dc->s->wait_semaphores.push_back({ l->fwd_dst, l->fwd_value });
+    ggml_vk_sync_buffers(nullptr, dc);
+    {
+        VkBufferCopy bc{ off, dst_offset, size };
+        vkCmdCopyBuffer(dc->s->buffer->buf, (VkBuffer)l->ring.buf_dst->buffer, (VkBuffer)dst_buf->buffer, 1, &bc);
+    }
+    ggml_vk_sync_buffers(nullptr, dc);
+    ++l->bwd_value;
+    // one signal per semaphore per batch: a second hop 2 in the same batch raises the value instead
+    bool merged = false;
+    for (auto & sem : dc->s->signal_semaphores) {
+        if (sem.s == l->bwd_dst) {
+            sem.value = l->bwd_value;
+            merged = true;
+        }
+    }
+    if (!merged) {
+        dc->s->signal_semaphores.push_back({ l->bwd_dst, l->bwd_value });
+    }
+    l->bwd_pending_ctx  = dc;
+    l->bwd_pending_mark = dc->n_submits;
+    l->live.push_back({ off, off + size_al, l->bwd_value });
+    return true;
+}
+#endif // __linux__
+
 static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_backend_vk_cpy_tensor_async(" << src << " -> " << dst << ", size=" << ggml_nbytes(src) << ")");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend_dst->context;
@@ -14667,8 +15207,20 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
     if (ggml_backend_buffer_is_vk(src->buffer)) {
         ggml_backend_vk_buffer_context * src_buf_ctx = (ggml_backend_vk_buffer_context *)src->buffer->context;
 
-        // Async copy only works within the same device
         if (src_buf_ctx->dev_buffer->device != dst_buf->device) {
+#ifdef __linux__
+            // cross-device: GPU-timeline copy through a host ring (comment above ggml_vk_d2d_copy_async)
+            if (ggml_vk_d2d_async_enabled() && ggml_backend_is_vk(backend_src)) {
+                ggml_backend_vk_context * src_ctx = (ggml_backend_vk_context *)backend_src->context;
+                if (src_ctx->device == src_buf_ctx->dev_buffer->device &&
+                    ggml_vk_d2d_copy_async(src_ctx, ctx,
+                                           src_buf_ctx->dev_buffer, vk_tensor_offset(src) + src->view_offs,
+                                           dst_buf, vk_tensor_offset(dst) + dst->view_offs, ggml_nbytes(src))) {
+                    return true;
+                }
+            }
+#endif
+            // the scheduler bounces it through the host with both devices synchronized
             return false;
         }
 
@@ -15562,6 +16114,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     // queue scope, so it encloses every submit this evaluation makes.
     // closed when the function returns
     ggml_vk_debug_label queue_dbg(ctx->device->compute_queue->handle.get(), "ggml_backend_vk_graph_compute");
+
+    ggml_vk_mem_watch_graph(ctx->device);   // GPU PLACEMENT warning, every GGML_VK_MEM_WATCH_EVERY graphs
 
     ctx->prealloc_size_add_rms_partials_offset = 0;
     ctx->do_add_rms_partials = false;
@@ -17033,6 +17587,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 }
                 if (!coopmat2 && !(device->subgroup_shuffle && device->subgroup_vote)) {
                     // scalar/coopmat1 FA uses subgroupShuffle/subgroupAll
+                    return false;
+                }
+                if (ggml_flash_attn_ext_get_emit_lse(op) && (coopmat2 || (HSV % 4) != 0)) {
+                    // emit_lse (context-parallel merge) is implemented in the scalar and coopmat1 shaders only
                     return false;
                 }
                 return true;

@@ -470,6 +470,10 @@ static void common_params_fit_impl(
         if (mparams->tensor_split) {
             for (size_t id = 0; id < nd; id++) {
                 if (mparams->tensor_split[id] != 0.0f) {
+                    // [fork, 2026-10-21] said loudly: the generic "failed to fit" line below was missed twice, the
+                    // unfitted context then overflowed a card into GTT (recurrent buffer, 3x slower steps, no other sign)
+                    LOG_WRN("%s: tensor_split set (-ts): fit disabled, layers and context not sized to free VRAM; a card that "
+                            "overflows spills to host memory (GTT) silently, drop -ts to let the fit place layers\n", __func__);
                     throw common_params_fit_exception("model_params::tensor_split already set by user, abort");
                 }
             }

@@ -46,6 +46,13 @@ const bool PV_REG_REQ      = (Flags & 1024) != 0;
 const bool PV_REG_F16_REQ  = (Flags & 2048) != 0;
 // GGML_VK_FA_PV_REG=3 adds bit 4096 (with 1024, ACC_TYPE accumulators): step C, V staged transposed through kvsh.
 const bool PV_REG_C_REQ    = (Flags & 4096) != 0;
+// ggml_flash_attn_ext_set_emit_lse (context-parallel merge of partial attentions over disjoint KV ranges): the
+// final dst rows are HSV + 4 floats, [HSV] = lse = Mf + log(Lf) (natural log, -inf when Lf == 0), [HSV+1..3] = 0.
+// Mf carries FATTN_KQ_MAX_OFFSET and Lf is relative to that same Mf, so the offset cancels in the lse.
+// Implemented in flash_attn.comp (scalar) and flash_attn_cm1.comp; split_k partials keep the HSV stride and
+// flash_attn_split_k_reduce.comp writes the lse. cm2 is refused in ggml_backend_vk_device_supports_op.
+const bool EMIT_LSE        = (Flags & 8192) != 0;
+const uint32_t HSV_out     = HSV + (EMIT_LSE ? 4 : 0);
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
@@ -272,8 +279,16 @@ const float FATTN_KQ_MAX_OFFSET = 3.0f*0.6931f;
 
 // Store the output when doing grouped query attention.
 // Rows index by Q's dimension 2, and the first N rows are valid.
-void gqaStore(const in uint32_t r, const in uint32_t c, const in O_TYPEV4 elems, const in uint32_t o_offset, const in uint32_t iq2, const in uint32_t N)
+// row_stride: HSV for split_k partials, HSV_out for the final dst.
+void gqaStore(const in uint32_t r, const in uint32_t c, const in O_TYPEV4 elems, const in uint32_t o_offset, const in uint32_t iq2, const in uint32_t N, const in uint32_t row_stride)
 {
-    uint32_t offset = (iq2 + r) * HSV / 4 + c;
+    uint32_t offset = (iq2 + r) * row_stride / 4 + c;
     data_ov4[o_offset + offset] = D_TYPEV4(elems);
+}
+
+// EMIT_LSE tail of one dst row: o_vec4 indexes data_ov4 at the row's first O element.
+void storeLse(const in uint32_t o_vec4, const in float M, const in float L)
+{
+    const float lse = (L == 0.0) ? uintBitsToFloat(0xFF800000) : M + log(L);
+    data_ov4[o_vec4 + HSV / 4] = D_TYPEV4(lse, 0.0, 0.0, 0.0);
 }

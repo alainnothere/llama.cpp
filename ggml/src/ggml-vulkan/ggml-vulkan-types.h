@@ -680,6 +680,21 @@ static constexpr std::array<ggml_type, 9> lightning_indexer_k_types = {
 
 class vk_memory_logger;
 
+// [fork, 2026-10-21] GPU PLACEMENT warning state (ledger lever 8), see ggml_vk_mem_watch_check in ggml-vulkan-buffers.cpp
+struct vk_mem_watch {
+    std::mutex mutex;
+    bool     init          = false;
+    bool     has_budget    = false; // VK_EXT_memory_budget supported by the physical device
+    bool     warned_type   = false;
+    bool     warned_budget = false;
+    uint64_t heap_size     = 0;     // sum of the device-local heaps
+    std::atomic<int64_t>  dev_local_bytes {0}; // live device-local bytes we allocated (fallback without the extension)
+    std::atomic<uint64_t> n_graphs {0};
+    std::deque<std::pair<size_t, std::string>> last; // last allocations (size, label), newest last
+};
+
+void ggml_vk_mem_watch_free(vk_device_struct * device, size_t size, bool counted);
+
 struct vk_device_struct {
     std::recursive_mutex mutex;
     std::mutex queue_submit_mutex;
@@ -702,6 +717,8 @@ struct vk_device_struct {
     uint64_t suballocation_block_size;
     uint64_t min_imported_host_pointer_alignment;
     bool external_memory_host {};
+    // VK_KHR_external_semaphore_fd: timeline semaphores shared with a peer device (async cross-device copy)
+    bool external_semaphore_fd {};
     bool fp16;
     bool bf16;
     bool pipeline_robustness;
@@ -1034,6 +1051,7 @@ struct vk_device_struct {
     bool disable_fusion;
     bool disable_descriptor_reuse;
     std::atomic<uint64_t> buffer_destroy_count {};
+    vk_mem_watch mem_watch;
     bool disable_host_visible_vidmem;
     bool allow_sysmem_fallback;
     bool disable_graph_optimize;
@@ -1137,6 +1155,7 @@ struct vk_buffer_struct {
     void * ptr;
     size_t size = 0;
     vk::DeviceAddress bda_addr {};
+    bool mem_watch_counted = false; // [fork] in device->mem_watch.dev_local_bytes
 
     vk_device device;
 
@@ -1149,6 +1168,7 @@ struct vk_buffer_struct {
 
         // bump before destroying, so a thread that sees the buffer gone also sees the new count
         device->buffer_destroy_count.fetch_add(1, std::memory_order_release);
+        ggml_vk_mem_watch_free(device.get(), size, mem_watch_counted);
         device->device.freeMemory(device_memory);
         device->device.destroyBuffer(buffer);
     }
@@ -1225,6 +1245,10 @@ struct vk_context_struct {
     std::vector<std::string> debug_labels;
 
     vk_command_pool * p {};
+
+    // ggml_vk_submit calls that sent work; the cross-device copy uses it to tell whether a signal it
+    // recorded into this context has reached the queue yet
+    uint64_t n_submits {};
 };
 
 typedef std::shared_ptr<vk_context_struct> vk_context;
@@ -1338,6 +1362,8 @@ class vk_perf_logger {
     uint32_t print_count {};
 };
 
+struct vk_d2d_link;
+
 struct ggml_backend_vk_context {
     std::string name;
 
@@ -1393,6 +1419,9 @@ struct ggml_backend_vk_context {
     uint64_t transfer_semaphore_last_submitted {};
 
     std::vector<vk_context_ref> tensor_ctxs;
+
+    // async cross-device copy links into this (destination) context, one per source device (GGML_VK_D2D_ASYNC)
+    std::vector<vk_d2d_link *> d2d_links;
 
     std::vector<vk::DescriptorPool> descriptor_pools;
     std::vector<vk::DescriptorSet> descriptor_sets;

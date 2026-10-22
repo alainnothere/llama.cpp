@@ -8839,6 +8839,20 @@ void ggml_compute_forward_top_k(
     }
 }
 
+// Store one normalized output row of FLASH_ATTN_EXT. With emit_lse (ggml_flash_attn_ext_set_emit_lse, op_params[5])
+// the row is DV + 4 floats: O, then lse = M + log(S) over the attended keys (-INF when S == 0), then 3 zeros.
+// The lse lets partial attentions over disjoint KV ranges be merged (context-parallel attention, see ggml.h).
+static inline void ggml_fa_store_row(char * dst_row, const float * VKQ, int64_t DV, bool emit_lse, float M, float S) {
+    memcpy(dst_row, VKQ, DV*sizeof(float));
+    if (emit_lse) {
+        float * tail = (float *) dst_row + DV;
+        tail[0] = S == 0.0f ? -INFINITY : M + logf(S);
+        tail[1] = 0.0f;
+        tail[2] = 0.0f;
+        tail[3] = 0.0f;
+    }
+}
+
 static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const ggml_compute_params * params,
         ggml_tensor * dst,
@@ -8866,7 +8880,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const int64_t DV = nev0;
     const int64_t N  = neq1;
 
-    GGML_ASSERT(ne0 == DV);
+    const bool emit_lse = ggml_get_op_params_i32(dst, 5) != 0;
+    GGML_ASSERT(ne0 == DV + (emit_lse ? 4 : 0));
     GGML_ASSERT(ne2 == N);
 
     // input tensor rows must be contiguous
@@ -8940,7 +8955,14 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         ggml_fp16_t * VKQ16 = (ggml_fp16_t *) (VKQ32 + 1*DV); // (temporary) FP16 VKQ accumulator
         ggml_fp16_t * Q_q   = (ggml_fp16_t *) (VKQ32 + 2*DV); // (temporary) buffer for Q converted to quantized/FP16
 
-        if (v->type == GGML_TYPE_F16) {
+        // F16 V used to accumulate VKQ in f16 (VKQ16). Over long KV the accumulator stagnates: once it reaches ~1e3 an
+        // increment vs*v < half an ulp rounds away. Measured 2026-10-21 (27B shape hs 256 4x6 heads, kv 32768, f16 KV):
+        // Vulkan vs this reference nmse 7.1e-4 on random data (test-backend-ops limit 5e-4), 1.1e-1 on peaked data
+        // (tests/test-flash-attn-merge.cpp), while Vulkan vs the f32-KV reference was 1e-7. It now accumulates in f32
+        // (v_to_float + ggml_vec_mad_f32) like every other V type.
+        const bool v_acc_f16 = false;
+
+        if (v_acc_f16) {
             memset(VKQ16, 0, DV*sizeof(ggml_fp16_t));
         } else {
             memset(VKQ32, 0, DV*sizeof(float));
@@ -8989,7 +9011,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
             const char * v_data = ((const char *) v->data + (ic*nbv1 + iv2*nbv2 + iv3*nbv3));
 
-            if (v->type == GGML_TYPE_F16) {
+            if (v_acc_f16) {
                 if (s > M) {
                     // s is new maximum, ms < 1.0f, vs == expf(s - s) == 1.0f
                     M = s;
@@ -9018,7 +9040,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                 }
 
                 // V += v*expf(s - M)
-                if (v_to_float) {
+                if (v->type == GGML_TYPE_F16) {
+                    ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) v_data, V32, DV);
+                    ggml_vec_mad_f32(DV, VKQ32, V32, vs);
+                } else if (v_to_float) {
                     v_to_float(v_data, V32, DV);
                     ggml_vec_mad_f32(DV, VKQ32, V32, vs);
                 } else {
@@ -9030,7 +9055,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             S = S*ms + vs; // scale and increment sum with partial sum
         }
 
-        if (v->type == GGML_TYPE_F16) {
+        if (v_acc_f16) {
             for (int64_t d = 0; d < DV; ++d) {
                 VKQ32[d] = GGML_CPU_FP16_TO_FP32(VKQ16[d]);
             }
@@ -9072,7 +9097,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             const int i3 = iq3;
 
             // permute(0, 2, 1, 3)
-            memcpy((char *) dst->data + (i3*ne2*ne1 + i2 + i1*ne1)*nb1, VKQ32, nb1);
+            ggml_fa_store_row((char *) dst->data + (i3*ne2*ne1 + i2 + i1*ne1)*nb1, VKQ32, DV, emit_lse, M, S);
         }
     }
 }
@@ -9100,7 +9125,8 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
     const int64_t DV = nev0;
     const int64_t N  = neq1;
 
-    GGML_ASSERT(ne0 == DV);
+    const bool emit_lse = ggml_get_op_params_i32(dst, 5) != 0;
+    GGML_ASSERT(ne0 == DV + (emit_lse ? 4 : 0));
     GGML_ASSERT(ne2 == N);
 
     // input tensor rows must be contiguous
@@ -9358,7 +9384,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
             const int i3 = iq3;
 
             // permute(0, 2, 1, 3)
-            memcpy((char *) dst->data + (i3*ne2*ne1 + i2 + i1*ne1)*nb1, VKQ32 + tq * DV, nb1);
+            ggml_fa_store_row((char *) dst->data + (i3*ne2*ne1 + i2 + i1*ne1)*nb1, VKQ32 + tq * DV, DV, emit_lse, M[tq], S[tq]);
         }
 
         ir += tile_rows;
@@ -9381,6 +9407,7 @@ static void ggml_flash_attn_ext_reduce_partials(
     const int64_t DV        = v->ne[0];
     const int64_t nek1      = k->ne[1];
     const int64_t n_q_heads = q->ne[2];
+    const bool    emit_lse  = ggml_get_op_params_i32(dst, 5) != 0;
 
     const int ith = params->ith;
     const int nth = params->nth;
@@ -9433,7 +9460,7 @@ static void ggml_flash_attn_ext_reduce_partials(
             ggml_vec_scale_f32(DV, VKQ_final, S_inv);
         }
         // iq1=0, iq3=0 for decode
-        memcpy((char *) dst->data + (0*ne2*ne1 + q_head + 0*ne1)*nb1, VKQ_final, nb1);
+        ggml_fa_store_row((char *) dst->data + (0*ne2*ne1 + q_head + 0*ne1)*nb1, VKQ_final, DV, emit_lse, M_final, S_final);
     }
 }
 
@@ -9458,8 +9485,8 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const int64_t DV = nev0;
     const int64_t N  = neq1;
 
-
-    GGML_ASSERT(ne0 == DV);
+    const bool emit_lse = ggml_get_op_params_i32(dst, 5) != 0;
+    GGML_ASSERT(ne0 == DV + (emit_lse ? 4 : 0));
     GGML_ASSERT(ne2 == N);
 
     // input tensor rows must be contiguous

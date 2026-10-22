@@ -204,6 +204,20 @@ public:
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
 
+    // [CP] context-parallel attention prototype, see cp_state
+    bool               cp_active(int32_t il) const;            // layer il has a mirror on the helper device
+    uint32_t           cp_split(int32_t il, uint32_t n_kv) const; // split cell h, 0: attend on the owner only
+    bool               cp_check() const;
+    ggml_backend_dev_t cp_dev(bool helper) const;
+    ggml_tensor *      cp_kq_mask_dev() const;                 // the helper's persistent mask (nullptr: graph input)
+    bool               cp_needs_resync() const;
+    // K/V cells [i0, i1) of layer il, from the owner's tensor or the helper's mirror
+    ggml_tensor * get_k_range(ggml_context * ctx, int32_t il, uint32_t i0, uint32_t i1, bool mirror) const;
+    ggml_tensor * get_v_range(ggml_context * ctx, int32_t il, uint32_t i0, uint32_t i1, bool mirror) const;
+    // the same set_rows as cpy_k/cpy_v (same global cell indices), into the mirror
+    ggml_tensor * cpy_k_mirror(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
+    ggml_tensor * cpy_v_mirror(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const;
+
     //
     // preparation API
     //
@@ -341,6 +355,41 @@ private:
     };
 
     mutable kq_mask_inc_state kq_inc;
+
+    // [CP] 2026-10-21: context-parallel attention prototype for ONE layer (env LLAMA_CP_LAYER=<il>, default -1 = off).
+    //
+    // What: the owner A (model.dev_layer(il)) keeps its K/V; the helper B (LLAMA_CP_DEV=<device name>, mandatory, a
+    // fixed device so the fit sees constant memory per device) holds a FULL mirror of layer il's K/V, written by
+    // a second set_rows with the same cell indices in every graph that writes the layer. FA runs over cells [0, h) on
+    // A and [h, n_kv) on B (emit_lse), A merges (llm_graph_context::build_attn_cp). h = LLAMA_CP_SPLIT_FRAC (default
+    // 0.5) of n_kv rounded to the 256-cell n_kv padding, so h is a function of n_kv and graph reuse holds.
+    // Cost: K+V of one layer on B (Qwen3.8-27B: 4 KV heads x 256 x f16 = 4 KiB/cell, 1 GiB at 256k).
+    //
+    // State: the mirror is write-only on the hot path and is NOT serialized. Every host-side K/V write (state_read,
+    // K-shift) sets dirty; the next memory update (llama_context::memory_update before the next decode) re-copies
+    // cells [0, used_max_p1) A -> B through the host and logs it at WARN. A whole-buffer clear zeroes both copies.
+    // Not supported (cp stays off, logged): n_stream > 1, v_trans (no FA), SWA, MLA, offload off. Owner == helper or
+    // owner not a GPU: mirror allocated but inactive (logged). LLAMA_CP_DEV missing or not a device of the split: throws.
+    struct cp_state {
+        int32_t il = -1;
+        float   frac = 0.5f;
+        bool    check = false;              // LLAMA_CP_CHECK=1, see llama_context::cp_check_step
+        bool    active = false;             // owner is a GPU other than the helper (the mirror exists either way)
+
+        ggml_backend_dev_t dev_a = nullptr;
+        ggml_backend_dev_t dev_b = nullptr;
+        ggml_backend_buffer_type_t buft_b = nullptr;
+
+        ggml_tensor * k = nullptr;          // [n_embd_k_gqa, kv_size] on B
+        ggml_tensor * v = nullptr;          // [n_embd_v_gqa, kv_size] on B
+        ggml_tensor * kq_mask_dev = nullptr; // B's [KQ_MASK_INC] tensor
+
+        mutable bool dirty = false;
+    };
+
+    cp_state cp;
+
+    void cp_resync() const;
 
     bool v_trans = true;  // the value tensor is transposed
 
@@ -491,6 +540,17 @@ public:
     //   - v_idxs [n_tokens] or [n_tokens*n_embd_v_gqa] depending if V cache is transposed
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const;
+
+    // [CP] see llama_kv_cache::cp_state
+    bool               cp_active(int32_t il) const;
+    uint32_t           cp_split(int32_t il) const;
+    bool               cp_check() const;
+    ggml_backend_dev_t cp_dev(bool helper) const;
+    ggml_tensor *      cp_kq_mask_dev() const;
+    ggml_tensor *      get_k_range(ggml_context * ctx, int32_t il, uint32_t i0, uint32_t i1, bool mirror) const;
+    ggml_tensor *      get_v_range(ggml_context * ctx, int32_t il, uint32_t i0, uint32_t i1, bool mirror) const;
+    ggml_tensor *      cpy_k_mirror(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
+    ggml_tensor *      cpy_v_mirror(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const;
 
     // create destination indices for each head of the current batch for where it would be written in the KV cache
     // the indices address the global KV cache (not per stream) - this is not relevant for the user of this API, but

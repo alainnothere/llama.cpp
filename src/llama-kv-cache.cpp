@@ -116,7 +116,7 @@ llama_kv_cache::llama_kv_cache(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t((2u*(1 + n_stream)*n_layer + 1)*ggml_tensor_overhead()), // +1: [KQ_MASK_INC] kq_mask_dev
+                /*.mem_size   =*/ size_t((2u*(1 + n_stream)*n_layer + 3)*ggml_tensor_overhead()), // +1: [KQ_MASK_INC] kq_mask_dev, +2: [CP] mirror
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -291,6 +291,87 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    // [CP] context-parallel attention prototype, see cp_state in llama-kv-cache.h
+    //
+    // The helper is a FIXED device (LLAMA_CP_DEV, mandatory) and the mirror is allocated there whenever the layer is in
+    // this cache, whatever device the layer itself landed on. The fit probes this constructor with many placements;
+    // 2026-10-21 night the helper was "the other GPU with the owner's description", so the mirror moved (or vanished)
+    // between probes: Vulkan1 was sized while layer 27 sat on the CPU (no mirror), then the owner moved to Vulkan3 and
+    // Vulkan1 grew by the 1156 MiB mirror after its share was fixed -> both XTX over budget, GTT placement/eviction,
+    // every step ~3x slower (GDN 0.3 -> 21.5 ms per 3-row step on Vulkan3). Constant memory per device = honest fit.
+    // CP runs only when the final owner is a GPU other than the helper; otherwise the mirror is dead weight (logged).
+    if (const char * env_il = getenv("LLAMA_CP_LAYER"); env_il && atoi(env_il) >= 0 && map_layer_ids.find(atoi(env_il)) != map_layer_ids.end()) {
+        const int32_t il = atoi(env_il);
+
+        const char * env_dev = getenv("LLAMA_CP_DEV");
+        if (!env_dev || !*env_dev) {
+            throw std::runtime_error("LLAMA_CP_LAYER is set but LLAMA_CP_DEV is not: set LLAMA_CP_DEV to the helper device name (e.g. Vulkan1), one of the model's devices");
+        }
+        ggml_backend_dev_t dev_b = nullptr;
+        std::string names;
+        for (const auto & d : model.devices) {
+            names += std::string(names.empty() ? "" : ", ") + ggml_backend_dev_name(d.dev);
+            if (strcmp(ggml_backend_dev_name(d.dev), env_dev) == 0) {
+                dev_b = d.dev;
+            }
+        }
+        if (!dev_b) {
+            throw std::runtime_error(std::string("LLAMA_CP_DEV=") + env_dev + " is not a device of this model's split (" + (names.empty() ? std::string("none, CPU only") : names) + ")");
+        }
+        if (ggml_backend_dev_type(dev_b) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            throw std::runtime_error(std::string("LLAMA_CP_DEV=") + env_dev + " is not a GPU");
+        }
+
+        const char * why_not = nullptr;
+        if (!offload)                             why_not = "KV offload off";
+        else if (v_trans)                         why_not = "no flash attention";
+        else if (n_stream != 1)                   why_not = "more than one stream";
+        else if (swa_type != LLAMA_SWA_TYPE_NONE) why_not = "SWA cache";
+        else if (is_mla)                          why_not = "MLA";
+
+        if (why_not) {
+            LLAMA_LOG_WARN("%s: context-parallel attention off for layer %d: %s (no mirror)\n", __func__, il, why_not);
+        } else {
+            const auto & layer = layers[map_layer_ids.at(il)];
+
+            ggml_backend_dev_t dev_a = model.dev_layer(il);
+
+            cp.il     = il;
+            cp.dev_a  = dev_a;
+            cp.dev_b  = dev_b;
+            cp.buft_b = ggml_backend_dev_buffer_type(dev_b);
+            cp.active = dev_a != dev_b && ggml_backend_dev_type(dev_a) == GGML_BACKEND_DEVICE_TYPE_GPU;
+
+            const char * env_frac = getenv("LLAMA_CP_SPLIT_FRAC");
+            const char * env_chk  = getenv("LLAMA_CP_CHECK");
+            cp.frac  = env_frac ? std::clamp((float) atof(env_frac), 0.0f, 1.0f) : 0.5f;
+            cp.check = env_chk && atoi(env_chk) != 0;
+
+            ggml_context * ctx = ctx_for_buft(cp.buft_b);
+            if (!ctx) {
+                throw std::runtime_error("failed to create ggml context for the kv cache mirror");
+            }
+            cp.k = ggml_new_tensor_3d(ctx, layer.k->type, layer.k->ne[0], kv_size, 1);
+            cp.v = ggml_new_tensor_3d(ctx, layer.v->type, layer.v->ne[0], kv_size, 1);
+            ggml_format_name(cp.k, "cache_%scp_k_l%d", name_tag, il);
+            ggml_format_name(cp.v, "cache_%scp_v_l%d", name_tag, il);
+
+            // B needs its own persistent mask even when it holds no other attention layer
+            buft_layers[cp.buft_b];
+
+            // the fit probes this constructor with no_alloc many times: the decision is loud only for the real cache
+            const double mib = (ggml_nbytes(cp.k) + ggml_nbytes(cp.v))/1024.0/1024.0;
+            const ggml_log_level lvl = hparams.no_alloc ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_WARN;
+            if (cp.active) {
+                llama_log_internal(lvl, "%s: context-parallel attention on layer %d: ACTIVE, owner %s, helper %s (full K/V mirror %.2f MiB on the helper), split frac %.3f, check %d\n",
+                        __func__, il, ggml_backend_dev_name(dev_a), ggml_backend_dev_name(dev_b), mib, cp.frac, cp.check);
+            } else {
+                llama_log_internal(lvl, "%s: context-parallel attention on layer %d: INACTIVE, owner %s (%s), helper %s; the %.2f MiB mirror is still allocated so every fit probe sees the same memory; pick a layer the fit puts on another GPU\n",
+                        __func__, il, ggml_backend_dev_name(dev_a), dev_a == dev_b ? "is the helper" : "not a GPU", ggml_backend_dev_name(dev_b), mib);
+            }
+        }
+    }
+
     // [KQ_MASK_INC] static gate + one persistent mask per buffer type that holds attention layers
     // (see kq_mask_inc_state). !v_trans <=> flash attention, the only path with an f16 mask
     {
@@ -338,6 +419,9 @@ llama_kv_cache::llama_kv_cache(
 
                 for (int il : it->second) {
                     layers[map_layer_ids.at(il)].kq_mask_dev = t;
+                }
+                if (buft == cp.buft_b) {
+                    cp.kq_mask_dev = t;
                 }
             }
 
@@ -1014,6 +1098,16 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 
             cells.reset_shift();
         }
+
+        // [CP] the K-shift graph rotated the owner's K only
+        if (cp.active) {
+            cp.dirty = true;
+        }
+    }
+
+    if (cp_needs_resync()) {
+        llama_synchronize(lctx);
+        cp_resync();
     }
 
     return updated;
@@ -1540,6 +1634,117 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
     v_cur = ggml_reshape_2d(ctx, v_cur, 1, ggml_nelements(v_cur));
 
     return ggml_set_rows(ctx, v_view, v_cur, v_idxs);
+}
+
+// [CP] see cp_state in llama-kv-cache.h
+
+bool llama_kv_cache::cp_active(int32_t il) const {
+    return cp.active && il == cp.il;
+}
+
+uint32_t llama_kv_cache::cp_split(int32_t il, uint32_t n_kv) const {
+    // n_kv is padded to 256 (get_n_kv), a multiple of every FA KV tile, so both ranges stay tile aligned
+    constexpr uint32_t pad = 256;
+    if (!cp_active(il) || n_kv < 2*pad) {
+        return 0;
+    }
+    const uint32_t h = (uint32_t) std::lround(cp.frac*n_kv/pad)*pad;
+    return std::clamp(h, pad, n_kv - pad);
+}
+
+bool llama_kv_cache::cp_check() const {
+    return cp.check;
+}
+
+ggml_backend_dev_t llama_kv_cache::cp_dev(bool helper) const {
+    return helper ? cp.dev_b : cp.dev_a;
+}
+
+ggml_tensor * llama_kv_cache::cp_kq_mask_dev() const {
+    return kq_inc.enabled ? cp.kq_mask_dev : nullptr;
+}
+
+bool llama_kv_cache::cp_needs_resync() const {
+    return cp.active && cp.dirty;
+}
+
+ggml_tensor * llama_kv_cache::get_k_range(ggml_context * ctx, int32_t il, uint32_t i0, uint32_t i1, bool mirror) const {
+    GGML_ASSERT(cp_active(il) && i0 < i1 && i1 <= get_size());
+
+    ggml_tensor * k = mirror ? cp.k : layers[map_layer_ids.at(il)].k;
+
+    const uint64_t n_embd_k_gqa = k->ne[0];
+
+    return ggml_view_4d(ctx, k,
+            hparams.n_embd_head_k(il), hparams.n_head_kv(il), i1 - i0, 1,
+            ggml_row_size(k->type, hparams.n_embd_head_k(il)),
+            ggml_row_size(k->type, n_embd_k_gqa),
+            ggml_row_size(k->type, n_embd_k_gqa*get_size()),
+            ggml_row_size(k->type, n_embd_k_gqa)*i0);
+}
+
+ggml_tensor * llama_kv_cache::get_v_range(ggml_context * ctx, int32_t il, uint32_t i0, uint32_t i1, bool mirror) const {
+    GGML_ASSERT(cp_active(il) && !v_trans && i0 < i1 && i1 <= get_size());
+
+    ggml_tensor * v = mirror ? cp.v : layers[map_layer_ids.at(il)].v;
+
+    const uint64_t n_embd_v_gqa = v->ne[0];
+
+    return ggml_view_4d(ctx, v,
+            hparams.n_embd_head_v(il), hparams.n_head_kv(il), i1 - i0, 1,
+            ggml_row_size(v->type, hparams.n_embd_head_v(il)),
+            ggml_row_size(v->type, n_embd_v_gqa),
+            ggml_row_size(v->type, n_embd_v_gqa*get_size()),
+            ggml_row_size(v->type, n_embd_v_gqa)*i0);
+}
+
+ggml_tensor * llama_kv_cache::cpy_k_mirror(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
+    GGML_ASSERT(cp_active(il));
+    GGML_ASSERT(ggml_row_size(k_cur->type, k_cur->ne[0]) == k_cur->nb[1]);
+
+    k_cur = ggml_view_2d(ctx, k_cur, k_cur->ne[0]*k_cur->ne[1], k_cur->ne[2], k_cur->nb[2], 0);
+
+    return ggml_set_rows(ctx, cp.k, k_cur, k_idxs);
+}
+
+ggml_tensor * llama_kv_cache::cpy_v_mirror(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const {
+    GGML_ASSERT(cp_active(il) && !v_trans);
+    GGML_ASSERT(ggml_row_size(v_cur->type, v_cur->ne[0]) == v_cur->nb[1]);
+
+    v_cur = ggml_view_2d(ctx, v_cur, v_cur->ne[0]*v_cur->ne[1], v_cur->ne[2], v_cur->nb[2], 0);
+
+    return ggml_set_rows(ctx, cp.v, v_cur, v_idxs);
+}
+
+// re-copy the owner's K/V of the cp layer into the mirror, cells [0, used_max_p1), through the host. Runs from
+// update() with the context synchronized, after a host-side K/V write (state_read) or a K-shift marked it dirty
+void llama_kv_cache::cp_resync() const {
+    if (!cp.active) {
+        return;
+    }
+
+    const int64_t t0 = ggml_time_us();
+
+    const auto & layer = layers[map_layer_ids.at(cp.il)];
+    const uint32_t n = v_cells[0].used_max_p1();
+
+    std::vector<uint8_t> buf;
+    size_t bytes = 0;
+    for (const auto & [src, dst] : { std::make_pair(layer.k, cp.k), std::make_pair(layer.v, cp.v) }) {
+        const size_t size = ggml_row_size(src->type, src->ne[0])*n;
+        if (size == 0) {
+            continue;
+        }
+        buf.resize(size);
+        ggml_backend_tensor_get(src, buf.data(), 0, size);
+        ggml_backend_tensor_set(dst, buf.data(), 0, size);
+        bytes += size;
+    }
+
+    cp.dirty = false;
+
+    LLAMA_LOG_WARN("%s: context-parallel mirror of layer %d re-copied after a host K/V write: %u cells, %.2f MiB, %.1f ms\n",
+            __func__, cp.il, n, bytes/1024.0/1024.0, (ggml_time_us() - t0)/1000.0);
 }
 
 ggml_tensor * llama_kv_cache::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
@@ -2474,6 +2679,11 @@ const slot_info_vec_t *   sinfos_in) {
     // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
 
+    // [CP] the io writes the owner's K/V only (possibly deferred to its destruction): re-copy at the next update
+    if (cp.active) {
+        cp.dirty = true;
+    }
+
     if (sinfos_out) {
         sinfos_out->assign(n_stream, slot_info{});
     }
@@ -3150,7 +3360,7 @@ llama_kv_cache_context::llama_kv_cache_context(
         llama_context * lctx,
         bool do_shift,
         stream_copy_info sc_info) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), lctx(lctx), do_shift(do_shift), sc_info(std::move(sc_info)) {
-    if (!do_shift && this->sc_info.empty()) {
+    if (!do_shift && this->sc_info.empty() && !kv->cp_needs_resync()) {
         status = LLAMA_MEMORY_STATUS_NO_UPDATE;
     }
 }
@@ -3225,6 +3435,42 @@ ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_
 
 ggml_tensor * llama_kv_cache_context::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const {
     return kv->cpy_v(ctx, v_cur, v_idxs, il, sinfos[i_cur]);
+}
+
+bool llama_kv_cache_context::cp_active(int32_t il) const {
+    return kv->cp_active(il);
+}
+
+uint32_t llama_kv_cache_context::cp_split(int32_t il) const {
+    return kv->cp_split(il, n_kv);
+}
+
+bool llama_kv_cache_context::cp_check() const {
+    return kv->cp_check();
+}
+
+ggml_backend_dev_t llama_kv_cache_context::cp_dev(bool helper) const {
+    return kv->cp_dev(helper);
+}
+
+ggml_tensor * llama_kv_cache_context::cp_kq_mask_dev() const {
+    return kv->cp_kq_mask_dev();
+}
+
+ggml_tensor * llama_kv_cache_context::get_k_range(ggml_context * ctx, int32_t il, uint32_t i0, uint32_t i1, bool mirror) const {
+    return kv->get_k_range(ctx, il, i0, i1, mirror);
+}
+
+ggml_tensor * llama_kv_cache_context::get_v_range(ggml_context * ctx, int32_t il, uint32_t i0, uint32_t i1, bool mirror) const {
+    return kv->get_v_range(ctx, il, i0, i1, mirror);
+}
+
+ggml_tensor * llama_kv_cache_context::cpy_k_mirror(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
+    return kv->cpy_k_mirror(ctx, k_cur, k_idxs, il);
+}
+
+ggml_tensor * llama_kv_cache_context::cpy_v_mirror(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const {
+    return kv->cpy_v_mirror(ctx, v_cur, v_idxs, il);
 }
 
 ggml_tensor * llama_kv_cache_context::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {

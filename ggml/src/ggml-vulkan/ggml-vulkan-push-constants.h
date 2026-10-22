@@ -867,6 +867,7 @@ struct vk_op_flash_attn_split_k_reduce_push_constants {
     uint32_t ne3;
     uint32_t k_num;
     uint32_t sinks;
+    uint32_t emit_lse; // ggml_flash_attn_ext_set_emit_lse: dst rows are D + 4, [D] = lse
 };
 
 struct vk_op_flash_attn_mask_opt_push_constants {

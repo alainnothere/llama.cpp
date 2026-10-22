@@ -199,7 +199,145 @@ vk_buffer ggml_vk_create_buffer_check(vk_device& device, size_t size, vk::Memory
     }
 }
 
-vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
+// [fork, 2026-10-21] GPU PLACEMENT warning (ledger lever 8), the GPU sibling of llama's CPU PLACEMENT warnings.
+//
+// Why: twice in two days (2026-10-21) a card ran 5-10x slow with nothing in the log. Morning: -ts disabled the fit,
+// the recurrent buffer of Vulkan3 overflowed and RADV put a 931 MiB BO in GTT (GATED_DELTA_NET 39-127 ms per step vs
+// 0.2-0.46). Night: the context-parallel mirror moved device between fit probes, both XTX ended over budget, Vulkan1
+// started with 1087 MiB in GTT and Vulkan3 had ~1 GB evicted to GTT while running (VRAM 23717 -> 22730 MiB, GTT
+// 68 -> 1281 MiB; GDN 21.5 ms, CPY 23.5 ms per 3-row step). In both cases every allocation succeeded in a
+// DEVICE_LOCAL memory type: the kernel decides residency, so the memory type flags alone do not show it.
+//
+// What: (a) an allocation that came back without DEVICE_LOCAL (only possible with GGML_VK_ALLOW_SYSMEM_FALLBACK or
+// prefer-host devices) warns at once; (b) after every device allocation and every GGML_VK_MEM_WATCH_EVERY graphs
+// (default 256, 0 = off) the device-local heaps' VK_EXT_memory_budget heapUsage is compared with heapBudget; usage >
+// budget is the oversubscription that ends in GTT placement/eviction. Without the extension (b) compares our own
+// live device-local bytes with the heap size at allocation time and the periodic check is skipped (zero cost).
+// Each kind warns once per device and re-arms when usage drops back under the budget. UMA devices are skipped.
+static std::string ggml_vk_mem_watch_last(const vk_mem_watch & w) {
+    std::string s;
+    for (auto it = w.last.rbegin(); it != w.last.rend(); ++it) {
+        char buf[96];
+        snprintf(buf, sizeof(buf), "%s%.1f MiB (%s)", s.empty() ? "" : ", ", it->first/1024.0/1024.0, it->second.c_str());
+        s += buf;
+    }
+    return s.empty() ? "none" : s;
+}
+
+static void ggml_vk_mem_watch_init(vk_device & device, vk_mem_watch & w) {
+    if (w.init) {
+        return;
+    }
+    w.init = true;
+    for (const auto & ext : device->physical_device.enumerateDeviceExtensionProperties()) {
+        if (strcmp(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME, ext.extensionName) == 0) {
+            w.has_budget = true;
+            break;
+        }
+    }
+    const vk::PhysicalDeviceMemoryProperties mp = device->physical_device.getMemoryProperties();
+    for (uint32_t i = 0; i < mp.memoryHeapCount; ++i) {
+        if (mp.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+            w.heap_size += mp.memoryHeaps[i].size;
+        }
+    }
+}
+
+// call with w.mutex held
+static void ggml_vk_mem_watch_check_locked(vk_device & device, vk_mem_watch & w, const char * why) {
+    if (device->uma) {
+        return;
+    }
+    ggml_vk_mem_watch_init(device, w);
+
+    uint64_t usage  = 0;
+    uint64_t budget = 0;
+    const char * src;
+    if (w.has_budget) {
+        vk::PhysicalDeviceMemoryBudgetPropertiesEXT bp;
+        vk::PhysicalDeviceMemoryProperties2 mp2;
+        mp2.pNext = &bp;
+        device->physical_device.getMemoryProperties2(&mp2);
+        for (uint32_t i = 0; i < mp2.memoryProperties.memoryHeapCount; ++i) {
+            if (mp2.memoryProperties.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+                usage  += bp.heapUsage[i];
+                budget += bp.heapBudget[i];
+            }
+        }
+        src = "VK_EXT_memory_budget heapUsage vs heapBudget";
+    } else {
+        usage  = (uint64_t) std::max<int64_t>(0, w.dev_local_bytes.load());
+        budget = w.heap_size;
+        src = "our device-local allocations vs heap size (no VK_EXT_memory_budget)";
+    }
+
+    if (usage <= budget) {
+        w.warned_budget = false;
+        return;
+    }
+    if (w.warned_budget) {
+        return;
+    }
+    w.warned_budget = true;
+
+    GGML_LOG_WARN("GPU PLACEMENT: ggml_vulkan: %s (%s): device-local memory usage %.0f MiB exceeds the budget %.0f MiB by %.0f MiB "
+            "(%s, %s); the kernel places or evicts buffers to host memory (GTT) and the kernels that read them run 5-10x slower; "
+            "last allocations: %s; check --fit-target / -ts / -c / extra per-device buffers (e.g. LLAMA_CP_LAYER mirror)\n",
+            device->name.c_str(), device->properties.deviceName.data(), usage/1024.0/1024.0, budget/1024.0/1024.0,
+            (usage - budget)/1024.0/1024.0, src, why, ggml_vk_mem_watch_last(w).c_str());
+}
+
+static void ggml_vk_mem_watch_alloc(vk_device & device, const vk_buffer & buf, size_t size, const char * label) {
+    if (!buf || buf->size == 0) {
+        return;
+    }
+    vk_mem_watch & w = device->mem_watch;
+    std::lock_guard<std::mutex> lock(w.mutex);
+
+    const bool dev_local = bool(buf->memory_property_flags & vk::MemoryPropertyFlagBits::eDeviceLocal);
+    if (dev_local) {
+        w.dev_local_bytes += (int64_t) size;
+        buf->mem_watch_counted = true;
+    }
+    w.last.emplace_back(size, label);
+    if (w.last.size() > 4) {
+        w.last.pop_front();
+    }
+
+    if (!dev_local && !device->uma && !device->prefer_host_memory && !w.warned_type) {
+        w.warned_type = true;
+        GGML_LOG_WARN("GPU PLACEMENT: ggml_vulkan: %s (%s): a %.2f MiB %s buffer was allocated in host memory (memory type "
+                "without DEVICE_LOCAL: sysmem fallback, the device-local heap is full); kernels reading it run 5-10x slower; "
+                "last allocations: %s; check --fit-target / -ts / -c\n",
+                device->name.c_str(), device->properties.deviceName.data(), size/1024.0/1024.0, label, ggml_vk_mem_watch_last(w).c_str());
+    }
+
+    ggml_vk_mem_watch_check_locked(device, w, "after an allocation");
+}
+
+void ggml_vk_mem_watch_free(vk_device_struct * device, size_t size, bool counted) {
+    if (counted) {
+        device->mem_watch.dev_local_bytes -= (int64_t) size;
+    }
+}
+
+void ggml_vk_mem_watch_graph(vk_device & device) {
+    static const uint64_t every = [] {
+        const char * e = getenv("GGML_VK_MEM_WATCH_EVERY");
+        return e ? (uint64_t) std::max(0, atoi(e)) : (uint64_t) 256;
+    }();
+    vk_mem_watch & w = device->mem_watch;
+    if (every == 0 || (w.init && !w.has_budget)) {
+        return;
+    }
+    if (w.n_graphs.fetch_add(1, std::memory_order_relaxed) % every != 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(w.mutex);
+    ggml_vk_mem_watch_check_locked(device, w, "periodic check while running");
+}
+
+vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size, const char * label) {
     vk_buffer buf;
     try {
         if (device->prefer_host_memory) {
@@ -234,6 +372,8 @@ vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
         std::cerr << "ggml_vulkan: " << e.what() << std::endl;
         throw e;
     }
+
+    ggml_vk_mem_watch_alloc(device, buf, size, label);
 
     return buf;
 }

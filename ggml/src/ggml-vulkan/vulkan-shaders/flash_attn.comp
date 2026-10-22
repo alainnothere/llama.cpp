@@ -674,7 +674,7 @@ void main() {
                 const uint row = tile_row(r);
                 if (row < N) {
                     [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
-                        gqaStore(row, d * D_split + d_tid, Of[r][d], o_offset, iq2, N);
+                        gqaStore(row, d * D_split + d_tid, Of[r][d], o_offset, iq2, N, HSV);
                     }
                 }
             }
@@ -728,6 +728,8 @@ void main() {
             }
 
             Lf[r] = Lf[r]*ms + vs;
+            // Lf is now relative to max(Mf, sink); only the EMIT_LSE store reads Mf after this point
+            Mf[r] = max(Mf[r], sink);
         }
     }
 
@@ -745,14 +747,18 @@ void main() {
         }
     }
 
-    uint32_t o_offset = (gqa_iq1*p.ne1*HSV + iq3*p.ne2*p.ne1*HSV) / 4;
+    // final dst rows are HSV_out apart (HSV + 4 with EMIT_LSE, see flash_attn_base.glsl)
+    uint32_t o_offset = (gqa_iq1*p.ne1*HSV_out + iq3*p.ne2*p.ne1*HSV_out) / 4;
 
     if (p.gqa_ratio > 1) {
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
             const uint row = tile_row(r);
             if (row < N) {
                 [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
-                    gqaStore(row, d * D_split + d_tid, Of[r][d], o_offset, iq2, N);
+                    gqaStore(row, d * D_split + d_tid, Of[r][d], o_offset, iq2, N, HSV_out);
+                }
+                if (EMIT_LSE && d_tid == 0 && col_tid == 0) {
+                    storeLse(o_offset + (iq2 + row) * HSV_out / 4, Mf[r], Lf[r]);
                 }
             }
         }
@@ -761,7 +767,10 @@ void main() {
             const uint row = tile_row(r);
             if (i * Br + row < N) {
                 [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
-                    data_ov4[o_offset + (iq2 * HSV + (i * Br + row) * p.ne1 * HSV) / 4 + d * D_split + d_tid] = D_TYPEV4(Of[r][d]);
+                    data_ov4[o_offset + (iq2 * HSV_out + (i * Br + row) * p.ne1 * HSV_out) / 4 + d * D_split + d_tid] = D_TYPEV4(Of[r][d]);
+                }
+                if (EMIT_LSE && d_tid == 0 && col_tid == 0) {
+                    storeLse(o_offset + (iq2 * HSV_out + (i * Br + row) * p.ne1 * HSV_out) / 4, Mf[r], Lf[r]);
                 }
             }
         }

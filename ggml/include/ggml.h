@@ -2476,8 +2476,8 @@ extern "C" {
     // q:    [n_embd_k, n_batch, n_head,    ne3 ]
     // k:    [n_embd_k, n_kv,    n_head_kv, ne3 ]
     // v:    [n_embd_v, n_kv,    n_head_kv, ne3 ] !! not transposed !!
-    // mask: [n_kv,     n_batch, ne32,      ne33]
-    // res:  [n_embd_v, n_head,  n_batch,   ne3 ] !! permuted !!
+    // mask: [n_kv,     n_batch, ne32,      ne33] rows contiguous (nb[0] == 2), row/plane strides free (a column view is fine)
+    // res:  [n_embd_v, n_head,  n_batch,   ne3 ] !! permuted !! (n_embd_v + 4 with ggml_flash_attn_ext_set_emit_lse)
     //
     // broadcast:
     //   n_head % n_head_kv == 0
@@ -2511,6 +2511,28 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
+
+    // Log-sum-exp output (op_params[5]), for merging partial attentions over disjoint KV ranges
+    // (context-parallel attention: each device attends the same Q over its own KV range, the owner merges).
+    // Call right after ggml_flash_attn_ext(), before the result is used: it changes the result shape
+    // (so the context must be no_alloc; the result has no data yet).
+    // When set, res is [n_embd_v + 4, n_head, n_batch, ne3] (n_embd_v % 4 == 0 keeps rows 16-byte aligned):
+    //   res[0 .. n_embd_v-1] = O, NORMALIZED as without the flag (0 when no key is attended)
+    //   res[n_embd_v]        = lse = M + log(L), natural log, in units of the scores the softmax sees
+    //                          (s = scale*q.k, after softcap, plus slope*mask), where M = max_j s_j and
+    //                          L = sum_j exp(s_j - M) over the attended keys (finite mask); -INFINITY when L == 0.
+    //                          A sink (ggml_flash_attn_ext_add_sinks) is part of L, so attach it to one partial only.
+    //   res[n_embd_v+1 .. +3] = 0
+    // Merge of partials (O_i, lse_i) over disjoint KV ranges that cover the full range:
+    //   w_i = softmax_i(lse) = exp(lse_i - logsumexp_j(lse_j)),  O = sum_i w_i * O_i,  lse = logsumexp_i(lse_i)
+    // Implemented: CPU, Vulkan scalar and coopmat1 (split_k included). Unsupported (supports_op false): Vulkan coopmat2,
+    // CUDA, SYCL, Metal, Hexagon. Other backends do not check the flag yet.
+    GGML_API void ggml_flash_attn_ext_set_emit_lse(
+            struct ggml_tensor * a,
+            bool                 emit_lse);
+
+    GGML_API bool ggml_flash_attn_ext_get_emit_lse(
+            const struct ggml_tensor * a);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

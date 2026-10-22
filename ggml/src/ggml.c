@@ -5520,7 +5520,12 @@ struct ggml_tensor * ggml_flash_attn_ext(
 
     if (mask) {
         GGML_ASSERT(mask->type == GGML_TYPE_F16);
-        GGML_ASSERT(ggml_is_contiguous(mask));
+        // rows must be contiguous; row/plane strides are free so a column view of a wider mask can be passed
+        // (the context-parallel merge attends KV ranges [h, n) with mask[:, h:n]); CPU and Vulkan read mask->nb
+        GGML_ASSERT(mask->nb[0] == ggml_type_size(mask->type));
+        GGML_ASSERT(mask->nb[1] >= mask->ne[0]*mask->nb[0]);
+        GGML_ASSERT(mask->nb[2] >= mask->ne[1]*mask->nb[1]);
+        GGML_ASSERT(mask->nb[3] >= mask->ne[2]*mask->nb[2]);
         //GGML_ASSERT(ggml_can_repeat_rows(mask, qk));
 
         GGML_ASSERT(q->ne[2] % mask->ne[2] == 0);
@@ -5574,6 +5579,33 @@ void ggml_flash_attn_ext_set_n_kv_max(
     GGML_ASSERT(n_kv_max >= 0);
 
     ggml_set_op_params_i32(a, 4, n_kv_max);
+}
+
+// op_params[5]: emit the per-(head, row) log-sum-exp in an extra 4-float column block, see ggml.h.
+// Reshapes the result in place, so it must run before anything consumes the tensor.
+void ggml_flash_attn_ext_set_emit_lse(
+        struct ggml_tensor * a,
+        bool                 emit_lse) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->buffer == NULL && a->data == NULL && a->view_src == NULL);
+
+    const int64_t DV = a->src[2]->ne[0];
+    GGML_ASSERT(DV % 4 == 0 || !emit_lse);
+
+    ggml_set_op_params_i32(a, 5, emit_lse ? 1 : 0);
+
+    a->ne[0] = DV + (emit_lse ? 4 : 0);
+    a->nb[1] = a->nb[0]*a->ne[0];
+    a->nb[2] = a->nb[1]*a->ne[1];
+    a->nb[3] = a->nb[2]*a->ne[2];
+}
+
+bool ggml_flash_attn_ext_get_emit_lse(
+        const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+
+    return ggml_get_op_params_i32(a, 5) != 0;
 }
 
 void ggml_flash_attn_ext_add_sinks(
