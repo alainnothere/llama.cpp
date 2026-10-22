@@ -15,6 +15,7 @@
 #include <clocale>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -1029,6 +1030,98 @@ static test_status test_seq_cp_resets_rollback(const common_params & params, lla
     return test_status::PASS;
 }
 
+// nullptr unsets
+static void set_env(const char * name, const char * value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) {
+        setenv(name, value, 1);
+    } else {
+        unsetenv(name);
+    }
+#endif
+}
+
+// [KQ_MASK_INC] review 2026-10-21: after a multi-seq ubatch the persistent KQ mask took its watermark from seq_id[0][0]
+// only, so the rows of the other seq were kept as settled below it. the next single-seq ubatch of seq_id[0][0] with the
+// same n_kv and more than one row uploaded only the columns past the watermark and row 1 kept the other seq's history.
+// it needs seq_id[0][0] exactly one position ahead of the other seq (cnt == n_tokens in set_input_kq_mask_dev); both
+// orders are run, the hybrid memory decides the ubatch order. LLAMA_KQ_MASK_CHECK=1 aborts on the stale region
+static test_status test_kq_mask_multi_seq(const common_params & params, llama_model * model, uint8_t fill) {
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
+    const auto tok = [&](llama_seq_id seq, llama_pos pos) {
+        return (llama_token) ((7*(uint32_t) pos + 31*(uint32_t) seq + 1) % (uint32_t) n_vocab);
+    };
+
+    for (llama_seq_id ahead : { 0, 1 }) {
+        const llama_seq_id behind = 1 - ahead;
+
+        auto cparams = common_context_params_to_llama(params);
+        cparams.n_seq_max       = 2;
+        cparams.n_ctx           = 256;
+        cparams.n_batch         = 64;
+        cparams.n_ubatch        = 64;
+        cparams.kv_unified      = true;
+        cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED; // the persistent mask is f16, FA only
+
+        // read once in the kv cache constructor
+        const char * env_prev = getenv("LLAMA_KQ_MASK_CHECK");
+        const std::string env_prev_s = env_prev ? env_prev : "";
+        set_env("LLAMA_KQ_MASK_CHECK", "1");
+        llama_context_ptr ctx = init_ctx(model, cparams, fill);
+        set_env("LLAMA_KQ_MASK_CHECK", env_prev ? env_prev_s.c_str() : nullptr);
+        if (!ctx) {
+            LOG_ERR("%s: failed to init context\n", __func__);
+            return test_status::FAIL;
+        }
+
+        constexpr llama_pos n_prompt = 8;
+
+        const auto decode = [&](const std::vector<std::pair<llama_seq_id, llama_pos>> & rows) {
+            common_batch batch(ctx.get());
+            for (const auto & [seq, pos] : rows) {
+                batch.add(tok(seq, pos), pos, seq, true);
+            }
+            return llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
+        };
+
+        std::vector<std::pair<llama_seq_id, llama_pos>> p_ahead, p_behind;
+        for (llama_pos pos = 0; pos < n_prompt + 1; ++pos) {
+            p_ahead.emplace_back(ahead, pos);
+        }
+        for (llama_pos pos = 0; pos < n_prompt; ++pos) {
+            p_behind.emplace_back(behind, pos);
+        }
+
+        const bool ok =
+            decode(p_ahead) && decode(p_behind) &&
+            // one row per seq, ahead one position past behind
+            decode({ { ahead, n_prompt + 1 }, { behind, n_prompt } }) &&
+            decode({ { ahead, n_prompt + 2 }, { behind, n_prompt + 1 } }) &&
+            // single seq, two rows: row 1 held the behind seq's row above
+            decode({ { ahead, n_prompt + 3 }, { ahead, n_prompt + 4 } }) &&
+            decode({ { ahead, n_prompt + 5 }, { ahead, n_prompt + 6 }, { ahead, n_prompt + 7 } });
+        if (!ok) {
+            LOG_ERR("%s: decode failed (ahead = %d)\n", __func__, ahead);
+            return test_status::FAIL;
+        }
+
+        for (int i = 0; i < 3; ++i) {
+            const float * logits = llama_get_logits_ith(ctx.get(), i);
+            for (int t = 0; logits && t < n_vocab; ++t) {
+                if (!std::isfinite(logits[t])) {
+                    LOG_ERR("%s: non-finite logit (ahead = %d, row %d, index %d)\n", __func__, ahead, i, t);
+                    return test_status::FAIL;
+                }
+            }
+        }
+    }
+
+    return test_status::PASS;
+}
+
 static test_status merge_status(test_status a, test_status b) {
     if (a == test_status::FAIL || b == test_status::FAIL) {
         return test_status::FAIL;
@@ -1047,6 +1140,7 @@ struct test_results {
     test_status restore  = test_status::SKIP;
     test_status prebatch = test_status::SKIP;
     test_status seq_cp   = test_status::SKIP;
+    test_status kq_mask  = test_status::SKIP;
 };
 
 // Run every test for an initialized model over both cache fills.
@@ -1061,6 +1155,7 @@ static test_results run_tests(const common_params & params, llama_model * model)
         const test_status rs = test_rollback_after_state_restore(params, model, fill);
         const test_status pb = test_prebatch_rollback(params, model, fill);
         const test_status sc = test_seq_cp_resets_rollback(params, model, fill);
+        const test_status km = test_kq_mask_multi_seq(params, model, fill);
         res.rollback = merge_status(res.rollback, rb);
         res.replay   = merge_status(res.replay,   rp);
         res.shared   = merge_status(res.shared,   ss);
@@ -1068,8 +1163,10 @@ static test_results run_tests(const common_params & params, llama_model * model)
         res.restore  = merge_status(res.restore,  rs);
         res.prebatch = merge_status(res.prebatch, pb);
         res.seq_cp   = merge_status(res.seq_cp,   sc);
+        res.kq_mask  = merge_status(res.kq_mask,  km);
         if (rb == test_status::FAIL || rp == test_status::FAIL || ss == test_status::FAIL ||
-            cp == test_status::FAIL || rs == test_status::FAIL || pb == test_status::FAIL || sc == test_status::FAIL) {
+            cp == test_status::FAIL || rs == test_status::FAIL || pb == test_status::FAIL || sc == test_status::FAIL ||
+            km == test_status::FAIL) {
             break;
         }
     }
@@ -1088,7 +1185,7 @@ static test_results run_tests_for_model(const std::string & model_path, const st
     if (model == nullptr) {
         LOG_ERR("%s: failed to init model '%s'\n", __func__, model_path.c_str());
         // a model that cannot be loaded is a failure, not a skip
-        return { test_status::FAIL, test_status::FAIL, test_status::FAIL, test_status::FAIL, test_status::FAIL, test_status::FAIL, test_status::FAIL };
+        return { test_status::FAIL, test_status::FAIL, test_status::FAIL, test_status::FAIL, test_status::FAIL, test_status::FAIL, test_status::FAIL, test_status::FAIL };
     }
 
     if (!llama_model_is_recurrent(model) && !llama_model_is_hybrid(model)) {
@@ -1174,10 +1271,10 @@ int main(int argc, char ** argv) {
         // silence everything but the table itself (LOG has verbosity LOG_LEVEL_OUTPUT = 0)
         common_log_set_verbosity_thold(0);
 
-        LOG("%-*s  %-8s  %-11s  %-10s  %-8s  %-13s  %-8s  %s\n", (int) name_width, "Model", "rollback", "split replay", "shared seq", "composed", "after restore", "prebatch", "seq_cp");
+        LOG("%-*s  %-8s  %-11s  %-10s  %-8s  %-13s  %-8s  %-6s  %s\n", (int) name_width, "Model", "rollback", "split replay", "shared seq", "composed", "after restore", "prebatch", "seq_cp", "kq mask");
         common_log_flush(common_log_main());
 
-        constexpr int n_tests = 7;
+        constexpr int n_tests = 8;
         size_t n_pass[n_tests] = {};
         size_t n_skip[n_tests] = {};
         size_t n_fail[n_tests] = {};
@@ -1190,12 +1287,12 @@ int main(int argc, char ** argv) {
 
             // all status strings have the same raw length, so the columns line up;
             // pad the first status to the width of the "rollback" header + separator
-            LOG("  %s      %s         %s        %s      %s           %s      %s", test_status_str(res.rollback), test_status_str(res.replay), test_status_str(res.shared),
-                    test_status_str(res.composed), test_status_str(res.restore), test_status_str(res.prebatch), test_status_str(res.seq_cp));
+            LOG("  %s      %s         %s        %s      %s           %s      %s    %s", test_status_str(res.rollback), test_status_str(res.replay), test_status_str(res.shared),
+                    test_status_str(res.composed), test_status_str(res.restore), test_status_str(res.prebatch), test_status_str(res.seq_cp), test_status_str(res.kq_mask));
             LOG("\n");
             common_log_flush(common_log_main());
 
-            const test_status all[n_tests] = { res.rollback, res.replay, res.shared, res.composed, res.restore, res.prebatch, res.seq_cp };
+            const test_status all[n_tests] = { res.rollback, res.replay, res.shared, res.composed, res.restore, res.prebatch, res.seq_cp, res.kq_mask };
             for (int t = 0; t < n_tests; ++t) {
                 switch (all[t]) {
                     case test_status::PASS: n_pass[t]++; break;
@@ -1222,6 +1319,8 @@ int main(int argc, char ** argv) {
                 __func__, n_pass[5], n_skip[5], n_fail[5], models.size());
         LOG_INF("%s: seq_cp:       %zu passed, %zu skipped, %zu failed (of %zu)\n",
                 __func__, n_pass[6], n_skip[6], n_fail[6], models.size());
+        LOG_INF("%s: kq mask:      %zu passed, %zu skipped, %zu failed (of %zu)\n",
+                __func__, n_pass[7], n_skip[7], n_fail[7], models.size());
 
         size_t n_fail_all = 0;
         for (int t = 0; t < n_tests; ++t) {
@@ -1235,5 +1334,5 @@ int main(int argc, char ** argv) {
 
     return (res.rollback == test_status::FAIL || res.replay   == test_status::FAIL || res.shared == test_status::FAIL ||
             res.composed == test_status::FAIL || res.restore  == test_status::FAIL || res.prebatch == test_status::FAIL ||
-            res.seq_cp   == test_status::FAIL) ? 1 : 0;
+            res.seq_cp   == test_status::FAIL || res.kq_mask  == test_status::FAIL) ? 1 : 0;
 }

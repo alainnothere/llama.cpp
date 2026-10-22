@@ -80,7 +80,8 @@ llama_kv_cache::llama_kv_cache(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
-             const char *   name_tag) :
+             const char *   name_tag,
+                   bool   kq_mask_inc) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
@@ -301,7 +302,8 @@ llama_kv_cache::llama_kv_cache(
         const int  n_rows = env_rows ? atoi(env_rows) : 64;
 
         const char * why_not = nullptr;
-        if (!on)                                  why_not = "LLAMA_KQ_MASK_INCREMENTAL=0";
+        if (!kq_mask_inc)                         why_not = "not read by the graphs of this cache (wrapper)";
+        else if (!on)                             why_not = "LLAMA_KQ_MASK_INCREMENTAL=0";
         else if (n_rows <= 0)                     why_not = "LLAMA_KQ_MASK_INC_ROWS <= 0";
         else if (v_trans)                         why_not = "no flash attention (f32 mask)";
         else if (n_stream != 1)                   why_not = "more than one stream";
@@ -2093,8 +2095,14 @@ void llama_kv_cache::set_input_kq_mask_dev(const llama_ubatch * ubatch, int64_t 
         }
     }
 
-    // the cells of this ubatch carry the causal triangle -> they are refreshed on the next upload
-    const uint32_t u_lo = cnt == n_tokens ? std::min<uint32_t>(u, (uint32_t) n_kv) : 0;
+    // the cells of this ubatch carry the causal triangle -> they are refreshed on the next upload.
+    // multi-seq ubatch: u and cnt describe seq_id[0][0] only, while the rows of the other seqs hold 0 (attend) at
+    // their own history columns, which can sit below u in a unified cache. the next single-seq step of seq_id[0][0]
+    // with the same n_kv passes the dynamic gate, so a u_lo > 0 here left those columns stale on the device
+    // (review 2026-10-21, -np 2 -kvu: before this fix LLAMA_KQ_MASK_CHECK aborted with "settled region changed: row = 1,
+    // col = 0 (row_lo = 27)" in tools/server/tests/unit/test_kq_mask_inc.py and on falcon-h1-dense in the "kq mask" case of
+    // tests/test-recurrent-state-rollback.cpp). keep every row unsettled -> the next step does a full upload
+    const uint32_t u_lo = (ubatch->n_seqs_unq == 1 && cnt == n_tokens) ? std::min<uint32_t>(u, (uint32_t) n_kv) : 0;
     for (uint32_t r = 0; r < n_tokens; ++r) {
         st.row_lo[r] = u_lo;
     }

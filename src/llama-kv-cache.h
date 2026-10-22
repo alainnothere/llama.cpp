@@ -114,7 +114,9 @@ public:
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
         // a model can hold more than one cache, so the tensor names have to stay unique
-                 const char *   name_tag = "");
+                 const char *   name_tag = "",
+        // [KQ_MASK_INC] false: no persistent mask, for wrappers whose graphs never read get_kq_mask_dev()
+                       bool   kq_mask_inc = true);
 
     ~llama_kv_cache();
 
@@ -301,7 +303,8 @@ private:
     // mask (it is applied to KQ), so it needs no gate.
     // Gate (dynamic, else a full build + full upload into the persistent tensors): one seq in the ubatch, the
     // same seq and n_kv as the previous upload, and every cell of that seq at or after the ubatch's min
-    // position is a ubatch cell (positions did not go backwards over retained cells).
+    // position is a ubatch cell (positions did not go backwards over retained cells). a multi-seq ubatch also leaves
+    // every row unsettled (row_lo 0) for the next step: its rows of the other seqs hold their own history.
     //
     // Why the watermark is exact: a column j left of row_lo was, at its upload, empty (-inf), not in the seq
     // (-inf) or in the seq with pos < the ubatch min pos (0 for every row). Any later change of cell j goes

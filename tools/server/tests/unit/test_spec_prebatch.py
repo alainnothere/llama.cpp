@@ -144,6 +144,8 @@ def test_prebatch_two_requests_without_checkpoint():
         assert j["n_ctx_used"] == jb["n_ctx_used"], (j["n_ctx_used"], jb["n_ctx_used"])
     assert "non-consecutive token position" not in log
     assert log.count("rolling back to the pre-ubatch plane") == lines[0]["n_prebatch_restore"] + lines[1]["n_prebatch_restore"]
+    # no checkpoint was taken, so none can be restored (a replay used to load the stale/empty blob, review 2026-10-21)
+    assert "restoring speculative checkpoint" not in log
 
 
 def _auto_round(v: int, n_min: int, n_max: int) -> int:
@@ -170,6 +172,9 @@ def test_prebatch_restore_scores_real_landing(monkeypatch):
         os.remove(server.log_path)
 
     assert j["n_prebatch_restore"] > 0, j
+    if j["n_spec_ckpt"] == 0:
+        assert "restoring speculative checkpoint" not in log
+        assert j["n_spec_ckpt_restore"] == 0, j
 
     re_auto = re.compile(r"ngram-mod auto: seq 0 offered (\d+) accepted (\d+) built \d+(?: \(cap bound\))? -> cap (\d+) -> (\d+)")
     re_step = re.compile(r"spec step: impl=ngram-mod built=\d+ offered=(\d+) accepted=(\d+)")
@@ -190,3 +195,79 @@ def test_prebatch_restore_scores_real_landing(monkeypatch):
     assert "rolling back to the pre-ubatch plane" in log
     assert "ngram policy: auto on" in log
     assert j["ngram_policy"]["cap_max"] < 16, j["ngram_policy"]
+
+
+# synthetic acceptance (--spec-synth-rates) with LLAMA_SPEC_SYNTH_REPLAY_REJECT=2: a replay of a landing deeper than 2
+# rows that re-verifies a draft token is rejected at its first row, the partial replay a greedy re-verify at another
+# batch shape can produce. the depth condition makes both arms reject the same replays (window 0 also replays the
+# shallow landings, window 2 rolls those back in place).
+# review 2026-10-21: the replay step did not plan its rollback (spec_prebatch false, no checkpoint), so a replay landing
+# deeper than --spec-rs-depth after a plane restore took the host checkpoint path and loaded a stale or empty blob; the
+# restore now asserts that the blob was taken right before the verify batch. the arm with --spec-rs-depth 0 serves every
+# rollback, replays included, from host checkpoints and is the reference. the replay's accept() (eagle3/draft-mtp
+# boundary) must not reach ngram-mod's auto cap: one "ngram-mod auto:" line per drafted chain ("spec step:" line, printed
+# once the chain's replays are done, with the offer of the chain; its accepted count is the final landing)
+SYNTH_RATES = "1,1,1,0.7,0.7,0.7,0.7,0.7,0.7,0.7,0.7,0.7,0.7,0.7,0.7,0.7"
+
+
+def _run_synth(monkeypatch, spec_args: list[str]):
+    global server
+    monkeypatch.setenv("LLAMA_SPEC_SYNTH_REPLAY_REJECT", "2")
+    monkeypatch.setenv("LLAMA_TRACE", "1")
+    fd, stats = tempfile.mkstemp(suffix=".jsonl")
+    os.close(fd)
+    fd, server.log_path = tempfile.mkstemp(suffix=".log")
+    os.close(fd)
+    server.debug = True
+    server.spec_type = "ngram-mod"
+    server.extra_args = ["-dev", "none"] + NGRAM_ARGS + ["--spec-ngram-auto", "--spec-synth-rates", SYNTH_RATES, "--spec-stats-file", stats] + spec_args
+    try:
+        server.start()
+        res = server.make_request("POST", "/completion", data={
+            "prompt": REPETITIVE_PROMPT,
+            "n_predict": 128,
+            "temperature": 0.0,
+            "top_k": 1,
+            "seed": 42,
+            "ignore_eos": True,
+            "cache_prompt": False,
+        })
+        assert res.status_code == 200
+        server.stop()
+        with open(server.log_path, errors="replace") as f:
+            log = f.read()
+        with open(stats) as f:
+            lines = [json.loads(l) for l in f if l.strip()]
+    finally:
+        os.remove(server.log_path)
+        os.unlink(stats)
+    assert len(lines) == 1
+    return res.body["content"], lines[0], log
+
+
+def test_prebatch_partial_replay(monkeypatch):
+    ref, jr, log_ref = _run_synth(monkeypatch, ["--spec-rs-depth", "0"])
+    assert jr["n_prebatch_restore"] == 0 and jr["n_spec_ckpt_restore"] > 0, jr
+
+    content, j, log = _run_synth(monkeypatch, ["--spec-rs-depth", "2"])
+    assert j["n_spec_ckpt"] == 0 and j["n_spec_ckpt_restore"] == 0, j
+    assert "restoring speculative checkpoint" not in log
+    assert "GGML_ASSERT" not in log
+
+    # partial replays deeper than the window: more plane rollbacks than deep partial verify landings
+    re_plane = re.compile(r"rolling back to the pre-ubatch plane \(pos = \d+, n_tokens = \d+, n_accepted = (\d+), n_draft = (\d+)\)")
+    planes = [tuple(int(x) for x in m.groups()) for m in re_plane.finditer(log)]
+    assert len(planes) == j["n_prebatch_restore"]
+    re_step = re.compile(r"spec step: impl=ngram-mod built=\d+ offered=(\d+) accepted=(\d+)")
+    step = [tuple(int(x) for x in m.groups()) for m in re_step.finditer(log)]
+    n_deep_verify = sum(1 for o, a in step if o - a > 2)
+    assert len(planes) > n_deep_verify, (len(planes), n_deep_verify)
+
+    assert content == ref, "partial replays through the plane and through host checkpoints disagree"
+
+    re_auto = re.compile(r"ngram-mod auto: seq 0 offered (\d+) accepted (\d+) built")
+    for lg in (log_ref, log):
+        auto = [tuple(int(x) for x in m.groups()) for m in re_auto.finditer(lg)]
+        step = [tuple(int(x) for x in m.groups()) for m in re_step.finditer(lg)]
+        assert len(auto) > 0
+        assert [o for o, _ in auto] == [o for o, _ in step], "the replay accept() was scored by ngram-mod"

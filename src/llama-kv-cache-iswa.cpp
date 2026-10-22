@@ -92,10 +92,12 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         mem_other_swa = static_cast<llama_kv_cache_iswa *>(mem_other)->get_swa();
     }
 
+    // [KQ_MASK_INC] no persistent mask: the iSWA graphs (llm_graph_input_attn_kv_iswa) read get_kq_mask(), never
+    // get_kq_mask_il(), so it was dead memory: kv_size x 64 rows f16 per device, 16 MiB at 128k (review 2026-10-21)
     kv_base = std::make_unique<llama_kv_cache>(
             model, hparams, type_k, type_v,
             v_trans, offload, unified, size_base, n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, mem_other_base, filter_base, reuse, share);
+            0, LLAMA_SWA_TYPE_NONE, mem_other_base, filter_base, reuse, share, "", /*kq_mask_inc =*/ false);
 
     LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
 
