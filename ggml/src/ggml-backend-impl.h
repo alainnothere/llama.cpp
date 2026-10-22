@@ -303,7 +303,7 @@ extern "C" {
         void    (*ts_arm)  (ggml_backend_t backend);
         // ticket >= 0, -1 nothing armed/recorded, -2 the ring was full (dropped)
         int64_t (*ts_take) (ggml_backend_t backend);
-        int     (*ts_read) (ggml_backend_t backend, int64_t ticket, int64_t * t_start_us, int64_t * t_end_us);
+        int     (*ts_read) (ggml_backend_t backend, int64_t ticket, int64_t * t_start_us, int64_t * t_end_us, int32_t * n_submit);
         int     (*ts_calib)(ggml_backend_t backend, int64_t * max_dev_ns);
         void    (*copy_arm)(ggml_backend_t backend_dst, struct ggml_backend_d2d_copy_stats * rec);
     };

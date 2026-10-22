@@ -502,7 +502,8 @@ extern "C" {
     // Never waits: returns 1 = ok, 0 = the GPU has not written both timestamps yet, -1 = no timer on that backend or
     // the ticket's slot was reused (the reader fell more than the ring behind). Call it after the backend was
     // synchronized (llama: in llama_context::synchronize, after ggml_backend_sched_synchronize) to get 1.
-    GGML_API int ggml_backend_sched_split_ts_read(ggml_backend_sched_t sched, int backend_id, int64_t ticket, int64_t * t_start_us, int64_t * t_end_us);
+    // n_submit (nullable): vkQueueSubmit calls the split made (amdgpu.sched_jobs caps queued submissions per context)
+    GGML_API int ggml_backend_sched_split_ts_read(ggml_backend_sched_t sched, int backend_id, int64_t ticket, int64_t * t_start_us, int64_t * t_end_us, int32_t * n_submit);
     // clock conversion of backend backend_id: -1 = no timer, 0 = calibrated (VK_EXT/KHR_calibrated_timestamps,
     // *max_dev_ns = largest deviation the driver reported over the calibrations so far), 1 = approx (timestampPeriod
     // plus a one-time host offset, *max_dev_ns = -1)

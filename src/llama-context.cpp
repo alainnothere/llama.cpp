@@ -2793,12 +2793,12 @@ void llama_context::dstats_flush(bool synced) {
     while (!dstats_pending.empty()) {
         dstats_pending_line & pl = dstats_pending.front();
 
-        struct res { int rc; int64_t t0, t1; };
-        std::vector<res> rs(pl.split_ts.size(), res{ -1, 0, 0 });
+        struct res { int rc; int64_t t0, t1; int32_t ns; };
+        std::vector<res> rs(pl.split_ts.size(), res{ -1, 0, 0, -1 });
         bool all_ready = true;
         for (size_t i = 0; i < pl.split_ts.size(); ++i) {
             const auto & ts = pl.split_ts[i];
-            rs[i].rc = s ? ggml_backend_sched_split_ts_read(s, ts.backend, ts.ticket, &rs[i].t0, &rs[i].t1) : -1;
+            rs[i].rc = s ? ggml_backend_sched_split_ts_read(s, ts.backend, ts.ticket, &rs[i].t0, &rs[i].t1, &rs[i].ns) : -1;
             all_ready = all_ready && rs[i].rc != 0;
         }
         if (!synced && !all_ready && dstats_pending.size() <= max_pending) {
@@ -2837,7 +2837,7 @@ void llama_context::dstats_flush(bool synced) {
                 t_last  = std::max(t_last, b);
                 busy[ggml_backend_name(ggml_backend_sched_get_backend(s, ts.backend))] += b - a;
                 if (ts.frag >= 0 && ts.frag < (int32_t) gpu_frag.size()) {
-                    gpu_frag[ts.frag] = ",\"t_gpu_start_us\":" + std::to_string(a) + ",\"t_gpu_end_us\":" + std::to_string(b);
+                    gpu_frag[ts.frag] = ",\"t_gpu_start_us\":" + std::to_string(a) + ",\"t_gpu_end_us\":" + std::to_string(b) + ",\"n_submit\":" + std::to_string(rs[i].ns);
                 }
                 if (ts.backend >= 0 && ts.backend < n_backends && !calib_seen[ts.backend]) {
                     calib_seen[ts.backend] = true;

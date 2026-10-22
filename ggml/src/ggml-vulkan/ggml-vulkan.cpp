@@ -918,8 +918,15 @@ static vk_command_buffer* ggml_vk_create_cmd_buffer(vk_device& device, vk_comman
 // 1194 ms in t_hop_submit_us, and that field also covers the transfer-ctx end + in_memcpys + submit-info building;
 // this splits the driver call (Mesa vk_queue / RADV winsys / amdgpu CS ioctl) from our bookkeeping around it.
 static thread_local int64_t * vk_queue_submit_time_sink = nullptr;
+// [fork, 2026-10-22 20:00] vkQueueSubmit calls on this thread; the split timeline (ggml_vk_dts_begin / fork_ts_take)
+// stores the delta per graph_compute so LLAMA_DECODE_STATS splits[].n_submit says how many submissions a split
+// made. Why: amdgpu.sched_jobs (32) caps queued submissions per context; the 12-per-graph rule committed at 19:10
+// did not take on the 110k paste (span 31.7 vs 20.6 s of work, issue 4.3 s) because two other bounds in the
+// graph loop (flops_cap 200 GFLOP per submission, max_nodes_per_submit 100) kept pp graphs at hundreds of submits.
+static thread_local uint64_t vk_queue_submit_counter = 0;
 
 void ggml_vk_submit(vk_context& ctx, vk::Fence fence) {
+    vk_queue_submit_counter++;
     vk_slope_timer slope_t(VK_SLOPE_SUBMIT);   // GGML_VK_MMVQ_SLOPE_STATS t_submit_us / n_submit (fence-only submits too)
     if (ctx->seqs.empty()) {
         if (fence) {
@@ -13733,6 +13740,8 @@ static bool ggml_vk_dts_init(ggml_backend_vk_context * ctx) {
     ctx->dts_pool  = dev->device.createQueryPool(qci);
     dev->device.resetQueryPool(ctx->dts_pool, 0, qci.queryCount);
     ctx->dts_host_arm_us.assign(VK_DTS_RING, 0);
+    ctx->dts_submit_at_begin.assign(VK_DTS_RING, 0);
+    ctx->dts_n_submit.assign(VK_DTS_RING, 0);
     ctx->dts_period_ns = dev->properties.limits.timestampPeriod;
     ctx->dts_mask      = dev->timestamp_valid_bits >= 64 ? ~0ull : ((1ull << dev->timestamp_valid_bits) - 1);
     ctx->dts_ok        = true;
@@ -13796,6 +13805,7 @@ static void ggml_vk_dts_begin(ggml_backend_vk_context * ctx) {
     vk_context cc = ggml_vk_get_compute_ctx(ctx);
     cc->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->dts_pool, 2 * slot);
     ctx->dts_host_arm_us[slot] = ggml_time_us();
+    ctx->dts_submit_at_begin[slot] = vk_queue_submit_counter;
     ctx->dts_ticket      = ticket;
     ctx->dts_end_pending = true;
 }
@@ -13814,17 +13824,24 @@ static void ggml_backend_vk_fork_ts_arm(ggml_backend_t backend) {
 static int64_t ggml_backend_vk_fork_ts_take(ggml_backend_t backend) {
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
     const int64_t t = ctx->dts_ticket;
+    if (t >= 0) {
+        const uint32_t slot = (uint32_t)(t % VK_DTS_RING);
+        ctx->dts_n_submit[slot] = (uint32_t)(vk_queue_submit_counter - ctx->dts_submit_at_begin[slot]);
+    }
     ctx->dts_armed  = false;
     ctx->dts_ticket = -1;
     return t;
 }
 
-static int ggml_backend_vk_fork_ts_read(ggml_backend_t backend, int64_t ticket, int64_t * t_start_us, int64_t * t_end_us) {
+static int ggml_backend_vk_fork_ts_read(ggml_backend_t backend, int64_t ticket, int64_t * t_start_us, int64_t * t_end_us, int32_t * n_submit) {
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
     if (!ctx->dts_ok || ticket < 0 || ticket >= ctx->dts_next || ctx->dts_next - ticket > VK_DTS_RING) {
         return -1;
     }
     const uint32_t slot = (uint32_t)(ticket % VK_DTS_RING);
+    if (n_submit) {
+        *n_submit = (int32_t) ctx->dts_n_submit[slot];
+    }
     uint64_t r[4] = {};   // {start, avail, end, avail}
     const VkResult res = vkGetQueryPoolResults((VkDevice)ctx->device->device, (VkQueryPool)ctx->dts_pool, 2 * slot, 2, sizeof(r), r,
                                                2 * sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
@@ -17157,7 +17174,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         const long v = e ? atol(e) : 12;
         return (uint32_t) (v < 1 ? 1 : v > 256 ? 256 : v);
     }();
-    uint64_t flops_per_submit = std::min(flops_cap, flops_basis / submits_per_graph);
+    // the cap (TDR guard for weak cards) and the node bound below must not undo the per-graph count: 110k paste,
+    // 2048-row graph ~110 TFLOP / 4500 nodes => 200 GFLOP cap = ~550 submits, 100 nodes = 45; either overflows
+    // sched_jobs with two graphs in flight. Take the larger of (old rule capped) and (flops / submits_per_graph).
+    uint64_t flops_per_submit = std::max(std::min(flops_cap, flops_basis / 40u), flops_basis / submits_per_graph);
+    const uint32_t nodes_per_submit = std::max<uint32_t>(ctx->device->max_nodes_per_submit, (uint32_t) cgraph->n_nodes / submits_per_graph);
     if (vk_mmvq_slope_stats) {
         ctx->slope_graph_flops = graph_flops;
         ctx->slope_flops_prev = ctx->last_total_flops;
@@ -17477,7 +17498,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
         // Signal the almost_ready fence when the graph is mostly complete (< 20% remaining)
         bool almost_ready = (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
-        bool submit = (submitted_nodes >= ctx->device->max_nodes_per_submit) ||
+        bool submit = (submitted_nodes >= nodes_per_submit) ||
                       (flops_per_submit != 0 && batch_flops >= flops_per_submit) ||
                       (i + ctx->num_additional_fused_ops >= last_node) ||
                       (almost_ready && !ctx->almost_ready_fence_pending);

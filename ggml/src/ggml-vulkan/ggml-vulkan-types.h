@@ -1477,6 +1477,8 @@ struct ggml_backend_vk_context {
     bool         dts_init_done {};
     bool         dts_ok {};             // pool exists and the device can timestamp + host reset
     std::vector<int64_t> dts_host_arm_us;   // per slot: host time of the start write, for the approx offset
+    std::vector<uint64_t> dts_submit_at_begin; // per slot: vk_queue_submit_counter at the start write
+    std::vector<uint32_t> dts_n_submit;        // per slot: vkQueueSubmit calls between start and ts_take
     double       dts_period_ns {};
     uint64_t     dts_mask {};
     bool         dts_calibrated {};     // last calibration succeeded
