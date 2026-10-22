@@ -348,11 +348,23 @@ public:
 
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
 
+    // [KQ_MASK_INC] the mask for layer il: a view of the kv cache's persistent mask on the layer's device
+    // when kq_mask_dev_ok (one view per device tensor per graph), else the graph input
+    ggml_tensor * get_kq_mask_il(ggml_context * ctx, int il);
+
+    // fill whichever masks the graph uses (persistent views and/or the allocated graph input)
+    // mctx is passed explicitly: the hybrid input does not refresh this->mctx on graph reuse
+    void set_input_kq_mask_any(const llama_kv_cache_context * mctx, const llama_ubatch * ubatch);
+
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+
+    // [KQ_MASK_INC] decided at graph build, see llama_kv_cache::kq_mask_inc_state
+    bool kq_mask_dev_ok = false;
+    std::vector<std::pair<ggml_tensor *, ggml_tensor *>> kq_mask_dev_views; // (device tensor, graph view)
 
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
@@ -951,6 +963,10 @@ public:
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
 
     std::vector<ggml_tensor *> t_layer_inp;
+
+    // [KQ_MASK_INC] some layer reads a persistent kv cache mask: set_inputs writes device memory directly,
+    // so the previous graph must have finished (llama_context::process_ubatch synchronizes)
+    bool kq_mask_dev = false;
 
     std::vector<ggml_tensor *> t_sampled;
     std::vector<ggml_tensor *> t_sampled_probs;

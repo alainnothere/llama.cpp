@@ -116,7 +116,7 @@ public:
         // a model can hold more than one cache, so the tensor names have to stay unique
                  const char *   name_tag = "");
 
-    ~llama_kv_cache() = default;
+    ~llama_kv_cache();
 
     //
     // llama_memory_i
@@ -238,6 +238,14 @@ public:
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
+    // [KQ_MASK_INC] persistent per-device KQ mask, see the comment at kq_mask_inc_state
+    // true if a graph for this ubatch can read the mask from get_kq_mask_dev() instead of a graph input
+    bool          kq_mask_dev_usable(const llama_ubatch & ubatch, int64_t n_stream, ggml_type type, bool causal_attn) const;
+    // the device-resident mask tensor for model layer il (nullptr: use the graph input)
+    ggml_tensor * get_kq_mask_dev(int32_t il) const;
+    // build the mask on the host and upload what changed since the last upload to every device tensor
+    void          set_input_kq_mask_dev(const llama_ubatch * ubatch, int64_t n_kv, bool causal_attn) const;
+
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
@@ -266,7 +274,70 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        // [KQ_MASK_INC] the persistent mask in the same buffer as k (nullptr for shared layers)
+        ggml_tensor * kq_mask_dev = nullptr;
     };
+
+    // [KQ_MASK_INC] 2026-10-21: persistent per-device KQ mask with incremental upload.
+    //
+    // Why: the mask was a graph input built on the host and copied by the scheduler to every device
+    // that holds attention layers, every decode step. LLAMA_DECODE_STATS --sched, Q8 Qwen3.8-27B, 3 cards
+    // (Vulkan2 = 7900 XT on PCIe x1, Vulkan3/Vulkan1 = XTX), 2008 verify decodes at 1-12 rows: CPU->Vulkan2
+    // 9.7 input copies/step, 366 KB, per-step sum p50 2.39 ms p90 3.95 (single copy p90 1.11 ms);
+    // CPU->Vulkan3 5.7 copies 559 KB 1.34 ms; CPU->Vulkan1 6.7 copies 476 KB 0.29 ms; ~4 ms of an ~87 ms
+    // step. The mask is n_kv x n_tokens f16 (~1.2 MB/card at 100k ctx, 6 rows) and only its tail changes.
+    //
+    // What: one 1-D f16 tensor of kv_size*n_rows per buffer type holding attention layers, owned like K/V;
+    // graphs view it as [n_kv, n_tokens] (contiguous, row stride n_kv, the same layout as the graph input)
+    // so the scheduler inserts no copy. A host shadow holds what every device holds (all devices get the
+    // same bytes every upload, so one shadow serves all). row_lo[r] = lowest column of shadow row r that may
+    // differ from a fresh build; each step uploads columns [min row_lo, n_kv) of the n_tokens rows with one
+    // 2-D set per device.
+    //
+    // Gate (static, else the graph input path exactly as before): LLAMA_KQ_MASK_INCREMENTAL != 0, FA (f16
+    // mask, !v_trans), one stream, no SWA, no ALiBi, causal, not training, n_tokens <= n_rows
+    // (LLAMA_KQ_MASK_INC_ROWS, default 64; prompt ubatches take the graph input). Soft-cap does not enter the
+    // mask (it is applied to KQ), so it needs no gate.
+    // Gate (dynamic, else a full build + full upload into the persistent tensors): one seq in the ubatch, the
+    // same seq and n_kv as the previous upload, and every cell of that seq at or after the ubatch's min
+    // position is a ubatch cell (positions did not go backwards over retained cells).
+    //
+    // Why the watermark is exact: a column j left of row_lo was, at its upload, empty (-inf), not in the seq
+    // (-inf) or in the seq with pos < the ubatch min pos (0 for every row). Any later change of cell j goes
+    // through a llama_kv_cells mutator and lowers row_lo via the dirty slot (seq_rm of a rejected draft
+    // tail, find_slot/apply_ubatch reuse, seq_cp/keep/add/div, state restore, clear); a retained cell with
+    // pos < the old min stays below every new row's pos while the dynamic gate holds. The cells of the
+    // uploaded ubatch (all cells with pos >= its min) carry the causal triangle and flip next step, so after
+    // an upload row_lo = their lowest index, not n_used. Rollback: the server seq_rm's the rejected tail and
+    // the next step reuses those cells; both lower row_lo to the lowest removed cell. n_kv growth (padding
+    // by 256) changes the row stride -> full upload. LLAMA_KQ_MASK_CHECK=1 verifies the settled region
+    // against a fresh build and reads every device tensor back after the upload; aborts on a mismatch.
+    struct kq_mask_inc_state {
+        bool     enabled = false;
+        bool     check   = false;
+        int      slot    = -1;  // dirty slot in v_cells[0]
+        uint32_t n_rows  = 0;
+
+        std::vector<ggml_tensor *> dev; // one per buffer type
+
+        std::vector<ggml_fp16_t> shadow; // [n_rows][n_kv], row stride n_kv
+        std::vector<ggml_fp16_t> tmp;    // LLAMA_KQ_MASK_CHECK scratch
+        std::vector<uint32_t>    row_lo; // [n_rows]
+
+        int64_t      n_kv = -1;
+        llama_seq_id seq  = -1;
+
+        bool        logged_inc  = false;
+        const char * last_reason = nullptr;
+
+        uint64_t n_inc   = 0; // incremental uploads
+        uint64_t n_full  = 0; // full uploads (dynamic gate)
+        uint64_t bytes   = 0; // bytes uploaded per device
+        uint64_t bytes_full = 0; // what full uploads would have been
+    };
+
+    mutable kq_mask_inc_state kq_inc;
 
     bool v_trans = true;  // the value tensor is transposed
 
@@ -433,6 +504,11 @@ public:
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
+    // [KQ_MASK_INC] see llama_kv_cache::kq_mask_inc_state
+    bool          kq_mask_dev_usable(const llama_ubatch & ubatch, int64_t n_stream, ggml_type type, bool causal_attn) const;
+    ggml_tensor * get_kq_mask_dev(int32_t il) const;
+    void          set_input_kq_mask_dev(const llama_ubatch * ubatch, int64_t n_kv, bool causal_attn) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;

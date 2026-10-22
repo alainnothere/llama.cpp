@@ -3,6 +3,8 @@
 #include "llama.h"
 #include "llama-cparams.h"
 
+#include <algorithm>
+#include <array>
 #include <bitset>
 #include <cassert>
 #include <cstring>
@@ -31,13 +33,64 @@ struct llama_kv_cell_ext {
     }
 };
 
+// [KQ_MASK_INC] 2026-10-21: lowest cell index whose mask-relevant state (pos, ext, seq set, empty) changed,
+// one slot per consumer (a kv cache keeping a persistent KQ mask; cells can be shared by two caches).
+// every mutator of llama_kv_cells marks it, so the incremental mask upload sees all changes by construction.
+// copying or assigning the cells (state save/restore, vector growth) marks everything dirty: the copy's
+// history is unknown, so the consumers must rebuild from column 0. slot registrations survive the copy.
+struct llama_kv_cells_dirty {
+    static constexpr uint32_t N_SLOTS = 4;
+
+    llama_kv_cells_dirty() { lo.fill(0); }
+    llama_kv_cells_dirty(const llama_kv_cells_dirty & o) : n_slots(o.n_slots) { lo.fill(0); }
+    llama_kv_cells_dirty & operator=(const llama_kv_cells_dirty & o) {
+        n_slots = std::max(n_slots, o.n_slots);
+        lo.fill(0);
+        return *this;
+    }
+
+    // returns -1 when all slots are taken
+    int add_slot() {
+        if (n_slots >= N_SLOTS) {
+            return -1;
+        }
+        lo[n_slots] = 0;
+        return (int) n_slots++;
+    }
+
+    void mark(uint32_t i) {
+        for (uint32_t k = 0; k < n_slots; ++k) {
+            lo[k] = std::min(lo[k], i);
+        }
+    }
+
+    void mark_all() { lo.fill(0); }
+
+    // the lowest dirty cell since the previous take() of this slot (UINT32_MAX = nothing changed)
+    uint32_t take(int slot) {
+        const uint32_t res = lo[slot];
+        lo[slot] = UINT32_MAX;
+        return res;
+    }
+
+private:
+    uint32_t n_slots = 0;
+    std::array<uint32_t, N_SLOTS> lo;
+};
+
 // meta information about KV cells that can be part of multiple sequences at the same time
 // TODO: add unit tests
 class llama_kv_cells {
 public:
     using seq_set_t = std::bitset<LLAMA_MAX_SEQ>;
 
+    // [KQ_MASK_INC] see llama_kv_cells_dirty
+    int      dirty_add_slot()         { return dirty.add_slot(); }
+    uint32_t dirty_take(int slot)     { return dirty.take(slot); }
+
     void reset() {
+        dirty.mark_all();
+
         for (uint32_t i = 0; i < pos.size(); ++i) {
             pos[i]   = -1;
             ext[i].reset();
@@ -166,6 +219,8 @@ public:
     void set(uint32_t i, const llama_kv_cells & other) {
         assert(i + other.pos.size() <= pos.size());
 
+        dirty.mark(i);
+
         for (uint32_t j = 0; j < other.pos.size(); ++j) {
             const auto idx = i + j;
 
@@ -200,6 +255,8 @@ public:
         for (uint32_t j = 0; j < other.pos.size(); ++j) {
             const auto idx = idxs[j];
 
+            dirty.mark(idx);
+
             if (pos[idx] == -1 && other.pos[j] != -1) {
                 used.insert(idx);
             }
@@ -229,6 +286,8 @@ public:
         assert(i < pos.size());
         assert(pos[i] != -1);
 
+        dirty.mark(i);
+
         seq_pos_rm(i);
         seq[i].reset();
 
@@ -246,6 +305,8 @@ public:
         assert(seq[i].test(seq_id));
         assert(pos[i] != -1);
         assert(seq_id >= 0);
+
+        dirty.mark(i);
 
         seq[i].reset(seq_id);
         seq_pos_dec(seq_id, i);
@@ -266,6 +327,10 @@ public:
     // return true if the cell becomes empty (i.e. it did not contain seq_id before the call)
     bool seq_keep(uint32_t i, llama_seq_id seq_id) {
         assert(i < pos.size());
+
+        if (seq[i].count() > (seq[i].test(seq_id) ? 1u : 0u)) {
+            dirty.mark(i);
+        }
 
         if (seq[i].test(seq_id)) {
             seq_pos_rm(i);
@@ -350,6 +415,8 @@ public:
         assert(pos[i] != -1);
         assert(!seq[i].test(seq_id));
 
+        dirty.mark(i);
+
         seq[i].set(seq_id);
         seq_pos_inc(seq_id, i);
     }
@@ -432,6 +499,8 @@ public:
         assert(pos[i] == -1);
         assert(seq[i].none());
 
+        dirty.mark(i);
+
         pos[i] = p;
 
         used.insert(i);
@@ -439,6 +508,7 @@ public:
 
     void ext_set(uint32_t i, llama_kv_cell_ext p) {
         assert(i < ext.size());
+        dirty.mark(i);
         ext[i] = p;
     }
 
@@ -448,6 +518,8 @@ public:
     bool pos_add(uint32_t i, llama_pos d) {
         assert(i < pos.size());
         assert(pos[i] != -1);
+
+        dirty.mark(i);
 
         seq_pos_rm(i);
 
@@ -478,6 +550,8 @@ public:
         assert(i < pos.size());
         assert(pos[i] != -1);
 
+        dirty.mark(i);
+
         const llama_pos p_old = pos[i];
 
         seq_pos_rm(i);
@@ -491,6 +565,8 @@ public:
     }
 
 private:
+    llama_kv_cells_dirty dirty;
+
     bool has_shift = false;
 
     // set of indices of used cells (i.e. pos[i] != -1, allowed to not have any seq_id)

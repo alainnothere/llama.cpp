@@ -1709,6 +1709,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         gf_res_prev_active = res;
     }
 
+    // [KQ_MASK_INC] the persistent KQ mask is written straight into device memory (a synchronous transfer
+    // outside the compute queue), so a still-running previous ubatch could read a half-updated mask. decode
+    // steps arrive synchronized (the caller read the logits) and this is a no-op; consecutive ubatches of one
+    // batch (ppl -ub 12) lose their pipeline overlap. prompt ubatches above LLAMA_KQ_MASK_INC_ROWS use the
+    // graph input and are unaffected
+    if (res->kq_mask_dev && synced_gen != async_gen) {
+        ggml_backend_sched_synchronize(sched.get());
+        synced_gen = async_gen;
+    }
+
     // set the input data for the input tensors
     {
         llama_debug_timer t(cparams.perf_instrumentation, t_set_inputs, n_set_inputs);

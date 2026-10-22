@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -114,7 +115,7 @@ llama_kv_cache::llama_kv_cache(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t((2u*(1 + n_stream)*n_layer + 1)*ggml_tensor_overhead()), // +1: [KQ_MASK_INC] kq_mask_dev
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -132,7 +133,8 @@ llama_kv_cache::llama_kv_cache(
         return it->second.get();
     };
 
-    // 2026-10-20: layer indices per buffer type, only consumed by the CPU PLACEMENT warning
+    // 2026-10-20: layer indices per buffer type, consumed by the CPU PLACEMENT warning and (2026-10-21) the
+    // incremental KQ mask placement
     std::map<ggml_backend_buffer_type_t, std::vector<int>> buft_layers;
 
     GGML_ASSERT(n_stream == 1 || n_stream == n_seq_max);
@@ -196,6 +198,7 @@ llama_kv_cache::llama_kv_cache(
 
                     layers.push_back(layer_share);
                     layers.back().il = il;
+                    layers.back().kq_mask_dev = nullptr; // the source cache's mask follows the source's uploads
 
                     continue;
                 } else {
@@ -284,6 +287,60 @@ llama_kv_cache::llama_kv_cache(
             map_layer_ids[il] = map_layer_ids[il_reuse];
 
             LLAMA_LOG_DEBUG("%s: - layer %3d: reuse layer %d, is_swa = %d\n", __func__, il, il_reuse, hparams.is_swa(il));
+        }
+    }
+
+    // [KQ_MASK_INC] static gate + one persistent mask per buffer type that holds attention layers
+    // (see kq_mask_inc_state). !v_trans <=> flash attention, the only path with an f16 mask
+    {
+        const char * env_inc  = getenv("LLAMA_KQ_MASK_INCREMENTAL");
+        const char * env_rows = getenv("LLAMA_KQ_MASK_INC_ROWS");
+        const char * env_chk  = getenv("LLAMA_KQ_MASK_CHECK");
+
+        const bool on = !(env_inc && atoi(env_inc) == 0);
+        const int  n_rows = env_rows ? atoi(env_rows) : 64;
+
+        const char * why_not = nullptr;
+        if (!on)                                  why_not = "LLAMA_KQ_MASK_INCREMENTAL=0";
+        else if (n_rows <= 0)                     why_not = "LLAMA_KQ_MASK_INC_ROWS <= 0";
+        else if (v_trans)                         why_not = "no flash attention (f32 mask)";
+        else if (n_stream != 1)                   why_not = "more than one stream";
+        else if (swa_type != LLAMA_SWA_TYPE_NONE) why_not = "SWA cache";
+        else if (hparams.use_alibi)               why_not = "ALiBi";
+        else if (layers.empty())                  why_not = "no layers";
+
+        if (!why_not) {
+            kq_inc.slot = v_cells[0].dirty_add_slot();
+            if (kq_inc.slot < 0) {
+                why_not = "no free dirty slot in the shared cells";
+            }
+        }
+
+        if (why_not) {
+            LLAMA_LOG_DEBUG("%s: incremental KQ mask off: %s\n", __func__, why_not);
+        } else {
+            kq_inc.enabled = true;
+            kq_inc.check   = env_chk && atoi(env_chk) != 0;
+            kq_inc.n_rows  = (uint32_t) n_rows;
+            kq_inc.row_lo.assign(kq_inc.n_rows, 0);
+
+            for (auto & [buft, ctx] : ctx_map) {
+                const auto it = buft_layers.find(buft);
+                if (it == buft_layers.end()) {
+                    continue;
+                }
+
+                ggml_tensor * t = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F16, (int64_t) kv_size*kq_inc.n_rows);
+                ggml_format_name(t, "cache_%skq_mask_dev", name_tag);
+                kq_inc.dev.push_back(t);
+
+                for (int il : it->second) {
+                    layers[map_layer_ids.at(il)].kq_mask_dev = t;
+                }
+            }
+
+            LLAMA_LOG_DEBUG("%s: incremental KQ mask on: %zu device tensors, %u rows, %.2f MiB each, check = %d\n", __func__,
+                    kq_inc.dev.size(), kq_inc.n_rows, (double) kv_size*kq_inc.n_rows*sizeof(ggml_fp16_t)/1024.0/1024.0, kq_inc.check);
         }
     }
 
@@ -421,6 +478,14 @@ llama_kv_cache::llama_kv_cache(
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
+}
+
+llama_kv_cache::~llama_kv_cache() {
+    if (kq_inc.enabled && (kq_inc.n_inc + kq_inc.n_full) > 0) {
+        LLAMA_LOG_DEBUG("%s: incremental KQ mask: %" PRIu64 " incremental + %" PRIu64 " full uploads, %.2f of %.2f MiB per device (%.1f%%)\n", __func__,
+                kq_inc.n_inc, kq_inc.n_full, kq_inc.bytes/1024.0/1024.0, kq_inc.bytes_full/1024.0/1024.0,
+                kq_inc.bytes_full ? 100.0*kq_inc.bytes/kq_inc.bytes_full : 0.0);
+    }
 }
 
 void llama_kv_cache::clear(bool data) {
@@ -1839,6 +1904,202 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
 }
 
+// [KQ_MASK_INC] see kq_mask_inc_state in llama-kv-cache.h for the measurements and the gate reasoning
+
+bool llama_kv_cache::kq_mask_dev_usable(const llama_ubatch & ubatch, int64_t n_stream, ggml_type type, bool causal_attn) const {
+    return kq_inc.enabled && causal_attn && type == GGML_TYPE_F16 && n_stream == 1 && ubatch.n_tokens <= kq_inc.n_rows;
+}
+
+ggml_tensor * llama_kv_cache::get_kq_mask_dev(int32_t il) const {
+    if (!kq_inc.enabled) {
+        return nullptr;
+    }
+
+    const auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) {
+        return nullptr;
+    }
+
+    return layers[it->second].kq_mask_dev;
+}
+
+void llama_kv_cache::set_input_kq_mask_dev(const llama_ubatch * ubatch, int64_t n_kv, bool causal_attn) const {
+    auto & st = kq_inc;
+
+    const uint32_t n_tokens = ubatch->n_tokens;
+
+    GGML_ASSERT(st.enabled && causal_attn);
+    GGML_ASSERT(n_tokens <= st.n_rows);
+    GGML_ASSERT(n_kv > 0 && (uint32_t) n_kv <= v_cells[0].size());
+
+    auto & cells = v_cells[0];
+
+    // every cell change since the previous upload (incl. the cells apply_ubatch just wrote for this ubatch)
+    const uint32_t d = cells.dirty_take(st.slot);
+    for (auto & lo : st.row_lo) {
+        lo = std::min(lo, d);
+    }
+
+    const llama_seq_id seq = ubatch->seq_id[0][0];
+
+    llama_pos pos_min = std::numeric_limits<llama_pos>::max();
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        pos_min = std::min(pos_min, ubatch->pos[i]);
+    }
+
+    // the cells whose value can still change for later rows: every cell of seq at or after pos_min. when the
+    // positions are monotonic these are exactly the n_tokens cells of this ubatch
+    uint32_t u   = UINT32_MAX;
+    uint32_t cnt = 0;
+    {
+        const auto & sp = cells.seq_pos_get(seq);
+        for (auto it = sp.lower_bound({ pos_min, 0 }); it != sp.end(); ++it) {
+            if (++cnt > n_tokens) {
+                break;
+            }
+            u = std::min(u, it->second);
+        }
+    }
+
+    const char * reason = nullptr;
+    if (ubatch->n_seqs_unq != 1) {
+        reason = "more than one seq in the ubatch";
+    } else if (n_kv != st.n_kv) {
+        reason = "n_kv changed (row stride)";
+    } else if (seq != st.seq) {
+        reason = "seq changed";
+    } else if (cnt != n_tokens) {
+        reason = "retained cells at or after the ubatch positions";
+    }
+
+    if (reason) {
+        std::fill(st.row_lo.begin(), st.row_lo.end(), 0);
+        if (reason != st.last_reason) {
+            LLAMA_LOG_DEBUG("%s: incremental KQ mask fallback (full upload): %s\n", __func__, reason);
+        }
+        st.last_reason = reason;
+        st.n_kv = n_kv;
+        st.seq  = seq;
+        if (st.shadow.size() < (size_t) n_kv*st.n_rows) {
+            st.shadow.resize((size_t) n_kv*st.n_rows);
+        }
+    }
+
+    ggml_fp16_t * data = st.shadow.data();
+
+    if (st.check && !reason) {
+        st.tmp.assign(data, data + (size_t) n_kv*n_tokens);
+    }
+
+    // the host build, unchanged (cheap): full rows [0, n_tokens) x [0, n_kv) into the shadow
+    {
+        const args_set_input_kq_mask args = {
+            /*.hparams          =*/ hparams,
+            /*.ubatch           =*/ ubatch,
+            /*.v_cells          =*/ v_cells,
+            /*.seq_to_stream    =*/ seq_to_stream,
+            /*.n_swa            =*/ n_swa,
+            /*.swa_type         =*/ swa_type,
+            /*.n_kv             =*/ n_kv,
+            /*.n_stream         =*/ 1,
+            /*.n_tps            =*/ n_tokens,
+        };
+
+        set_input_kq_mask_impl<ggml_fp16_t>(args, data, true);
+    }
+
+    if (st.check && !reason) {
+        for (uint32_t r = 0; r < n_tokens; ++r) {
+            const uint32_t lo = (uint32_t) std::min<int64_t>(st.row_lo[r], n_kv);
+            const ggml_fp16_t * a = st.tmp.data() + (size_t) r*n_kv;
+            const ggml_fp16_t * b = data          + (size_t) r*n_kv;
+            if (memcmp(a, b, lo*sizeof(ggml_fp16_t)) != 0) {
+                uint32_t c = 0;
+                while (a[c] == b[c]) {
+                    c++;
+                }
+                LLAMA_LOG_ERROR("%s: LLAMA_KQ_MASK_CHECK: settled region changed: device = all (shared shadow), row = %u, col = %u (row_lo = %u, n_kv = %" PRId64 "), expected = %f, got = %f\n",
+                        __func__, r, c, lo, n_kv, ggml_fp16_to_fp32(b[c]), ggml_fp16_to_fp32(a[c]));
+                GGML_ABORT("LLAMA_KQ_MASK_CHECK failed");
+            }
+        }
+    }
+
+    uint32_t lo = (uint32_t) n_kv;
+    for (uint32_t r = 0; r < n_tokens; ++r) {
+        lo = std::min(lo, st.row_lo[r]);
+    }
+
+    if (lo == 0 && !reason) {
+        // not a gate failure: the cells changed from cell 0 (clear, state restore, seq_rm/cp at 0, first ubatch)
+        reason = "cells changed from cell 0";
+        if (reason != st.last_reason) {
+            LLAMA_LOG_DEBUG("%s: incremental KQ mask full upload: %s\n", __func__, reason);
+        }
+        st.last_reason = reason;
+    } else if (lo > 0 && (!st.logged_inc || st.last_reason != nullptr)) {
+        LLAMA_LOG_DEBUG("%s: incremental KQ mask: incremental upload (n_kv = %" PRId64 ", n_tokens = %u, cols [%u, %" PRId64 "))\n", __func__, n_kv, n_tokens, lo, n_kv);
+        st.logged_inc  = true;
+        st.last_reason = nullptr;
+    }
+
+    const size_t es     = sizeof(ggml_fp16_t);
+    const size_t stride = (size_t) n_kv*es;
+
+    // one 2-D set per run of consecutive rows with the same row_lo: rows beyond the previous step's n_tokens are
+    // usually stale since the last n_kv change (row_lo 0) and must not drag the fresh rows into a full upload.
+    // 2026-10-21 session B: a 49-row verify after 6-row steps took t_set_inputs p50 6.8 ms with a single min(row_lo)
+    // upload (~6 MB/card at 60k ctx through the XT's x1 link)
+    for (uint32_t r0 = 0; r0 < n_tokens; ) {
+        const uint32_t c0 = std::min<uint32_t>(st.row_lo[r0], (uint32_t) n_kv);
+        uint32_t r1 = r0 + 1;
+        while (r1 < n_tokens && std::min<uint32_t>(st.row_lo[r1], (uint32_t) n_kv) == c0) {
+            r1++;
+        }
+        if (c0 < (uint32_t) n_kv) {
+            for (ggml_tensor * t : st.dev) {
+                if (c0 == 0) {
+                    ggml_backend_tensor_set(t, data + (size_t) r0*n_kv, r0*stride, (size_t) (r1 - r0)*stride);
+                } else {
+                    ggml_backend_tensor_set_2d(t, data + (size_t) r0*n_kv + c0, r0*stride + c0*es, (n_kv - c0)*es, r1 - r0, stride, stride);
+                }
+            }
+            st.bytes += (size_t) (n_kv - c0)*(r1 - r0)*es;
+        }
+        r0 = r1;
+    }
+
+    st.bytes_full += (size_t) n_tokens*stride;
+    if (lo == 0) {
+        st.n_full++;
+    } else {
+        st.n_inc++;
+    }
+
+    if (st.check) {
+        st.tmp.resize((size_t) n_kv*n_tokens);
+        for (ggml_tensor * t : st.dev) {
+            ggml_backend_tensor_get(t, st.tmp.data(), 0, (size_t) n_tokens*stride);
+            if (memcmp(st.tmp.data(), data, (size_t) n_tokens*stride) != 0) {
+                size_t k = 0;
+                while (st.tmp[k] == data[k]) {
+                    k++;
+                }
+                LLAMA_LOG_ERROR("%s: LLAMA_KQ_MASK_CHECK: device tensor differs from a fresh build: device = %s, row = %zu, col = %zu (lo = %u, n_kv = %" PRId64 "), expected = %f, got = %f\n",
+                        __func__, ggml_backend_buffer_name(t->buffer), k / n_kv, k % n_kv, lo, n_kv,
+                        ggml_fp16_to_fp32(data[k]), ggml_fp16_to_fp32(st.tmp[k]));
+                GGML_ABORT("LLAMA_KQ_MASK_CHECK failed");
+            }
+        }
+    }
+
+    // the cells of this ubatch carry the causal triangle -> they are refreshed on the next upload
+    const uint32_t u_lo = cnt == n_tokens ? std::min<uint32_t>(u, (uint32_t) n_kv) : 0;
+    for (uint32_t r = 0; r < n_tokens; ++r) {
+        st.row_lo[r] = u_lo;
+    }
+}
+
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     const int64_t n_tokens = ubatch->n_tokens;
 
@@ -2988,6 +3249,18 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
+}
+
+bool llama_kv_cache_context::kq_mask_dev_usable(const llama_ubatch & ubatch, int64_t n_stream, ggml_type type, bool causal_attn) const {
+    return kv->kq_mask_dev_usable(ubatch, n_stream, type, causal_attn);
+}
+
+ggml_tensor * llama_kv_cache_context::get_kq_mask_dev(int32_t il) const {
+    return kv->get_kq_mask_dev(il);
+}
+
+void llama_kv_cache_context::set_input_kq_mask_dev(const llama_ubatch * ubatch, int64_t n_kv, bool causal_attn) const {
+    kv->set_input_kq_mask_dev(ubatch, n_kv, causal_attn);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

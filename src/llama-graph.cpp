@@ -75,7 +75,56 @@ static bool can_reuse_kq_mask(
     return res;
 }
 
+// [KQ_MASK_INC] static part of the gate, see llama_kv_cache::kq_mask_inc_state
+static bool kq_mask_dev_decide(
+        const llama_kv_cache_context * mctx,
+        const llama_ubatch & ubatch,
+        const llama_cparams & cparams,
+        const ggml_tensor * kq_mask) {
+    return !cparams.training && kq_mask && mctx->kq_mask_dev_usable(ubatch, kq_mask->ne[3], kq_mask->type, cparams.causal_attn);
+}
+
 // impl
+
+ggml_tensor * llm_graph_input_attn_kv::get_kq_mask_il(ggml_context * ctx, int il) {
+    if (kq_mask_dev_ok && self_kq_mask_cnv == self_kq_mask) {
+        ggml_tensor * dev = mctx->get_kq_mask_dev(il);
+        if (dev) {
+            for (const auto & [d, v] : kq_mask_dev_views) {
+                if (d == dev) {
+                    return v;
+                }
+            }
+
+            const int64_t n_kv  = self_kq_mask->ne[0];
+            const int64_t n_tps = self_kq_mask->ne[1];
+            const size_t  es    = ggml_element_size(dev);
+
+            GGML_ASSERT(self_kq_mask->ne[2] == 1 && self_kq_mask->ne[3] == 1 && dev->type == self_kq_mask->type);
+
+            ggml_tensor * v = ggml_view_4d(ctx, dev, n_kv, n_tps, 1, 1, n_kv*es, n_kv*n_tps*es, n_kv*n_tps*es, 0);
+            ggml_format_name(v, "attn_inp_kq_mask_dev%zu", kq_mask_dev_views.size());
+
+            kq_mask_dev_views.emplace_back(dev, v);
+
+            return v;
+        }
+    }
+
+    return get_kq_mask();
+}
+
+void llm_graph_input_attn_kv::set_input_kq_mask_any(const llama_kv_cache_context * mctx, const llama_ubatch * ubatch) {
+    if (!kq_mask_dev_views.empty()) {
+        mctx->set_input_kq_mask_dev(ubatch, self_kq_mask->ne[0], cparams.causal_attn);
+    }
+
+    // the mask is left unallocated when the graph only stores K/V without attending
+    // (e.g. DFlash's KV-injection pass) or when every layer reads the persistent mask
+    if (self_kq_mask && self_kq_mask->buffer) {
+        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+    }
+}
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
@@ -519,11 +568,7 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         mctx->set_input_v_idxs(self_v_idxs, ubatch);
     }
 
-    // the mask is left unallocated when the graph only stores K/V without attending
-    // (e.g. DFlash's KV-injection pass)
-    if (self_kq_mask && self_kq_mask->buffer) {
-        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
-    }
+    set_input_kq_mask_any(mctx, ubatch);
 
     if (self_k_rot && self_k_rot->buffer) {
         mctx->set_input_k_rot(self_k_rot);
@@ -545,6 +590,8 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+
+    res &= kq_mask_dev_ok == kq_mask_dev_decide(mctx, params.ubatch, params.cparams, self_kq_mask);
 
     return res;
 }
@@ -1138,7 +1185,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    inp_attn->set_input_kq_mask_any(mctx->get_attn(), ubatch);
 
     if (inp_attn->self_k_rot) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
@@ -1178,6 +1225,11 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
         res = false;
     }
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
+
+    if (inp_attn->kq_mask_dev_ok != kq_mask_dev_decide(attn, ub, params.cparams, inp_attn->self_kq_mask)) {
+        if (graph_reuse_log_enabled()) LLAMA_LOG_WARN("%s: no reuse: persistent kq mask decision changed\n", __func__);
+        res = false;
+    }
 
     if (!can_reuse_kq_mask(inp_attn->self_kq_mask, attn, ub, params.cparams)) {
         const auto * m = inp_attn->self_kq_mask;
@@ -1391,6 +1443,8 @@ int64_t llm_graph_result::get_max_nodes() const {
 }
 
 void llm_graph_result::reset() {
+    kq_mask_dev   = false;
+
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
     t_logits      = nullptr;
@@ -3009,6 +3063,8 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 
         inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
+
+        inp->kq_mask_dev_ok = kq_mask_dev_decide(mctx_cur, ubatch, cparams, inp->self_kq_mask);
     }
 
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
@@ -3080,7 +3136,10 @@ ggml_tensor * llm_graph_context::build_attn(
         v = mctx_cur->get_v(ctx0, il);
     }
 
-    ggml_tensor * kq_mask = inp->get_kq_mask();
+    ggml_tensor * kq_mask = inp->get_kq_mask_il(ctx0, il);
+    if (kq_mask != inp->get_kq_mask()) {
+        res->kq_mask_dev = true;
+    }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
