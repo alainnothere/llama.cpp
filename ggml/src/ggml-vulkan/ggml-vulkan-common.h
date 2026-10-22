@@ -85,6 +85,11 @@ vk_buffer ggml_vk_create_buffer_check(vk_device& device, size_t size, vk::Memory
 vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size, const char * label = "buffer");
 // [fork] GPU PLACEMENT warning: budget check after allocations and every N graphs (ggml-vulkan-buffers.cpp)
 void ggml_vk_mem_watch_graph(vk_device& device);
+// [fork, 2026-10-22] kernel-side view (sysfs mem_info_gtt_used / mem_info_vram_used of the device's PCI node);
+// false when there is no such node (not Linux, not amdgpu, no VK_EXT_pci_bus_info, UMA device)
+bool ggml_vk_gtt_watch_read(vk_device& device, uint64_t & gtt_used, uint64_t & vram_used);
+// [fork, 2026-10-22] one WARN line per lazy scratch / ring growth, rate limited by *counter (first 8, then every 64th)
+void ggml_vk_scratch_grow_log(vk_device& device, const char * which, size_t old_size, size_t new_size, uint32_t * counter);
 void ggml_vk_destroy_buffer(vk_buffer& buf);
 void * ggml_vk_host_malloc(vk_device& device, size_t size);
 void ggml_vk_host_free(vk_device& device, void* ptr);

@@ -695,6 +695,24 @@ struct vk_mem_watch {
 
 void ggml_vk_mem_watch_free(vk_device_struct * device, size_t size, bool counted);
 
+// [fork, 2026-10-22] kernel-side GTT watch state (sysfs mem_info_*), see ggml_vk_gtt_watch_* in ggml-vulkan-buffers.cpp.
+// The VK_EXT_memory_budget watch above is blind to kernel placement: at n_ctx 289024 TTM evicted a 1.13 GB BO off
+// the XT into GTT while RADV's heapUsage stayed under heapBudget. sysfs is the only runtime view without root.
+struct vk_gtt_watch {
+    std::mutex  mutex;
+    bool        init     = false;
+    bool        enabled  = false;  // sysfs node found (Linux + amdgpu-style mem_info_* files)
+    std::string bdf;               // domain:bus:device.function from VK_EXT_pci_bus_info
+    std::string card;              // DRM node name, e.g. card1
+    std::string dir;               // /sys/bus/pci/devices/<bdf>
+    bool        sampled  = false;  // first (baseline) sample taken, at the device's first graph
+    uint64_t    gtt_base = 0;      // warn level: last warned value, lowered when GTT shrinks
+    uint64_t    gtt_prev = 0, vram_prev = 0;
+    uint64_t    gtt_first = 0, vram_first = 0;
+    uint32_t    n_warn   = 0;
+    bool        armed_recovery = false; // a growth warning fired; log once when GTT falls back
+};
+
 struct vk_device_struct {
     std::recursive_mutex mutex;
     std::mutex queue_submit_mutex;
@@ -1053,6 +1071,7 @@ struct vk_device_struct {
     bool disable_descriptor_reuse;
     std::atomic<uint64_t> buffer_destroy_count {};
     vk_mem_watch mem_watch;
+    vk_gtt_watch gtt_watch;   // [fork, 2026-10-22] kernel GTT watch (sysfs)
     bool disable_host_visible_vidmem;
     bool allow_sysmem_fallback;
     bool disable_graph_optimize;
@@ -1374,6 +1393,7 @@ struct ggml_backend_vk_context {
     ggml_vk_garbage_collector gc;
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset;
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, sync_staging;
+    uint32_t  scratch_grow_n[5] {};   // [fork, 2026-10-22] growth events per scratch buffer (x, y, mask_scratch, split_k, add_rms_partials), rate limit of ggml_vk_scratch_grow_log
 
     // Scratch for FA inputs derived from the KQ mask (mask_opt bitmaps, sparse index lists).
     // The mask is identical for every layer that shares it, so each (mask, params) is computed

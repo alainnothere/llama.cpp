@@ -1,5 +1,10 @@
 #include "ggml-vulkan-common.h"
 
+#if defined(__linux__)
+#include <dirent.h>
+#endif
+#include <cstdio>
+
 ggml_backend_buffer_type_i ggml_backend_vk_buffer_type_interface = {
     /* .get_name            = */ ggml_backend_vk_buffer_type_name,
     /* .alloc_buffer        = */ ggml_backend_vk_buffer_type_alloc_buffer,
@@ -321,16 +326,261 @@ void ggml_vk_mem_watch_free(vk_device_struct * device, size_t size, bool counted
     }
 }
 
+// [fork, 2026-10-22] Kernel-side GTT watch (sysfs), the half of the placement picture VK_EXT_memory_budget cannot see.
+//
+// Why: 2026-10-22 11:30-12:00 (ledger "289k CLIFF NAMED"), n_ctx 289024, -ub 2048, split pinned -ts 23,24,19: at the
+// start of the first prompt the kernel evicted the KQ mask op's never-yet-touched OUTPUT buffer (1183842304 B =
+// 289024 x 2048 x 2 B, inside the fit's 2182 MiB compute buffer) off the 7900 XT (PCIe x1, DRM card1, 0000:09:00.0)
+// into GTT to place the first prompt's ~250 MB of lazy allocations: sysfs mem_info_vram_used 17249 -> 17000 MiB,
+// mem_info_gtt_used 522 -> 1925 MiB; amdgpu_gem_info showed the BO in GTT. Under pipelining it never migrated back
+// (amdgpu_cs_bo_validate: a BO left in GTT drops off the evicted list; the serialized run had it back in VRAM within
+// 0.5 s), and every FA on the XT read its mask over the x1 link: the prompt ran 5-8x slow. The GPU PLACEMENT warning
+// above never fired: RADV's heapUsage stayed under heapBudget (19191 MiB free at start, ~17.5 GB demand) while the
+// kernel moved the pages. Why TTM evicts with ~3 GB nominally free is still unexplained (ledger: OPEN).
+//
+// Cross-module preconditions: RADV's budget is its own accounting, blind to TTM placement/eviction; sysfs
+// mem_info_* is the only runtime view of where the kernel put things (debugfs amdgpu_gem_info names the BO but needs
+// root, so it is not read here). The counters are DEVICE-WIDE: every process on the card (a second llama-server, the
+// desktop on card0) moves them too. Host-visible memory this process maps into the device also counts as GTT on it:
+// Vulkan_Host buffers on the first device (the XT showed 400-5000 MiB depending on config), pinned staging, D2D host
+// rings (VK_EXT_external_memory_host imports, if the kernel accounts userptr BOs in GTT). Hence only DELTAS after the
+// baseline are reported, never absolute values, and the scratch growth lines (ggml_vk_scratch_grow_log) are the
+// attribution for host-side growth.
+//
+// What: the device is mapped to /sys/bus/pci/devices/<bdf> (bdf from VK_EXT_pci_bus_info, same lowercase format as
+// sysfs); without mem_info_gtt_used there (not Linux, not amdgpu, no extension) the watch is silently off; UMA devices
+// (the iGPU, card3, if it is a vk_device at all) are skipped since GTT is their normal home. Baseline + one WARN
+// line with the kernel and RADV views side by side at the device's first graph (after model/KV/compute allocation;
+// at vk_device creation the fit's probes have the log redirected to DEBUG and the model is not loaded yet, so a
+// baseline there would report the model load itself as growth). Then every GGML_VK_MEM_WATCH_EVERY graphs (shared
+// cadence, 0 = off) two sysfs reads; WARN when GTT grew more than GGML_VK_GTT_WATCH_MIB (default 256, 0 = off) above
+// the warn level (= the last warned value, lowered whenever GTT shrinks, so it is <= the previous sample: a jump
+// since the previous sample always warns, and slow creep warns once it adds up). One line when GTT falls back below
+// the level of the first warning (evicted BOs migrated back). At most 32 growth warnings per device.
+static bool ggml_vk_sysfs_read_u64(const std::string & path, uint64_t & v) {
+#if defined(__linux__)
+    FILE * f = fopen(path.c_str(), "r");
+    if (!f) {
+        return false;
+    }
+    unsigned long long x = 0;
+    const bool ok = fscanf(f, "%llu", &x) == 1;
+    fclose(f);
+    if (ok) {
+        v = (uint64_t) x;
+    }
+    return ok;
+#else
+    GGML_UNUSED(path);
+    GGML_UNUSED(v);
+    return false;
+#endif
+}
+
+// path mapping helper: "<bdf>" -> "/sys/bus/pci/devices/<bdf>" if it has mem_info_gtt_used, card = first drm/card*
+static bool ggml_vk_gtt_sysfs_dir(const std::string & bdf, std::string & dir, std::string & card) {
+#if defined(__linux__)
+    if (bdf.empty()) {
+        return false;
+    }
+    dir = "/sys/bus/pci/devices/" + bdf;
+    uint64_t v;
+    if (!ggml_vk_sysfs_read_u64(dir + "/mem_info_gtt_used", v) || !ggml_vk_sysfs_read_u64(dir + "/mem_info_vram_used", v)) {
+        return false;
+    }
+    card = "card?";
+    if (DIR * d = opendir((dir + "/drm").c_str())) {
+        while (dirent * e = readdir(d)) {
+            if (strncmp(e->d_name, "card", 4) == 0) {
+                card = e->d_name;
+                break;
+            }
+        }
+        closedir(d);
+    }
+    return true;
+#else
+    GGML_UNUSED(bdf);
+    GGML_UNUSED(dir);
+    GGML_UNUSED(card);
+    return false;
+#endif
+}
+
+static std::string ggml_vk_physical_device_bdf(vk::PhysicalDevice & pd) {
+    bool ext = false;
+    for (const auto & p : pd.enumerateDeviceExtensionProperties()) {
+        if (strcmp(VK_EXT_PCI_BUS_INFO_EXTENSION_NAME, p.extensionName) == 0) {
+            ext = true;
+            break;
+        }
+    }
+    if (!ext) {
+        return "";
+    }
+    vk::PhysicalDeviceProperties2 props;
+    vk::PhysicalDevicePCIBusInfoPropertiesEXT pci;
+    props.pNext = &pci;
+    pd.getProperties2(&props);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%04x:%02x:%02x.%x", pci.pciDomain, pci.pciBus, pci.pciDevice, (unsigned) (pci.pciFunction & 0xf));
+    return buf;
+}
+
+// call with w.mutex held
+static void ggml_vk_gtt_watch_init_locked(vk_device & device, vk_gtt_watch & w) {
+    if (w.init) {
+        return;
+    }
+    w.init = true;
+    if (device->uma) {
+        return;
+    }
+    w.bdf     = ggml_vk_physical_device_bdf(device->physical_device);
+    w.enabled = ggml_vk_gtt_sysfs_dir(w.bdf, w.dir, w.card);
+}
+
+bool ggml_vk_gtt_watch_read(vk_device & device, uint64_t & gtt_used, uint64_t & vram_used) {
+    vk_gtt_watch & w = device->gtt_watch;
+    {
+        std::lock_guard<std::mutex> lock(w.mutex);
+        ggml_vk_gtt_watch_init_locked(device, w);
+    }
+    if (!w.enabled) {
+        return false;
+    }
+    return ggml_vk_sysfs_read_u64(w.dir + "/mem_info_gtt_used", gtt_used) &&
+           ggml_vk_sysfs_read_u64(w.dir + "/mem_info_vram_used", vram_used);
+}
+
+static void ggml_vk_gtt_watch_sample(vk_device & device, uint64_t n_graph) {
+    static const uint64_t thr = [] {
+        const char * e = getenv("GGML_VK_GTT_WATCH_MIB");
+        return (uint64_t) (e ? std::max(0, atoi(e)) : 256) * 1024 * 1024;
+    }();
+    constexpr double MiB = 1024.0 * 1024.0;
+    vk_gtt_watch & w = device->gtt_watch;
+    uint64_t gtt = 0, vram = 0;
+    if (!ggml_vk_gtt_watch_read(device, gtt, vram)) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(w.mutex);
+
+    if (!w.sampled) {
+        w.sampled  = true;
+        w.gtt_base = w.gtt_prev = w.gtt_first = gtt;
+        w.vram_prev = w.vram_first = vram;
+        // RADV's view next to the kernel's (the same numbers the fit read via ggml_backend_vk_get_device_memory)
+        size_t free = 0, total = 0;
+        ggml_backend_vk_get_device_memory((int) device->idx, &free, &total);
+        uint64_t budget = 0, usage = 0, vram_total = 0;
+        bool has_budget;
+        {
+            std::lock_guard<std::mutex> lock_mw(device->mem_watch.mutex);
+            ggml_vk_mem_watch_init(device, device->mem_watch);
+            has_budget = device->mem_watch.has_budget;
+        }
+        if (has_budget) {
+            vk::PhysicalDeviceMemoryBudgetPropertiesEXT bp;
+            vk::PhysicalDeviceMemoryProperties2 mp2;
+            mp2.pNext = &bp;
+            device->physical_device.getMemoryProperties2(&mp2);
+            for (uint32_t i = 0; i < mp2.memoryProperties.memoryHeapCount; ++i) {
+                if (mp2.memoryProperties.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+                    usage  += bp.heapUsage[i];
+                    budget += bp.heapBudget[i];
+                }
+            }
+        }
+        ggml_vk_sysfs_read_u64(w.dir + "/mem_info_vram_total", vram_total);
+        // WARN, not INFO: library INFO is demoted to TRACE and hidden at the default -lv 3 (fork log rule)
+        GGML_LOG_WARN("GTT WATCH: ggml_vulkan: %s (%s) %s %s: kernel VRAM %.0f / %.0f MiB used, GTT %.0f MiB used (device-wide, "
+                "all processes, incl. host-visible buffers mapped to it); RADV heapUsage %.0f MiB, heapBudget %.0f MiB, "
+                "free %.0f of %.0f MiB; baseline at graph %llu, growth > %.0f MiB warns\n",
+                device->name.c_str(), device->properties.deviceName.data(), w.bdf.c_str(), w.card.c_str(),
+                vram/MiB, vram_total/MiB, gtt/MiB, usage/MiB, budget/MiB, free/MiB, total/MiB,
+                (unsigned long long) n_graph, thr/MiB);
+        return;
+    }
+
+    if (thr > 0 && gtt > w.gtt_base + thr) {
+        if (w.n_warn < 32) {
+            GGML_LOG_WARN("GTT WATCH: ggml_vulkan: %s (%s) %s %s: GTT grew %.0f -> %.0f MiB (+%.0f since the previous sample, "
+                    "+%.0f since baseline), VRAM %.0f -> %.0f MiB, graph %llu; the kernel placed or evicted buffers to host memory "
+                    "(GTT) and the kernels that read them run 5-10x slower (RADV's budget does not see this); "
+                    "check --fit-target / -c / extra per-device buffers%s\n",
+                    device->name.c_str(), device->properties.deviceName.data(), w.bdf.c_str(), w.card.c_str(),
+                    w.gtt_prev/MiB, gtt/MiB, ((double) gtt - (double) w.gtt_prev)/MiB, ((double) gtt - (double) w.gtt_first)/MiB,
+                    w.vram_prev/MiB, vram/MiB, (unsigned long long) n_graph,
+                    w.n_warn == 31 ? " (last GTT growth warning for this device)" : "");
+        }
+        w.n_warn++;
+        if (!w.armed_recovery) {
+            w.armed_recovery = true;
+            w.gtt_first = std::min(w.gtt_first, w.gtt_prev);   // recovery level = GTT before the first growth
+        }
+        w.gtt_base = gtt;
+    } else if (gtt < w.gtt_base) {
+        w.gtt_base = gtt;
+    }
+    if (w.armed_recovery && gtt <= w.gtt_first + thr / 4) {
+        w.armed_recovery = false;
+        GGML_LOG_WARN("GTT WATCH: ggml_vulkan: %s (%s) %s %s: GTT back down to %.0f MiB (baseline %.0f), VRAM %.0f MiB, graph %llu: "
+                "the evicted buffers migrated back\n",
+                device->name.c_str(), device->properties.deviceName.data(), w.bdf.c_str(), w.card.c_str(),
+                gtt/MiB, w.gtt_first/MiB, vram/MiB, (unsigned long long) n_graph);
+    }
+    w.gtt_prev  = gtt;
+    w.vram_prev = vram;
+}
+
+// [fork, 2026-10-22] Lazy scratch growth log (prealloc_* in ggml_vk_preallocate_buffers, D2D host ring regrowth).
+//
+// Why: the 289k first-prompt eviction above was triggered by ~250 MB of first-prompt allocations that nothing in the
+// log named (VK_LOG_MEMORY is a debug-build macro). These buffers are sized lazily by the first graph that needs them,
+// after the fit and after the model/KV/compute buffers, so they are exactly what lands on a card the fit left with
+// little headroom. free is ggml_backend_vk_get_device_memory (RADV budget - usage, the fit's view) right after the
+// growth; kernel VRAM/GTT is sysfs (device-wide). D2D rings are host memory imported into both devices: they cost
+// no VRAM, they may show as GTT. Rate limit per buffer: the first 8 growths, then every 64th.
+void ggml_vk_scratch_grow_log(vk_device & device, const char * which, size_t old_size, size_t new_size, uint32_t * counter) {
+    if (new_size <= old_size) {
+        return;
+    }
+    const uint32_t n = (*counter)++;
+    if (n >= 8 && n % 64 != 0) {
+        return;
+    }
+    constexpr double MiB = 1024.0 * 1024.0;
+    size_t free = 0, total = 0;
+    ggml_backend_vk_get_device_memory((int) device->idx, &free, &total);
+    char kernel[128] = "";
+    uint64_t gtt = 0, vram = 0;
+    if (ggml_vk_gtt_watch_read(device, gtt, vram)) {
+        snprintf(kernel, sizeof(kernel), ", kernel VRAM %.0f MiB / GTT %.0f MiB used", vram/MiB, gtt/MiB);
+    }
+    GGML_LOG_WARN("SCRATCH GROW: ggml_vulkan: %s (%s): %s %.2f -> %.2f MiB (growth #%u), free VRAM %.0f of %.0f MiB%s\n",
+            device->name.c_str(), device->properties.deviceName.data(), which, old_size/MiB, new_size/MiB, n + 1,
+            free/MiB, total/MiB, kernel);
+}
+
 void ggml_vk_mem_watch_graph(vk_device & device) {
     static const uint64_t every = [] {
         const char * e = getenv("GGML_VK_MEM_WATCH_EVERY");
         return e ? (uint64_t) std::max(0, atoi(e)) : (uint64_t) 256;
     }();
     vk_mem_watch & w = device->mem_watch;
-    if (every == 0 || (w.init && !w.has_budget)) {
+    if (every == 0) {
         return;
     }
-    if (w.n_graphs.fetch_add(1, std::memory_order_relaxed) % every != 0) {
+    const uint64_t n_graph = w.n_graphs.fetch_add(1, std::memory_order_relaxed);
+    if (n_graph % every != 0) {
+        return;
+    }
+    // one pointer test when the device has no sysfs node (after the first call), two small sysfs reads otherwise
+    if (!device->gtt_watch.init || device->gtt_watch.enabled) {
+        ggml_vk_gtt_watch_sample(device, n_graph);
+    }
+    if (w.init && !w.has_budget) {
         return;
     }
     std::lock_guard<std::mutex> lock(w.mutex);

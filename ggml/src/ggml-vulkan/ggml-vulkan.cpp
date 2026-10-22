@@ -13541,6 +13541,9 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
     if (subctx && slope_t.p) {
         slope_t.p->n_prealloc_drain++;
     }
+    // [fork, 2026-10-22] each growth below logs one SCRATCH GROW line (ggml_vk_scratch_grow_log, ggml-vulkan-buffers.cpp):
+    // the 289k first-prompt eviction of the KQ mask output off the XT (VRAM 17249 -> 17000 MiB, GTT 522 -> 1925 MiB)
+    // was triggered by ~250 MB of first-prompt allocations nothing named; these lazy buffers are prime suspects
     if (subctx) {
         // Submit and wait for any pending work before reallocating the buffers
         ggml_vk_ctx_end(subctx);
@@ -13555,18 +13558,22 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
     if (ctx->prealloc_x == nullptr || (ctx->prealloc_size_x > 0 && ctx->prealloc_x->size < ctx->prealloc_size_x)) {
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(x_size: " << ctx->prealloc_size_x << ")");
         // Resize buffer
+        const size_t old_size = ctx->prealloc_x ? ctx->prealloc_x->size : 0;
         if (ctx->prealloc_x != nullptr) {
             ggml_vk_destroy_buffer(ctx->prealloc_x);
         }
         ctx->prealloc_x = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_x, "prealloc_x");
+        ggml_vk_scratch_grow_log(ctx->device, "prealloc_x", old_size, ctx->prealloc_size_x, &ctx->scratch_grow_n[0]);
     }
     if (ctx->prealloc_y == nullptr || (ctx->prealloc_size_y > 0 && ctx->prealloc_y->size < ctx->prealloc_size_y)) {
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(y_size: " << ctx->prealloc_size_y << ")");
         // Resize buffer
+        const size_t old_size = ctx->prealloc_y ? ctx->prealloc_y->size : 0;
         if (ctx->prealloc_y != nullptr) {
             ggml_vk_destroy_buffer(ctx->prealloc_y);
         }
         ctx->prealloc_y = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_y, "prealloc_y");
+        ggml_vk_scratch_grow_log(ctx->device, "prealloc_y", old_size, ctx->prealloc_size_y, &ctx->scratch_grow_n[1]);
         ctx->prealloc_y_last_pipeline_used = nullptr;
         ctx->prealloc_y_last_tensor_used = nullptr;
         ctx->prealloc_y_last_k_padded = false;
@@ -13574,10 +13581,12 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
     if (ctx->prealloc_size_mask_scratch > 0 &&
         (ctx->prealloc_mask_scratch == nullptr || ctx->prealloc_mask_scratch->size < ctx->prealloc_size_mask_scratch)) {
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(mask_scratch_size: " << ctx->prealloc_size_mask_scratch << ")");
+        const size_t old_size = ctx->prealloc_mask_scratch ? ctx->prealloc_mask_scratch->size : 0;
         if (ctx->prealloc_mask_scratch != nullptr) {
             ggml_vk_destroy_buffer(ctx->prealloc_mask_scratch);
         }
         ctx->prealloc_mask_scratch = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_mask_scratch, "prealloc_mask_scratch");
+        ggml_vk_scratch_grow_log(ctx->device, "prealloc_mask_scratch", old_size, ctx->prealloc_size_mask_scratch, &ctx->scratch_grow_n[2]);
         // the old contents are gone, so every cached entry is invalid
         ctx->mask_scratch_entries.clear();
         ctx->mask_scratch_used = 0;
@@ -13585,18 +13594,22 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
     if (ctx->prealloc_split_k == nullptr || (ctx->prealloc_size_split_k > 0 && ctx->prealloc_split_k->size < ctx->prealloc_size_split_k)) {
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(split_k_size: " << ctx->prealloc_size_split_k << ")");
         // Resize buffer
+        const size_t old_size = ctx->prealloc_split_k ? ctx->prealloc_split_k->size : 0;
         if (ctx->prealloc_split_k != nullptr) {
             ggml_vk_destroy_buffer(ctx->prealloc_split_k);
         }
         ctx->prealloc_split_k = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_split_k, "prealloc_split_k");
+        ggml_vk_scratch_grow_log(ctx->device, "prealloc_split_k", old_size, ctx->prealloc_size_split_k, &ctx->scratch_grow_n[3]);
     }
     if (ctx->prealloc_add_rms_partials == nullptr || (ctx->prealloc_size_add_rms_partials > 0 && ctx->prealloc_add_rms_partials->size < ctx->prealloc_size_add_rms_partials)) {
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(add_partials_size: " << ctx->prealloc_add_rms_partials << ")");
         // Resize buffer
+        const size_t old_size = ctx->prealloc_add_rms_partials ? ctx->prealloc_add_rms_partials->size : 0;
         if (ctx->prealloc_add_rms_partials != nullptr) {
             ggml_vk_destroy_buffer(ctx->prealloc_add_rms_partials);
         }
         ctx->prealloc_add_rms_partials = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_add_rms_partials, "prealloc_add_rms_partials");
+        ggml_vk_scratch_grow_log(ctx->device, "prealloc_add_rms_partials", old_size, ctx->prealloc_size_add_rms_partials, &ctx->scratch_grow_n[4]);
     }
 }
 
@@ -14930,6 +14943,8 @@ struct vk_d2d_link {
     uint64_t       bwd_submitted    = 0;
     vk_context_ref bwd_pending_ctx;
     uint64_t       bwd_pending_mark = 0;
+
+    uint32_t n_grow_log = 0;   // [fork] rate limit of the ring's SCRATCH GROW lines
 };
 
 static bool ggml_vk_d2d_timeline_shareable(const vk_device & dev) {
@@ -15157,10 +15172,24 @@ static bool ggml_vk_d2d_ensure_cap(vk_d2d_link * l, size_t size_al) {
         cap *= 2;
     }
     // no drain: the old ring is retired with its imports, hops still queued on it complete against it
+    const size_t old_cap = l->cap;
     if (!ggml_vk_d2d_ring_alloc(l, cap)) {
         GGML_LOG_WARN("ggml_vulkan: async D2D %s -> %s: host ring grow to %zu MiB failed, using the host bounce\n", l->src_dev->name.c_str(), l->dst_dev->name.c_str(), cap >> 20);
         l->ok = false;
         return false;
+    }
+    // [fork, 2026-10-22] SCRATCH GROW line per side (see ggml_vk_scratch_grow_log): the ring is pinned host memory
+    // imported into BOTH devices, no VRAM, but it may count in both cards' sysfs GTT and so explain a GTT WATCH
+    // delta that is not an eviction; the retired ring stays mapped until link destroy (live total = sum of rings)
+    {
+        char which[96];
+        snprintf(which, sizeof(which), "d2d ring %s->%s (src side, %zu retired)", l->src_dev->name.c_str(), l->dst_dev->name.c_str(), l->retired.size());
+        ggml_vk_scratch_grow_log(l->src_dev, which, old_cap, l->cap, &l->n_grow_log);
+        if (l->cap > old_cap) {
+            l->n_grow_log--;   // one growth event, two lines: count it once
+        }
+        snprintf(which, sizeof(which), "d2d ring %s->%s (dst side, %zu retired)", l->src_dev->name.c_str(), l->dst_dev->name.c_str(), l->retired.size());
+        ggml_vk_scratch_grow_log(l->dst_dev, which, old_cap, l->cap, &l->n_grow_log);
     }
     return true;
 }
