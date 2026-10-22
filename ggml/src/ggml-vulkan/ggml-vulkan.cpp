@@ -15227,6 +15227,9 @@ static bool ggml_vk_d2d_async_enabled() {
 // [fork, 2026-10-22 evening] EXPORTED RING (default) vs USERPTR RING (GGML_VK_D2D_RING=userptr). CPU-only build,
 // NOT yet run on the GPUs when written; first-run checks are in the report of that change (startup DEBUG line
 // "ring export", no "falling back" WARN, LLAMA_DECODE_STATS ring_kind, per-split issue, ppl gate bit-identical).
+// [2026-10-22 night] gated on the GPUs: bit-identical to userptr (2.8989, 12 chunks pipelined; 3.3986 one ubatch per
+// decode) once the host-source copy bug it exposed was fixed (ggml_backend_vk_cpy_tensor_async); GGML_VK_D2D_CHECK=1
+// verified every hop byte-exact, including hops whose bwd wait was elided.
 //
 // Why: the userptr ring (host mmap imported into both devices through VK_EXT_external_memory_host) is a userptr BO
 // on each card, and amdgpu_cs.c:876-890 (kernel 7.1.3) walks EVERY userptr BO in the bo_list on EVERY CS and
@@ -15275,18 +15278,23 @@ static bool ggml_vk_d2d_async_enabled() {
 static int32_t ggml_vk_d2d_ring_pref() {
     static const int32_t kind = [] {
         const char * v = getenv("GGML_VK_D2D_RING");
-        // [2026-10-22 18:30 after reboot] DEFAULT userptr until the exported ring passes the gate: ppl 13326.86 with
-        // export vs 2.8989 with userptr (deterministic, identical digits across two export runs, with either submit
-        // rule), -c 8192 -b 8192 -ub 2048, 12 chunks. Host-side submit cost of the exported ring was right (issue
-        // 0.76/0.81/0.73 ms vs 8/16.6/8); its data is not. Bisection: bounce path, one ubatch per batch.
-        if (v == nullptr || strcmp(v, "userptr") == 0) {
-            return (int32_t) GGML_BACKEND_D2D_RING_USERPTR;
-        }
-        if (strcmp(v, "export") == 0) {
+        // [2026-10-22 18:30 after reboot] was DEFAULT userptr: ppl 13326.86 with export vs 2.8989 with userptr
+        // (deterministic, -c 8192 -b 8192 -ub 2048, 12 chunks). [2026-10-22 night] DEFAULT export again: the ring was
+        // never wrong. GGML_VK_D2D_CHECK=1 compared every hop (src tensor, ring as the dst reads it, dst tensor) and all
+        // were byte-exact; the corruption was the host-source GPU copy of model.input_embed into Vulkan2 (comment at
+        // that return in ggml_backend_vk_cpy_tensor_async), which the export ring exposed only by making hop 1 cheap
+        // enough (issue 0.76/0.81/0.73 ms vs 8/16.6/8) for the host to run two ubatches ahead. Gate after that fix,
+        // export ring: 2.8989 +/- 0.02573 with 256 and with 12 submits, all 12 per-chunk values identical to the
+        // userptr arms; one ubatch per decode (-c 4096 -b 2048) 3.3986 identical per chunk; 1367 t/s on every
+        // pipelined arm.
+        if (v == nullptr || strcmp(v, "export") == 0) {
             return (int32_t) GGML_BACKEND_D2D_RING_EXPORT;
         }
-        GGML_LOG_WARN("ggml_vulkan: GGML_VK_D2D_RING=%s not understood (export | userptr), using userptr\n", v);
-        return (int32_t) GGML_BACKEND_D2D_RING_USERPTR;
+        if (strcmp(v, "userptr") == 0) {
+            return (int32_t) GGML_BACKEND_D2D_RING_USERPTR;
+        }
+        GGML_LOG_WARN("ggml_vulkan: GGML_VK_D2D_RING=%s not understood (export | userptr), using export\n", v);
+        return (int32_t) GGML_BACKEND_D2D_RING_EXPORT;
     }();
     return kind;
 }
@@ -15330,7 +15338,202 @@ struct vk_d2d_link {
 
     uint32_t n_grow_log = 0;   // [fork] rate limit of the ring's SCRATCH GROW lines
     int32_t  why_code   = 0;   // [fork, 2026-10-22] ggml_backend_d2d_bounce_reason of a refused setup (LLAMA_DECODE_STATS)
+
+    // [fork, 2026-10-22 night] GGML_VK_D2D_CHECK=1 (comment at ggml_vk_d2d_check_on): one record per hop whose
+    // snapshots are compared when the dst context next synchronizes. Empty and untouched when the knob is off.
+    struct check_rec {
+        uint64_t  hop = 0, graph = 0;
+        size_t    off = 0, size = 0, cap = 0, n_retired = 0;
+        int32_t   n_overlap = 0;       // live entries the final pick overlapped
+        uint64_t  max_bwd = 0;         // largest bwd among them (before the elide verdict)
+        int32_t   verdict = 0;         // 0 no overlap, 1 elided, 2 GPU wait, 3 GPU wait forced by NO_ELIDE
+        uint64_t  v_src = 0, v_dst = 0, bwd_value = 0, bwd_submitted = 0, fwd_value = 0, seen = 0;
+        vk_buffer snap_src;            // src device: the src tensor, copied right after hop 1's ring write
+        vk_buffer snap_ring;           // dst device: the ring region as the dst reads it, right after hop 2
+        vk_buffer snap_dst;            // dst device: the dst tensor, right after hop 2
+    };
+    std::vector<check_rec> checks;
+    std::vector<vk_buffer> check_free_src, check_free_dst;
+    uint64_t n_hops = 0;
 };
+
+// [fork, 2026-10-22 night] D2D correctness instrument. The gate (ppl, Qwen3.8-27B Q8, -c 8192 -b 8192 -ub 2048,
+// 12 chunks, 3 cards) is 2.8989 with the userptr ring + 256 submits, but 1383.57 with GGML_VK_SUBMITS_PER_GRAPH=12
+// and 13326.86 with the exported ring; both need the async ring AND several ubatches in flight (one ubatch per
+// decode passes, the bounce passes). ppl says "wrong", not where. GGML_VK_D2D_CHECK=1 adds, per async hop, a copy of
+// the src tensor on the src queue right after hop 1 (same submission, before the fwd signal), and copies of the ring
+// region and of the dst tensor on the dst queue right after hop 2 (before the bwd signal), into host-visible
+// snapshots; the next ggml_vk_synchronize of the dst context (every submitted hop 2 done => every hop 1 done, hop 2
+// waited fwd) memcmps them and aborts on the first mismatch with the hop's ring bookkeeping and the wait/elide
+// verdict. The pipeline shape is kept (no extra host waits; the snapshot copies add GPU time on both queues).
+// GGML_VK_D2D_NO_ELIDE=1: a pick that overlaps a live region always carries the GPU bwd wait even when the counter
+// says reached (the counter still decides grow-vs-wait, so ring sizes match an elided run). Both are one cached
+// bool test per hop when unset.
+// GGML_VK_D2D_CHECK=2 also logs one "D2D HASH" line per hop (link, hop index, 64-bit hash of the bytes): two runs
+// with the same prompt/batching walk the same hops in the same order, so diffing the lines of a passing and a
+// failing config names the first hop whose SOURCE data already diverged (corruption upstream of the copy).
+static int ggml_vk_d2d_check_level() {
+    static const int lvl = [] { const char * v = getenv("GGML_VK_D2D_CHECK"); return v ? atoi(v) : 0; }();
+    return lvl;
+}
+static bool ggml_vk_d2d_check_on() {
+    return ggml_vk_d2d_check_level() != 0;
+}
+static bool ggml_vk_d2d_no_elide() {
+    static const bool on = [] { const char * v = getenv("GGML_VK_D2D_NO_ELIDE"); return v && atoi(v) != 0; }();
+    return on;
+}
+static uint64_t vk_d2d_check_graph_ctr = 0;   // graph_compute calls (all contexts), only counted with the check on
+
+static vk_buffer ggml_vk_d2d_check_buf(vk_device & dev, std::vector<vk_buffer> & pool, size_t size) {
+    for (size_t i = 0; i < pool.size(); i++) {
+        if (pool[i]->size >= size) {
+            vk_buffer b = pool[i];
+            pool.erase(pool.begin() + i);
+            return b;
+        }
+    }
+    return ggml_vk_create_buffer_check(dev, size,
+        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
+        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+}
+
+static size_t ggml_vk_d2d_first_diff(const uint8_t * a, const uint8_t * b, size_t n) {
+    if (memcmp(a, b, n) == 0) {
+        return SIZE_MAX;
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (a[i] != b[i]) {
+            return i;
+        }
+    }
+    return SIZE_MAX;
+}
+
+// GGML_VK_D2D_CHECK also covers the host-source branch of ggml_backend_vk_cpy_tensor_async that records a GPU copy
+// straight out of pinned host memory (the copy reads the host bytes when the GPU gets to it, not when it is
+// recorded): the bytes are snapshotted on the host at record time, the dst is copied into a host-visible snapshot
+// right after the GPU copy, and the next synchronize of the dst context compares both (and the source's bytes as
+// they are NOW, to tell "overwritten by the host before the GPU read it" from anything else).
+struct vk_host_check_rec {
+    std::string          name;
+    const uint8_t *      src = nullptr;
+    size_t               size = 0;
+    uint64_t             graph = 0;
+    bool                 src_sync = false;   // the src backend is synchronous (no iface.synchronize: CPU)
+    std::vector<uint8_t> at_record;
+    vk_buffer            snap_dst;
+};
+static std::mutex vk_host_check_mutex;
+static std::unordered_map<const ggml_backend_vk_context *, std::vector<vk_host_check_rec>> vk_host_checks;
+
+static void ggml_vk_host_check_drain(ggml_backend_vk_context * ctx) {
+    std::lock_guard<std::mutex> lock(vk_host_check_mutex);
+    auto it = vk_host_checks.find(ctx);
+    if (it == vk_host_checks.end()) {
+        return;
+    }
+    for (auto & c : it->second) {
+        const uint8_t * pd = (const uint8_t *) c.snap_dst->ptr;
+        const size_t d = ggml_vk_d2d_first_diff(c.at_record.data(), pd, c.size);
+        if (d != SIZE_MAX) {
+            size_t n_bad = 0;
+            for (size_t i = 0; i < c.size; i++) { n_bad += c.at_record[i] != pd[i]; }
+            const bool dst_is_now = memcmp(pd, c.src, c.size) == 0;
+            const bool src_moved  = memcmp(c.at_record.data(), c.src, c.size) != 0;
+            GGML_LOG_ERROR("ggml_vulkan: HOST->%s CHECK MISMATCH tensor '%s' size %zu graph %llu src_backend_synchronous %d: first diff %zu, %zu bytes differ; "
+                           "src bytes changed since record %d, dst == src bytes as they are now %d\n",
+                           ctx->device->name.c_str(), c.name.c_str(), c.size, (unsigned long long) c.graph, c.src_sync, d, n_bad, src_moved, dst_is_now);
+            GGML_ABORT("GGML_VK_D2D_CHECK host-source mismatch");
+        }
+    }
+    static uint64_t n_ok = 0;
+    n_ok += it->second.size();
+    if (!it->second.empty() && (n_ok < 16 || (n_ok & (n_ok - 1)) == 0)) {
+        GGML_LOG_INFO("ggml_vulkan: HOST->%s CHECK: %zu GPU copies from pinned host memory ok this sync, %llu total\n", ctx->device->name.c_str(),
+                      it->second.size(), (unsigned long long) n_ok);
+    }
+    vk_host_checks.erase(it);
+}
+
+static void ggml_vk_d2d_check_drain(ggml_backend_vk_context * ctx) {
+    ggml_vk_host_check_drain(ctx);
+    for (vk_d2d_link * l : ctx->d2d_links) {
+        for (size_t ci = 0; ci < l->checks.size(); ci++) {
+            auto & c = l->checks[ci];
+            const uint8_t * ps = (const uint8_t *) c.snap_src->ptr;
+            const uint8_t * pr = (const uint8_t *) c.snap_ring->ptr;
+            const uint8_t * pd = (const uint8_t *) c.snap_dst->ptr;
+            const size_t d_dst  = ggml_vk_d2d_first_diff(ps, pd, c.size);
+            const size_t d_ring = ggml_vk_d2d_first_diff(ps, pr, c.size);
+            if (d_dst != SIZE_MAX || d_ring != SIZE_MAX) {
+                static const char * vname[] = { "no-overlap", "ELIDED", "gpu-wait", "gpu-wait(NO_ELIDE)" };
+                size_t n_bad = 0;
+                for (size_t i = 0; i < c.size; i++) { n_bad += ps[i] != pd[i]; }
+                GGML_LOG_ERROR("ggml_vulkan: D2D CHECK MISMATCH %s -> %s ring=%s hop=%llu graph=%llu (pending %zu in this sync, idx %zu)\n",
+                    l->src_dev->name.c_str(), l->dst_dev->name.c_str(), l->ring_kind == GGML_BACKEND_D2D_RING_EXPORT ? "export" : "userptr",
+                    (unsigned long long) c.hop, (unsigned long long) c.graph, l->checks.size(), ci);
+                GGML_LOG_ERROR("  region off=%zu size=%zu (end %zu) cap=%zu MiB retired=%zu overlap=%d max_bwd=%llu verdict=%s\n",
+                    c.off, c.size, c.off + c.size, c.cap >> 20, c.n_retired, c.n_overlap, (unsigned long long) c.max_bwd, vname[c.verdict]);
+                GGML_LOG_ERROR("  at hop-1 submit: bwd counter src=%llu dst=%llu seen=%llu bwd_value=%llu bwd_submitted=%llu fwd_value=%llu\n",
+                    (unsigned long long) c.v_src, (unsigned long long) c.v_dst, (unsigned long long) c.seen, (unsigned long long) c.bwd_value,
+                    (unsigned long long) c.bwd_submitted, (unsigned long long) c.fwd_value);
+                GGML_LOG_ERROR("  bytes %zu: src vs dst first diff %zd (%zu bytes differ), src vs ring-as-dst-sees-it first diff %zd\n",
+                    c.size, d_dst == SIZE_MAX ? (ssize_t) -1 : (ssize_t) d_dst, n_bad, d_ring == SIZE_MAX ? (ssize_t) -1 : (ssize_t) d_ring);
+                const size_t at = d_dst != SIZE_MAX ? d_dst : d_ring;
+                const size_t a0 = at & ~(size_t) 15;
+                std::string hs, hr, hd;
+                char tmp[8];
+                for (size_t i = a0; i < std::min(c.size, a0 + 32); i++) {
+                    snprintf(tmp, sizeof(tmp), "%02x", ps[i]); hs += tmp;
+                    snprintf(tmp, sizeof(tmp), "%02x", pr[i]); hr += tmp;
+                    snprintf(tmp, sizeof(tmp), "%02x", pd[i]); hd += tmp;
+                }
+                GGML_LOG_ERROR("  @%zu src  %s\n  @%zu ring %s\n  @%zu dst  %s\n", a0, hs.c_str(), a0, hr.c_str(), a0, hd.c_str());
+                // whose data did the dst get? another hop of this sync on the same link, same bytes at the same offset
+                for (size_t cj = 0; cj < l->checks.size(); cj++) {
+                    if (cj == ci) { continue; }
+                    const auto & o = l->checks[cj];
+                    const size_t n = std::min(o.size, c.size);
+                    const bool m_dst  = memcmp(o.snap_src->ptr, pd, n) == 0;
+                    const bool m_ring = memcmp(o.snap_src->ptr, pr, n) == 0;
+                    GGML_LOG_ERROR("  other hop=%llu off=%zu size=%zu verdict=%s: dst==its src %d, ring==its src %d\n",
+                        (unsigned long long) o.hop, o.off, o.size, vname[o.verdict], m_dst, m_ring);
+                }
+                size_t n_zero = 0;
+                for (size_t i = 0; i < c.size; i++) { n_zero += pd[i] == 0; }
+                GGML_LOG_ERROR("  dst zero bytes %zu of %zu\n", n_zero, c.size);
+                GGML_ABORT("GGML_VK_D2D_CHECK mismatch");
+            }
+        }
+        if (ggml_vk_d2d_check_level() >= 2) {
+            for (const auto & c : l->checks) {
+                const uint64_t * q = (const uint64_t *) c.snap_src->ptr;
+                uint64_t h = 1469598103934665603ull;
+                for (size_t i = 0; i < c.size / 8; i++) { h = (h ^ q[i]) * 1099511628211ull; }
+                GGML_LOG_INFO("D2D HASH %s->%s hop %llu size %zu hash %016llx\n", l->src_dev->name.c_str(), l->dst_dev->name.c_str(),
+                              (unsigned long long) c.hop, c.size, (unsigned long long) h);
+            }
+        }
+        static uint64_t n_ok = 0;
+        static uint64_t n_verdict[4] = {};
+        n_ok += l->checks.size();
+        for (const auto & c : l->checks) {
+            n_verdict[c.verdict]++;
+        }
+        if (!l->checks.empty() && (n_ok < 16 || (n_ok & (n_ok - 1)) == 0)) {
+            GGML_LOG_INFO("ggml_vulkan: D2D CHECK %s -> %s: %zu hops ok this sync, %llu total (all links: no-overlap %llu, elided %llu, gpu-wait %llu, forced %llu)\n",
+                          l->src_dev->name.c_str(), l->dst_dev->name.c_str(), l->checks.size(), (unsigned long long) n_ok,
+                          (unsigned long long) n_verdict[0], (unsigned long long) n_verdict[1], (unsigned long long) n_verdict[2], (unsigned long long) n_verdict[3]);
+        }
+        for (auto & c : l->checks) {
+            l->check_free_src.push_back(std::move(c.snap_src));
+            l->check_free_dst.push_back(std::move(c.snap_ring));
+            l->check_free_dst.push_back(std::move(c.snap_dst));
+        }
+        l->checks.clear();
+    }
+}
 
 static bool ggml_vk_d2d_timeline_shareable(const vk_device & dev) {
     if (!dev->external_semaphore_fd) {
@@ -15879,15 +16082,26 @@ static bool ggml_vk_d2d_copy_async(ggml_backend_vk_context * src_ctx, ggml_backe
     size_t   off      = 0;
     uint64_t wait_bwd = 0;
     int32_t  n_elided = 0;
+    int32_t  ck_overlap = 0;     // GGML_VK_D2D_CHECK bookkeeping (cheap ints, always computed)
+    uint64_t ck_max_bwd = 0;
+    bool     ck_forced  = false;
     for (int attempt = 0; ; attempt++) {
         off = l->head + size_al > l->cap ? 0 : l->head;
         wait_bwd = 0;
+        ck_overlap = 0;
+        ck_forced  = false;
         for (const auto & r : l->live) {
             if (r.begin < off + size_al && off < r.end) {
                 wait_bwd = std::max(wait_bwd, r.bwd);
+                ck_overlap++;
             }
         }
+        ck_max_bwd = wait_bwd;
         if (wait_bwd > 0 && ggml_vk_d2d_bwd_reached(l, wait_bwd)) {
+            if (ggml_vk_d2d_no_elide()) {
+                ck_forced = true;   // keep the wait, but no grow: ring sizes stay those of an elided run
+                break;
+            }
             wait_bwd = 0;
             n_elided = 1;
         }
@@ -15960,6 +16174,22 @@ static bool ggml_vk_d2d_copy_async(ggml_backend_vk_context * src_ctx, ggml_backe
         VkBufferCopy bc{ src_offset, off, size };
         vkCmdCopyBuffer(sc->s->buffer->buf, (VkBuffer)src_buf->buffer, (VkBuffer)l->ring.buf_src->buffer, 1, &bc);
     }
+    vk_d2d_link::check_rec * ck = nullptr;
+    if (ggml_vk_d2d_check_on()) {
+        l->checks.emplace_back();
+        ck = &l->checks.back();
+        ck->hop = l->n_hops; ck->graph = vk_d2d_check_graph_ctr; ck->off = off; ck->size = size; ck->cap = l->cap;
+        ck->n_retired = l->retired.size(); ck->n_overlap = ck_overlap; ck->max_bwd = ck_max_bwd;
+        ck->verdict = ck_overlap == 0 ? 0 : wait_bwd == 0 ? 1 : ck_forced ? 3 : 2;
+        ck->v_src = l->src_dev->device.getSemaphoreCounterValue(l->bwd_src);
+        ck->v_dst = l->dst_dev->device.getSemaphoreCounterValue(l->bwd_dst);
+        ck->seen = l->bwd_signaled_seen; ck->bwd_value = l->bwd_value; ck->bwd_submitted = l->bwd_submitted;
+        ck->fwd_value = l->fwd_value + 1;
+        ck->snap_src = ggml_vk_d2d_check_buf(l->src_dev, l->check_free_src, size);
+        VkBufferCopy bc{ src_offset, 0, size };
+        vkCmdCopyBuffer(sc->s->buffer->buf, (VkBuffer)src_buf->buffer, (VkBuffer)ck->snap_src->buffer, 1, &bc);
+    }
+    l->n_hops++;
     ggml_vk_sync_buffers(nullptr, sc);
     sc->s->signal_semaphores.push_back({ l->fwd_src, ++l->fwd_value });
     if (rec) {
@@ -16023,6 +16253,16 @@ static bool ggml_vk_d2d_copy_async(ggml_backend_vk_context * src_ctx, ggml_backe
         vkCmdCopyBuffer(dc->s->buffer->buf, (VkBuffer)l->ring.buf_dst->buffer, (VkBuffer)dst_buf->buffer, 1, &bc);
     }
     ggml_vk_sync_buffers(nullptr, dc);
+    if (ck) {
+        // ck still points into l->checks: nothing between hop 1 and here appends to it
+        ck->snap_ring = ggml_vk_d2d_check_buf(l->dst_dev, l->check_free_dst, size);
+        ck->snap_dst  = ggml_vk_d2d_check_buf(l->dst_dev, l->check_free_dst, size);
+        VkBufferCopy br{ off, 0, size };
+        vkCmdCopyBuffer(dc->s->buffer->buf, (VkBuffer)l->ring.buf_dst->buffer, (VkBuffer)ck->snap_ring->buffer, 1, &br);
+        VkBufferCopy bd{ dst_offset, 0, size };
+        vkCmdCopyBuffer(dc->s->buffer->buf, (VkBuffer)dst_buf->buffer, (VkBuffer)ck->snap_dst->buffer, 1, &bd);
+        ggml_vk_sync_buffers(nullptr, dc);
+    }
     ++l->bwd_value;
     // one signal per semaphore per batch: a second hop 2 in the same batch raises the value instead
     bool merged = false;
@@ -16121,6 +16361,34 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
             return true;
         }
 
+        // [fork, 2026-10-22 night] THE PPL GATE BUG. The GPU path below copies straight out of the pinned host pages
+        // when the GPU reaches the copy, not when it is recorded. The scheduler's contract for cpy_tensor_async is
+        // "ordered after the src backend's earlier work and before its later work"; a synchronous src backend (CPU,
+        // no iface.synchronize) does its later work on the host the moment we return, so its output is overwritten
+        // before the dst GPU has read it whenever the dst queue is behind. Here: model.input_embed (the CPU split's
+        // get_rows, 2048 x 5120 x f32 = 40 MiB per ubatch) feeding Vulkan2, the first card. With -b 8192 -ub 2048 the
+        // host runs ubatch k+1's CPU split while Vulkan2 still works on ubatch k-1 (the scheduler only waits for the
+        // copy slot, events[dst][cur_copy], and model.input_embed is a graph node, not a per-slot copy), so the copy
+        // queued behind ubatch k-1 reads ubatch k+1's embeddings.
+        // Measured (Qwen3.8-27B Q8, -c 8192 -b 8192 -ub 2048, 3 cards -ts 16,26,24): GGML_VK_D2D_CHECK=1 on the export
+        // ring said every cross-device ring hop was byte-exact (src tensor == ring as the dst reads it == dst tensor,
+        // ELIDED verdicts included), while CHECK=2 hashes put the first divergence vs the passing run at Vulkan2's
+        // OUTPUT of ubatch 1 (the card that receives no D2D hop at all); the host-source check then reported
+        //   HOST->Vulkan2 CHECK MISMATCH tensor 'model.input_embed' size 41943040 graph 6 src_backend_synchronous 1:
+        //   first diff 1, 31268867 bytes differ; src bytes changed since record 1, dst == src bytes as they are now 0
+        // It needs a host that issues faster than Vulkan2 computes: the exported ring (hop 1 submit 0.8 ms instead of
+        // the userptr ring's 8-16 ms per CS) and GGML_VK_SUBMITS_PER_GRAPH=12 (12 instead of ~40 submits per graph)
+        // each let the host get two ubatches ahead (ppl 13326.86 / 1383.57), the userptr ring with ~40 submits kept it
+        // behind (2.8989 by luck of timing); one ubatch per decode synchronizes before the next CPU split (passes);
+        // the D2D bounce synchronizes Vulkan2 at its hop (passes). With this return the gate is bit-identical on every
+        // arm (table in the 2026-10-22 night report).
+        // Fix: refuse the GPU path for a synchronous src on another backend; the scheduler then does its bounce for this
+        // input (synchronous write through the transfer queue after events[dst][cur_copy], one 40 MiB staging copy +
+        // fence wait per ubatch). The CPU path above (idle dst, <= 128 KiB) is synchronous and stays.
+        if (src_backend_synchronous && backend_src != backend_dst) {
+            return false;
+        }
+
         vk_context cpy_ctx;
         if (ctx->device->async_use_transfer_queue) {
             cpy_ctx = ggml_vk_get_transfer_ctx(ctx);
@@ -16128,9 +16396,29 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
             cpy_ctx = ggml_vk_get_compute_ctx(ctx);
         }
 
-        return ggml_vk_buffer_write_async(cpy_ctx, dst_buf,
+        const bool ok = ggml_vk_buffer_write_async(cpy_ctx, dst_buf,
                                           vk_tensor_offset(dst) + dst->view_offs,
                                           src->data, ggml_nbytes(src));
+#ifdef __linux__
+        if (ok && ggml_vk_d2d_check_on()) {
+            vk_host_check_rec r;
+            r.name     = src->name;
+            r.src      = (const uint8_t *) src->data;
+            r.size     = ggml_nbytes(src);
+            r.graph    = vk_d2d_check_graph_ctr;
+            r.src_sync = src_backend_synchronous;
+            r.at_record.assign(r.src, r.src + r.size);
+            r.snap_dst = ggml_vk_create_buffer_check(ctx->device, r.size,
+                vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
+                vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+            ggml_vk_sync_buffers(nullptr, cpy_ctx);
+            VkBufferCopy bc{ vk_tensor_offset(dst) + dst->view_offs, 0, r.size };
+            vkCmdCopyBuffer(cpy_ctx->s->buffer->buf, (VkBuffer)dst_buf->buffer, (VkBuffer)r.snap_dst->buffer, 1, &bc);
+            std::lock_guard<std::mutex> lock(vk_host_check_mutex);
+            vk_host_checks[ctx].push_back(std::move(r));
+        }
+#endif
+        return ok;
     }
 
     return false;
@@ -16216,6 +16504,11 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
     // A sync from inside graph_compute (staging reads, ggml_vk_submit_compute_ctx_nowait) leaves the current ticket's
     // end unsubmitted: that ticket stays above the floor
     ctx->dts_floor = ctx->dts_end_pending ? ctx->dts_next - 1 : ctx->dts_next;
+#ifdef __linux__
+    if (ggml_vk_d2d_check_on()) {
+        ggml_vk_d2d_check_drain(ctx);   // the dst queue is idle: every hop 2 recorded here (and its hop 1) is done
+    }
+#endif
 }
 
 static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
@@ -16985,6 +17278,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ggml_vk_debug_label queue_dbg(ctx->device->compute_queue->handle.get(), "ggml_backend_vk_graph_compute");
 
     ggml_vk_mem_watch_graph(ctx->device);   // GPU PLACEMENT warning, every GGML_VK_MEM_WATCH_EVERY graphs
+#ifdef __linux__
+    if (ggml_vk_d2d_check_on()) {
+        vk_d2d_check_graph_ctr++;
+    }
+#endif
 
     ctx->prealloc_size_add_rms_partials_offset = 0;
     ctx->do_add_rms_partials = false;
@@ -17175,11 +17473,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     // way. Raising amdgpu.sched_jobs (modprobe.d, power of two, needs a reboot) is the other half.
     static const uint32_t submits_per_graph = [] {
         const char * e = getenv("GGML_VK_SUBMITS_PER_GRAPH");
-        // [2026-10-22 18:30 after reboot] DEFAULT 256 (= the old 40-submit rule wins): the ppl gate on the 27B gave
-        // 1383.57 with 12 vs 2.8989 with 256 (userptr ring, -c 8192 -b 8192 -ub 2048, 12 chunks). Fewer submissions per
-        // graph corrupt results somewhere (suspects: sched event/copy ordering across ubatches, almost_ready fence,
-        // scratch hazards inside one submission); bisection in progress. Set 12 only to reproduce.
-        const long v = e ? atol(e) : 256;
+        // [2026-10-22 18:30 after reboot] was DEFAULT 256: 1383.57 with 12 vs 2.8989 with 256 (userptr ring, -c 8192
+        // -b 8192 -ub 2048, 12 chunks). [2026-10-22 night] DEFAULT 12 again: the submit rule was never wrong either; 12
+        // submits only made the host issue fast enough to overwrite model.input_embed before Vulkan2's GPU copy read it
+        // (same bug as the export ring, fixed in ggml_backend_vk_cpy_tensor_async). CHECK=2 hashes: first divergence at
+        // Vulkan2's output of ubatch 1 on both failing configs. Gate after the fix: 2.8989 identical per chunk with 12
+        // on both rings, 3.3986 identical at one ubatch per decode.
+        const long v = e ? atol(e) : 12;
         return (uint32_t) (v < 1 ? 1 : v > 256 ? 256 : v);
     }();
     // the cap (TDR guard for weak cards) and the node bound below must not undo the per-graph count: 110k paste,
