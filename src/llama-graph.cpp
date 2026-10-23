@@ -643,6 +643,15 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+// [CP] an idx input is unallocated when no node reads it (range 1 below h: no helper store in the graph)
+void llm_graph_input_attn_kv::set_input_cp_idxs(const llama_kv_cache_context * mctx, const llama_ubatch * ubatch) {
+    for (size_t r = 0; r < self_cp_idxs.size(); ++r) {
+        if (self_cp_idxs[r] && self_cp_idxs[r]->buffer) {
+            mctx->set_input_cp_idxs(self_cp_idxs[r], ubatch, (int) r);
+        }
+    }
+}
+
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     // the idxs are left unallocated when the KV cache is bypassed during training
     if (self_k_idxs && self_k_idxs->buffer) {
@@ -651,6 +660,7 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     if (self_v_idxs && self_v_idxs->buffer) {
         mctx->set_input_v_idxs(self_v_idxs, ubatch);
     }
+    set_input_cp_idxs(mctx, ubatch);
 
     set_input_kq_mask_any(mctx, ubatch);
 
@@ -1271,6 +1281,7 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
 void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+    inp_attn->set_input_cp_idxs(mctx->get_attn(), ubatch);
 
     inp_attn->set_input_kq_mask_any(mctx->get_attn(), ubatch);
 
@@ -3156,6 +3167,11 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
 
+        // [CP] one per range; same shape as self_k_idxs (pinned by can_reuse), present iff the cache has a CP layer
+        for (int r = 0; r < mctx_cur->cp_n_ranges(); ++r) {
+            inp->self_cp_idxs.push_back(mctx_cur->build_input_cp_idxs(ctx0, ubatch, r));
+        }
+
         inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
 
@@ -3231,6 +3247,9 @@ ggml_tensor * llm_graph_context::build_attn(
     // [CP] split cell of the context-parallel layer (0: plain attention); a function of n_kv only, so it is known before
     // the K/V store and the store can already feed the helper from the packed Q|K|V (cp_pack_qkv)
     const uint32_t cp_h = cparams.training || kq_b || sinks || !cparams.flash_attn ? 0 : mctx_cur->cp_split(il);
+    // [CP] range split: above h there is no single K/V tensor, so a graph that cannot run build_attn_cp cannot attend
+    GGML_ASSERT(!(cp_h == 0 && !cparams.training && mctx_cur->cp_split(il) > 0) &&
+            "context-parallel layer above h needs the build_attn_cp path (flash attention, no kq_b, no sinks)");
     ggml_tensor * q_b = nullptr; // [CP] Q on the helper when packed, else the sched hops q itself
 
     if (cparams.training) {
@@ -3243,23 +3262,59 @@ ggml_tensor * llm_graph_context::build_attn(
             const auto & k_idxs = inp->get_k_idxs();
             const auto & v_idxs = inp->get_v_idxs();
 
-            ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-            ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+            if (!mctx_cur->cp_active(il)) {
+                ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+                ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+            } else {
+                // [CP] range-split store (llama_kv_cache::cp_state): range 0 on the owner always; range 1 on the helper
+                // only when n_kv > h (else every cell of the ubatch is < h, see cp_split). Each set_rows takes all
+                // n_tokens rows, the other range's tokens land in its trash row (fixed shape -> graph reuse holds).
+                // The 2026-10-21 mirror wrote all rows into a full copy on the helper (1056 MiB per layer at -c 270336).
+                GGML_ASSERT((int) inp->self_cp_idxs.size() == mctx_cur->cp_n_ranges() && mctx_cur->cp_n_ranges() == 2);
+                ggml_tensor * idx_0 = inp->self_cp_idxs[0];
+                ggml_tensor * idx_1 = inp->self_cp_idxs[1];
 
-            // [CP] every graph that writes the layer also writes the helper's mirror (even when h == 0 below), same rows
-            if (mctx_cur->cp_active(il)) {
-                ggml_tensor * k_m = k_cur;
-                ggml_tensor * v_m = v_cur;
-                if (cp_h > 0 && mctx_cur->cp_pack()) {
-                    cp_pack_qkv(mctx_cur, q_cur, k_cur, v_cur, q_b, k_m, v_m, il);
+                ggml_build_forward_expand(gf, mctx_cur->cpy_k_range(ctx0, k_cur, idx_0, il, 0));
+                ggml_build_forward_expand(gf, mctx_cur->cpy_v_range(ctx0, v_cur, idx_0, il, 0));
+                if (mctx_cur->cp_check()) {
+                    // LLAMA_CP_CHECK reference: the whole layer on the owner, global indices
+                    ggml_build_forward_expand(gf, mctx_cur->cpy_k_range(ctx0, k_cur, k_idxs, il, -1));
+                    ggml_build_forward_expand(gf, mctx_cur->cpy_v_range(ctx0, v_cur, v_idxs, il, -1));
                 }
-                ggml_build_forward_expand(gf, mctx_cur->cpy_k_mirror(ctx0, k_m, k_idxs, il));
-                ggml_build_forward_expand(gf, mctx_cur->cpy_v_mirror(ctx0, v_m, v_idxs, il));
+                if (cp_h > 0) {
+                    ggml_tensor * k_m = k_cur;
+                    ggml_tensor * v_m = v_cur;
+                    if (mctx_cur->cp_pack() && mctx_cur->cp_dev(false) != mctx_cur->cp_dev(true)) {
+                        cp_pack_qkv(mctx_cur, q_cur, k_cur, v_cur, q_b, k_m, v_m, il);
+                    }
+                    ggml_tensor * sk = mctx_cur->cpy_k_range(ctx0, k_m, idx_1, il, 1);
+                    ggml_tensor * sv = mctx_cur->cpy_v_range(ctx0, v_m, idx_1, il, 1);
+                    // pinned: a set_rows follows its destination's buffer anyway, the pin keeps the sched from
+                    // splitting the helper's two stores around an owner node
+                    ggml_backend_t be_b = nullptr;
+                    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+                        ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
+                        if (ggml_backend_get_device(b) == mctx_cur->cp_dev(true)) {
+                            be_b = b;
+                        }
+                    }
+                    GGML_ASSERT(be_b && "context-parallel attention: helper device has no backend in the scheduler");
+                    ggml_backend_sched_set_tensor_backend(sched, sk, be_b);
+                    ggml_backend_sched_set_tensor_backend(sched, sv, be_b);
+                    ggml_build_forward_expand(gf, sk);
+                    ggml_build_forward_expand(gf, sv);
+                }
             }
         }
 
-        k = mctx_cur->get_k(ctx0, il);
-        v = mctx_cur->get_v(ctx0, il);
+        // [CP] above h get_k/get_v of a CP layer would abort (no single tensor): build_attn_cp reads the ranges
+        if (cp_h == 0) {
+            k = mctx_cur->get_k(ctx0, il);
+            v = mctx_cur->get_v(ctx0, il);
+        } else {
+            k = nullptr;
+            v = nullptr;
+        }
     }
 
     ggml_tensor * kq_mask = inp->get_kq_mask_il(ctx0, il);
@@ -3301,9 +3356,11 @@ ggml_tensor * llm_graph_context::build_attn(
 }
 
 // [CP] 2026-10-21 context-parallel attention prototype for one layer (llama_kv_cache::cp_state has the memory side).
+// 2026-10-22 night: the helper holds only cells [h, kv_size) of the layer (range split, llama_kv_cache::cp_state), not a
+// full mirror; h is fixed at construction, so below h this function is not called (cp_split 0, plain graph on range 0).
 //
 // Node order is the schedule: the sched runs splits in graph order and copies a split's inputs before issuing it.
-//   A1 [... Q/K/V, store into A's cache] -> B1 [mirror store, FA_B over [h, n_kv)] -> A2 [FA_A over [0, h)]
+//   A1 [... Q/K/V, store into A's cache] -> B1 [range-1 store, FA_B over [h, n_kv)] -> A2 [FA_A over [0, h)]
 //   -> B2 [B's partial out] -> A3 [merge, then the rest of the layer]
 // B1's inputs wait for A1 only, so B starts FA_B before A has FA_A queued; A2 has no input copies and with
 // ggml_backend_sched_set_split_sync_relax its issue does not wait for B either; B2 (a tiny node on B) is the split
@@ -3333,7 +3390,7 @@ ggml_tensor * llm_graph_context::build_attn(
 //     of FA saved = the +0.6 ms of C2 over A2.
 // So the pack cuts the hops to one each way:
 //   - forward: Q|K|V concatenated on A (two concat kernels, ~250 KB at 7 rows), one hop, one cont on B (the sched
-//     copies the tensor a B node reads; views of an A tensor would be hopped one by one), mirror store and FA_B read
+//     copies the tensor a B node reads; views of an A tensor would be hopped one by one), range-1 store and FA_B read
 //     views of it. Needs F32 Q/K/V with one head size (Qwen 3.x: 256/256/256); otherwise the per-tensor hops stay.
 //   - mask: with the device-built mask (KQ_MASK_DEV, kq_build_on) B reads the op of its own device instead of a
 //     1.5 MB view of A's (the op already exists when B holds attention layers, llama_kv_cache::cp_kq_build_dev; the
@@ -3458,9 +3515,11 @@ ggml_tensor * llm_graph_context::build_attn_cp(
     q = ggml_permute(ctx0, q, 0, 2, 1, 3);
     ggml_tensor * qp_b = q_b ? ggml_permute(ctx0, q_b, 0, 2, 1, 3) : q;
 
-    auto fa = [&](ggml_tensor * qq, uint32_t i0, uint32_t i1, bool mirror, ggml_tensor * m, bool lse) {
-        ggml_tensor * k = ggml_permute(ctx0, mctx_cur->get_k_range(ctx0, il, i0, i1, mirror), 0, 2, 1, 3);
-        ggml_tensor * v = ggml_permute(ctx0, mctx_cur->get_v_range(ctx0, il, i0, i1, mirror), 0, 2, 1, 3);
+    // [CP] i0/i1 are global cells; get_k_range picks the range holding them (range 0 [0, h) on A, range 1 [h, n_kv) on
+    // B, both at local row 0: no offset view, unlike the mirror read at h), ref = the LLAMA_CP_CHECK reference on A
+    auto fa = [&](ggml_tensor * qq, uint32_t i0, uint32_t i1, bool ref, ggml_tensor * m, bool lse) {
+        ggml_tensor * k = ggml_permute(ctx0, mctx_cur->get_k_range(ctx0, il, i0, i1, ref), 0, 2, 1, 3);
+        ggml_tensor * v = ggml_permute(ctx0, mctx_cur->get_v_range(ctx0, il, i0, i1, ref), 0, 2, 1, 3);
 
         ggml_tensor * cur = ggml_flash_attn_ext(ctx0, qq, k, v, m, kq_scale, hparams.f_max_alibi_bias,
                                                 hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
@@ -3471,7 +3530,7 @@ ggml_tensor * llm_graph_context::build_attn_cp(
         return cur; // [D (+4), nh, nt]
     };
 
-    ggml_tensor * p_b = on(fa(qp_b, h, n_kv, true, cols(mask_b, h, n_kv), true), be_b);
+    ggml_tensor * p_b = on(fa(qp_b, h, n_kv, false, cols(mask_b, h, n_kv), true), be_b);
     cb(p_b, "cp_fa_b", il);
     ggml_build_forward_expand(gf, p_b);
 
@@ -3520,7 +3579,7 @@ ggml_tensor * llm_graph_context::build_attn_cp(
     ggml_build_forward_expand(gf, cur);
 
     if (mctx_cur->cp_check()) {
-        ggml_tensor * full = on(fa(q, 0, n_kv, false, kq_mask, false), be_a);
+        ggml_tensor * full = on(fa(q, 0, n_kv, true, kq_mask, false), be_a);
         cb(full, "cp_fa_full", il);
         ggml_set_output(full);
         ggml_set_output(cur);

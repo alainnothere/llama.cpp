@@ -364,6 +364,11 @@ public:
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
+    // [CP] per-range local store indices (llama_kv_cache::build_input_cp_idxs), empty when the cache has no CP layer;
+    // filled by both set_input sites (this class and llm_graph_input_mem_hybrid)
+    std::vector<ggml_tensor *> self_cp_idxs; // I64 [n_batch] each
+    void set_input_cp_idxs(const llama_kv_cache_context * mctx, const llama_ubatch * ubatch);
+
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
 

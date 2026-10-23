@@ -204,21 +204,24 @@ public:
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
 
-    // [CP] context-parallel attention prototype, see cp_state
-    bool               cp_active(int32_t il) const;            // layer il has a mirror on the helper device
-    uint32_t           cp_split(int32_t il, uint32_t n_kv) const; // split cell h, 0: attend on the owner only
+    // [CP] context-parallel attention, range-split KV, see cp_state
+    bool               cp_active(int32_t il) const;            // layer il's K/V is split into ranges
+    uint32_t           cp_split(int32_t il, uint32_t n_kv) const; // boundary cell h when n_kv > h, 0: attend on range 0 only
     bool               cp_check() const;
-    ggml_backend_dev_t cp_dev(bool helper) const;
+    ggml_backend_dev_t cp_dev(bool helper) const;               // device of range 1 (helper) or range 0 (owner)
     ggml_tensor *      cp_kq_mask_dev() const;                 // the helper's persistent mask (nullptr: graph input)
     bool               cp_pack() const;                        // LLAMA_CP_PACK (default 1), see cp_state::pack
     int                cp_kq_build_dev() const;                // kq_build anchor index of the helper's device, -1: none
-    bool               cp_needs_resync() const;
-    // K/V cells [i0, i1) of layer il, from the owner's tensor or the helper's mirror
-    ggml_tensor * get_k_range(ggml_context * ctx, int32_t il, uint32_t i0, uint32_t i1, bool mirror) const;
-    ggml_tensor * get_v_range(ggml_context * ctx, int32_t il, uint32_t i0, uint32_t i1, bool mirror) const;
-    // the same set_rows as cpy_k/cpy_v (same global cell indices), into the mirror
-    ggml_tensor * cpy_k_mirror(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
-    ggml_tensor * cpy_v_mirror(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const;
+    int                cp_n_ranges() const;                    // 0: no CP layer in this cache
+    bool               cp_ref_dirty() const;                   // LLAMA_CP_CHECK reference waits for the next update
+    bool               cp_on_device_ok() const;                // ON_DEVICE state works (all ranges on one buffer type)
+    // K/V cells [i0, i1) of layer il: from the range that holds them (must be one range), or from the
+    // LLAMA_CP_CHECK reference (ref = true, global cells)
+    ggml_tensor * get_k_range(ggml_context * ctx, int32_t il, uint32_t i0, uint32_t i1, bool ref) const;
+    ggml_tensor * get_v_range(ggml_context * ctx, int32_t il, uint32_t i0, uint32_t i1, bool ref) const;
+    // store into range r with that range's local indices (build_input_cp_idxs), r = -1: the reference, global indices
+    ggml_tensor * cpy_k_range(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * idxs, int32_t il, int r) const;
+    ggml_tensor * cpy_v_range(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * idxs, int32_t il, int r) const;
 
     //
     // preparation API
@@ -250,6 +253,10 @@ public:
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
+
+    // [CP] per-range local store indices, shared by K and V and by every CP layer (see cp_state)
+    ggml_tensor * build_input_cp_idxs(ggml_context * ctx, const llama_ubatch & ubatch, int r) const;
+    void          set_input_cp_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo, int r) const;
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
@@ -429,44 +436,69 @@ private:
 
     mutable kq_mask_inc_state kq_inc;
 
-    // [CP] 2026-10-21: context-parallel attention prototype for ONE layer (env LLAMA_CP_LAYER=<il>, default -1 = off).
+    // [CP] context-parallel attention for ONE layer (env LLAMA_CP_LAYER=<il>, default -1 = off), RANGE-SPLIT KV
+    // (2026-10-22 night, design-cp-range-split-kv.md in ~/Documents/contextFiles; replaces the 2026-10-21 full mirror).
     //
-    // What: the owner A (model.dev_layer(il)) keeps its K/V; the helper B (LLAMA_CP_DEV=<device name>, mandatory, a
-    // fixed device so the fit sees constant memory per device) holds a FULL mirror of layer il's K/V, written by
-    // a second set_rows with the same cell indices in every graph that writes the layer. FA runs over cells [0, h) on
-    // A and [h, n_kv) on B (emit_lse), A merges (llm_graph_context::build_attn_cp). h = LLAMA_CP_SPLIT_FRAC (default
-    // 0.5) of n_kv rounded to the 256-cell n_kv padding, so h is a function of n_kv and graph reuse holds.
-    // Cost: K+V of one layer on B (Qwen3.8-27B: 4 KV heads x 256 x f16 = 4 KiB/cell, 1 GiB at 256k).
-    //
-    // State: the mirror is write-only on the hot path and is NOT serialized. Every host-side K/V write (state_read,
-    // K-shift) sets dirty; the next memory update (llama_context::memory_update before the next decode) re-copies
-    // cells [0, used_max_p1) A -> B through the host and logs it at WARN. A whole-buffer clear zeroes both copies.
-    // Not supported (cp stays off, logged): n_stream > 1, v_trans (no FA), SWA, MLA, offload off. Owner == helper or
-    // owner not a GPU: mirror allocated but inactive (logged). LLAMA_CP_DEV missing or not a device of the split: throws.
+    // What: layer il's K/V cells are split at h: range 0 = cells [0, h) on the owner A (model.dev_layer(il), whatever
+    // device the fit gives it), range 1 = cells [h, kv_size) on the helper B (LLAMA_CP_DEV=<device name>, mandatory, a
+    // fixed device; "CPU" = the CPU test mode). Nothing is duplicated. h = LLAMA_CP_SPLIT_FRAC (default 0.5) of kv_size
+    // rounded to 256 (every FA KV tile divides 256 and n_kv is padded to 256, so h and n_kv - h stay tile aligned),
+    // fixed at construction; LLAMA_CP_SPLIT_CELL=<h> overrides it (tests). While n_kv <= h the graph is the plain one
+    // over range 0; above, FA_A runs over [0, h) on A and FA_B over [h, n_kv) on B, A merges (build_attn_cp).
+    // Why: the mirror cost one layer's full K/V on B (1056 MiB per layer at -c 270336, 16 layers = 17 GB, Vulkan1 has
+    // ~3 GB), the production fit summary printed est. free -1658 MiB on Vulkan1, and cp_resync re-copied it through the
+    // host after every host K/V write (410 MiB / 233 ms per layer, ~4 s per restore at 16 layers).
+    // Layout: each range tensor has (c1 - c0) + 1 rows; the last row is the TRASH row: a ubatch's tokens are stored by
+    // one fixed-shape set_rows per range (build_input_cp_idxs), tokens of the other range go to the trash row (the CPU
+    // set_rows asserts 0 <= idx < ne1, and a per-ubatch token split would change the graph shape every step). FA never
+    // reads it (reads are [0, n_kv - c0) of a range, n_kv <= kv_size).
+    // Host side: every cell-indexed K/V access (state write/read/clear, K-shift) goes through cp_rows, which splits a cell
+    // range at the bounds; the blob bytes are identical to a no-CP cache's. ON_DEVICE state is refused across two buffer types (per-buft
+    // byte counts depend on where the restored cells land). The helper's range is allocated on B in every fit probe
+    // whatever device A is (2026-10-21: a helper share that moved between probes was sized out of Vulkan1 -> GTT).
+    // LLAMA_CP_CHECK=1 adds a full reference copy on A (ref_k / ref_v, global set_rows) that cp_fa_full reads.
+    // Not supported (cp stays off, logged): n_stream > 1, v_trans (no FA), SWA, MLA, offload off, kv_size < 512, a shared
+    // layer. LLAMA_CP_DEV missing or not a device of the split: throws.
+    struct cp_range {
+        uint32_t c0 = 0;  // global cells [c0, c1)
+        uint32_t c1 = 0;
+        ggml_backend_dev_t         dev  = nullptr;
+        ggml_backend_buffer_type_t buft = nullptr;
+        ggml_tensor * k = nullptr; // [n_embd_k_gqa, c1 - c0 + 1]
+        ggml_tensor * v = nullptr; // [n_embd_v_gqa, c1 - c0 + 1]
+    };
+
     struct cp_state {
-        int32_t il = -1;
-        float   frac = 0.5f;
-        bool    check = false;              // LLAMA_CP_CHECK=1, see llama_context::cp_check_step
-        bool    active = false;             // owner is a GPU other than the helper (the mirror exists either way)
+        int32_t  il    = -1;
+        float    frac  = 0.5f;
+        uint32_t h     = 0;
+        bool     check = false;             // LLAMA_CP_CHECK=1, see llama_context::cp_check_step
         // LLAMA_CP_PACK (default 1; 0 = the 2026-10-21 graph). 2026-10-22 evening: one D2D hop each way instead of
         // 4 + 2 (Q|K|V packed on the owner, mask built on the helper, the helper's partial as one tensor), because each
         // hop costs ~0.13 ms of queue time on the card that submits it. Measurements: llm_graph_context::build_attn_cp.
-        bool    pack = true;
+        bool     pack  = true;
 
-        ggml_backend_dev_t dev_a = nullptr;
-        ggml_backend_dev_t dev_b = nullptr;
-        ggml_backend_buffer_type_t buft_b = nullptr;
+        std::vector<cp_range> ranges;       // empty: no CP layer in this cache
 
-        ggml_tensor * k = nullptr;          // [n_embd_k_gqa, kv_size] on B
-        ggml_tensor * v = nullptr;          // [n_embd_v_gqa, kv_size] on B
+        ggml_tensor * ref_k = nullptr;      // LLAMA_CP_CHECK reference [n_embd_k_gqa, kv_size] on A
+        ggml_tensor * ref_v = nullptr;
         ggml_tensor * kq_mask_dev = nullptr; // B's [KQ_MASK_INC] tensor
 
-        mutable bool dirty = false;
+        // LLAMA_CP_CHECK: cells written from the host since the last update, copied ranges -> reference in update()
+        mutable std::vector<std::pair<uint32_t, uint32_t>> ref_dirty;
+
+        bool active() const { return !ranges.empty(); }
     };
 
     cp_state cp;
 
-    void cp_resync() const;
+    // calls fn(tensor, local row0, n_rows) for each piece of cells [c0, c1) of layer (K or V); one call with the stream
+    // tensor for a non-CP layer
+    template <typename F>
+    void cp_rows(const struct kv_layer & layer, bool is_v, uint32_t strm, uint32_t c0, uint32_t c1, F && fn) const;
+
+    // LLAMA_CP_CHECK: copy cells [c0, c1) of the CP layer from the ranges into the reference after a host write
+    void cp_ref_from_ranges(uint32_t c0, uint32_t c1) const;
 
     bool v_trans = true;  // the value tensor is transposed
 
@@ -626,10 +658,13 @@ public:
     ggml_tensor *      cp_kq_mask_dev() const;
     bool               cp_pack() const;
     int                cp_kq_build_dev() const;
-    ggml_tensor *      get_k_range(ggml_context * ctx, int32_t il, uint32_t i0, uint32_t i1, bool mirror) const;
-    ggml_tensor *      get_v_range(ggml_context * ctx, int32_t il, uint32_t i0, uint32_t i1, bool mirror) const;
-    ggml_tensor *      cpy_k_mirror(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
-    ggml_tensor *      cpy_v_mirror(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const;
+    int                cp_n_ranges() const;
+    ggml_tensor *      get_k_range(ggml_context * ctx, int32_t il, uint32_t i0, uint32_t i1, bool ref) const;
+    ggml_tensor *      get_v_range(ggml_context * ctx, int32_t il, uint32_t i0, uint32_t i1, bool ref) const;
+    ggml_tensor *      cpy_k_range(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * idxs, int32_t il, int r) const;
+    ggml_tensor *      cpy_v_range(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * idxs, int32_t il, int r) const;
+    ggml_tensor *      build_input_cp_idxs(ggml_context * ctx, const llama_ubatch & ubatch, int r) const;
+    void               set_input_cp_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, int r) const;
 
     // create destination indices for each head of the current batch for where it would be written in the KV cache
     // the indices address the global KV cache (not per stream) - this is not relevant for the user of this API, but
