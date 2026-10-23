@@ -5918,6 +5918,52 @@ private:
                             slot.prompt.checkpoints.empty() ||
                             is_last_user_message || near_prompt_end ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+
+                    // [TAG_CKPT_DEDUP] the bypass above (is_last_user_message || near_prompt_end) lets a short chat turn
+                    // take a checkpoint at the user-message start a few tokens after checkpoint A, the one the turn
+                    // opens with at the cached prefix end (n_prompt_cached). trace, 2026-10-22: a new-user-message
+                    // turn has its first batch start at the cached end P (checkpoint A, published from the .rec
+                    // snapshot for free, [TAG_REC_REUSE]), the batch loop breaks at last_user_pos (the
+                    // is_user_start break in the loop above) typically 3 tokens later ("<|im_end|>\n" closing the
+                    // previous assistant reply), and the next batch starts AT last_user_pos, so
+                    // is_last_user_message (and near_prompt_end on a turn shorter than n_ubatch) skip the
+                    // min-step test and create_checkpoint() does a full PARTIAL_ONLY readback: ~123 ms per turn for
+                    // a 149.6 MiB recurrent plane (27B hybrid), for a state 3 tokens from one we already hold.
+                    // checkpoint-min-step (8192) never got a say. production log (output_log.txt) shows the same
+                    // cadence for the tail offsets: per turn "converted pos_min=220728" (A) then 222566 / 223078 /
+                    // 223728, all far inside min-step of A.
+                    // rule: skip when a checkpoint of this prompt timeline (token_prefix_hash still matches the
+                    // current tokens, so a context-reuse rewrite or a divergence invalidates it; checkpoints past
+                    // pos_next were already erased by the rollback path) sits within min-step before this one.
+                    // NOT skipped:
+                    //   - the turn-start checkpoint (n_tokens_start == n_prompt_cached): that is checkpoint A, which
+                    //     the rec-reuse path and the disk tier's cp_ spill of the turn rely on (cross-module
+                    //     precondition: TAG_REC_REUSE publishes the .rec blob only into A).
+                    //   - the prompt-tail offsets (4 and 4 + n_ubatch before the end, PR #20288): they are the
+                    //     rollback target when the next request re-sends this prompt with a different tail (the
+                    //     Qwen template stripping prior-turn think), skipping them turns that into a reprocess of up
+                    //     to min-step tokens.
+                    // rollback safety: the restore search (checking checkpoint ... against pos_min_thold) takes the
+                    // newest checkpoint with pos_min <= thold and falls back to older ones; nothing looks a
+                    // checkpoint up by its exact position (merge_checkpoint_spills dedups by pos_min only), so
+                    // a dropped user-start checkpoint just means restoring the one a few tokens earlier.
+                    if (do_checkpoint) {
+                        const bool is_turn_start = n_tokens_start == (int64_t) slot.stats.n_prompt_cached;
+                        const int  n_left        = slot.task->n_tokens() - (int) n_tokens_start;
+                        const bool is_tail_ckpt  = n_left == std::min(n_batch, 4) || n_left == std::min(n_batch, 4 + n_ubatch);
+                        if (!is_turn_start && !is_tail_ckpt) {
+                            for (const auto & ckpt : slot.prompt.checkpoints) {
+                                if (ckpt.n_tokens < (int64_t) n_tokens_start &&
+                                        ckpt.n_tokens + params_base.checkpoint_min_step >= (int64_t) n_tokens_start &&
+                                        ckpt.token_prefix_hash == hash_token_prefix(slot.prompt.tokens, (size_t) ckpt.n_tokens)) {
+                                    SLT_TRC(slot, "skipping checkpoint at n_tokens = %d: checkpoint at n_tokens = %" PRId64 " is within min-step (%d)\n",
+                                            (int) n_tokens_start, ckpt.n_tokens, params_base.checkpoint_min_step);
+                                    do_checkpoint = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
