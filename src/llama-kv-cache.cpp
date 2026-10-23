@@ -1636,6 +1636,25 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     return result;
 }
 
+uint32_t llama_kv_cache::get_n_kv_after(const slot_info & sinfo) const {
+    uint32_t result = 0;
+
+    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        const auto & cells = v_cells[sinfo.strm[s]];
+
+        uint32_t used_max_p1 = cells.used_max_p1();
+        for (const uint32_t idx : sinfo.idxs[s]) {
+            used_max_p1 = std::max(used_max_p1, idx + 1);
+        }
+
+        result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(used_max_p1, n_pad_cur))), result);
+    }
+
+    return result;
+}
+
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
     const int32_t ikv = map_layer_ids.at(il);
 
@@ -3838,6 +3857,16 @@ bool llama_kv_cache_context::apply() {
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv = kv->get_n_kv(sinfos[i_cur]);
+
+    return true;
+}
+
+bool llama_kv_cache_context::prepare_graph() {
+    if (status != LLAMA_MEMORY_STATUS_SUCCESS || ubatches.empty() || i_cur >= ubatches.size()) {
+        return false;
+    }
+
+    n_kv = kv->get_n_kv_after(sinfos[i_cur]);
 
     return true;
 }

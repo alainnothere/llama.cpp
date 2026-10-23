@@ -1689,6 +1689,15 @@ struct server_slot {
                 "   graphs reused = %10d\n",
                 llama_perf_context(ctx_tgt).n_reused);
 
+        // [fork, 2026-10-22 night] LLAMA_VERIFY_PREBUILD (scout item 5): context totals, printed once any prebuild ran
+        {
+            int32_t n_pb = 0, n_hit = 0, n_miss = 0;
+            llama_decode_prebuild_stats(ctx_tgt, &n_pb, &n_hit, &n_miss);
+            if (n_pb > 0) {
+                SLT_INF(*this, " graphs prebuilt = %10d (hit %d, miss %d)\n", n_pb, n_hit, n_miss);
+            }
+        }
+
         const int32_t n_draft_total       = stats.n_draft_tokens;
         const int32_t n_draft_accepted    = stats.n_draft_accepted;
         const int32_t n_draft_verif_steps = stats.n_draft_verif_steps;
@@ -2363,6 +2372,12 @@ private:
 
     server_batch batch;
 
+    // [fork, 2026-10-22 night] LLAMA_VERIFY_PREBUILD=1: the predicted verify batch (shape only), see verify_prebuild()
+    common_batch batch_prebuild;
+    int32_t prebuild_pause     = 0;
+    int32_t prebuild_win_built = 0;
+    int32_t prebuild_win_hit   = 0;
+
     llama_model   * model_dft = nullptr;
     llama_context * ctx_dft   = nullptr;
 
@@ -2969,6 +2984,7 @@ private:
             const int32_t n_batch = llama_n_batch(ctx_tgt);
             const int32_t n_embd  = llama_model_n_embd_inp(model_tgt);
             batch.init(ctx_tgt, std::max(n_batch, params_base.n_parallel), n_embd);
+            batch_prebuild = common_batch(ctx_tgt);
         }
 
         // decision requests rarely repeat a state, the prompt cache is opt-in for decision models
@@ -5149,6 +5165,9 @@ private:
         // note: this is where the draft batch submitted by the previous iteration's
         //       common_speculative_process() is finally waited on - the draft loop reads ctx_dft
         //       logits on its first step [TAG_SPEC_OVERLAP]
+        if (drafting.size() == 1 && generating.size() == 1) {
+            verify_prebuild(*drafting[0]);
+        }
         if (!drafting.empty()) {
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
@@ -6091,6 +6110,112 @@ private:
         }
     }
 
+    // [fork, 2026-10-22 night] wrong-tool scout item 4 (whatifs "2026-10-22 night: wrong-tool scout"): a prompt view
+    // of at most n_ubatch rows (the checkpoint tail [end-(4+n_ubatch), end-4) of PR #20288, or a short turn's first
+    // piece) is ONE ubatch, so the pipelined target (n_batch > n_ubatch, 3 cards) runs it in series with nothing to
+    // overlap. MEASURED on the 20:34 production session (31 turns, 107-140k, -ub 512): single-ubatch target prompt
+    // decodes = 58.7 s of span for 25.9 s of busiest-card busy; one 512 tail at 120k = 2.1-2.9 s span vs 0.9-1.2 s on
+    // the busiest card. DERIVED: cut into 4 x 128 inside the same llama_decode the span is ~first piece + 3 x slowest
+    // piece ~= 0.57 + 0.75 = 1.3 s vs 2.25 s, ~0.9 s per short turn at 120k (FA work per token unchanged, 4 x ~9 ms
+    // weight re-reads per card). Returns the per-call ubatch cap for the view at off, 0 = leave it whole.
+    // Only plain causal text prompt rows of completion tasks: verify rows must stay one ubatch (spec_prebatch plane
+    // holds the start of the LAST ubatch), mtmd embd rows / non-causal / pooled embeddings need the single ubatch.
+    // Checkpoints are untouched: create_checkpoint() runs before the call at the same positions, and the call still
+    // decodes the same tokens; only the ubatch boundaries inside it move.
+    // Knobs: LLAMA_SERVER_TAIL_SPLIT = max pieces (default 1 = off, 4 = the scout's 4 x 128; off by default because a
+    // different ubatch size is not bit-identical on Vulkan: the mul_mm/FA variant is picked by n rows; CPU A/B text and
+    // checkpoints identical, 2026-10-22 night), LLAMA_SERVER_TAIL_SPLIT_MIN = min rows per
+    // piece (default 128: below that the per-piece weight read dominates and splitting loses). Only on a pipelined
+    // target (llama_pipeline_parallel); LLAMA_SERVER_TAIL_SPLIT_FORCE=1 skips that gate (CPU tests of the path)
+    uint32_t prompt_tail_ubatch_cap(int32_t off) const {
+        static const int  max_pieces = [] { const char * e = getenv("LLAMA_SERVER_TAIL_SPLIT");       return e ? atoi(e) : 1;   }();
+        static const int  min_rows   = [] { const char * e = getenv("LLAMA_SERVER_TAIL_SPLIT_MIN");   return e ? std::max(1, atoi(e)) : 128; }();
+        static const bool force      = [] { const char * e = getenv("LLAMA_SERVER_TAIL_SPLIT_FORCE"); return e && atoi(e) != 0; }();
+        const int32_t n_view = batch.view.size();
+        const int32_t n_ub   = (int32_t) llama_n_ubatch(ctx_tgt);
+        if (max_pieces <= 1 || n_view > n_ub || !llama_get_memory(ctx_tgt) || !llama_get_causal_attn(ctx_tgt) ||
+                (!force && !llama_pipeline_parallel(ctx_tgt))) {
+            return 0;
+        }
+        const int pieces = std::min(max_pieces, n_view / min_rows);
+        if (pieces < 2) {
+            return 0;
+        }
+        for (int32_t i = off; i < off + n_view; ++i) {
+            const auto & t = batch.tokens[i];
+            if (!t.is_prompt || t.i_embd >= 0 || t.id_slot < 0 || t.id_slot >= (int32_t) slots.size()) {
+                return 0;
+            }
+            const auto & slot = slots[t.id_slot];
+            if (!slot.task || slot.task->need_embd() || (slot.state != SLOT_STATE_PROCESSING_PROMPT && slot.state != SLOT_STATE_DONE_PROMPT)) {
+                return 0;
+            }
+        }
+        return (uint32_t) ((n_view + pieces - 1) / pieces);
+    }
+
+    // [fork, 2026-10-22 night] wrong-tool scout item 5 (whatifs "2026-10-22 night: wrong-tool scout"; measurements at
+    // llama_context::decode_prebuild): 4922 of 10351 production verify steps reused the target graph, each miss 3.4 ms
+    // of build + sched split/alloc with every card idle (1.8 ms/step average, 2.2% tg). The verify length is
+    // predictable here: the sampled token + the cap the auto-tuner just chose (drafts stop at the cap on ~99.9% of
+    // steps). Built here, i.e. after the previous iteration's common_speculative_process() put the MTP catch-up decode
+    // on ctx_dft's queue and before common_speculative_draft() waits for it, so the ~3.4 ms of host work runs while the
+    // MTP GPU work does. Single generating slot only (the verify batch is then exactly this slot's rows). A wrong
+    // prediction (short draft, n-gram chain, replay, n_kv crossing a 256 pad) only wastes the prebuild: the decode's
+    // can_reuse rebuilds. LLAMA_VERIFY_PREBUILD=1 to enable, default off until the GPU gate.
+    void verify_prebuild(const server_slot & slot) {
+        static const bool on = [] { const char * e = getenv("LLAMA_VERIFY_PREBUILD"); return e && atoi(e) != 0; }();
+        if (!on || !spec) {
+            return;
+        }
+        // n-gram drafts stop wherever the table runs out, so cap + 1 is a guess: CPU test 2026-10-22 night (ngram-mod,
+        // --spec-draft-auto, LFM2 80M): 589 prebuilds, 2 hits, and graphs reused fell 352 -> 4 because every miss
+        // replaced the graph the next step would have reused. Model drafters (MTP, draft model) run to the cap
+        bool any_model_drafter = false;
+        for (const auto t : params_base.speculative.types) {
+            any_model_drafter |= t != COMMON_SPECULATIVE_TYPE_NONE && !common_speculative_type_is_ngram(t);
+        }
+        if (!any_model_drafter || common_speculative_type_is_ngram(common_speculative_type_last(spec.get(), slot.id))) {
+            return;
+        }
+        // backoff: a window of 32 prebuilds with fewer than half hits pauses prebuilding for 256 steps
+        if (prebuild_pause > 0) {
+            prebuild_pause--;
+            return;
+        }
+        {
+            int32_t n_pb = 0, n_hit = 0, n_miss = 0;
+            llama_decode_prebuild_stats(ctx_tgt, &n_pb, &n_hit, &n_miss);
+            if (n_pb - prebuild_win_built >= 32) {
+                if (2 * (n_hit - prebuild_win_hit) < n_pb - prebuild_win_built) {
+                    SLT_DBG(slot, "verify prebuild: %d hits of %d, pausing\n", n_hit - prebuild_win_hit, n_pb - prebuild_win_built);
+                    prebuild_pause = 256;
+                }
+                prebuild_win_built = n_pb;
+                prebuild_win_hit   = n_hit;
+                if (prebuild_pause > 0) {
+                    return;
+                }
+            }
+        }
+        const auto & dp = common_speculative_get_draft_params(spec.get(), slot.id);
+        if (!dp.drafting || dp.n_max <= 0 || !slot.spec_draft.empty()) {
+            return;
+        }
+        const int32_t n = 1 + dp.n_max;
+        if (n > (int32_t) llama_n_ubatch(ctx_tgt) || slot.prompt.n_tokens() + n > slot.n_ctx) {
+            return;
+        }
+        batch_prebuild.clear();
+        const llama_pos pos0 = slot.prompt.tokens.pos_next();
+        for (int32_t i = 0; i < n; ++i) {
+            batch_prebuild.add(slot.sampled, pos0 + i, slot.id, true);
+        }
+        const int64_t t0 = ggml_time_us();
+        const int32_t r  = llama_decode_prebuild(ctx_tgt, batch_prebuild.get());
+        SLT_DBG(slot, "verify prebuild n = %d at pos %d: %d (%.3f ms)\n", n, pos0, r, (ggml_time_us() - t0) / 1000.0);
+    }
+
     // returns true = success ; false = retry with smaller batch size
     // throw std::runtime_error on fatal error
     bool decode(int32_t & n_batch, int32_t off) {
@@ -6172,8 +6297,15 @@ private:
         // batch stays in flight across post_decode(), where common_speculative_process() submits the
         // same chunk to ctx_dft, so target and draft prefill overlap
         int ret = 0;
+        const uint32_t n_ub_cap = prompt_tail_ubatch_cap(off);
         queue_tasks.yield_to_queue([&]() {
+            if (n_ub_cap > 0) {
+                llama_set_n_ubatch_cap(ctx_tgt, n_ub_cap);
+            }
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+            if (n_ub_cap > 0) {
+                llama_set_n_ubatch_cap(ctx_tgt, 0);
+            }
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }

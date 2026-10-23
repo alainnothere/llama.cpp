@@ -919,6 +919,10 @@ struct ggml_backend_sched_split {
     struct ggml_tensor ** inputs;
     int n_inputs;
     int inputs_capacity;
+    // [fork, 2026-10-22 night] inputs_live[j]: some node that is computed (COMPUTE or OUTPUT flag, or op NONE) reads
+    // inputs[j]'s copy on this backend; dead inputs are not copied (GGML_SCHED_SKIP_DEAD_INPUTS=1, default off)
+    bool * inputs_live;
+    int n_inputs_live;
     // a node reads a tensor of another backend in place (buffer supported, no copy)
     bool reads_foreign;
     // graph view of this split
@@ -931,6 +935,17 @@ struct ggml_backend_sched {
 
     // [fork, 2026-10-21] see ggml_backend_sched_set_split_sync_relax
     bool split_sync_relax;
+
+    // [fork, 2026-10-22 night] skip split input copies that no computed node consumes. Why (wrong-tool scout,
+    // whatifs 2026-10-22 night item 2): build_inp_embd builds three select branches (llama-graph.cpp
+    // ggml_build_forward_select); the inactive ones lose GGML_TENSOR_FLAG_COMPUTE and every backend skips them, but
+    // the sched still copied their split inputs. MEASURED: per text decode step node_1 (the mixed-path get_rows, CPU,
+    // garbage) + inp_mixed_embd go to the x1 XT next to model.input_embed, 2 x 123-143 KB = 83 + 146 us (production
+    // 20:34 tape) / 96 + 143 us (arm_A3) of host time on the critical path; in pp 2 x 20 MB per 1024-row ubatch =
+    // 118 + 120 ms of host on the issue path. On: GGML_SCHED_SKIP_DEAD_INPUTS=1. Default OFF until the pipelined ppl
+    // gate on the cards (house rule for sched-copy changes, 2026-10-22); CPU: test-backend-sched-stats run_dead
+    bool skip_dead_inputs;
+    uint8_t * hv_copy_live; // [hash_set.size][n_backends]: a live node reads the copy of this tensor on this backend
 
     int n_backends;
 
@@ -1014,6 +1029,11 @@ static void ggml_backend_sched_split_inputs_grow(struct ggml_backend_sched_split
         GGML_ABORT("failed to grow split inputs container");
     }
     split->inputs = pnew;
+    auto * lnew = (bool *) realloc((void *) split->inputs_live, new_cap * sizeof(bool));
+    if (lnew == NULL) {
+        GGML_ABORT("failed to grow split inputs container");
+    }
+    split->inputs_live = lnew;
     split->inputs_capacity = new_cap;
 }
 
@@ -1563,6 +1583,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         split->inputs[n_inputs] = src;
                     }
                     node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
+                    // the copy is per (tensor, backend), shared by later splits of this backend: liveness is too.
+                    // Conservative: op NONE and OUTPUT-flagged consumers count as live even without COMPUTE
+                    if ((node->flags & (GGML_TENSOR_FLAG_COMPUTE | GGML_TENSOR_FLAG_OUTPUT)) || node->op == GGML_OP_NONE) {
+                        sched->hv_copy_live[src_id * sched->n_backends + cur_backend_id] = 1;
+                    }
                 } else if (src_backend_id != cur_backend_id) {
                     split->reads_foreign = true;
                 }
@@ -1570,6 +1595,19 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         }
         split->i_end = graph->n_nodes;
         sched->n_splits = i_split + 1;
+
+        // [fork, 2026-10-22 night] dead split inputs (see skip_dead_inputs). Views never hold a copy (view ops are
+        // skipped above, a consumer of a foreign view copies the view itself), so a direct src match is complete
+        for (int s = 0; s < sched->n_splits; s++) {
+            struct ggml_backend_sched_split * sp = &sched->splits[s];
+            sp->n_inputs_live = 0;
+            for (int j = 0; j < sp->n_inputs; j++) {
+                const size_t id = hash_id(sp->inputs[j]);
+                const bool live = !sched->skip_dead_inputs || sched->hv_copy_live[id * sched->n_backends + sp->backend_id] != 0;
+                sp->inputs_live[j] = live;
+                sp->n_inputs_live += live ? 1 : 0;
+            }
+        }
     }
 
     if (sched->debug) {
@@ -2059,6 +2097,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         st->t_d2d_hop_queue_submit_us          = 0;
         st->n_d2d_ring_export                  = 0;
         st->n_d2d_ring_userptr                 = 0;
+        st->n_copies_skipped                   = 0;
+        st->nbytes_skipped                     = 0;
+        st->t_split_graph_us                   = sched->realloc_pending.t_split_graph_us;
+        st->t_alloc_splits_us                  = sched->realloc_pending.t_alloc_splits_us;
+        sched->realloc_pending.t_split_graph_us  = 0;
+        sched->realloc_pending.t_alloc_splits_us = 0;
         sched->realloc_pending.n_realloc            = 0;
         sched->realloc_pending.t_realloc_sync_us    = 0;
         sched->realloc_pending.t_realloc_reserve_us = 0;
@@ -2078,7 +2122,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // this split, the allocator may have reused buffer regions across splits
         // relax: skip the wait when neither split reads the other backend's memory in place (no RAW/WAR across them)
         const bool sync_skip = sched->split_sync_relax && !split->reads_foreign && split_id > 0 && !splits[split_id - 1].reads_foreign;
-        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id && !sync_skip) {
+        // [fork, 2026-10-22 night] a split whose inputs are all dead copies nothing, so it waits like an input-less one
+        if (split->n_inputs_live == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id && !sync_skip) {
             if (st) {
                 ggml_backend_sched_stats_close_pending(sched);
             }
@@ -2095,13 +2140,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // copy the input tensors to the split backend
         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
+        // [fork, 2026-10-22 night] dead inputs (no computed consumer, see skip_dead_inputs) are skipped and counted
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+            if (!split->inputs_live[input_id]) {
+                if (st) {
+                    st->n_copies_skipped++;
+                    st->nbytes_skipped += ggml_nbytes(split->inputs[input_id]);
+                }
+                continue;
+            }
             if (!ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
                 ggml_backend_sched_copy_input(sched, split_id, split, split->inputs[input_id]);
             }
         }
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
-            if (ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
+            if (split->inputs_live[input_id] && ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
                 ggml_backend_sched_copy_input(sched, split_id, split, split->inputs[input_id]);
             }
         }
@@ -2228,6 +2281,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->hash_set    = ggml_hash_set_new(graph_size);
     sched->hv_tensor_backend_ids = (int *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
     sched->hv_tensor_copies      = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+    sched->hv_copy_live          = (uint8_t *) malloc(sched->hash_set.size * sched->n_backends);
+    {
+        const char * e = getenv("GGML_SCHED_SKIP_DEAD_INPUTS");
+        sched->skip_dead_inputs = e ? atoi(e) != 0 : false;
+    }
 
     const size_t ggml_sched_max_splits = graph_size; // at most there is one split for each node in the graph
     const size_t nodes_size = graph_size + ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2;
@@ -2283,11 +2341,13 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     ggml_hash_set_free(&sched->hash_set);
     for (int i = 0; i < sched->splits_capacity; i++) {
         free(sched->splits[i].inputs);
+        free(sched->splits[i].inputs_live);
     }
     free(sched->splits);
     free(sched->graph_inputs);
     free(sched->hv_tensor_backend_ids);
     free(sched->hv_tensor_copies);
+    free(sched->hv_copy_live);
     free(sched->node_backend_ids);
     free(sched->leaf_backend_ids);
     free(sched->prev_node_backend_ids);
@@ -2306,6 +2366,7 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
         ggml_hash_set_reset(&sched->hash_set);
         memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
         memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+        memset(sched->hv_copy_live,           0, sched->hash_set.size * sched->n_backends);
         sched->is_reset = true;
     }
     sched->is_alloc = false;
@@ -2350,10 +2411,17 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
 
+    // [fork, 2026-10-22 night] t_split_graph_us / t_alloc_splits_us (ggml_backend_sched_stats), stats on only
+    const int64_t t0 = sched->stats ? ggml_time_us() : 0;
     ggml_backend_sched_split_graph(sched, graph);
+    const int64_t t1 = sched->stats ? ggml_time_us() : 0;
 
     if (!ggml_backend_sched_alloc_splits(sched)) {
         return false;
+    }
+    if (sched->stats) {
+        sched->realloc_pending.t_split_graph_us  += t1 - t0;
+        sched->realloc_pending.t_alloc_splits_us += ggml_time_us() - t1;
     }
 
     sched->is_alloc = true;

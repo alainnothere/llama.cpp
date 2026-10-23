@@ -484,6 +484,16 @@ extern "C" {
         // [fork, 2026-10-22 evening] async copies per ring kind (ggml_backend_d2d_copy_stats ring_kind)
         int32_t n_d2d_ring_export;
         int32_t n_d2d_ring_userptr;
+        // [fork, 2026-10-22 night] split inputs with no computed consumer, not copied (GGML_SCHED_SKIP_DEAD_INPUTS):
+        // the inactive build_inp_embd select branches, 2 per text decode on the first GPU split. Not in copies[]
+        int32_t n_copies_skipped;
+        size_t  nbytes_skipped;
+        // [fork, 2026-10-22 night] set by alloc_graph like n_realloc (0 on a reused graph): ggml_backend_sched_alloc_graph
+        // split into split_graph (backend assignment + splits + graph_copy) and alloc_splits (gallocr, incl. the
+        // t_realloc_* above). Why: a verify-graph miss costs build 0.58 + sched 2.81 ms with every card idle
+        // (wrong-tool scout item 5, 5429 of 10351 production steps); which half dominates decides cache vs faster split
+        int64_t t_split_graph_us;
+        int64_t t_alloc_splits_us;
         struct ggml_backend_sched_copy_stats  copies[GGML_BACKEND_SCHED_STATS_MAX_COPIES];
         struct ggml_backend_sched_split_stats splits[GGML_BACKEND_SCHED_STATS_MAX_SPLITS];
     };

@@ -69,6 +69,10 @@ struct llama_context {
     uint32_t n_ctx_seq() const;
     uint32_t n_batch()   const;
     uint32_t n_ubatch()  const;
+
+    // [fork, 2026-10-22 night] see llama_set_n_ubatch_cap
+    void set_n_ubatch_cap(uint32_t cap);
+    bool pipeline_parallel() const;
     uint32_t n_seq_max() const;
 
     uint32_t n_threads()       const;
@@ -147,6 +151,11 @@ struct llama_context {
 
     int encode(const llama_batch_ext & batch_inp);
     int decode(const llama_batch_ext & batch_inp);
+
+    // [fork, 2026-10-22 night] llama_decode_prebuild: build + sched-alloc the graph a coming decode of this batch shape
+    // would build, so that decode finds it reusable. 1 built, 0 the current graph already fits, -1 not applicable
+    int decode_prebuild(const llama_batch_ext & batch_inp);
+    void decode_prebuild_stats(int32_t * n_built, int32_t * n_hit, int32_t * n_miss) const;
 
     // compat version
     int encode(const llama_batch & batch_inp);
@@ -294,6 +303,9 @@ private:
     const llama_model & model;
 
     llama_cparams cparams;
+
+    // [fork, 2026-10-22 night] llama_set_n_ubatch_cap: 0 = off, else min(cparams.n_ubatch, this) per ubatch
+    uint32_t n_ubatch_cap = 0;
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
@@ -445,6 +457,14 @@ private:
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
 
+    // [fork, 2026-10-22 night] decode_prebuild: a prebuilt graph waits for its decode; counts since context creation
+    bool    prebuild_pending = false;
+    int32_t n_prebuild_built = 0;
+    int32_t n_prebuild_hit   = 0; // the next ubatch reused the prebuilt graph
+    int32_t n_prebuild_miss  = 0; // the next ubatch rebuilt anyway (shape or n_kv/head differed)
+    int64_t dstats_t_prebuild_us = 0; // [LLAMA_DECODE_STATS] host time of the prebuild before the next decode line
+    int32_t dstats_prebuild = -1;     // 1 hit, 0 miss, -1 no prebuild before this decode
+
     // debug timing breakdown of decode() / process_ubatch() (see DEBUG_TIMINGS in server-context.cpp)
     mutable int64_t t_build_graph  = 0;
     mutable int64_t t_alloc_graph  = 0;
@@ -549,6 +569,12 @@ public:
         // 2026-10-22 evening: async hops per ring kind (exported GTT ring vs userptr host ring)
         int32_t s_n_d2d_ring_export                  = 0;
         int32_t s_n_d2d_ring_userptr                 = 0;
+        // 2026-10-22 night (wrong-tool scout item 2): split inputs the sched did not copy, no computed consumer
+        int32_t s_n_copies_skipped                   = 0;
+        int64_t s_bytes_skipped                      = 0;
+        // 2026-10-22 night (scout item 5): t_sched_alloc split, ggml_backend_sched_stats t_split_graph_us / t_alloc_splits_us
+        int64_t s_t_split_graph                      = 0;
+        int64_t s_t_alloc_splits                     = 0;
     };
 private:
     bool             dstats_on     = false;

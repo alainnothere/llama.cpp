@@ -207,6 +207,11 @@ public:
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
+    // [fork, 2026-10-22 night] head / n / rs_z are read from the memory at build time and are those of the last
+    // find_slot(): for a seq continuing its decode find_slot keeps them, and llm_graph_input_rs::can_reuse rejects the
+    // candidate when the real apply moved them
+    bool prepare_graph() override { return status == LLAMA_MEMORY_STATUS_SUCCESS && !ubatches.empty(); }
+
     //
     // llama_memory_recurrent_context specific API
     //

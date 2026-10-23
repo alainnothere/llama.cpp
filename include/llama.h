@@ -580,6 +580,24 @@ extern "C" {
     LLAMA_API uint32_t llama_n_ctx_seq  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_batch    (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_ubatch   (const struct llama_context * ctx);
+
+    // [fork, 2026-10-22 night] cap the physical batch of the following decode calls at n_ubatch_cap rows (0 = no cap,
+    // i.e. n_ubatch). Lets one call be cut into several smaller ubatches so a pipelined (n_batch > n_ubatch) context
+    // overlaps them across devices. Causal decodes only; does not change n_ubatch, the reserved graph or the buffers
+    LLAMA_API void     llama_set_n_ubatch_cap(struct llama_context * ctx, uint32_t n_ubatch_cap);
+    // [fork, 2026-10-22 night] true when the scheduler pipelines ubatches across devices (n_batch > n_ubatch, several
+    // devices, offload on): the only case where a smaller ubatch cap can overlap work instead of re-reading weights
+    LLAMA_API bool     llama_pipeline_parallel(const struct llama_context * ctx);
+
+    // [fork, 2026-10-22 night] build and sched-allocate the graph that a coming llama_process(DECODE) of a batch with
+    // this shape (n_tokens, seqs, positions, outputs; token ids are ignored) would build, so that decode reuses it
+    // instead of paying graph build + sched split + gallocr with the devices idle. Touches no memory state (the memory
+    // runs its init_batch dry run only) and computes nothing. The real decode still checks can_reuse and rebuilds on a
+    // mismatch, so a wrong prediction costs only the prebuild. Single-ubatch batches, contexts without backend
+    // samplers, nothing in flight. Returns 1 built, 0 the current graph already fits, -1 not applicable.
+    LLAMA_API int32_t  llama_decode_prebuild(struct llama_context * ctx, struct llama_batch_ext * batch);
+    // counts since context creation: prebuilds, and whether the next ubatch reused (hit) or rebuilt (miss) it
+    LLAMA_API void     llama_decode_prebuild_stats(const struct llama_context * ctx, int32_t * n_built, int32_t * n_hit, int32_t * n_miss);
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
 

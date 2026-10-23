@@ -342,6 +342,10 @@ bool llama_kv_cache_iswa_context::apply() {
     return res;
 }
 
+bool llama_kv_cache_iswa_context::prepare_graph() {
+    return status == LLAMA_MEMORY_STATUS_SUCCESS && ctx_base->prepare_graph() && ctx_swa->prepare_graph();
+}
+
 llama_memory_status llama_kv_cache_iswa_context::get_status() const {
     return status;
 }

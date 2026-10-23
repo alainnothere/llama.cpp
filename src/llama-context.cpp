@@ -79,9 +79,9 @@ struct llama_debug_timer {
 // n_splits / n_nodes_cpu (of the last built graph; n_nodes_cpu > 0 means a CPU split runs inside
 // t_compute and blocks the host), t_total_us, t_mem_apply_us, t_graph_reserve_us (sched_reserve
 // when it really reserved: new sched + 3 worst-case graph reserves + compute buffer realloc),
-// t_graph_build_us, t_sched_alloc_us (sched reset + alloc_graph), t_sched_split_us (null: split
-// and gallocr run inside ggml_backend_sched_alloc_graph and are not separable without touching
-// ggml-backend.cpp), t_set_inputs_us, t_compute_us (host side of graph_compute_async: Vulkan
+// t_graph_build_us, t_sched_alloc_us (sched reset + alloc_graph), t_sched_split_us /
+// t_sched_galloc_us (2026-10-22 night: the two halves of alloc_graph, ggml_backend_sched_split_graph
+// and alloc_splits incl. any re-plan; null when no graph was computed), t_set_inputs_us, t_compute_us (host side of graph_compute_async: Vulkan
 // submits, cross-device input copies that wait, any CPU split), t_output_reserve_us,
 // t_output_us, t_mem_commit_us (no commit phase in this tree: only the failed-ubatch seq_rm),
 // t_other_us = total - named phases, t_sync_prev_us (synchronize() wait on this context since its
@@ -1173,6 +1173,14 @@ uint32_t llama_context::n_ubatch() const {
     return cparams.n_ubatch;
 }
 
+void llama_context::set_n_ubatch_cap(uint32_t cap) {
+    n_ubatch_cap = cap;
+}
+
+bool llama_context::pipeline_parallel() const {
+    return cparams.pipeline_parallel;
+}
+
 uint32_t llama_context::n_seq_max() const {
     return cparams.n_seq_max;
 }
@@ -1784,7 +1792,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         if (dstats_on) {
             dstats.n_reused++;
         }
+        if (prebuild_pending) {
+            prebuild_pending = false;
+            n_prebuild_hit++;
+            dstats_prebuild = 1;
+        }
     } else {
+        if (prebuild_pending) {
+            prebuild_pending = false;
+            n_prebuild_miss++;
+            dstats_prebuild = 0;
+        }
         gf_res_prev_active = nullptr;
         res->reset();
 
@@ -2151,6 +2169,93 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     return ret;
 }
 
+// [fork, 2026-10-22 night] wrong-tool scout item 5 (whatifs "2026-10-22 night: wrong-tool scout"): the single-slot
+// graph reuse (process_ubatch) misses whenever the verify length changes. MEASURED (20:34 production tape): 4922 of
+// 10351 verify steps reused (consecutive equal n: 4922/5013, so the misses are the shape only, the auto-tuner moving
+// the cap); a miss costs build 0.58 + sched split/alloc 2.81 ms (of which the gallocr re-plan 0.45: backend_ids_changed
+// 1711x, input_embed growth 852x) with every card idle = 1.8 ms/step average, 2.2% of a 79.3 ms step (arm_A3 with
+// alternating n: 3.4 ms = 4%). Padding n to buckets costs GPU rows (~7 ms/row slope): no. A per-n LRU of built
+// graphs would save only the 0.58 ms build: the sched holds ONE split/alloc plan (splits, graph_copy, gallocr), and
+// re-planning a cached graph is the 2.8 ms part. So: predict the next verify shape (the server knows cap + 1 before
+// the MTP chain) and run build + sched alloc here while the MTP catch-up decode is on the GPU; the verify then takes
+// the reuse branch. Correctness guard is the same as for any reuse: can_reuse() against the real, applied mctx.
+// The memory context only runs init_batch (a dry run that restores the memory) + prepare_graph() (n_kv as after
+// apply). Callers: tools/server (LLAMA_VERIFY_PREBUILD=1, default off until the GPU gate).
+int llama_context::decode_prebuild(const llama_batch_ext & batch_inp) {
+    if (!memory || graph_reuse_disable || batch_inp.tokens.empty() || batch_inp.n_embd > 0 ||
+            sched_need_reserve || cparams.embeddings || !sampling.samplers.empty() || synced_gen != async_gen) {
+        return -1;
+    }
+
+    const int64_t t_start = ggml_time_us();
+
+    if (!balloc->init(batch_inp, model.vocab, false)) {
+        return -1;
+    }
+
+    const uint32_t n_tokens_all  = balloc->get_n_tokens();
+    const uint32_t n_outputs_all = balloc->get_n_outputs();
+    if (n_tokens_all > cparams.n_ubatch) {
+        return -1;
+    }
+
+    llama_memory_context_ptr mctx = memory->init_batch(*balloc, cparams.n_ubatch, false);
+    if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
+        return -1;
+    }
+
+    const auto & ubatch = mctx->get_ubatch();
+    if (ubatch.n_tokens != n_tokens_all || !mctx->prepare_graph()) {
+        return -1;
+    }
+
+    // as decode_impl: n_outputs must be set before graph_params / the build
+    const int32_t n_outputs_save = n_outputs;
+    n_outputs = (int32_t) n_outputs_all;
+
+    auto * res = get_gf_res_prev();
+    const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
+
+    int ret = 0;
+    if (gf_res_prev_active == res && res->can_reuse(gparams)) {
+        ret = 0;
+    } else {
+        gf_res_prev_active = nullptr;
+        res->reset();
+        ggml_backend_sched_reset(sched.get());
+        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
+        ggml_cgraph * gf = model.build_graph(gparams);
+        if (!gf || !ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+            // nothing active: the real decode builds as usual
+            n_outputs = n_outputs_save;
+            return -1;
+        }
+        if (dstats_on) {
+            dstats_capture_placement(gf);
+        }
+        if (!placement_checked) {
+            placement_checked = true;
+            check_cpu_placement(gf);
+        }
+        gf_res_prev_active = res;
+        prebuild_pending   = true;
+        n_prebuild_built++;
+        ret = 1;
+    }
+
+    n_outputs = n_outputs_save;
+    dstats_t_prebuild_us += ggml_time_us() - t_start;
+
+    return ret;
+}
+
+void llama_context::decode_prebuild_stats(int32_t * n_built, int32_t * n_hit, int32_t * n_miss) const {
+    if (n_built) { *n_built = n_prebuild_built; }
+    if (n_hit)   { *n_hit   = n_prebuild_hit;   }
+    if (n_miss)  { *n_miss  = n_prebuild_miss;  }
+}
+
 // [LLAMA_DECODE_STATS] 2026-10-20 - where the scheduler put the nodes of the last built graph
 //
 // Why. Production at --spec-ngram-draft-n-max 64 (n_rs_seq 64, 65 recurrent planes per layer, 27B
@@ -2479,6 +2584,10 @@ void llama_context::dstats_fold_sched() {
     d.s_t_d2d_hop_queue_submit             += st->t_d2d_hop_queue_submit_us;
     d.s_n_d2d_ring_export                  += st->n_d2d_ring_export;
     d.s_n_d2d_ring_userptr                 += st->n_d2d_ring_userptr;
+    d.s_n_copies_skipped                   += st->n_copies_skipped;
+    d.s_t_split_graph                      += st->t_split_graph_us;
+    d.s_t_alloc_splits                     += st->t_alloc_splits_us;
+    d.s_bytes_skipped                      += (int64_t) st->nbytes_skipped;
 
     // 2026-10-22 (design-kq-mask-on-device.md 3.6b): one re-plan per pp ubatch is the expected state before the
     // device-built mask; the reason names the first node that outgrew its planned slot
@@ -2662,26 +2771,46 @@ void llama_context::dstats_emit(int ret, int64_t t_start_us, uint32_t n_tokens, 
 
     const double t_unix = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
 
+    // 2026-10-22 night (scout item 5): t_sched_alloc_us split, measured only when the sched computed a graph
+    char ssplit[24] = "null";
+    char sgalloc[24] = "null";
+    if (d.s_n_graphs > 0) {
+        snprintf(ssplit,  sizeof(ssplit),  "%" PRId64, d.s_t_split_graph);
+        snprintf(sgalloc, sizeof(sgalloc), "%" PRId64, d.s_t_alloc_splits);
+    }
+
     char buf[1536];
     snprintf(buf, sizeof(buf),
             "{\"t\":%.6f,\"ctx\":%d,\"n_layer\":%u,\"n_rs_seq\":%u,\"ret\":%d,\"n_tokens\":%u,\"n_ubatch\":%d,\"n_outputs\":%u,"
             "\"graph_reused\":%s,\"n_reused\":%d,\"n_nodes\":%d,\"n_splits\":%d,\"n_nodes_cpu\":%d,"
             "\"t_total_us\":%" PRId64 ",\"t_mem_apply_us\":%" PRId64 ",\"t_graph_reserve_us\":%" PRId64 ",\"t_graph_build_us\":%" PRId64 ","
-            "\"t_sched_alloc_us\":%" PRId64 ",\"t_sched_split_us\":null,\"t_set_inputs_us\":%" PRId64 ",\"t_compute_us\":%" PRId64 ","
+            "\"t_sched_alloc_us\":%" PRId64 ",\"t_sched_split_us\":%s,\"t_sched_galloc_us\":%s,\"t_set_inputs_us\":%" PRId64 ",\"t_compute_us\":%" PRId64 ","
             "\"t_output_reserve_us\":%" PRId64 ",\"t_output_us\":%" PRId64 ",\"t_mem_commit_us\":%" PRId64 ",\"t_other_us\":%" PRId64 ","
             "\"t_sync_prev_us\":%" PRId64 ",\"rs_depth_max\":%d",
             t_unix, dstats_ctx_id, model.hparams.n_layer(), cparams.n_rs_seq, ret, n_tokens, d.n_ubatch, n_outputs_all,
             (d.n_ubatch > 0 && d.n_reused == d.n_ubatch) ? "true" : "false", d.n_reused, dstats_n_nodes, dstats_n_splits, dstats_n_cpu,
             t_total, d.t_mem_apply, d.t_graph_reserve, d.t_graph_build,
-            d.t_sched_alloc, d.t_set_inputs, d.t_compute,
+            d.t_sched_alloc, ssplit, sgalloc, d.t_set_inputs, d.t_compute,
             d.t_output_reserve, d.t_output, d.t_mem_commit, t_total - t_named,
             dstats_t_sync, rs_depth_max);
 
     dstats_t_sync = 0;
 
+    // [fork, 2026-10-22 night] scout item 5: a verify-graph prebuild ran before this call (llama_decode_prebuild).
+    // hit = this call reused it. Its build + sched time is NOT in t_graph_build/t_sched_alloc of this line, but the
+    // sched's split/galloc timers carry over into this line's t_sched_split_us / t_sched_galloc_us
+    char pb[96] = "";
+    if (dstats_prebuild >= 0 || dstats_t_prebuild_us > 0) {
+        snprintf(pb, sizeof(pb), ",\"prebuild\":{\"hit\":%d,\"t_us\":%" PRId64 "}", dstats_prebuild, dstats_t_prebuild_us);
+    }
+    dstats_prebuild      = -1;
+    dstats_t_prebuild_us = 0;
+
+    std::string extra = pb;
     // placement fragment of the last built graph (dstats_capture_placement): can be a few hundred
     // bytes, so it is appended here instead of growing the fixed snprintf buffer
     std::string line = buf;
+    line += extra;
     if (!dstats_place_json.empty()) {
         line += ',';
         line += dstats_place_json;
@@ -2699,7 +2828,8 @@ void llama_context::dstats_emit(int ret, int64_t t_start_us, uint32_t n_tokens, 
                 "\"t_hop_queue_submit_us\":%" PRId64 ",\"n_bwd_wait_elided\":%d,\"n_ring_grow_wait\":%d,"
                 "\"n_bwd_unsignaled_at_submit\":%d,\"n_bwd_dst_unsignaled_at_submit\":%d,\"n_bwd_unsubmitted_at_submit\":%d,"
                 "\"n_src_submit_pending\":%d,\"bwd_lag\":%" PRId64 ","
-                "\"ring_kind\":\"%s\",\"n_ring_export\":%d,\"n_ring_userptr\":%d}",
+                "\"ring_kind\":\"%s\",\"n_ring_export\":%d,\"n_ring_userptr\":%d,"
+                "\"n_copies_skipped\":%d,\"bytes_skipped\":%" PRId64 "}",
                 d.s_n_graphs, d.s_n_splits, d.s_n_copies, d.s_n_copies_drop, d.s_n_splits_drop,
                 d.s_bytes, d.s_t_dst_wait, d.s_t_src_sync, d.s_t_copy, d.s_t_split_sync, d.s_t_wall,
                 d.s_n_realloc, d.s_t_realloc_sync, d.s_t_realloc_reserve,
@@ -2711,7 +2841,9 @@ void llama_context::dstats_emit(int ret, int64_t t_start_us, uint32_t n_tokens, 
                 // 2026-10-22 evening: "export" | "userptr" | "mixed" over this call's async hops, "none" without any
                 (d.s_n_d2d_ring_export > 0 && d.s_n_d2d_ring_userptr > 0) ? "mixed" :
                     d.s_n_d2d_ring_export > 0 ? "export" : d.s_n_d2d_ring_userptr > 0 ? "userptr" : "none",
-                d.s_n_d2d_ring_export, d.s_n_d2d_ring_userptr);
+                d.s_n_d2d_ring_export, d.s_n_d2d_ring_userptr,
+                // 2026-10-22 night: dead split inputs (GGML_SCHED_SKIP_DEAD_INPUTS), 2 per text decode expected
+                d.s_n_copies_skipped, d.s_bytes_skipped);
         line += sb;
         line += ",\"realloc\":[" + d.s_realloc_json + "]";
         line += ",\"copies\":[" + d.s_copies_json + "]";
@@ -3044,7 +3176,16 @@ int llama_context::decode_impl(const llama_batch_ext & batch_inp) {
         {
             // [LLAMA_DECODE_STATS] split_equal(n_ubatch, ..., n_rs_seq + 1) + prepare() (find_slot dry run)
             llama_dstats_timer dt(dstats_on, dstats.t_mem_apply);
-            mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
+            // [fork, 2026-10-22 night] llama_set_n_ubatch_cap (server prompt tail, wrong-tool scout item 4); causal only,
+            // the non-causal assert above needs the whole batch in one ubatch. Floor n_rs_seq + 2: split_equal keeps the
+            // last n_rs_seq + 1 tokens of a seq in one ubatch and asserts n_ubatch > that (test_spec_prebatch, -ub 64,
+            // n-gram cap 16, cap 16 aborted in llama-batch.cpp split_equal)
+            uint32_t n_ub = cparams.n_ubatch;
+            if (n_ubatch_cap > 0 && cparams.causal_attn) {
+                const uint32_t n_floor = cparams.n_rs_seq > 0 ? cparams.n_rs_seq + 2 : 1;
+                n_ub = std::min(cparams.n_ubatch, std::max(n_ubatch_cap, n_floor));
+            }
+            mctx = memory->init_batch(*balloc, n_ub, output_all);
         }
         if (!mctx) {
             return -2;
@@ -5328,6 +5469,14 @@ uint32_t llama_n_ubatch(const llama_context * ctx) {
     return ctx->n_ubatch();
 }
 
+void llama_set_n_ubatch_cap(llama_context * ctx, uint32_t n_ubatch_cap) {
+    ctx->set_n_ubatch_cap(n_ubatch_cap);
+}
+
+bool llama_pipeline_parallel(const llama_context * ctx) {
+    return ctx->pipeline_parallel();
+}
+
 uint32_t llama_n_seq_max(const llama_context * ctx) {
     return ctx->n_seq_max();
 }
@@ -5914,6 +6063,14 @@ void llama_opt_epoch(
         idata_split,
         callback_train,
         callback_eval);
+}
+
+int32_t llama_decode_prebuild(llama_context * ctx, llama_batch_ext * batch) {
+    return ctx->decode_prebuild(*batch);
+}
+
+void llama_decode_prebuild_stats(const llama_context * ctx, int32_t * n_built, int32_t * n_hit, int32_t * n_miss) {
+    ctx->decode_prebuild_stats(n_built, n_hit, n_miss);
 }
 
 int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_ext * batch) {

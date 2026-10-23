@@ -195,6 +195,8 @@ public:
     //
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
+    // [fork, 2026-10-22 night] get_n_kv as it will be after apply_ubatch(sinfo): the slot's cells counted as used
+    uint32_t get_n_kv_after(const slot_info & sinfo) const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -627,6 +629,8 @@ public:
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
+
+    bool prepare_graph() override;
 
     //
     // llama_kv_cache_context specific API

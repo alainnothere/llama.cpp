@@ -64,6 +64,11 @@ struct llama_memory_context_i {
 
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
+
+    // [fork, 2026-10-22 night] verify-graph prebuild (llama_decode_prebuild): set what apply() would expose to a graph
+    // build of the current ubatch (kv: n_kv) WITHOUT touching the memory. false = unsupported, do not build from it.
+    // The graph is only a candidate: the real decode applies a fresh context and can_reuse() decides
+    virtual bool prepare_graph() { return false; }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;

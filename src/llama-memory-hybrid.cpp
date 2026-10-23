@@ -280,6 +280,10 @@ bool llama_memory_hybrid_context::apply() {
     return res;
 }
 
+bool llama_memory_hybrid_context::prepare_graph() {
+    return status == LLAMA_MEMORY_STATUS_SUCCESS && ctx_attn->prepare_graph() && ctx_recr->prepare_graph();
+}
+
 llama_memory_status llama_memory_hybrid_context::get_status() const {
     return status;
 }

@@ -161,9 +161,89 @@ static void run(bool stats) {
     ggml_backend_free(g_cpu_inner);
 }
 
+// [fork, 2026-10-22 night] GGML_SCHED_SKIP_DEAD_INPUTS=1: an inactive ggml_build_forward_select branch (no COMPUTE flag)
+// reading a CPU input on the fake device must not be copied (llama's unused build_inp_embd branches); with the knob
+// off, or when the dead node is a graph OUTPUT, it is copied as before. The live result must not change.
+static void run_dead(bool knob, bool dead_is_output) {
+    setenv("GGML_SCHED_SKIP_DEAD_INPUTS", knob ? "1" : "0", 1);
+    ggml_backend_i bi = {};
+    bi.get_name      = fake_name;
+    bi.graph_compute = fake_compute;
+    ggml_backend fake = { &fake_guid, bi, &fake_dev, nullptr };
+
+    g_cpu_inner        = ggml_backend_cpu_init();
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+    ggml_backend_t backends[2] = { &fake, cpu };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 2, 64, false, false);
+    ggml_backend_sched_set_stats_enabled(sched, true);
+
+    const int N = 1000;
+    ggml_init_params ip = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, N);
+    ggml_set_name(a, "a");
+    ggml_set_input(a);
+    ggml_tensor * x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, N);
+    ggml_set_name(x, "x_dead");
+    ggml_set_input(x);
+    ggml_tensor * b = ggml_add(ctx, a, a);
+    ggml_set_name(b, "b");
+    ggml_tensor * dd = ggml_scale(ctx, x, 3.0f);
+    ggml_set_name(dd, "dd");
+    if (dead_is_output) {
+        ggml_set_output(dd);
+    }
+    ggml_tensor * c = ggml_scale(ctx, b, 2.0f);
+    ggml_set_name(c, "c");
+    ggml_set_output(c);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_tensor * sel[2] = { c, dd };
+    ggml_build_forward_select(gf, sel, 2, 0);
+    CHECK((dd->flags & GGML_TENSOR_FLAG_COMPUTE) == 0);
+
+    ggml_backend_sched_set_tensor_backend(sched, b, &fake);
+    ggml_backend_sched_set_tensor_backend(sched, dd, &fake);
+    ggml_backend_sched_set_tensor_backend(sched, c, cpu);
+    CHECK(ggml_backend_sched_alloc_graph(sched, gf));
+
+    std::vector<float> in(N), out(N);
+    for (int i = 0; i < N; ++i) {
+        in[i] = (float) i;
+    }
+    // inputs are re-set per compute: gallocr may reuse an input's memory once its copy is done
+    for (int rep = 0; rep < 2; ++rep) {
+        ggml_backend_tensor_set(a, in.data(), 0, N * sizeof(float));
+        ggml_backend_tensor_set(x, in.data(), 0, N * sizeof(float));
+        CHECK(ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_get(c, out.data(), 0, N * sizeof(float));
+        for (int i = 0; i < N; ++i) {
+            CHECK(out[i] == 4.0f * in[i]);
+        }
+        const ggml_backend_sched_stats * st = ggml_backend_sched_get_last_stats(sched);
+        const bool skip = knob && !dead_is_output;
+        printf("dead knob %d output %d: n_copies %d n_copies_skipped %d bytes_skipped %zu\n", knob, dead_is_output,
+               st->n_copies, st->n_copies_skipped, st->nbytes_skipped);
+        CHECK(st->n_copies == (skip ? 2 : 3));
+        CHECK(st->n_copies_skipped == (skip ? 1 : 0));
+        CHECK(st->nbytes_skipped == (skip ? N * sizeof(float) : 0));
+        for (int i = 0; i < st->n_copies; ++i) {
+            CHECK(!skip || strcmp(st->copies[i].name, "x_dead") != 0);
+        }
+    }
+
+    ggml_free(ctx);
+    ggml_backend_sched_free(sched);
+    ggml_backend_free(cpu);
+    ggml_backend_free(g_cpu_inner);
+    unsetenv("GGML_SCHED_SKIP_DEAD_INPUTS");
+}
+
 int main() {
     run(false);
     run(true);
+    run_dead(true, false);
+    run_dead(false, false);
+    run_dead(true, true);
     printf("OK\n");
     return 0;
 }
