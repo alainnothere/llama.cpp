@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <map>
 #include <cinttypes>
@@ -1490,6 +1491,144 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<common_speculative_mtp_stop>  conf_stop;
     std::vector<common_speculative_mtp_stats> conf_stats;
 
+    // [VOCAB_SUBSET] --spec-draft-vocab-subset (2026-10-23, default off). the MTP head projects onto these rows of
+    // model.output instead of all 248,320 (llama_set_logits_subset on ctx_dft); the target verifies over the full
+    // vocab, so only acceptance can change. list = file ids (user top-K by frequency from the disk-cache .tok
+    // corpus) + forced control/EOG/digit/newline tokens + every id seen in a prompt, append-only so rows keep
+    // their place. measured coverage of sampled tokens, held-out (agent-reports 2026-10-23-1517): top-16k alone
+    // 97.67%, top-16k U ids of the conversation 99.62% (~17k rows); BPE id order is worthless (89% at 16k).
+    // the union is refreshed in begin() (once per request, never per step): a new n_pad re-plans the draft graphs
+    // once. vs_ctx_max bounds the prompt part: past it the list restarts from the base + the current prompt
+    // acceptance rule (--spec-draft-sampling probabilistic): the draft's q is the top_k(10) + temp softmax of the
+    // logits it was sampled from, already renormalized over 10 candidates with the full head too. with the subset
+    // that softmax runs over the subset's top 10, which IS the distribution the draft token was drawn from, so the
+    // verifier's min(1, p/q) + residual max(0, p - q) stays exact with q as reported. an un-normalized q (mass
+    // relative to the full vocab) would be wrong: q must be the sampling distribution, not the full-head one.
+    // nothing changes in common_sampler_sample_and_accept_n_rejection; only how often p/q accepts can drop.
+    // CPU 9B smoke 2026-10-23 (2 turns, 96 + 128 tokens): accepted/drafted 73/84 + 97/120 full head vs 71/92 +
+    // 96/124 at top-16k U prompt (90.4% of accepted ids in the static 16k list; the rest were prompt ids such as
+    // 'price', 'xF', 'Widget' of a never-seen identifier that joined on the next request), MTP graph 25.3 -> 5.4 ms
+    bool                     vs_on     = false;
+    std::vector<llama_token> vs_ids;
+    std::vector<uint8_t>     vs_in;     // [n_vocab] membership of vs_ids
+    size_t                   vs_n_base = 0; // file + forced part of vs_ids
+    static constexpr size_t  vs_ctx_max = 32768; // 230-290k conversations hold 6.8-9.2k distinct ids (1517)
+
+    bool vs_add(llama_token t) {
+        if (t < 0 || t >= (llama_token) vs_in.size() || vs_in[t]) {
+            return false;
+        }
+        vs_in[t] = 1;
+        vs_ids.push_back(t);
+        return true;
+    }
+
+    // push the list to ctx_dft; on failure the head goes back to the full vocab for good
+    void vs_apply(const char * why, size_t n_before) {
+        const int64_t t0 = ggml_time_us();
+        const int32_t rc = llama_set_logits_subset(params.ctx_dft, vs_ids.data(), (int32_t) vs_ids.size());
+        if (rc != 0) {
+            SPC_WRN("vocab subset: llama_set_logits_subset failed (%d), drafting over the full vocab\n", (int) rc);
+            llama_set_logits_subset(params.ctx_dft, nullptr, 0);
+            vs_on = false;
+            return;
+        }
+        SPC_INF("vocab subset (%s): %zu -> %zu ids (base %zu), n_pad %zu, set in %.2f ms\n", why, n_before, vs_ids.size(),
+                vs_n_base, (vs_ids.size() + 255)/256*256, (ggml_time_us() - t0)/1000.0);
+    }
+
+    void vs_init(const std::string & path) {
+        const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(params.ctx_dft));
+        const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+
+        std::ifstream f(path);
+        if (!f) {
+            SPC_WRN("vocab subset: cannot open '%s', drafting over the full vocab\n", path.c_str());
+            return;
+        }
+
+        vs_in.assign(n_vocab, 0);
+        vs_ids.clear();
+
+        size_t n_file = 0;
+        size_t n_bad  = 0;
+        std::string line;
+        while (std::getline(f, line)) {
+            const size_t p = line.find_first_not_of(" \t");
+            if (p == std::string::npos || line[p] == '#') {
+                continue;
+            }
+            char * end = nullptr;
+            const long v = std::strtol(line.c_str() + p, &end, 10);
+            if (end == line.c_str() + p || v < 0 || v >= n_vocab) {
+                n_bad++;
+                continue;
+            }
+            n_file += vs_add((llama_token) v) ? 1 : 0;
+        }
+
+        // tokens a ranking by past text can miss but a turn cannot do without: control / user-defined (think,
+        // tool-call, im_start/end), end-of-generation, digit-only and newline-only pieces
+        size_t n_forced = 0;
+        for (llama_token t = 0; t < n_vocab; ++t) {
+            if (vs_in[t]) {
+                continue;
+            }
+            bool force = llama_vocab_is_eog(vocab, t) ||
+                (llama_vocab_get_attr(vocab, t) & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) != 0;
+            if (!force) {
+                const std::string piece = common_token_to_piece(vocab, t, true);
+                const bool digits = !piece.empty() && std::all_of(piece.begin(), piece.end(), [](char c) { return c >= '0' && c <= '9'; });
+                const bool nl     = !piece.empty() && piece.find('\n') != std::string::npos &&
+                    std::all_of(piece.begin(), piece.end(), [](char c) { return c == '\n' || c == '\r' || c == ' ' || c == '\t'; });
+                force = digits || nl;
+            }
+            if (force) {
+                n_forced += vs_add(t) ? 1 : 0;
+            }
+        }
+
+        vs_n_base = vs_ids.size();
+        vs_on     = !vs_ids.empty();
+
+        SPC_INF("vocab subset: '%s': %zu ids from the file (%zu bad lines), %zu forced, n_vocab %d\n",
+                path.c_str(), n_file, n_bad, n_forced, n_vocab);
+
+        if (vs_on) {
+            vs_apply("init", 0);
+        }
+    }
+
+    // once per request: ids of the prompt that the list does not hold yet
+    void vs_update(const llama_tokens & prompt) {
+        if (!vs_on) {
+            return;
+        }
+
+        const size_t n_before = vs_ids.size();
+        for (const llama_token t : prompt) {
+            vs_add(t);
+        }
+        if (vs_ids.size() == n_before) {
+            return;
+        }
+
+        const char * why = "prompt";
+        if (vs_ids.size() - vs_n_base > vs_ctx_max) {
+            // restart from the base + this prompt, so a long-lived server does not accumulate every id ever seen
+            for (size_t i = vs_n_base; i < vs_ids.size(); ++i) {
+                vs_in[vs_ids[i]] = 0;
+            }
+            vs_ids.resize(vs_n_base);
+            for (const llama_token t : prompt) {
+                vs_add(t);
+            }
+            why = "prompt, restarted";
+        }
+
+        vs_apply(why, n_before);
+    }
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1569,10 +1708,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         conf_p.assign(n_seq, {});
         conf_stop.assign(n_seq, COMMON_SPECULATIVE_MTP_STOP_OTHER);
         conf_stats.assign(n_seq, {});
+
+        if (!this->params.vocab_subset_path.empty()) {
+            vs_init(this->params.vocab_subset_path);
+        }
     }
 
     ~common_speculative_impl_draft_mtp() override {
         auto * ctx_dft = this->params.ctx_dft;
+        if (vs_on && ctx_dft) {
+            llama_set_logits_subset(ctx_dft, nullptr, 0);
+        }
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
                 continue;
@@ -1591,6 +1737,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         conf_p[seq_id].clear();
         conf_stats[seq_id] = {};
+
+        // [VOCAB_SUBSET] the prompt is already decoded here (the server calls begin() at the first sampled
+        // token), so a re-plan of the draft graphs lands before the first draft, not inside a step
+        vs_update(prompt);
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {

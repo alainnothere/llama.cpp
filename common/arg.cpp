@@ -4395,6 +4395,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_SAMPLING"));
     add_opt(common_arg(
+        {"--spec-draft-vocab-subset"}, "FNAME",
+        "draft-mtp: project the MTP head onto a vocab subset: the ids in FNAME (one per line, e.g. the top-16k by "
+        "frequency), plus control/digit/newline tokens, plus every id seen in the prompts (append-only). "
+        "the target still verifies over the full vocab, so output stays correct; acceptance can drop (default: off)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.vocab_subset_path = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_VOCAB_SUBSET"));
+    add_opt(common_arg(
         {"--spec-draft-device", "-devd", "--device-draft"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading the draft model (none = don't offload, default: follows --device)\n"
         "use --list-devices to see a list of available devices",

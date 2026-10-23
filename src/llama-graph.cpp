@@ -1567,6 +1567,7 @@ void llm_graph_result::reset() {
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
+    t_logits_ids  = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -1734,6 +1735,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     moe_cache        (params.moe_cache),
     prec_policy      (params.prec_policy),
     samplers         (params.samplers),
+    logits_subset    (params.logits_subset),
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
@@ -1792,6 +1794,41 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     }
 
     return res;
+}
+
+ggml_tensor * llm_graph_context::build_head_logits(
+          ggml_tensor * w,
+          ggml_tensor * cur,
+          ggml_tensor * w_s) const {
+    const llama_logits_subset * ls = logits_subset;
+
+    bool use = ls != nullptr && ls->active() && ls->src == w;
+
+    // a LoRA on the head would be dropped by the gathered copy (its rows are not in the adapter map)
+    if (use) {
+        for (const auto & lora : *loras) {
+            if (lora.first->get_weight(w) != nullptr) {
+                use = false;
+                break;
+            }
+        }
+    }
+
+    if (!use) {
+        return build_lora_mm(w, cur, w_s);
+    }
+
+    // same matvec on n_pad rows instead of n_vocab: CPU 9B smoke 2026-10-23 and the gate numbers are in
+    // llama_context::set_logits_subset. pad rows repeat ids[0], so they would tie with it: the mask makes them -INF.
+    // n_pad is fixed between id-list rebuilds (gen), which happen at most once per request (common draft-mtp begin())
+    ggml_tensor * res_l = build_lora_mm(ls->w, cur, w_s);
+    if (ls->n_pad > ls->n_ids) {
+        res_l = ggml_add(ctx0, res_l, ls->mask);
+    }
+
+    res->t_logits_ids = ls->ids;
+
+    return res_l;
 }
 
 ggml_tensor * llm_graph_context::build_lora_mm_id(
@@ -4650,11 +4687,14 @@ void llm_graph_context::build_sampling() const {
             ggml_tensor * logits_seq = ggml_view_1d(ctx0, logits_t, logits_t->ne[0], rows[i] * logits_t->nb[1]);
             ggml_format_name(logits_seq, "logits_seq_%d_%u", seq_id, i);
 
+            // [VOCAB_SUBSET] subset logits: row r is vocab id ids[r]. every backend sampler that reorders or
+            // filters maps candidates through get_rows (top_k, dist, top_p, ...), so the ids that come back
+            // to the host are vocab ids and the CPU sampler sees a normal (truncated) candidate list
             struct llama_sampler_data data = {
                 /*.logits       =*/ logits_seq,
                 /*.probs        =*/ nullptr,
                 /*.sampled      =*/ nullptr,
-                /*.candidates   =*/ nullptr,
+                /*.candidates   =*/ res->t_logits_ids,
             };
 
             assert(sampler->iface->backend_apply);

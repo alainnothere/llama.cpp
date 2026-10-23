@@ -1671,6 +1671,153 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
 
+// [VOCAB_SUBSET] 2026-10-23. the gather is a device-side get_rows over an I32 view of model.output's bytes, so
+// quantized rows are copied bit for bit (a get_rows on the real type would dequantize to F32: 4x the bytes per
+// draft matvec). one graph of one node on the backend of model.output's device, run synchronously.
+// measured on CPU (Qwen3.5-9B MTP, Q8_0 head [4096 x 248320], 12 threads, -nr, n_max 4, probabilistic):
+//   1-row MTP graph p50 25.3 ms full -> 5.4 ms at 16,640 rows (top-16k U prompt) / 6.8 ms at 33,024 (top-32k),
+//   session 13.5 -> 16.7-17.4 t/s; all 248,320 ids in id order = byte-identical text and spec stats to the full
+//   head (backend and host sampler paths). set cost: 25 ms init (16k), 7 ms per prompt refresh, 315 ms for 248k.
+//   Vulkan not measured yet (gate: mtp_vocab/gate/run_vocab_subset.sh)
+int32_t llama_context::set_logits_subset(const llama_token * ids, int32_t n_ids) {
+    synchronize(__func__);
+
+    if (ids == nullptr || n_ids <= 0) {
+        if (logits_subset.active()) {
+            const uint64_t gen = logits_subset.gen + 1;
+            logits_subset = {};
+            logits_subset.gen = gen;
+            logits_subset_buf.reset();
+            logits_subset_ctx.reset();
+            logits_subset_ids.clear();
+        }
+        return 0;
+    }
+
+    ggml_tensor * src = model.output;
+    const int64_t n_vocab = model.vocab.n_tokens();
+
+    // CPU repack (and other extra buffer types) store rows in another layout, recognizable by tensor->extra
+    if (src == nullptr || src->buffer == nullptr || src->extra != nullptr || src->ne[1] != n_vocab || !ggml_is_contiguous(src)) {
+        LLAMA_LOG_WARN("%s: model.output is missing, not plain or not [n_embd, n_vocab]; logits subset not supported\n", __func__);
+        return -1;
+    }
+
+    const size_t row_bytes = ggml_row_size(src->type, src->ne[0]);
+    if (row_bytes % sizeof(int32_t) != 0) {
+        LLAMA_LOG_WARN("%s: head row size %zu is not a multiple of 4; logits subset not supported\n", __func__, row_bytes);
+        return -2;
+    }
+
+    if (n_ids > n_vocab) {
+        return -3;
+    }
+    for (int32_t i = 0; i < n_ids; ++i) {
+        if (ids[i] < 0 || ids[i] >= n_vocab) {
+            LLAMA_LOG_WARN("%s: id %d at %d is out of range\n", __func__, ids[i], i);
+            return -3;
+        }
+    }
+
+    ggml_backend_buffer_type_t buft_src = ggml_backend_buffer_get_type(src->buffer);
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft_src);
+    ggml_backend_t backend = nullptr;
+    for (const auto & b : backends) {
+        if (dev != nullptr && ggml_backend_get_device(b.get()) == dev) {
+            backend = b.get();
+            break;
+        }
+    }
+    // a mmap'ed CPU head lives in a from_ptr buffer whose type has no device (CPU 9B smoke, 2026-10-23)
+    if (backend == nullptr && ggml_backend_buft_is_host(buft_src) && backend_cpu != nullptr) {
+        backend = backend_cpu;
+        dev     = ggml_backend_get_device(backend_cpu);
+    }
+    if (backend == nullptr) {
+        LLAMA_LOG_WARN("%s: no backend of this context runs on the device of model.output\n", __func__);
+        return -4;
+    }
+
+    const int32_t n_pad = GGML_PAD(n_ids, 256);
+
+    if (!logits_subset.active() || n_pad != logits_subset.n_pad) {
+        ggml_init_params ip = {
+            /*.mem_size   =*/ 3*ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx_new(ggml_init(ip));
+
+        llama_logits_subset ls;
+        ls.src  = src;
+        ls.w    = ggml_new_tensor_2d(ctx_new.get(), src->type, src->ne[0], n_pad);
+        ls.ids  = ggml_new_tensor_1d(ctx_new.get(), GGML_TYPE_I32, n_pad);
+        ls.mask = ggml_new_tensor_1d(ctx_new.get(), GGML_TYPE_F32, n_pad);
+        ggml_set_name(ls.w,    "output_subset.weight");
+        ggml_set_name(ls.ids,  "output_subset.ids");
+        ggml_set_name(ls.mask, "output_subset.mask");
+
+        ggml_backend_buffer_ptr buf_new(ggml_backend_alloc_ctx_tensors_from_buft(ctx_new.get(), ggml_backend_dev_buffer_type(dev)));
+        if (!buf_new) {
+            LLAMA_LOG_WARN("%s: failed to allocate %.1f MiB for %d head rows\n", __func__, n_pad*row_bytes/1024.0/1024.0, n_pad);
+            return -5;
+        }
+        // weights usage: the scheduler places the head matvec on this buffer's backend, like model.output
+        ggml_backend_buffer_set_usage(buf_new.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+        ls.n_pad = n_pad;
+        ls.gen   = logits_subset.gen + 1;
+
+        logits_subset     = ls;
+        logits_subset_buf = std::move(buf_new);
+        logits_subset_ctx = std::move(ctx_new);
+    }
+
+    logits_subset.n_ids = n_ids;
+    logits_subset_ids.assign(ids, ids + n_ids);
+
+    {
+        std::vector<int32_t> ids_pad(n_pad, ids[0]);
+        std::vector<float>   mask(n_pad, -INFINITY);
+        for (int32_t i = 0; i < n_ids; ++i) {
+            ids_pad[i] = ids[i];
+            mask[i]    = 0.0f;
+        }
+        ggml_backend_tensor_set(logits_subset.ids,  ids_pad.data(), 0, ggml_nbytes(logits_subset.ids));
+        ggml_backend_tensor_set(logits_subset.mask, mask.data(),    0, ggml_nbytes(logits_subset.mask));
+    }
+
+    {
+        ggml_init_params ip = {
+            /*.mem_size   =*/ 4*ggml_tensor_overhead() + ggml_graph_overhead_custom(4, false),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx_g(ggml_init(ip));
+
+        ggml_tensor * src_i32 = ggml_new_tensor_2d(ctx_g.get(), GGML_TYPE_I32, row_bytes/sizeof(int32_t), n_vocab);
+        ggml_tensor * dst_i32 = ggml_get_rows(ctx_g.get(), src_i32, logits_subset.ids);
+
+        if (ggml_backend_tensor_alloc(src->buffer, src_i32, src->data) != GGML_STATUS_SUCCESS ||
+            ggml_backend_tensor_alloc(logits_subset_buf.get(), dst_i32, logits_subset.w->data) != GGML_STATUS_SUCCESS) {
+            LLAMA_LOG_WARN("%s: failed to place the gather tensors\n", __func__);
+            set_logits_subset(nullptr, 0);
+            return -6;
+        }
+
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx_g.get(), 4, false);
+        ggml_build_forward_expand(gf, dst_i32);
+
+        if (!ggml_backend_supports_op(backend, dst_i32) || ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+            LLAMA_LOG_WARN("%s: the gather failed on %s\n", __func__, ggml_backend_name(backend));
+            set_logits_subset(nullptr, 0);
+            return -6;
+        }
+    }
+
+    return 0;
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -3606,7 +3753,28 @@ int llama_context::decode_impl(const llama_batch_ext & batch_inp) {
                 if (dstats_on) {
                     dstats.b_output += (int64_t) n_outputs * n_vocab * sizeof(float);
                 }
-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                if (res->t_logits_ids != nullptr) {
+                    // [VOCAB_SUBSET] host-sampler path (draft backend sampling off): t_logits is [n_pad, n_outputs]
+                    // in subset order. read it synchronously and scatter into full rows, -INF elsewhere, so every
+                    // llama_get_logits_ith consumer stays unchanged. the extra sync only costs on this path; the
+                    // production draft samples on the backend (top_k maps ids in-graph) and never gets here
+                    const int64_t n_pad = t_logits->ne[0];
+                    GGML_ASSERT(logits_subset.active() && n_pad == logits_subset.n_pad);
+                    logits_subset_tmp.resize((size_t) n_outputs*n_pad);
+                    ggml_backend_tensor_get_async(backend_res, t_logits, logits_subset_tmp.data(), 0, (size_t) n_outputs*n_pad*sizeof(float));
+                    ggml_backend_synchronize(backend_res);
+                    const int32_t n_ids = logits_subset.n_ids;
+                    for (int64_t r = 0; r < n_outputs; ++r) {
+                        float       * dst = logits_out + r*n_vocab;
+                        const float * sub = logits_subset_tmp.data() + r*n_pad;
+                        std::fill(dst, dst + n_vocab, -INFINITY);
+                        for (int32_t k = 0; k < n_ids; ++k) {
+                            dst[logits_subset_ids[k]] = sub[k];
+                        }
+                    }
+                } else {
+                    ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                }
             }
         }
 
@@ -4289,7 +4457,7 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
-    return {
+    llm_graph_params p = {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,
@@ -4308,6 +4476,11 @@ llm_graph_params llama_context::graph_params(
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
+
+    p.logits_subset     = logits_subset.active() ? &logits_subset : nullptr;
+    p.logits_subset_gen = logits_subset.gen;
+
+    return p;
 }
 
 ggml_status llama_context::graph_compute(
@@ -5870,6 +6043,10 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
+}
+
+int32_t llama_set_logits_subset(llama_context * ctx, const llama_token * ids, int32_t n_ids) {
+    return ctx->set_logits_subset(ids, n_ids);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

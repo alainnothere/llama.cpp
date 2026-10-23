@@ -126,6 +126,9 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
+
+    // [VOCAB_SUBSET] see llama_set_logits_subset() in llama-ext.h
+    int32_t set_logits_subset(const llama_token * ids, int32_t n_ids);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -395,6 +398,13 @@ private:
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
+
+    // [VOCAB_SUBSET] gathered head rows (on the device of model.output) and the host copy of their ids
+    llama_logits_subset     logits_subset;
+    ggml_context_ptr        logits_subset_ctx;
+    ggml_backend_buffer_ptr logits_subset_buf;
+    std::vector<int32_t>    logits_subset_ids; // n_ids entries
+    std::vector<float>      logits_subset_tmp; // host-sampler path: [n_pad x n_outputs] before the scatter
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;

@@ -812,6 +812,26 @@ using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor
 
 class llm_graph_result;
 
+// [VOCAB_SUBSET] 2026-10-23: rows of the LM head gathered by an id list, for a draft context (MTP) whose
+// projection over the full vocab is the cost (Qwen3.8-27B: Q8_0 [5120 x 248320] = 1.35 GB read per draft graph,
+// ~1.5 ms of each ~3.05 ms MTP graph at 196k, 6 graphs/step; agent-reports 2026-10-23-1513/1517). owned by
+// llama_context, set with llama_set_logits_subset(); graphs that call llm_graph_context::build_head_logits()
+// project onto w instead of src and their t_logits rows are in subset order (ids maps row -> vocab id).
+// preconditions: src rows are plain ggml blocks (no CPU repack extra), row bytes % 4 == 0 (the gather copies
+// rows as I32), no LoRA on src (build_head_logits falls back to src when one is attached)
+struct llama_logits_subset {
+    ggml_tensor * src  = nullptr; // the full head weight the rows came from (model.output)
+    ggml_tensor * w    = nullptr; // [n_embd, n_pad], same type as src
+    ggml_tensor * ids  = nullptr; // I32 [n_pad], vocab id of each row; pad rows repeat ids[0]
+    ggml_tensor * mask = nullptr; // F32 [n_pad], 0 for real rows, -INF for pad rows
+
+    int32_t  n_ids = 0;
+    int32_t  n_pad = 0; // multiple of 256; changes only when the id list outgrows it
+    uint64_t gen   = 0; // bumped whenever the tensors are re-created (graph reuse must not cross it)
+
+    bool active() const { return w != nullptr; }
+};
+
 struct llm_graph_params {
     llm_arch arch = LLM_ARCH_UNKNOWN;
 
@@ -855,6 +875,11 @@ struct llm_graph_params {
     llm_graph_cb cb;
 
     llm_graph_result * res;
+
+    // [VOCAB_SUBSET] nullptr or inactive = full-vocab head; gen copied by value so a re-created subset never
+    // reuses a graph that references the old tensors
+    const llama_logits_subset * logits_subset = nullptr;
+    uint64_t logits_subset_gen = 0;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -915,6 +940,11 @@ struct llm_graph_params {
 
         // TODO: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448035248
         if (cparams.nextn_layer_offset != other.cparams.nextn_layer_offset) {
+            return false;
+        }
+
+        // [VOCAB_SUBSET] the head tensors (and their n_pad) changed
+        if (logits_subset_gen != other.logits_subset_gen) {
             return false;
         }
 
@@ -983,6 +1013,10 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+
+    // [VOCAB_SUBSET] non-null when t_logits is [n_pad, n_outputs] over a logits subset: I32 [n_pad] row -> vocab id.
+    // build_sampling seeds the backend samplers' candidates with it, the host extraction scatters through it
+    ggml_tensor * t_logits_ids  = nullptr;
 
     std::vector<ggml_tensor *> t_layer_inp;
 
@@ -1097,6 +1131,8 @@ struct llm_graph_context {
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
+    const llama_logits_subset * logits_subset;
+
     const llm_graph_cb & cb_func;
 
     llm_graph_result * res;
@@ -1158,6 +1194,15 @@ struct llm_graph_context {
 
     // do mat_mul, while optionally apply lora and per-tensor scale
     ggml_tensor * build_lora_mm(
+              ggml_tensor * w,
+              ggml_tensor * cur,
+              ggml_tensor * w_s = nullptr) const;
+
+    // [VOCAB_SUBSET] the LM head of a draft graph: build_lora_mm(w, cur, w_s), or, when the context holds an
+    // active logits subset gathered from w, the projection onto the subset rows (+ pad mask). in that case the
+    // result is [n_pad, n_outputs] in subset order and res->t_logits_ids is set; assign the result to
+    // res->t_logits unchanged (build_sampling and the host extraction rely on t_logits_ids describing it)
+    ggml_tensor * build_head_logits(
               ggml_tensor * w,
               ggml_tensor * cur,
               ggml_tensor * w_s = nullptr) const;

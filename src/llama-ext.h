@@ -130,6 +130,17 @@ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uin
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
+// [VOCAB_SUBSET] Restrict the LM head of this context's draft graphs (the ones built with
+// llm_graph_context::build_head_logits, today the qwen35 / qwen35moe MTP heads) to the rows of model.output listed
+// in ids. Logits of other tokens become -INF: the host logits row is still n_vocab wide, and backend samplers
+// return vocab ids. The rows are gathered on the device that holds model.output (n_pad = n_ids rounded up to
+// 256, ~92 MB at 17k rows of the 27B's Q8_0 head). n_ids == 0 or ids == NULL turns it off. Synchronizes the
+// context. Returns 0 on success, < 0 when unsupported (no plain model.output, row size % 4 != 0, CPU-repacked
+// head, device without a backend in this context, out-of-range ids, allocation failure); the head is then full.
+// The list is taken as is: keep it append-only so rows keep their place, and call it between requests, not per
+// step - a new n_pad (or the first call) re-creates the tensors and every graph after it is rebuilt.
+LLAMA_API int32_t llama_set_logits_subset(struct llama_context * ctx, const llama_token * ids, int32_t n_ids);
+
 //
 // model/context data extraction
 //

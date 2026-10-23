@@ -346,6 +346,10 @@ struct common_params_speculative_draft {
 
     bool probabilistic = false; // sample the draft and verify by rejection, instead of argmax and match
 
+    // draft-mtp only: file of vocab ids (one per line, '#' comments) the MTP head projects onto, unioned with the
+    // control/digit/newline tokens and every id seen in the prompts; empty = full vocab (default)
+    std::string vocab_subset_path;
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;

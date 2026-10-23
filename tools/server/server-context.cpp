@@ -19,6 +19,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
@@ -1435,6 +1436,14 @@ struct server_slot {
     // not in server_slot_stats to avoid copying to every task result
     std::vector<uint64_t> n_accepted_per_pos;
 
+    // --spec-stats-file "acc_ids" / "rej_ids" (2026-10-23, for the MTP vocab-subset head): the token ids behind
+    // acc_per_pos. acc: { draft pos, accepted id, impl } per accepted draft token; rej: { draft pos, drafted id,
+    // target id, impl } for the first rejection of each step (impl = common_speculative_type of the step). nothing
+    // else records accepted ids: the 1517 coverage report could only measure all sampled tokens, a lower bound.
+    // ~8 B/token on disk, ~10 MB/day at production volume. per request, cleared in reset()
+    std::vector<std::array<int32_t, 3>> spec_acc_ids;
+    std::vector<std::array<int32_t, 4>> spec_rej_ids;
+
     std::function<void(int /* id_slot */)>   callback_on_release;
     std::function<void(const server_slot &)> callback_on_reset; // called before reset()
 
@@ -1482,6 +1491,8 @@ struct server_slot {
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
         n_accepted_per_pos.clear();
+        spec_acc_ids.clear();
+        spec_rej_ids.clear();
 
         n_predict_max = -1;
 
@@ -2119,6 +2130,19 @@ struct server_slot {
         j["draft_acc_rate"]      = stats.n_draft_tokens > 0 ? (double) stats.n_draft_accepted/stats.n_draft_tokens : 0.0;
         j["draft_mean_len"]      = stats.n_draft_verif_steps > 0 ? 1.0 + (double) stats.n_draft_accepted/stats.n_draft_verif_steps : 1.0;
         j["acc_per_pos"]         = arr(n_accepted_per_pos.data(), (int) n_accepted_per_pos.size()); // counts; divide by n_draft_verif_steps for the logged rates
+        {
+            // [[pos, id, impl], ...] and [[pos, draft_id, target_id, impl], ...]; see spec_acc_ids
+            json acc = json::array();
+            for (const auto & e : spec_acc_ids) {
+                acc.push_back(arr(e.data(), 3));
+            }
+            json rej = json::array();
+            for (const auto & e : spec_rej_ids) {
+                rej.push_back(arr(e.data(), 4));
+            }
+            j["acc_ids"] = std::move(acc);
+            j["rej_ids"] = std::move(rej);
+        }
         j["n_prebatch_restore"]  = stats.n_prebatch_restore;
         j["n_spec_ckpt"]         = stats.n_spec_ckpt;
         j["n_spec_ckpt_restore"] = stats.n_spec_ckpt_restore;
@@ -7065,6 +7089,14 @@ private:
                 }
             }
 
+            // first rejection of this step for the stats file. a replay re-verifies an already scored draft, so it
+            // is skipped (its rejection, if any, was recorded by the step that drafted it)
+            if (accepted.size() - 1 < n_draft && !slot.spec_is_replay && slot.spec_stats_writer != nullptr && slot.spec_stats_writer->enabled()) {
+                const size_t k = accepted.size() - 1;
+                slot.spec_rej_ids.push_back({ (int32_t) k, slot.spec_draft[k], accepted.back(),
+                        (int32_t) common_speculative_type_last(slot.spec, slot.id) });
+            }
+
             spec_verified.push_back({ slot.id, n_draft, accepted.size() - 1, restore, restore_prebatch,
                     slot.spec_prebatch_pos, slot.spec_prebatch_n_tokens, std::move(smpl_save) });
 
@@ -7382,6 +7414,12 @@ private:
             }
             for (size_t i = 0; i < n_accepted && i < n_accepted_per_pos.size(); ++i) {
                 n_accepted_per_pos[i]++;
+            }
+            if (n_accepted > 0 && slot.spec_stats_writer != nullptr && slot.spec_stats_writer->enabled()) {
+                const int32_t impl = (int32_t) common_speculative_type_last(slot.spec, slot.id);
+                for (size_t i = 0; i < n_accepted; ++i) {
+                    slot.spec_acc_ids.push_back({ (int32_t) i, ids[i], impl });
+                }
             }
 
             // add accepted tokens to the prompt
