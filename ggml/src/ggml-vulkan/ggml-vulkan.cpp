@@ -13790,11 +13790,14 @@ static bool ggml_vk_dts_init(ggml_backend_vk_context * ctx) {
     // drain) is a submit-path change on the stats path, and the user's production server runs with
     // LLAMA_DECODE_STATS set. House rule (feedback 2026-10-22: two unrun defaults cost an hour of garbage
     // output): it ships OFF until the A2 gate in context-perf-step-budget-whatifs.md ("timeline clock offset")
-    // passes on a dry-road run. GGML_VK_DTS_ANCHOR=1 enables it; without it the tape keeps the per-device
-    // calibration fields and the uncorrected ~1.4 ms Vulkan1-vs-Vulkan3 offset the readers now flag as FAIL.
+    // passes on a dry-road run. GATE PASSED 2026-10-22 21:36 (arm A2, -c 150000, 120k ctx, 151 timed lines):
+    // Vulkan3&Vulkan1 intersection 1.175 -> 0.000 ms, causal residual 0.000, probe_corr p50 Vulkan1 +0.031 /
+    // Vulkan2 +1.482 / Vulkan3 +1.499 ms (V1 vs V3 1.468 ms, inside the 1.24-1.58 bracket from the hops),
+    // probe spread p50 132/269/281 us, GOLDEN_TSC-vs-CP theory confirmed (V2 and V3 share the offset). Default
+    // ON since; GGML_VK_DTS_ANCHOR=0 disables (then the readers flag the ~1.4 ms offset as FAIL).
     {
         const char * e = getenv("GGML_VK_DTS_ANCHOR");
-        if (e && atoi(e) != 0) {
+        if (!e || atoi(e) != 0) {
             ggml_vk_dts_probe_init(ctx);
         } else {
             ctx->dts_probe_ok = false;
