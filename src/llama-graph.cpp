@@ -643,7 +643,9 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
     }
 }
 
-// [CP] an idx input is unallocated when no node reads it (range 1 below h: no helper store in the graph)
+// [CP] an idx input is unallocated when no node reads it: a range that is not live (h_r >= n_kv) has its input in the
+// graph but no store reads it. Kept as an unread input on purpose: the input set stays fixed per cache (can_reuse
+// compares it), only the nodes change at an n_kv step, and the setter skips what the sched did not allocate.
 void llm_graph_input_attn_kv::set_input_cp_idxs(const llama_kv_cache_context * mctx, const llama_ubatch * ubatch) {
     for (size_t r = 0; r < self_cp_idxs.size(); ++r) {
         if (self_cp_idxs[r] && self_cp_idxs[r]->buffer) {
@@ -1279,17 +1281,25 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
-    mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
-    mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+    // [CP] same guard as llm_graph_input_attn_kv::set_input: an input no node reads gets no buffer. With every
+    // attention layer context-parallel and no LLAMA_CP_CHECK, no node reads the global k/v idxs (each layer stores
+    // through the per-range cp idxs), so the sched leaves them unallocated (2026-10-23: GGML_ASSERT(buffer) in
+    // set_input_k_idxs at the warm-up decode of the 27B, LLAMA_CP_LAYERS=all)
+    if (inp_attn->self_k_idxs && inp_attn->self_k_idxs->buffer) {
+        mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
+    }
+    if (inp_attn->self_v_idxs && inp_attn->self_v_idxs->buffer) {
+        mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+    }
     inp_attn->set_input_cp_idxs(mctx->get_attn(), ubatch);
 
     inp_attn->set_input_kq_mask_any(mctx->get_attn(), ubatch);
 
-    if (inp_attn->self_k_rot) {
+    if (inp_attn->self_k_rot && inp_attn->self_k_rot->buffer) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
     }
 
-    if (inp_attn->self_v_rot) {
+    if (inp_attn->self_v_rot && inp_attn->self_v_rot->buffer) {
         mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
     }
 
@@ -1548,8 +1558,8 @@ int64_t llm_graph_result::get_max_nodes() const {
 void llm_graph_result::reset() {
     kq_mask_dev   = false;
     kq_build_check.clear();
-    t_cp_merged   = nullptr;
-    t_cp_full     = nullptr;
+    t_cp_merged.clear();
+    t_cp_full.clear();
 
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
@@ -3152,6 +3162,16 @@ ggml_tensor * llm_graph_context::build_attn(
     return cur;
 }
 
+static ggml_backend_t cp_backend_of(ggml_backend_sched_t sched, ggml_backend_dev_t dev);
+
+// [CP] node names of the context-parallel ranges: range 0 is "a" (the owner), range 1 "b" as before N ranges
+static const char * cp_name(const char * fmt, int r) {
+    static thread_local char buf[GGML_MAX_SRC][64];
+    GGML_ASSERT(r >= 0 && r < GGML_MAX_SRC);
+    snprintf(buf[r], sizeof(buf[r]), fmt, 'a' + r);
+    return buf[r];
+}
+
 static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
            ggml_context * ctx0,
      const llama_ubatch & ubatch,
@@ -3250,7 +3270,8 @@ ggml_tensor * llm_graph_context::build_attn(
     // [CP] range split: above h there is no single K/V tensor, so a graph that cannot run build_attn_cp cannot attend
     GGML_ASSERT(!(cp_h == 0 && !cparams.training && mctx_cur->cp_split(il) > 0) &&
             "context-parallel layer above h needs the build_attn_cp path (flash attention, no kq_b, no sinks)");
-    ggml_tensor * q_b = nullptr; // [CP] Q on the helper when packed, else the sched hops q itself
+    std::vector<ggml_tensor *> q_h; // [CP] Q on helper r when packed, else the sched hops q itself
+    int cp_live = 1;                // [CP] ranges with cells < n_kv
 
     if (cparams.training) {
         GGML_ASSERT(mctx_cur->get_n_kv() == n_tokens);
@@ -3266,43 +3287,43 @@ ggml_tensor * llm_graph_context::build_attn(
                 ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
                 ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
             } else {
-                // [CP] range-split store (llama_kv_cache::cp_state): range 0 on the owner always; range 1 on the helper
-                // only when n_kv > h (else every cell of the ubatch is < h, see cp_split). Each set_rows takes all
-                // n_tokens rows, the other range's tokens land in its trash row (fixed shape -> graph reuse holds).
-                // The 2026-10-21 mirror wrote all rows into a full copy on the helper (1056 MiB per layer at -c 270336).
-                GGML_ASSERT((int) inp->self_cp_idxs.size() == mctx_cur->cp_n_ranges() && mctx_cur->cp_n_ranges() == 2);
-                ggml_tensor * idx_0 = inp->self_cp_idxs[0];
-                ggml_tensor * idx_1 = inp->self_cp_idxs[1];
+                // [CP] range-split store (llama_kv_cache::cp_state): range 0 on the owner always; range r >= 1 on its device
+                // only when it is live (h_r < n_kv, else no cell of the ubatch is in it, see cp_split / cp_n_live). Each
+                // set_rows takes all n_tokens rows, other ranges' tokens land in its trash row (fixed shape -> graph reuse
+                // holds; a ubatch across a bound is split by the indices, not by the graph). The 2026-10-21 mirror wrote all
+                // rows into a full copy on the helper (1056 MiB per layer at -c 270336).
+                const int n_ranges = mctx_cur->cp_n_ranges();
+                GGML_ASSERT((int) inp->self_cp_idxs.size() == n_ranges && n_ranges >= 2);
 
-                ggml_build_forward_expand(gf, mctx_cur->cpy_k_range(ctx0, k_cur, idx_0, il, 0));
-                ggml_build_forward_expand(gf, mctx_cur->cpy_v_range(ctx0, v_cur, idx_0, il, 0));
-                if (mctx_cur->cp_check()) {
+                ggml_build_forward_expand(gf, mctx_cur->cpy_k_range(ctx0, k_cur, inp->self_cp_idxs[0], il, 0));
+                ggml_build_forward_expand(gf, mctx_cur->cpy_v_range(ctx0, v_cur, inp->self_cp_idxs[0], il, 0));
+                if (mctx_cur->cp_check(il)) {
                     // LLAMA_CP_CHECK reference: the whole layer on the owner, global indices
                     ggml_build_forward_expand(gf, mctx_cur->cpy_k_range(ctx0, k_cur, k_idxs, il, -1));
                     ggml_build_forward_expand(gf, mctx_cur->cpy_v_range(ctx0, v_cur, v_idxs, il, -1));
                 }
                 if (cp_h > 0) {
-                    ggml_tensor * k_m = k_cur;
-                    ggml_tensor * v_m = v_cur;
-                    if (mctx_cur->cp_pack() && mctx_cur->cp_dev(false) != mctx_cur->cp_dev(true)) {
-                        cp_pack_qkv(mctx_cur, q_cur, k_cur, v_cur, q_b, k_m, v_m, il);
+                    cp_live = mctx_cur->cp_n_live(il);
+                    GGML_ASSERT(cp_live >= 2);
+
+                    q_h.assign(cp_live, nullptr);
+                    std::vector<ggml_tensor *> k_h(cp_live, k_cur);
+                    std::vector<ggml_tensor *> v_h(cp_live, v_cur);
+                    if (mctx_cur->cp_pack()) {
+                        cp_pack_qkv(mctx_cur, q_cur, k_cur, v_cur, q_h, k_h, v_h, cp_live, il);
                     }
-                    ggml_tensor * sk = mctx_cur->cpy_k_range(ctx0, k_m, idx_1, il, 1);
-                    ggml_tensor * sv = mctx_cur->cpy_v_range(ctx0, v_m, idx_1, il, 1);
-                    // pinned: a set_rows follows its destination's buffer anyway, the pin keeps the sched from
-                    // splitting the helper's two stores around an owner node
-                    ggml_backend_t be_b = nullptr;
-                    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
-                        ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
-                        if (ggml_backend_get_device(b) == mctx_cur->cp_dev(true)) {
-                            be_b = b;
-                        }
+                    for (int r = 1; r < cp_live; ++r) {
+                        ggml_tensor * sk = mctx_cur->cpy_k_range(ctx0, k_h[r], inp->self_cp_idxs[r], il, r);
+                        ggml_tensor * sv = mctx_cur->cpy_v_range(ctx0, v_h[r], inp->self_cp_idxs[r], il, r);
+                        // pinned: a set_rows follows its destination's buffer anyway, the pin keeps the sched from
+                        // splitting the helper's two stores around an owner node
+                        ggml_backend_t be_r = cp_backend_of(sched, mctx_cur->cp_dev(il, r));
+                        GGML_ASSERT(be_r && "context-parallel attention: helper device has no backend in the scheduler");
+                        ggml_backend_sched_set_tensor_backend(sched, sk, be_r);
+                        ggml_backend_sched_set_tensor_backend(sched, sv, be_r);
+                        ggml_build_forward_expand(gf, sk);
+                        ggml_build_forward_expand(gf, sv);
                     }
-                    GGML_ASSERT(be_b && "context-parallel attention: helper device has no backend in the scheduler");
-                    ggml_backend_sched_set_tensor_backend(sched, sk, be_b);
-                    ggml_backend_sched_set_tensor_backend(sched, sv, be_b);
-                    ggml_build_forward_expand(gf, sk);
-                    ggml_build_forward_expand(gf, sv);
                 }
             }
         }
@@ -3327,7 +3348,7 @@ ggml_tensor * llm_graph_context::build_attn(
     }
 
     ggml_tensor * cur = cp_h > 0
-        ? build_attn_cp(inp, q, q_b, kq_mask, cp_h, kq_scale, il)
+        ? build_attn_cp(inp, q, q_h, kq_mask, cp_live, kq_scale, il)
         : build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
 
@@ -3414,17 +3435,28 @@ static ggml_backend_t cp_backend_of(ggml_backend_sched_t sched, ggml_backend_dev
     return nullptr;
 }
 
-// [CP] LLAMA_CP_PACK forward half (comment above build_attn_cp): Q|K|V as one tensor on the owner, one hop, views on
-// the helper. Leaves q_b / k_b / v_b untouched (per-tensor hops) when the shapes or types do not allow one concat.
+// [CP] LLAMA_CP_PACK forward half (comment above build_attn_cp): Q|K|V as one tensor on the owner, one hop per helper on
+// another device, views there. Leaves q_h / k_h / v_h untouched (per-tensor hops) when the shapes or types do not allow
+// one concat, and for helpers on the owner's device (the CPU test mode: no hop to save, no concat built).
 void llm_graph_context::cp_pack_qkv(
         const llama_kv_cache_context * mctx_cur,
         ggml_tensor * q_cur,
         ggml_tensor * k_cur,
         ggml_tensor * v_cur,
-        ggml_tensor *& q_b,
-        ggml_tensor *& k_b,
-        ggml_tensor *& v_b,
+        std::vector<ggml_tensor *> & q_h,
+        std::vector<ggml_tensor *> & k_h,
+        std::vector<ggml_tensor *> & v_h,
+                int   n_live,
                 int   il) const {
+    ggml_backend_dev_t dev_a = mctx_cur->cp_dev(il, 0);
+    bool any = false;
+    for (int r = 1; r < n_live; ++r) {
+        any = any || mctx_cur->cp_dev(il, r) != dev_a;
+    }
+    if (!any) {
+        return;
+    }
+
     const int64_t D = q_cur->ne[0];
     const bool ok =
         q_cur->type == GGML_TYPE_F32 && k_cur->type == GGML_TYPE_F32 && v_cur->type == GGML_TYPE_F32 &&
@@ -3435,9 +3467,8 @@ void llm_graph_context::cp_pack_qkv(
         return;
     }
 
-    ggml_backend_t be_a = cp_backend_of(sched, mctx_cur->cp_dev(false));
-    ggml_backend_t be_b = cp_backend_of(sched, mctx_cur->cp_dev(true));
-    GGML_ASSERT(be_a && be_b && "context-parallel attention: owner or helper device has no backend in the scheduler");
+    ggml_backend_t be_a = cp_backend_of(sched, dev_a);
+    GGML_ASSERT(be_a && "context-parallel attention: owner device has no backend in the scheduler");
 
     ggml_tensor * qk = ggml_concat(ctx0, q_cur, k_cur, 1);
     ggml_backend_sched_set_tensor_backend(sched, qk, be_a);
@@ -3445,39 +3476,57 @@ void llm_graph_context::cp_pack_qkv(
     ggml_backend_sched_set_tensor_backend(sched, qkv, be_a);
     cb(qkv, "cp_qkv", il);
 
-    ggml_tensor * qkv_b = ggml_cont(ctx0, qkv);            // the one hop: the sched copies qkv into B for this node
-    ggml_backend_sched_set_tensor_backend(sched, qkv_b, be_b);
-    cb(qkv_b, "cp_qkv_b", il);
-
     const int64_t nh    = q_cur->ne[1];
     const int64_t nh_kv = k_cur->ne[1];
     const int64_t nt    = q_cur->ne[2];
-    const size_t  nb1   = qkv_b->nb[1];
-    const size_t  nb2   = qkv_b->nb[2];
 
-    q_b = ggml_view_3d(ctx0, qkv_b, D, nh,    nt, nb1, nb2, 0);
-    k_b = ggml_view_3d(ctx0, qkv_b, D, nh_kv, nt, nb1, nb2, nh*nb1);
-    v_b = ggml_view_3d(ctx0, qkv_b, D, nh_kv, nt, nb1, nb2, (nh + nh_kv)*nb1);
+    for (int r = 1; r < n_live; ++r) {
+        if (mctx_cur->cp_dev(il, r) == dev_a) {
+            continue;
+        }
+        ggml_backend_t be_r = cp_backend_of(sched, mctx_cur->cp_dev(il, r));
+        GGML_ASSERT(be_r && "context-parallel attention: helper device has no backend in the scheduler");
+
+        ggml_tensor * qkv_r = ggml_cont(ctx0, qkv);        // the one hop: the sched copies qkv into helper r for this node
+        ggml_backend_sched_set_tensor_backend(sched, qkv_r, be_r);
+        cb(qkv_r, cp_name("cp_qkv_%c", r), il);
+
+        const size_t nb1 = qkv_r->nb[1];
+        const size_t nb2 = qkv_r->nb[2];
+
+        q_h[r] = ggml_view_3d(ctx0, qkv_r, D, nh,    nt, nb1, nb2, 0);
+        k_h[r] = ggml_view_3d(ctx0, qkv_r, D, nh_kv, nt, nb1, nb2, nh*nb1);
+        v_h[r] = ggml_view_3d(ctx0, qkv_r, D, nh_kv, nt, nb1, nb2, (nh + nh_kv)*nb1);
+    }
 }
 
+// [CP] 2026-10-23, N ranges: helper r (range [h_r, h_r+1) on its own device) is what "B" is below; every helper gets
+// its own B1 (store + FA over [h_r, min(h_r+1, n_kv))) and B2 (its partial out), all B1 before A2 so every helper
+// starts before the owner queues FA_A, all B2 after it. Hops per layer per step: one forward and one back per helper
+// on another device (pack). N = 2 is node for node the graph below (same calls, same order).
 ggml_tensor * llm_graph_context::build_attn_cp(
         llm_graph_input_attn_kv * inp,
         ggml_tensor * q,
-        ggml_tensor * q_b,
+        const std::vector<ggml_tensor *> & q_h,
         ggml_tensor * kq_mask,
-           uint32_t   h,
+                int   n_live,
               float   kq_scale,
                 int   il) const {
     const auto * mctx_cur = inp->mctx;
 
-    ggml_backend_t be_a = cp_backend_of(sched, mctx_cur->cp_dev(false));
-    ggml_backend_t be_b = cp_backend_of(sched, mctx_cur->cp_dev(true));
-    GGML_ASSERT(be_a && be_b && "context-parallel attention: owner or helper device has no backend in the scheduler");
+    GGML_ASSERT(n_live >= 2 && (int) q_h.size() == n_live);
+
+    std::vector<ggml_backend_t> be(n_live);
+    for (int r = 0; r < n_live; ++r) {
+        be[r] = cp_backend_of(sched, mctx_cur->cp_dev(il, r));
+        GGML_ASSERT(be[r] && "context-parallel attention: owner or helper device has no backend in the scheduler");
+    }
+    ggml_backend_t be_a = be[0];
 
     const bool pack = mctx_cur->cp_pack();
 
-    auto on = [&](ggml_tensor * t, ggml_backend_t be) {
-        ggml_backend_sched_set_tensor_backend(sched, t, be);
+    auto on = [&](ggml_tensor * t, ggml_backend_t b) {
+        ggml_backend_sched_set_tensor_backend(sched, t, b);
         return t;
     };
 
@@ -3488,22 +3537,24 @@ ggml_tensor * llm_graph_context::build_attn_cp(
     const int64_t  nh   = q->ne[1];
     const int64_t  nt   = q->ne[2];
 
-    GGML_ASSERT(h > 0 && h < n_kv);
+    GGML_ASSERT(mctx_cur->cp_bound(n_live - 1) < n_kv);
 
-    // the helper reads its own persistent mask when the owner does, else a column view of the graph input
-    // [KQ_MASK_DEV] with the device-built mask the helper reads the owner's op output (the sched copies it to B),
-    // unless LLAMA_CP_PACK and B's device has its own op (cp_kq_build_dev): then B reads that one, no 1.5 MB hop
-    ggml_tensor * mask_b = kq_mask;
-    if (kq_mask != inp->get_kq_mask() && !inp->kq_build_on) {
-        ggml_tensor * dev_b = mctx_cur->cp_kq_mask_dev();
-        GGML_ASSERT(dev_b);
-        mask_b = inp->get_kq_mask_dev_view(ctx0, dev_b);
-    } else if (pack && inp->kq_build_on && kq_mask != inp->get_kq_mask()) {
-        const int idx_b = mctx_cur->cp_kq_build_dev();
-        if (idx_b >= 0) {
-            mask_b = inp->get_kq_build_view(ctx0, idx_b);
-            GGML_ASSERT(mask_b->ne[0] == kq_mask->ne[0] && mask_b->ne[1] == kq_mask->ne[1]);
-            on(mask_b->view_src, be_b);
+    // each helper reads its own persistent mask when the owner does, else a column view of the graph input
+    // [KQ_MASK_DEV] with the device-built mask a helper reads the owner's op output (the sched copies it over),
+    // unless LLAMA_CP_PACK and the helper's device has its own op (cp_kq_build_dev): then it reads that one, no 1.5 MB hop
+    std::vector<ggml_tensor *> mask(n_live, kq_mask);
+    for (int r = 1; r < n_live; ++r) {
+        if (kq_mask != inp->get_kq_mask() && !inp->kq_build_on) {
+            ggml_tensor * dev_r = mctx_cur->cp_kq_mask_dev(il, r);
+            GGML_ASSERT(dev_r);
+            mask[r] = inp->get_kq_mask_dev_view(ctx0, dev_r);
+        } else if (pack && inp->kq_build_on && kq_mask != inp->get_kq_mask()) {
+            const int idx_r = mctx_cur->cp_kq_build_dev(il, r);
+            if (idx_r >= 0) {
+                mask[r] = inp->get_kq_build_view(ctx0, idx_r);
+                GGML_ASSERT(mask[r]->ne[0] == kq_mask->ne[0] && mask[r]->ne[1] == kq_mask->ne[1]);
+                on(mask[r]->view_src, be[r]);
+            }
         }
     }
 
@@ -3513,10 +3564,9 @@ ggml_tensor * llm_graph_context::build_attn_cp(
     };
 
     q = ggml_permute(ctx0, q, 0, 2, 1, 3);
-    ggml_tensor * qp_b = q_b ? ggml_permute(ctx0, q_b, 0, 2, 1, 3) : q;
 
-    // [CP] i0/i1 are global cells; get_k_range picks the range holding them (range 0 [0, h) on A, range 1 [h, n_kv) on
-    // B, both at local row 0: no offset view, unlike the mirror read at h), ref = the LLAMA_CP_CHECK reference on A
+    // [CP] i0/i1 are global cells; get_k_range picks the range holding them (each range at its local row 0), ref = the
+    // LLAMA_CP_CHECK reference on the owner
     auto fa = [&](ggml_tensor * qq, uint32_t i0, uint32_t i1, bool ref, ggml_tensor * m, bool lse) {
         ggml_tensor * k = ggml_permute(ctx0, mctx_cur->get_k_range(ctx0, il, i0, i1, ref), 0, 2, 1, 3);
         ggml_tensor * v = ggml_permute(ctx0, mctx_cur->get_v_range(ctx0, il, i0, i1, ref), 0, 2, 1, 3);
@@ -3530,66 +3580,133 @@ ggml_tensor * llm_graph_context::build_attn_cp(
         return cur; // [D (+4), nh, nt]
     };
 
-    ggml_tensor * p_b = on(fa(qp_b, h, n_kv, false, cols(mask_b, h, n_kv), true), be_b);
-    cb(p_b, "cp_fa_b", il);
-    ggml_build_forward_expand(gf, p_b);
-
-    ggml_tensor * p_a = on(fa(q, 0, h, false, cols(kq_mask, 0, h), true), be_a);
-    res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, p_a, il});
-    cb(p_a, "cp_fa_a", il);
-    ggml_build_forward_expand(gf, p_a);
-
-    auto lse_of = [&](ggml_tensor * p, ggml_backend_t be) {
-        return on(ggml_cont(ctx0, ggml_view_3d(ctx0, p, 1, nh, nt, p->nb[1], p->nb[2], D*sizeof(float))), be);
-    };
-    auto o_of = [&](ggml_tensor * p) {
-        return ggml_view_3d(ctx0, p, D, nh, nt, p->nb[1], p->nb[2], 0);
-    };
-
-    // B2 and the hop back. Pack: B2 = cont(p_b) on B, A3 opens with a cont of it on A (the one hop: an A node reads
-    // the whole B tensor), lse_b / O_b are views on A. Else B2 = lse_b on B and A hops lse_b and the O_b view.
-    ggml_tensor * lse_b;
-    ggml_tensor * o_b;
-    if (pack) {
-        ggml_tensor * x = on(ggml_cont(ctx0, p_b), be_b);
-        cb(x, "cp_fa_b_out", il);
-        ggml_build_forward_expand(gf, x);
-
-        ggml_tensor * p_b_a = on(ggml_cont(ctx0, x), be_a);
-        cb(p_b_a, "cp_fa_b_on_a", il);
-
-        lse_b = lse_of(p_b_a, be_a);
-        o_b   = o_of(p_b_a);
-    } else {
-        lse_b = lse_of(p_b, be_b);
-        cb(lse_b, "cp_lse_b", il);
-        ggml_build_forward_expand(gf, lse_b);
-        o_b   = o_of(p_b);
+    std::vector<ggml_tensor *> p(n_live, nullptr);
+    for (int r = 1; r < n_live; ++r) {
+        const uint32_t c0 = mctx_cur->cp_bound(r);
+        const uint32_t c1 = std::min(mctx_cur->cp_bound(r + 1), n_kv);
+        ggml_tensor * qq = q_h[r] ? ggml_permute(ctx0, q_h[r], 0, 2, 1, 3) : q;
+        p[r] = on(fa(qq, c0, c1, false, cols(mask[r], c0, c1), true), be[r]);
+        cb(p[r], cp_name("cp_fa_%c", r), il);
+        ggml_build_forward_expand(gf, p[r]);
     }
 
-    ggml_tensor * lse_a = lse_of(p_a, be_a);
-    ggml_tensor * w     = on(ggml_soft_max(ctx0, on(ggml_concat(ctx0, lse_a, lse_b, 0), be_a)), be_a); // [2, nh, nt]
-    ggml_tensor * w_a   = on(ggml_cont(ctx0, ggml_view_3d(ctx0, w, 1, nh, nt, w->nb[1], w->nb[2], 0)), be_a);
-    ggml_tensor * w_b   = on(ggml_cont(ctx0, ggml_view_3d(ctx0, w, 1, nh, nt, w->nb[1], w->nb[2], sizeof(float))), be_a);
+    const uint32_t h = mctx_cur->cp_bound(1);
+    p[0] = on(fa(q, 0, h, false, cols(kq_mask, 0, h), true), be_a);
+    res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, p[0], il});
+    cb(p[0], "cp_fa_a", il);
+    ggml_build_forward_expand(gf, p[0]);
 
-    ggml_tensor * cur = on(ggml_add(ctx0,
-            on(ggml_mul(ctx0, o_of(p_a), w_a), be_a),
-            on(ggml_mul(ctx0, o_b, w_b), be_a)), be_a);
-    cb(cur, "cp_merged", il);
-    ggml_build_forward_expand(gf, cur);
+    auto lse_of = [&](ggml_tensor * t, ggml_backend_t b) {
+        return on(ggml_cont(ctx0, ggml_view_3d(ctx0, t, 1, nh, nt, t->nb[1], t->nb[2], D*sizeof(float))), b);
+    };
+    auto o_of = [&](ggml_tensor * t) {
+        return ggml_view_3d(ctx0, t, D, nh, nt, t->nb[1], t->nb[2], 0);
+    };
 
-    if (mctx_cur->cp_check()) {
+    // B2 and the hop back, per helper. Pack: B2 = cont(p_r) on the helper, A3 opens with a cont of it on the owner (the
+    // one hop: an owner node reads the whole helper tensor), lse_r / O_r are views on the owner. Else B2 = lse_r on the
+    // helper and the owner hops lse_r and the O_r view (N >= 3: the merge op hops the whole p_r instead).
+    // Partials in range order (owner first); lse/o are only read by the 2-way ops path, p (the whole [D + 4] tensor)
+    // only by GGML_OP_FLASH_ATTN_MERGE, so the 2-way non-pack graph keeps its two separate hops.
+    std::vector<llm_cp_partial> parts(n_live);
+    for (int r = 1; r < n_live; ++r) {
+        if (pack) {
+            ggml_tensor * x = on(ggml_cont(ctx0, p[r]), be[r]);
+            cb(x, cp_name("cp_fa_%c_out", r), il);
+            ggml_build_forward_expand(gf, x);
+
+            ggml_tensor * p_r_a = on(ggml_cont(ctx0, x), be_a);
+            cb(p_r_a, cp_name("cp_fa_%c_on_a", r), il);
+
+            parts[r] = { p_r_a, nullptr, nullptr };
+            parts[r].lse = lse_of(p_r_a, be_a);
+            parts[r].o   = o_of(p_r_a);
+        } else {
+            ggml_tensor * lse_r = lse_of(p[r], be[r]);
+            cb(lse_r, cp_name("cp_lse_%c", r), il);
+            ggml_build_forward_expand(gf, lse_r);
+            parts[r] = { n_live > 2 ? p[r] : nullptr, o_of(p[r]), lse_r };
+        }
+    }
+    parts[0] = { pack || n_live > 2 ? p[0] : nullptr, o_of(p[0]), lse_of(p[0], be_a) };
+
+    ggml_tensor * cur = build_attn_cp_merge(parts, be_a, il);
+
+    if (mctx_cur->cp_check(il)) {
         ggml_tensor * full = on(fa(q, 0, n_kv, true, kq_mask, false), be_a);
         cb(full, "cp_fa_full", il);
         ggml_set_output(full);
         ggml_set_output(cur);
         ggml_build_forward_expand(gf, full);
 
-        res->t_cp_full   = full;
-        res->t_cp_merged = cur;
+        res->t_cp_full.push_back(full);
+        res->t_cp_merged.push_back(cur);
     }
 
     return ggml_reshape_2d(ctx0, cur, D*nh, nt);
+}
+
+// [CP] 2026-10-23: merge of N context-parallel partials (design-context-parallel-at-scale.md step 3 needs N = 3: owner +
+// two helpers). All merge nodes run on `be` (the owner).
+//   N == 2 and LLAMA_CP_MERGE_OP unset (default): the 2-way ops recipe of 2026-10-21, node for node as before
+//     (concat of the two lse -> soft_max -> 2 views/cont -> 2 mul -> add). Kept because the LLAMA_CP_CHECK gate numbers
+//     (nmse 2.3e-7, argmax 1.0 on Vulkan, 2026-10-22) were taken on exactly this arithmetic.
+//   N >= 3, or N == 2 with LLAMA_CP_MERGE_OP=1: one GGML_OP_FLASH_ATTN_MERGE over the packed [D + 4] partials (needs
+//     every p, i.e. the LLAMA_CP_PACK path; N == 2 without it falls back to the ops, N >= 3 asserts). Softmax over N lse = pairwise fold up to f32 rounding:
+//     test-flash-attn-merge 2026-10-23 on CPU, nway vs fold and vs the ops recipe <= 1e-6 row-relative. A partial with
+//     lse -inf (its range holds no attended cell for this row, e.g. a helper range beyond n_kv) is skipped, not multiplied.
+//     Vulkan: compiled, NOT gated (gate: test-backend-ops -o FLASH_ATTN_MERGE -b Vulkan<n>, then LLAMA_CP_CHECK with
+//     LLAMA_CP_MERGE_OP=1). Vulkan takes N <= 4 (supports_op), more falls back to the CPU via the sched.
+// Shapes: every partial is [D (+4), nh, nt] for this ubatch; nothing here depends on n_kv, so N fixed per layer keeps the
+// graph shape fixed (no gallocr re-plan per ubatch).
+ggml_tensor * llm_graph_context::build_attn_cp_merge(
+        const std::vector<llm_cp_partial> & parts,
+        ggml_backend_t be,
+        int il) const {
+    static const bool use_op = [] {
+        const char * e = getenv("LLAMA_CP_MERGE_OP");
+        return e && atoi(e) != 0;
+    }();
+
+    auto on = [&](ggml_tensor * t) {
+        ggml_backend_sched_set_tensor_backend(sched, t, be);
+        return t;
+    };
+
+    const int N = (int) parts.size();
+    GGML_ASSERT(N >= 2 && N <= GGML_MAX_SRC);
+
+    // LLAMA_CP_MERGE_OP=1 with LLAMA_CP_PACK=0: no whole partial on the owner, keep the 2-way ops
+    const bool have_p = std::all_of(parts.begin(), parts.end(), [](const llm_cp_partial & p) { return p.p != nullptr; });
+
+    ggml_tensor * cur;
+    if (N == 2 && (!use_op || !have_p)) {
+        ggml_tensor * o_a   = parts[0].o;
+        ggml_tensor * lse_a = parts[0].lse;
+        ggml_tensor * o_b   = parts[1].o;
+        ggml_tensor * lse_b = parts[1].lse;
+        const int64_t nh = o_a->ne[1];
+        const int64_t nt = o_a->ne[2];
+
+        ggml_tensor * w     = on(ggml_soft_max(ctx0, on(ggml_concat(ctx0, lse_a, lse_b, 0)))); // [2, nh, nt]
+        ggml_tensor * w_a   = on(ggml_cont(ctx0, ggml_view_3d(ctx0, w, 1, nh, nt, w->nb[1], w->nb[2], 0)));
+        ggml_tensor * w_b   = on(ggml_cont(ctx0, ggml_view_3d(ctx0, w, 1, nh, nt, w->nb[1], w->nb[2], sizeof(float))));
+
+        cur = on(ggml_add(ctx0,
+                on(ggml_mul(ctx0, o_a, w_a)),
+                on(ggml_mul(ctx0, o_b, w_b))));
+    } else {
+        std::vector<ggml_tensor *> ps;
+        for (const auto & p : parts) {
+            GGML_ASSERT(p.p && "context-parallel N-way merge needs the packed partials (LLAMA_CP_PACK)");
+            ps.push_back(p.p);
+        }
+        cur = on(ggml_flash_attn_merge(ctx0, ps.data(), N, false));
+    }
+    cb(cur, "cp_merged", il);
+    ggml_build_forward_expand(gf, cur);
+
+    return cur;
 }
 
 static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(

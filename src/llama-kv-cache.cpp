@@ -111,12 +111,14 @@ llama_kv_cache::llama_kv_cache(
     };
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
 
+    size_t cp_extra_tensors = 0; // [CP] per CP layer: N - 1 range K/V pairs + the check reference pair, set below
+
     // create a context for each buffer type
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t((2u*(1 + n_stream)*n_layer + 6)*ggml_tensor_overhead()), // +1: [KQ_MASK_INC] kq_mask_dev, +4: [CP] range 1 K/V + check reference K/V
+                /*.mem_size   =*/ size_t((2u*(1 + n_stream)*n_layer + 6 + cp_extra_tensors)*ggml_tensor_overhead()), // +1: [KQ_MASK_INC] kq_mask_dev
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -169,82 +171,229 @@ llama_kv_cache::llama_kv_cache(
     const bool is_mla = hparams.is_mla();
 
     // [CP] context-parallel attention, range-split KV, see cp_state in llama-kv-cache.h. Decided before the layer loop
-    // because the CP layer's range 0 replaces its K/V tensor. The helper is a FIXED device (LLAMA_CP_DEV, mandatory) and
-    // range 1 is allocated there whenever the layer is in this cache, whatever device the layer itself landed on: the
-    // fit probes this constructor with many placements; 2026-10-21 night the helper was "the other GPU with the owner's
-    // description", so its share moved (or vanished) between probes: Vulkan1 was sized while layer 27 sat on the CPU,
-    // then the owner moved to Vulkan3 and Vulkan1 grew by 1156 MiB after its share was fixed -> both XTX over budget,
-    // GTT placement, every step ~3x slower. Constant memory per device = honest fit (memory_breakdown counts every range
-    // tensor on its own buffer type in the no_alloc probes, common/fit.cpp needs no change).
-    int32_t            cp_il   = -1;
-    ggml_backend_dev_t cp_devb = nullptr;
-    if (const char * env_il = getenv("LLAMA_CP_LAYER"); env_il && atoi(env_il) >= 0 && (uint32_t) atoi(env_il) < n_layer) {
-        const int32_t il = atoi(env_il);
-
-        const char * env_dev = getenv("LLAMA_CP_DEV");
-        if (!env_dev || !*env_dev) {
-            throw std::runtime_error("LLAMA_CP_LAYER is set but LLAMA_CP_DEV is not: set LLAMA_CP_DEV to the helper device name (e.g. Vulkan1), one of the model's devices, or CPU for the CPU test mode");
-        }
-        ggml_backend_dev_t dev_b = nullptr;
-        if (strcmp(env_dev, "CPU") == 0) {
-            // CPU test mode (2026-10-22 night): both ranges in host memory, the whole CP graph on the CPU backend
-            dev_b = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-        } else {
-            std::string names;
-            for (const auto & d : model.devices) {
-                names += std::string(names.empty() ? "" : ", ") + ggml_backend_dev_name(d.dev);
-                if (strcmp(ggml_backend_dev_name(d.dev), env_dev) == 0) {
-                    dev_b = d.dev;
+    // because a CP layer's range 0 replaces its K/V tensor. The helpers are FIXED devices (LLAMA_CP_DEVS / LLAMA_CP_DEV)
+    // and their ranges are allocated whenever the layer is in this cache: the fit probes this constructor with many
+    // placements; 2026-10-21 night the helper was "the other GPU with the owner's description", so its share moved (or
+    // vanished) between probes: Vulkan1 was sized while layer 27 sat on the CPU, then the owner moved to Vulkan3 and
+    // Vulkan1 grew by 1156 MiB after its share was fixed -> both XTX over budget, GTT placement, every step ~3x slower.
+    std::vector<bool>               cp_want(n_layer, false);
+    std::vector<ggml_backend_dev_t> cp_devs;                 // LLAMA_CP_DEVS, or the one LLAMA_CP_DEV helper
+    bool                            cp_owner_listed = false; // LLAMA_CP_DEVS: each layer's owner must be in cp_devs
+    std::vector<int32_t>            cp_ref_layers;           // LLAMA_CP_CHECK_LAYERS, empty: every CP layer
+    int                             cp_n    = 0;             // N
+    bool                            cp_ok   = false;
+    bool                            cp_all  = false;         // LLAMA_CP_LAYERS=all: skipped layers are not loud
+    {
+        auto split = [](const char * str) {
+            std::vector<std::string> out;
+            std::string cur;
+            for (const char * c = str; ; ++c) {
+                if (*c == ',' || *c == 0) {
+                    if (!cur.empty()) {
+                        out.push_back(cur);
+                    }
+                    cur.clear();
+                    if (*c == 0) {
+                        break;
+                    }
+                } else if (*c != ' ') {
+                    cur += *c;
                 }
             }
-            if (!dev_b) {
-                throw std::runtime_error(std::string("LLAMA_CP_DEV=") + env_dev + " is not a device of this model's split (" + (names.empty() ? std::string("none, CPU only; LLAMA_CP_DEV=CPU is the CPU test mode") : names) + ")");
+            return out;
+        };
+
+        if (const char * e = getenv("LLAMA_CP_LAYER"); e && atoi(e) >= 0 && (uint32_t) atoi(e) < n_layer) {
+            cp_want[atoi(e)] = true;
+        }
+        if (const char * e = getenv("LLAMA_CP_LAYERS"); e && *e) {
+            if (strcmp(e, "all") == 0) {
+                cp_all = true;
+                for (uint32_t il = 0; il < std::min(n_layer, hparams.n_layer()); ++il) {
+                    cp_want[il] = true;
+                }
+            } else {
+                for (const auto & t : split(e)) {
+                    const int il = atoi(t.c_str());
+                    if (il >= 0 && (uint32_t) il < n_layer) {
+                        cp_want[il] = true;
+                    }
+                }
             }
-            if (ggml_backend_dev_type(dev_b) != GGML_BACKEND_DEVICE_TYPE_GPU) {
-                throw std::runtime_error(std::string("LLAMA_CP_DEV=") + env_dev + " is not a GPU");
+        }
+        bool any = std::find(cp_want.begin(), cp_want.end(), true) != cp_want.end();
+
+        const char * env_dev  = getenv("LLAMA_CP_DEV");
+        const char * env_devs = getenv("LLAMA_CP_DEVS");
+        if (any) {
+            if ((!env_dev || !*env_dev) && (!env_devs || !*env_devs)) {
+                throw std::runtime_error("LLAMA_CP_LAYER(S) is set but LLAMA_CP_DEVS / LLAMA_CP_DEV is not: set LLAMA_CP_DEVS to the devices in range order (e.g. Vulkan3,Vulkan1,Vulkan2) or LLAMA_CP_DEV to one helper; CPU is the CPU test mode");
+            }
+            if (env_dev && *env_dev && env_devs && *env_devs) {
+                throw std::runtime_error("set one of LLAMA_CP_DEVS and LLAMA_CP_DEV, not both");
+            }
+            auto find_dev = [&](const std::string & name, const char * var) {
+                if (name == "CPU") {
+                    // CPU test mode (2026-10-22 night): the ranges in host memory, the whole CP graph on the CPU backend
+                    return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                }
+                ggml_backend_dev_t dev = nullptr;
+                std::string names;
+                for (const auto & d : model.devices) {
+                    names += std::string(names.empty() ? "" : ", ") + ggml_backend_dev_name(d.dev);
+                    if (name == ggml_backend_dev_name(d.dev)) {
+                        dev = d.dev;
+                    }
+                }
+                if (!dev) {
+                    throw std::runtime_error(std::string(var) + ": " + name + " is not a device of this model's split (" + (names.empty() ? std::string("none, CPU only; CPU is the CPU test mode") : names) + ")");
+                }
+                if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    throw std::runtime_error(std::string(var) + ": " + name + " is not a GPU");
+                }
+                return dev;
+            };
+            if (env_devs && *env_devs) {
+                for (const auto & t : split(env_devs)) {
+                    try {
+                        cp_devs.push_back(find_dev(t, "LLAMA_CP_DEVS"));
+                    } catch (const std::exception & e) {
+                        // LLAMA_CP_LAYERS=all also reaches a second model of the process (a -md draft on its own
+                        // devices): that model stays plain instead of failing to load
+                        if (!cp_all) {
+                            throw;
+                        }
+                        LLAMA_LOG_WARN("%s: context-parallel attention off for this model: %s\n", __func__, e.what());
+                        cp_devs.clear();
+                        break;
+                    }
+                }
+                if (cp_devs.empty()) {
+                    std::fill(cp_want.begin(), cp_want.end(), false);
+                }
+                cp_owner_listed = true;
+                cp_n = (int) cp_devs.size();
+                any  = any && cp_n > 0;
+                if (any && (cp_n < 2 || cp_n > GGML_MAX_SRC)) {
+                    throw std::runtime_error("LLAMA_CP_DEVS needs 2 to " + std::to_string(GGML_MAX_SRC) + " devices (the owner included)");
+                }
+            } else {
+                cp_devs.push_back(find_dev(env_dev, "LLAMA_CP_DEV"));
+                cp_n = 2;
+            }
+        }
+
+        const char * env_cell = getenv("LLAMA_CP_SPLIT_CELL");
+        std::vector<uint32_t> cells;
+        if (env_cell) {
+            for (const auto & t : split(env_cell)) {
+                cells.push_back((uint32_t) std::max(0, atoi(t.c_str())));
             }
         }
 
         const char * why_not = nullptr;
-        if (!offload)                             why_not = "KV offload off";
+        if (!any)                                 why_not = "no layer";
+        else if (!offload)                        why_not = "KV offload off";
         else if (v_trans)                         why_not = "no flash attention";
         else if (n_stream != 1)                   why_not = "more than one stream";
         else if (swa_type != LLAMA_SWA_TYPE_NONE) why_not = "SWA cache";
         else if (is_mla)                          why_not = "MLA";
-        else if (kv_size < 512)                   why_not = "kv_size < 512 (each range needs >= 256 cells)";
+        else if (!kq_mask_inc)                    why_not = "wrapper cache (iSWA/MSA/DSA/DSv4 graphs do not read it through build_attn_inp_kv)";
+        else if (name_tag && *name_tag)           why_not = "auxiliary cache (indexer)";
+        else if (env_cell && (int) cells.size() != cp_n - 1) why_not = "LLAMA_CP_SPLIT_CELL needs N - 1 cells (N = number of ranges)";
+        else if (!env_cell && kv_size < 256u*cp_n) why_not = "kv_size < 256 x N (each range needs >= 256 cells)";
 
-        if (const char * env_cell = getenv("LLAMA_CP_SPLIT_CELL"); !why_not && env_cell && (atoi(env_cell) <= 0 || (uint32_t) atoi(env_cell) >= kv_size)) {
-            why_not = "LLAMA_CP_SPLIT_CELL outside (0, kv_size)";
-        }
-        // the CPU test mode runs the stock tests at n_ctx 256 with LLAMA_CP_SPLIT_CELL=128
-        if (why_not && kv_size < 512 && getenv("LLAMA_CP_SPLIT_CELL") && atoi(getenv("LLAMA_CP_SPLIT_CELL")) > 0 && (uint32_t) atoi(getenv("LLAMA_CP_SPLIT_CELL")) < kv_size &&
-                offload && !v_trans && n_stream == 1 && swa_type == LLAMA_SWA_TYPE_NONE && !is_mla) {
-            why_not = nullptr;
+        // 256: n_kv is padded to max(n_pad, 256) (get_n_kv) and every FA KV tile divides 256, so every FA length
+        // (h_r+1 - h_r, n_kv - h_r) stays tile aligned, the invariant the 2026-10-21 cp_split had
+        constexpr uint32_t pad = 256;
+        std::vector<uint32_t> bounds;
+        if (!why_not) {
+            std::vector<double> fr(cp_n, 1.0);
+            const char * env_fracs = getenv("LLAMA_CP_FRACS");
+            const char * env_frac  = getenv("LLAMA_CP_SPLIT_FRAC");
+            if (env_fracs) {
+                const auto t = split(env_fracs);
+                if ((int) t.size() != cp_n) {
+                    throw std::runtime_error("LLAMA_CP_FRACS needs one fraction per range (N = " + std::to_string(cp_n) + ")");
+                }
+                for (int r = 0; r < cp_n; ++r) {
+                    fr[r] = std::max(1e-6, atof(t[r].c_str()));
+                }
+            } else if (env_frac && cp_n == 2) {
+                const double f = std::clamp((float) atof(env_frac), 0.0f, 1.0f);
+                fr = { f, 1.0 - f };
+            }
+
+            // ranges [r0, N) share cells [c0, kv_size) by their fractions, each >= pad
+            auto share = [&](int r0, uint32_t c0) {
+                double tot = 0.0;
+                for (int r = r0; r < cp_n; ++r) {
+                    tot += fr[r];
+                }
+                double cum = 0.0;
+                for (int r = r0 + 1; r < cp_n; ++r) {
+                    cum += fr[r - 1];
+                    const uint32_t h = c0 + (uint32_t) std::lround(cum/tot*(kv_size - c0)/pad)*pad;
+                    bounds[r] = std::clamp(h, bounds[r - 1] + pad, kv_size - (uint32_t) (cp_n - r)*pad);
+                }
+            };
+
+            bounds.assign(cp_n + 1, 0);
+            bounds[cp_n] = kv_size;
+            if (env_cell) {
+                for (int r = 1; r < cp_n; ++r) {
+                    bounds[r] = cells[r - 1];
+                }
+            } else {
+                share(0, 0);
+            }
+
+            if (const char * env_min = getenv("LLAMA_CP_MIN_KV"); env_min && atoi(env_min) > 0) {
+                const uint32_t h1 = GGML_PAD((uint32_t) atoi(env_min), pad);
+                if (h1 >= kv_size) {
+                    why_not = "LLAMA_CP_MIN_KV >= kv_size: the owner holds every cell";
+                } else if (bounds[1] < h1) {
+                    bounds[1] = h1;
+                    if (!env_cell) {
+                        if (kv_size - h1 < (uint32_t) (cp_n - 1)*pad) {
+                            why_not = "LLAMA_CP_MIN_KV leaves < 256 cells per helper range";
+                        } else {
+                            share(1, h1);
+                        }
+                    }
+                }
+            }
+            for (int r = 1; r <= cp_n && !why_not; ++r) {
+                if (bounds[r] <= bounds[r - 1]) {
+                    why_not = "range bounds not increasing in (0, kv_size) (LLAMA_CP_SPLIT_CELL / LLAMA_CP_MIN_KV)";
+                }
+            }
         }
 
         if (why_not) {
-            LLAMA_LOG_WARN("%s: context-parallel attention off for layer %d: %s\n", __func__, il, why_not);
+            if (any) {
+                LLAMA_LOG_WARN("%s: context-parallel attention off: %s\n", __func__, why_not);
+            }
         } else {
-            cp_il   = il;
-            cp_devb = dev_b;
+            cp_ok     = true;
+            cp.bounds = bounds;
 
-            const char * env_frac = getenv("LLAMA_CP_SPLIT_FRAC");
-            const char * env_cell = getenv("LLAMA_CP_SPLIT_CELL");
             const char * env_chk  = getenv("LLAMA_CP_CHECK");
             const char * env_pack = getenv("LLAMA_CP_PACK");
-            cp.frac  = env_frac ? std::clamp((float) atof(env_frac), 0.0f, 1.0f) : 0.5f;
             cp.check = env_chk && atoi(env_chk) != 0;
             cp.pack  = !env_pack || atoi(env_pack) != 0;
-            if (env_cell) {
-                cp.h = (uint32_t) atoi(env_cell);
-            } else {
-                // 256: n_kv is padded to max(n_pad, 256) (get_n_kv) and every FA KV tile divides 256, so both FA
-                // lengths (h, n_kv - h) stay tile aligned, the invariant the 2026-10-21 cp_split had
-                constexpr uint32_t pad = 256;
-                cp.h = std::clamp((uint32_t) std::lround(cp.frac*kv_size/pad)*pad, pad, kv_size - pad);
+            if (const char * e = getenv("LLAMA_CP_CHECK_LAYERS"); cp.check && e && *e) {
+                for (const auto & t : split(e)) {
+                    cp_ref_layers.push_back(atoi(t.c_str()));
+                }
             }
+
+            cp_extra_tensors = (size_t) 2*(cp_n + 1)*n_layer;
         }
     }
+
+    // [CP] per-layer decisions that keep the layer plain, logged once after the loop
+    int cp_n_unlisted = 0;
 
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
@@ -329,10 +478,32 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        // [CP] the CP layer's tensor is range 0 = cells [0, h) + the trash row (see cp_state); range 1 and the check
-        // reference are allocated next to it below. kv_size here stays the cell count every other path uses.
-        const bool     cp_here  = (int32_t) il == cp_il && has_k && has_v;
-        const uint32_t n_rows_0 = cp_here ? cp.h + 1 : kv_size;
+        // [CP] a CP layer's tensor is range 0 = cells [0, h_1) + the trash row (see cp_state); the other ranges and the
+        // check reference are allocated next to it below. kv_size here stays the cell count every other path uses.
+        // Range devices: [owner] + LLAMA_CP_DEVS without the owner's first occurrence, or [owner, LLAMA_CP_DEV].
+        std::vector<ggml_backend_dev_t> cp_rdev;
+        bool cp_here = cp_ok && cp_want[il] && has_k && has_v;
+        if (cp_here) {
+            ggml_backend_dev_t owner = model.dev_layer(il);
+            cp_rdev.push_back(owner);
+            if (cp_owner_listed) {
+                const auto it = std::find(cp_devs.begin(), cp_devs.end(), owner);
+                if (it == cp_devs.end()) {
+                    cp_here = false;
+                    cp_n_unlisted++;
+                    LLAMA_LOG_DEBUG("%s: layer %3d: context-parallel off, its owner %s is not in LLAMA_CP_DEVS\n", __func__, il, ggml_backend_dev_name(owner));
+                } else {
+                    for (auto jt = cp_devs.begin(); jt != cp_devs.end(); ++jt) {
+                        if (jt != it) {
+                            cp_rdev.push_back(*jt);
+                        }
+                    }
+                }
+            } else {
+                cp_rdev.push_back(cp_devs[0]);
+            }
+        }
+        const uint32_t n_rows_0 = cp_here ? cp.bounds[1] + 1 : kv_size;
 
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, n_rows_0, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, n_rows_0, n_stream) : nullptr;
@@ -349,55 +520,60 @@ llama_kv_cache::llama_kv_cache(
         }
 
         if (cp_here) {
-            cp.il = il;
+            cp_layer cl;
+            cl.il = il;
 
-            cp_range r0;
-            r0.c0   = 0;
-            r0.c1   = cp.h;
-            r0.dev  = offload ? model.dev_layer(il) : ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-            r0.buft = buft;
-            r0.k    = k;
-            r0.v    = v;
+            for (int r = 0; r < cp_n; ++r) {
+                cp_range rg;
+                rg.c0  = cp.bounds[r];
+                rg.c1  = cp.bounds[r + 1];
+                rg.dev = cp_rdev[r];
+                if (r == 0) {
+                    rg.buft = buft;
+                    rg.k    = k;
+                    rg.v    = v;
+                } else {
+                    rg.buft = ggml_backend_dev_buffer_type(rg.dev);
+                    ggml_context * ctx_r = ctx_for_buft(rg.buft);
+                    if (!ctx_r) {
+                        throw std::runtime_error("failed to create ggml context for a kv cache helper range");
+                    }
+                    rg.k = ggml_new_tensor_3d(ctx_r, type_k, n_embd_k_gqa, rg.c1 - rg.c0 + 1, 1);
+                    rg.v = ggml_new_tensor_3d(ctx_r, type_v, n_embd_v_gqa, rg.c1 - rg.c0 + 1, 1);
+                    ggml_format_name(rg.k, "cache_%sk_l%d_r%d", name_tag, il, r);
+                    ggml_format_name(rg.v, "cache_%sv_l%d_r%d", name_tag, il, r);
 
-            cp_range r1;
-            r1.c0   = cp.h;
-            r1.c1   = kv_size;
-            r1.dev  = cp_devb;
-            r1.buft = ggml_backend_dev_buffer_type(cp_devb);
-
-            ggml_context * ctx_b = ctx_for_buft(r1.buft);
-            if (!ctx_b) {
-                throw std::runtime_error("failed to create ggml context for the kv cache helper range");
-            }
-            r1.k = ggml_new_tensor_3d(ctx_b, type_k, n_embd_k_gqa, r1.c1 - r1.c0 + 1, 1);
-            r1.v = ggml_new_tensor_3d(ctx_b, type_v, n_embd_v_gqa, r1.c1 - r1.c0 + 1, 1);
-            ggml_format_name(r1.k, "cache_%sk_l%d_r1", name_tag, il);
-            ggml_format_name(r1.v, "cache_%sv_l%d_r1", name_tag, il);
-
-            // B needs its own persistent mask even when it holds no other attention layer
-            buft_layers[r1.buft];
-
-            if (cp.check) {
-                cp.ref_k = ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, 1);
-                cp.ref_v = ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, 1);
-                ggml_format_name(cp.ref_k, "cache_%sk_l%d_cpref", name_tag, il);
-                ggml_format_name(cp.ref_v, "cache_%sv_l%d_cpref", name_tag, il);
+                    // a helper needs its own persistent mask even when it holds no other attention layer
+                    buft_layers[rg.buft];
+                }
+                cl.ranges.push_back(rg);
             }
 
-            cp.ranges = { r0, r1 };
-
-            // the fit probes this constructor with no_alloc many times: the decision is loud only for the real cache
-            auto mib = [](const ggml_tensor * a, const ggml_tensor * b) { return (ggml_nbytes(a) + ggml_nbytes(b))/1024.0/1024.0; };
-            const ggml_log_level lvl = hparams.no_alloc ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_WARN;
-            llama_log_internal(lvl, "%s: context-parallel attention on layer %d: range split at cell %u of %u (frac %.3f): owner %s cells [0, %u) %.2f MiB, helper %s cells [%u, %u) %.2f MiB%s; check %d%s, pack %d\n",
-                    __func__, il, cp.h, kv_size, (double) cp.h/kv_size,
-                    ggml_backend_dev_name(r0.dev), cp.h, mib(r0.k, r0.v),
-                    ggml_backend_dev_name(r1.dev), cp.h, kv_size, mib(r1.k, r1.v),
-                    r0.dev == r1.dev ? " (same device: no overlap)" : "",
-                    cp.check, cp.check ? " (+ full reference on the owner)" : "", cp.pack);
-            if (cp.h % 256 != 0 && (ggml_backend_dev_type(r0.dev) != GGML_BACKEND_DEVICE_TYPE_CPU || ggml_backend_dev_type(r1.dev) != GGML_BACKEND_DEVICE_TYPE_CPU)) {
-                llama_log_internal(lvl, "%s: context-parallel split cell %u is not a multiple of 256: the FA ranges are not tile aligned on the GPU\n", __func__, cp.h);
+            if (cp.check && (cp_ref_layers.empty() || std::find(cp_ref_layers.begin(), cp_ref_layers.end(), (int32_t) il) != cp_ref_layers.end())) {
+                cl.ref_k = ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, 1);
+                cl.ref_v = ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, 1);
+                ggml_format_name(cl.ref_k, "cache_%sk_l%d_cpref", name_tag, il);
+                ggml_format_name(cl.ref_v, "cache_%sv_l%d_cpref", name_tag, il);
             }
+
+            // the fit probes this constructor with no_alloc many times: the decision is loud only for the real cache,
+            // and per layer only for a short layer list (the summary after the loop covers "all")
+            const ggml_log_level lvl = hparams.no_alloc || cp_all ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_WARN;
+            std::string desc;
+            for (int r = 0; r < cp_n; ++r) {
+                const auto & rg = cl.ranges[r];
+                char buf[256];
+                snprintf(buf, sizeof(buf), "%s%s %s cells [%u, %u) %.2f MiB", r ? ", " : "", r ? "helper" : "owner",
+                        ggml_backend_dev_name(rg.dev), rg.c0, rg.c1, (ggml_nbytes(rg.k) + ggml_nbytes(rg.v))/1024.0/1024.0);
+                desc += buf;
+            }
+            const bool same = std::all_of(cl.ranges.begin(), cl.ranges.end(), [&](const cp_range & rg) { return rg.dev == cl.ranges[0].dev; });
+            llama_log_internal(lvl, "%s: context-parallel attention on layer %d: %d ranges: %s%s; check %d%s, pack %d\n",
+                    __func__, il, cp_n, desc.c_str(), same ? " (same device: no overlap)" : "",
+                    cl.ref_k != nullptr, cl.ref_k ? " (+ full reference on the owner)" : "", cp.pack);
+
+            cp.idx[il] = cp.layers.size();
+            cp.layers.push_back(std::move(cl));
         }
 
         map_layer_ids[il] = layers.size();
@@ -429,21 +605,63 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
-    // [CP] a layer that reuses the CP layer's K/V would read it as one tensor (get_k) above h
-    if (cp.active()) {
+    // [CP] a layer that reuses a CP layer's K/V would read it as one tensor (get_k) above h_1
+    for (const auto & cl : cp.layers) {
         for (const auto & [il_m, ikv] : map_layer_ids) {
-            if (il_m != cp.il && ikv == map_layer_ids.at(cp.il)) {
-                throw std::runtime_error("LLAMA_CP_LAYER=" + std::to_string(cp.il) + ": layer " + std::to_string(il_m) + " reuses its K/V, not supported with context-parallel attention");
+            if (il_m != cl.il && ikv == map_layer_ids.at(cl.il)) {
+                throw std::runtime_error("context-parallel layer " + std::to_string(cl.il) + ": layer " + std::to_string(il_m) + " reuses its K/V, not supported with context-parallel attention (leave the layer out of LLAMA_CP_LAYERS)");
             }
         }
     }
 
-    // loud only when the layer is a K/V layer of this cache that could not be split (shared); a cache that does not hold
-    // the layer at all (the MTP / draft cache next to the target) stays quiet
-    if (cp_il >= 0 && !cp.active()) {
-        const bool here = map_layer_ids.find(cp_il) != map_layer_ids.end();
-        llama_log_internal(here ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_DEBUG, "%s: context-parallel attention off for layer %d: %s\n", __func__, cp_il,
-                here ? "the layer shares or reuses another layer's K/V" : "not a K/V layer of this cache");
+    // loud when a listed K/V layer of this cache could not be split (shared); a cache that does not hold the layer at
+    // all (the MTP / draft cache next to the target) stays quiet
+    if (cp_ok) {
+        const ggml_log_level lvl = hparams.no_alloc ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_WARN;
+        for (uint32_t il = 0; il < n_layer; ++il) {
+            if (cp_want[il] && !cp.get(il) && !cp_all) {
+                const bool here = map_layer_ids.find(il) != map_layer_ids.end();
+                llama_log_internal(here ? lvl : GGML_LOG_LEVEL_DEBUG, "%s: context-parallel attention off for layer %d: %s\n", __func__, il,
+                        here ? "the layer shares or reuses another layer's K/V, or its owner is not in LLAMA_CP_DEVS" : "not a K/V layer of this cache");
+            }
+        }
+        if (cp.active()) {
+            // per device: what the fit sees (memory_breakdown counts each range on its buffer type)
+            std::map<std::string, double> per_dev;
+            for (const auto & cl : cp.layers) {
+                for (const auto & rg : cl.ranges) {
+                    per_dev[ggml_backend_dev_name(rg.dev)] += (ggml_nbytes(rg.k) + ggml_nbytes(rg.v))/1024.0/1024.0;
+                }
+            }
+            std::string bs;
+            for (size_t r = 0; r < cp.bounds.size(); ++r) {
+                bs += (r ? ", " : "") + std::to_string(cp.bounds[r]);
+            }
+            std::string ds;
+            for (const auto & [name, mib] : per_dev) {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "%s%s %.2f MiB", ds.empty() ? "" : ", ", name.c_str(), mib);
+                ds += buf;
+            }
+            llama_log_internal(lvl, "%s: context-parallel attention: %zu layers, %d ranges, bounds [%s], CP above n_kv %u; CP K/V per device: %s; %d layers plain (owner not in LLAMA_CP_DEVS)\n",
+                    __func__, cp.layers.size(), cp_n, bs.c_str(), cp.bounds[1], ds.c_str(), cp_n_unlisted);
+            if (cp_n > 4) {
+                llama_log_internal(lvl, "%s: context-parallel N = %d: the Vulkan merge op takes N <= 4, the merge falls back to the CPU\n", __func__, cp_n);
+            }
+            bool aligned = true;
+            bool all_cpu = true;
+            for (size_t r = 0; r < cp.bounds.size(); ++r) {
+                aligned = aligned && cp.bounds[r] % 256 == 0;
+            }
+            for (const auto & cl : cp.layers) {
+                for (const auto & rg : cl.ranges) {
+                    all_cpu = all_cpu && ggml_backend_dev_type(rg.dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+                }
+            }
+            if (!aligned && !all_cpu) {
+                llama_log_internal(lvl, "%s: context-parallel range bounds [%s] are not multiples of 256: the FA ranges are not tile aligned on the GPU\n", __func__, bs.c_str());
+            }
+        }
     }
 
     // [KQ_MASK_DEV] static gate of the device-built mask (see kq_build_state); decided before 6a so its
@@ -541,8 +759,12 @@ llama_kv_cache::llama_kv_cache(
                 for (int il : it->second) {
                     layers[map_layer_ids.at(il)].kq_mask_dev = t;
                 }
-                if (cp.active() && buft == cp.ranges[1].buft) {
-                    cp.kq_mask_dev = t;
+                for (auto & cl : cp.layers) {
+                    for (auto & rg : cl.ranges) {
+                        if (rg.buft == buft) {
+                            rg.kq_mask_dev = t;
+                        }
+                    }
                 }
             }
 
@@ -1664,7 +1886,7 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
     // returns 0 exactly then). Above h there is no contiguous K: build_attn_cp is the only reader, and the graph paths
     // that cannot take it (training, kq_b, sinks, no FA) end here.
     if (cp_active(il)) {
-        GGML_ASSERT(n_kv <= cp.h && "context-parallel layer read as one tensor with n_kv > h (training, kq_b, sinks or no FA?)");
+        GGML_ASSERT(n_kv <= cp.bounds[1] && "context-parallel layer read as one tensor with n_kv > h_1 (training, kq_b, sinks or no FA?)");
         return get_k_range(ctx, il, 0, n_kv, false);
     }
 
@@ -1690,7 +1912,7 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
 
     // [CP] see get_k
     if (cp_active(il)) {
-        GGML_ASSERT(n_kv <= cp.h && "context-parallel layer read as one tensor with n_kv > h (training, kq_b, sinks or no FA?)");
+        GGML_ASSERT(n_kv <= cp.bounds[1] && "context-parallel layer read as one tensor with n_kv > h_1 (training, kq_b, sinks or no FA?)");
         return get_v_range(ctx, il, 0, n_kv, false);
     }
 
@@ -1820,28 +2042,47 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
 // [CP] see cp_state in llama-kv-cache.h
 
 bool llama_kv_cache::cp_active(int32_t il) const {
-    return cp.active() && il == cp.il;
+    return cp.get(il) != nullptr;
 }
 
 uint32_t llama_kv_cache::cp_split(int32_t il, uint32_t n_kv) const {
-    // a function of n_kv only, so graph reuse holds (n_kv is pinned by can_reuse_kq_mask); n_kv <= h: every cell of the
-    // ubatch is < used_max_p1 <= n_kv <= h (apply_ubatch runs before get_n_kv), range 1 has nothing to store or read
-    if (!cp_active(il) || n_kv <= cp.h) {
+    // a function of n_kv only, so graph reuse holds (n_kv is pinned by can_reuse_kq_mask); n_kv <= h_1: every cell of
+    // the ubatch is < used_max_p1 <= n_kv <= h_1 (apply_ubatch runs before get_n_kv), the helpers have nothing to store or read
+    if (!cp_active(il) || n_kv <= cp.bounds[1]) {
         return 0;
     }
-    return cp.h;
+    return cp.bounds[1];
 }
 
-bool llama_kv_cache::cp_check() const {
-    return cp.check;
+int llama_kv_cache::cp_n_live(int32_t il, uint32_t n_kv) const {
+    if (!cp_active(il)) {
+        return 1;
+    }
+    int n = 0;
+    while (n < (int) cp.bounds.size() - 1 && cp.bounds[n] < n_kv) {
+        n++;
+    }
+    return std::max(n, 1);
 }
 
-ggml_backend_dev_t llama_kv_cache::cp_dev(bool helper) const {
-    return cp.active() ? cp.ranges[helper ? 1 : 0].dev : nullptr;
+uint32_t llama_kv_cache::cp_bound(int r) const {
+    GGML_ASSERT(r >= 0 && r < (int) cp.bounds.size());
+    return cp.bounds[r];
 }
 
-ggml_tensor * llama_kv_cache::cp_kq_mask_dev() const {
-    return kq_inc.enabled ? cp.kq_mask_dev : nullptr;
+bool llama_kv_cache::cp_check(int32_t il) const {
+    const cp_layer * cl = cp.get(il);
+    return cl && cl->ref_k;
+}
+
+ggml_backend_dev_t llama_kv_cache::cp_dev(int32_t il, int r) const {
+    const cp_layer * cl = cp.get(il);
+    return cl && r >= 0 && r < (int) cl->ranges.size() ? cl->ranges[r].dev : nullptr;
+}
+
+ggml_tensor * llama_kv_cache::cp_kq_mask_dev(int32_t il, int r) const {
+    const cp_layer * cl = cp.get(il);
+    return kq_inc.enabled && cl ? cl->ranges[r].kq_mask_dev : nullptr;
 }
 
 bool llama_kv_cache::cp_pack() const {
@@ -1849,7 +2090,7 @@ bool llama_kv_cache::cp_pack() const {
 }
 
 int llama_kv_cache::cp_n_ranges() const {
-    return (int) cp.ranges.size();
+    return cp.active() ? (int) cp.bounds.size() - 1 : 0;
 }
 
 bool llama_kv_cache::cp_ref_dirty() const {
@@ -1859,24 +2100,28 @@ bool llama_kv_cache::cp_ref_dirty() const {
 // [CP] llama_io_write/read_device group their copies per buffer type and abort when the per-buft byte counts of the save
 // and the restore differ; with ranges on two buffer types those counts depend on where the restored cells land
 bool llama_kv_cache::cp_on_device_ok() const {
-    for (const auto & r : cp.ranges) {
-        if (r.buft != cp.ranges[0].buft) {
-            return false;
+    for (const auto & cl : cp.layers) {
+        for (const auto & r : cl.ranges) {
+            if (r.buft != cl.ranges[0].buft) {
+                return false;
+            }
         }
     }
     return true;
 }
 
-// [CP] the helper builds its own mask only when its device already has a KQ_MASK_BUILD op (an attention layer of this
+// [CP] a helper builds its own mask only when its device already has a KQ_MASK_BUILD op (an attention layer of this
 // cache lives there): no new op, no new per-device reserve (kv_size x n_ubatch f16 per op, 876 MiB at 224k/2048), so
 // the fit is unchanged. On the 2026-10-22 production split (Vulkan1 holds layers 43-63) it exists; -1 keeps the hop.
-int llama_kv_cache::cp_kq_build_dev() const {
-    if (!kq_build.enabled || !cp.active() || cp.ranges[0].dev == cp.ranges[1].dev) {
+// With all layers CP every model device holds attention layers, so every helper finds its op.
+int llama_kv_cache::cp_kq_build_dev(int32_t il, int r) const {
+    const cp_layer * cl = cp.get(il);
+    if (!kq_build.enabled || !cl || r <= 0 || r >= (int) cl->ranges.size() || cl->ranges[0].dev == cl->ranges[r].dev) {
         return -1;
     }
     for (size_t i = 0; i < kq_build.anchor.size(); i++) {
         const ggml_tensor * a = kq_build.anchor[i];
-        if (a && a->buffer && ggml_backend_buft_get_device(ggml_backend_buffer_get_type(a->buffer)) == cp.ranges[1].dev) {
+        if (a && a->buffer && ggml_backend_buft_get_device(ggml_backend_buffer_get_type(a->buffer)) == cl->ranges[r].dev) {
             return (int) i;
         }
     }
@@ -1885,15 +2130,16 @@ int llama_kv_cache::cp_kq_build_dev() const {
 
 // [CP] cells [i0, i1) as a [head, n_head_kv, cells, 1] view: of the range holding them (local rows), or of the reference
 ggml_tensor * llama_kv_cache::get_k_range(ggml_context * ctx, int32_t il, uint32_t i0, uint32_t i1, bool ref) const {
-    GGML_ASSERT(cp_active(il) && i0 < i1 && i1 <= get_size());
+    const cp_layer * cl = cp.get(il);
+    GGML_ASSERT(cl && i0 < i1 && i1 <= get_size());
 
     ggml_tensor * k = nullptr;
     uint32_t      c0 = 0;
     if (ref) {
-        GGML_ASSERT(cp.ref_k && "context-parallel: the reference K exists only with LLAMA_CP_CHECK=1");
-        k = cp.ref_k;
+        GGML_ASSERT(cl->ref_k && "context-parallel: the reference K exists only with LLAMA_CP_CHECK=1");
+        k = cl->ref_k;
     } else {
-        for (const auto & r : cp.ranges) {
+        for (const auto & r : cl->ranges) {
             if (i0 >= r.c0 && i1 <= r.c1) {
                 k  = r.k;
                 c0 = r.c0;
@@ -1911,15 +2157,16 @@ ggml_tensor * llama_kv_cache::get_k_range(ggml_context * ctx, int32_t il, uint32
 }
 
 ggml_tensor * llama_kv_cache::get_v_range(ggml_context * ctx, int32_t il, uint32_t i0, uint32_t i1, bool ref) const {
-    GGML_ASSERT(cp_active(il) && !v_trans && i0 < i1 && i1 <= get_size());
+    const cp_layer * cl = cp.get(il);
+    GGML_ASSERT(cl && !v_trans && i0 < i1 && i1 <= get_size());
 
     ggml_tensor * v = nullptr;
     uint32_t      c0 = 0;
     if (ref) {
-        GGML_ASSERT(cp.ref_v && "context-parallel: the reference V exists only with LLAMA_CP_CHECK=1");
-        v = cp.ref_v;
+        GGML_ASSERT(cl->ref_v && "context-parallel: the reference V exists only with LLAMA_CP_CHECK=1");
+        v = cl->ref_v;
     } else {
-        for (const auto & r : cp.ranges) {
+        for (const auto & r : cl->ranges) {
             if (i0 >= r.c0 && i1 <= r.c1) {
                 v  = r.v;
                 c0 = r.c0;
@@ -1936,14 +2183,15 @@ ggml_tensor * llama_kv_cache::get_v_range(ggml_context * ctx, int32_t il, uint32
             v->nb[1]*(i0 - c0));
 }
 
-// [CP] the store of a CP layer: range r with its local indices (trash row for the other range's tokens), r = -1 the
-// LLAMA_CP_CHECK reference with the global indices. k_cur may be a strided view (the packed Q|K|V on the helper): only
+// [CP] the store of a CP layer: range r with its local indices (trash row for other ranges' tokens), r = -1 the
+// LLAMA_CP_CHECK reference with the global indices. k_cur may be a strided view (the packed Q|K|V on a helper): only
 // dims 0 and 1 must merge (the same requirement as cpy_k).
 ggml_tensor * llama_kv_cache::cpy_k_range(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * idxs, int32_t il, int r) const {
-    GGML_ASSERT(cp_active(il) && r >= -1 && r < (int) cp.ranges.size());
+    const cp_layer * cl = cp.get(il);
+    GGML_ASSERT(cl && r >= -1 && r < (int) cl->ranges.size());
     GGML_ASSERT(ggml_row_size(k_cur->type, k_cur->ne[0]) == k_cur->nb[1]);
 
-    ggml_tensor * dst = r < 0 ? cp.ref_k : cp.ranges[r].k;
+    ggml_tensor * dst = r < 0 ? cl->ref_k : cl->ranges[r].k;
     GGML_ASSERT(dst);
 
     k_cur = ggml_view_2d(ctx, k_cur, k_cur->ne[0]*k_cur->ne[1], k_cur->ne[2], k_cur->nb[2], 0);
@@ -1952,10 +2200,11 @@ ggml_tensor * llama_kv_cache::cpy_k_range(ggml_context * ctx, ggml_tensor * k_cu
 }
 
 ggml_tensor * llama_kv_cache::cpy_v_range(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * idxs, int32_t il, int r) const {
-    GGML_ASSERT(cp_active(il) && !v_trans && r >= -1 && r < (int) cp.ranges.size());
+    const cp_layer * cl = cp.get(il);
+    GGML_ASSERT(cl && !v_trans && r >= -1 && r < (int) cl->ranges.size());
     GGML_ASSERT(ggml_row_size(v_cur->type, v_cur->ne[0]) == v_cur->nb[1]);
 
-    ggml_tensor * dst = r < 0 ? cp.ref_v : cp.ranges[r].v;
+    ggml_tensor * dst = r < 0 ? cl->ref_v : cl->ranges[r].v;
     GGML_ASSERT(dst);
 
     v_cur = ggml_view_2d(ctx, v_cur, v_cur->ne[0]*v_cur->ne[1], v_cur->ne[2], v_cur->nb[2], 0);
@@ -1970,12 +2219,13 @@ void llama_kv_cache::cp_rows(const kv_layer & layer, bool is_v, uint32_t strm, u
     if (c0 >= c1) {
         return;
     }
-    if (!cp_active((int32_t) layer.il)) {
+    const cp_layer * cl = cp.get((int32_t) layer.il);
+    if (!cl) {
         fn(is_v ? layer.v_stream[strm] : layer.k_stream[strm], c0, c1 - c0);
         return;
     }
     GGML_ASSERT(strm == 0 && c1 <= get_size());
-    for (const auto & r : cp.ranges) {
+    for (const auto & r : cl->ranges) {
         const uint32_t a = std::max(c0, r.c0);
         const uint32_t b = std::min(c1, r.c1);
         if (a < b) {
@@ -1984,30 +2234,35 @@ void llama_kv_cache::cp_rows(const kv_layer & layer, bool is_v, uint32_t strm, u
     }
 }
 
-// [CP] LLAMA_CP_CHECK only: after a host write of cells [c0, c1) of the CP layer (state restore), bring the reference up
-// to the ranges. The ranges are what production reads; the round trip tests (test-save-load-state,
+// [CP] LLAMA_CP_CHECK only: after a host write of cells [c0, c1) of the CP layers (state restore), bring each reference
+// up to its ranges. The ranges are what production reads; the round trip tests (test-save-load-state,
 // test-state-restore-fragmented with the CP env) prove the host routing, the check then proves the graph side.
 void llama_kv_cache::cp_ref_from_ranges(uint32_t c0, uint32_t c1) const {
-    if (!cp.active() || !cp.ref_k || c0 >= c1) {
+    if (c0 >= c1) {
         return;
     }
-    const auto & layer = layers[map_layer_ids.at(cp.il)];
     std::vector<uint8_t> buf;
-    for (const bool is_v : { false, true }) {
-        ggml_tensor * ref = is_v ? cp.ref_v : cp.ref_k;
-        const size_t row = ref->nb[1];
-        cp_rows(layer, is_v, 0, c0, c1, [&](ggml_tensor * t, uint32_t r0, uint32_t n) {
-            buf.resize((size_t) n*row);
-            ggml_backend_tensor_get(t, buf.data(), (size_t) r0*row, buf.size());
-            // r0 is local to t; the global cell is found from the range that t belongs to
-            uint32_t g0 = r0;
-            for (const auto & r : cp.ranges) {
-                if (t == r.k || t == r.v) {
-                    g0 = r.c0 + r0;
+    for (const auto & cl : cp.layers) {
+        if (!cl.ref_k) {
+            continue;
+        }
+        const auto & layer = layers[map_layer_ids.at(cl.il)];
+        for (const bool is_v : { false, true }) {
+            ggml_tensor * ref = is_v ? cl.ref_v : cl.ref_k;
+            const size_t row = ref->nb[1];
+            cp_rows(layer, is_v, 0, c0, c1, [&](ggml_tensor * t, uint32_t r0, uint32_t n) {
+                buf.resize((size_t) n*row);
+                ggml_backend_tensor_get(t, buf.data(), (size_t) r0*row, buf.size());
+                // r0 is local to t; the global cell is found from the range that t belongs to
+                uint32_t g0 = r0;
+                for (const auto & r : cl.ranges) {
+                    if (t == r.k || t == r.v) {
+                        g0 = r.c0 + r0;
+                    }
                 }
-            }
-            ggml_backend_tensor_set(ref, buf.data(), (size_t) g0*row, buf.size());
-        });
+                ggml_backend_tensor_set(ref, buf.data(), (size_t) g0*row, buf.size());
+            });
+        }
     }
 }
 
@@ -2115,7 +2370,7 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
 // [CP] one input per range, shared by K and V (FA: !v_trans, one index per token) and by every CP layer: the token's
 // local row if its cell is in [c0, c1), else the range's trash row c1 - c0 (see cp_state)
 ggml_tensor * llama_kv_cache::build_input_cp_idxs(ggml_context * ctx, const llama_ubatch & ubatch, int r) const {
-    GGML_ASSERT(r >= 0 && r < (int) cp.ranges.size());
+    GGML_ASSERT(r >= 0 && r < cp_n_ranges());
 
     ggml_tensor * idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, ubatch.n_tokens);
 
@@ -2126,16 +2381,17 @@ ggml_tensor * llama_kv_cache::build_input_cp_idxs(ggml_context * ctx, const llam
 }
 
 void llama_kv_cache::set_input_cp_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo, int r) const {
-    GGML_ASSERT(r >= 0 && r < (int) cp.ranges.size());
+    GGML_ASSERT(r >= 0 && r < cp_n_ranges());
     GGML_ASSERT(sinfo.n_stream() == 1 && ubatch->n_tokens == (int64_t) sinfo.size());
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
-    const auto & rg = cp.ranges[r];
+    const uint32_t c0 = cp.bounds[r];
+    const uint32_t c1 = cp.bounds[r + 1];
     int64_t * data = (int64_t *) dst->data;
 
     for (uint32_t i = 0; i < sinfo.size(); ++i) {
         const uint32_t c = sinfo.idxs[0][i];
-        data[i] = c >= rg.c0 && c < rg.c1 ? c - rg.c0 : rg.c1 - rg.c0;
+        data[i] = c >= c0 && c < c1 ? c - c0 : c1 - c0;
     }
 }
 
@@ -2830,10 +3086,12 @@ size_t llama_kv_cache::size_k_bytes() const {
     }
 
     // [CP] layer.k is range 0; the other ranges and the check reference
-    for (size_t r = 1; r < cp.ranges.size(); ++r) {
-        size_k_bytes += ggml_nbytes(cp.ranges[r].k);
+    for (const auto & cl : cp.layers) {
+        for (size_t r = 1; r < cl.ranges.size(); ++r) {
+            size_k_bytes += ggml_nbytes(cl.ranges[r].k);
+        }
+        size_k_bytes += cl.ref_k ? ggml_nbytes(cl.ref_k) : 0;
     }
-    size_k_bytes += cp.ref_k ? ggml_nbytes(cp.ref_k) : 0;
 
     return size_k_bytes;
 }
@@ -2845,10 +3103,12 @@ size_t llama_kv_cache::size_v_bytes() const {
         size_v_bytes += layer.v ? ggml_nbytes(layer.v) : 0;
     }
 
-    for (size_t r = 1; r < cp.ranges.size(); ++r) {
-        size_v_bytes += ggml_nbytes(cp.ranges[r].v);
+    for (const auto & cl : cp.layers) {
+        for (size_t r = 1; r < cl.ranges.size(); ++r) {
+            size_v_bytes += ggml_nbytes(cl.ranges[r].v);
+        }
+        size_v_bytes += cl.ref_v ? ggml_nbytes(cl.ref_v) : 0;
     }
-    size_v_bytes += cp.ref_v ? ggml_nbytes(cp.ref_v) : 0;
 
     return size_v_bytes;
 }
@@ -2984,12 +3244,12 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
             ggml_build_forward_expand(gf, cur);
         };
 
-        if (cp_active((int32_t) il)) {
-            for (const auto & r : cp.ranges) {
+        if (const cp_layer * cl = cp.get((int32_t) il)) {
+            for (const auto & r : cl->ranges) {
                 shift_view(r.k, r.c0, r.c1 - r.c0);
             }
-            if (cp.ref_k) {
-                shift_view(cp.ref_k, 0, get_size());
+            if (cl->ref_k) {
+                shift_view(cl->ref_k, 0, get_size());
             }
         } else {
             shift_view(layer.k, 0, get_size()*n_stream);
@@ -3614,7 +3874,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
 
         // [CP] LLAMA_CP_CHECK: the reference follows the ranges at the next update (the io may defer its tensor writes to
         // its destruction: llama_io_read_buffer/_file/_device all do, so the ranges are not written yet here)
-        if (cp.ref_k) {
+        if (cp.has_ref()) {
             for (const auto & r : runs) {
                 cp.ref_dirty.emplace_back(r.from, r.to);
             }
@@ -3787,7 +4047,7 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
     }
 
     // [CP] LLAMA_CP_CHECK: the reference follows the cleared ranges at the next update
-    if (cp.ref_k) {
+    if (cp.has_ref()) {
         for (uint32_t i = 0; i < cell_count; ++i) {
             cp.ref_dirty.emplace_back(sinfo.idxs[0][i], sinfo.idxs[0][i] + 1);
         }
@@ -3917,24 +4177,32 @@ uint32_t llama_kv_cache_context::cp_split(int32_t il) const {
     return kv->cp_split(il, n_kv);
 }
 
-bool llama_kv_cache_context::cp_check() const {
-    return kv->cp_check();
+int llama_kv_cache_context::cp_n_live(int32_t il) const {
+    return kv->cp_n_live(il, n_kv);
 }
 
-ggml_backend_dev_t llama_kv_cache_context::cp_dev(bool helper) const {
-    return kv->cp_dev(helper);
+uint32_t llama_kv_cache_context::cp_bound(int r) const {
+    return kv->cp_bound(r);
 }
 
-ggml_tensor * llama_kv_cache_context::cp_kq_mask_dev() const {
-    return kv->cp_kq_mask_dev();
+bool llama_kv_cache_context::cp_check(int32_t il) const {
+    return kv->cp_check(il);
+}
+
+ggml_backend_dev_t llama_kv_cache_context::cp_dev(int32_t il, int r) const {
+    return kv->cp_dev(il, r);
+}
+
+ggml_tensor * llama_kv_cache_context::cp_kq_mask_dev(int32_t il, int r) const {
+    return kv->cp_kq_mask_dev(il, r);
 }
 
 bool llama_kv_cache_context::cp_pack() const {
     return kv->cp_pack();
 }
 
-int llama_kv_cache_context::cp_kq_build_dev() const {
-    return kv->cp_kq_build_dev();
+int llama_kv_cache_context::cp_kq_build_dev(int32_t il, int r) const {
+    return kv->cp_kq_build_dev(il, r);
 }
 
 int llama_kv_cache_context::cp_n_ranges() const {

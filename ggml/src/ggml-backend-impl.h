@@ -310,9 +310,28 @@ extern "C" {
         // [fork, 2026-10-22 night] monotonic synchronize totals of this backend context (ggml_backend_sync_totals in
         // ggml-backend.h); the first call turns the accounting on (one bool test per synchronize until then)
         void    (*sync_totals)(ggml_backend_t backend, struct ggml_backend_sync_totals * out);
+        // [fork, 2026-10-23] vkQueueSubmit calls made so far on the calling thread (monotonic, all contexts of the backend)
+        int64_t (*n_queue_submit)(void);
     };
     #define GGML_BACKEND_FORK_STATS_PROC "ggml_backend_fork_stats"
     typedef const struct ggml_backend_fork_stats_i * (*ggml_backend_fork_stats_iface_t)(ggml_backend_t backend);
+
+    // [fork, 2026-10-23] hop fold (GGML_VK_D2D_HOP_FOLD, ggml-vulkan.cpp ggml_vk_hop_fold_level). Looked up once per
+    // backend at ggml_backend_sched_new, independent of the stats; the backend returns NULL when the knob is off, so a
+    // scheduler without it behaves exactly as before. Contract the scheduler keeps (ggml_backend_sched_compute_splits):
+    //   - defer_next(b) only right before graph_compute(b) of split i, and only when split i+1 runs on another backend
+    //     and copies at least one live input produced on b. b then leaves that graph's final batch unsubmitted (event
+    //     record appends to it) so the hop 1 of split i+1's copy loop goes out in the same submit.
+    //   - flush(b) after split i+1's input copies (before its graph_compute) and on every early return: submits the
+    //     tail if no hop took it. Between defer_next and flush nothing waits on b's events on the host (split i+1 has
+    //     a live input, so the input-less split sync is skipped; the copy loop only waits on split i+1's own events).
+    //     Returns true when it had to submit a tail.
+    struct ggml_backend_fork_fold_i {
+        void (*defer_next)(ggml_backend_t backend);
+        bool (*flush)(ggml_backend_t backend);
+    };
+    #define GGML_BACKEND_FORK_FOLD_PROC "ggml_backend_fork_fold"
+    typedef const struct ggml_backend_fork_fold_i * (*ggml_backend_fork_fold_iface_t)(ggml_backend_t backend);
 
 #ifdef  __cplusplus
 }

@@ -166,8 +166,9 @@ struct llama_dstats_timer {
 // turns it off for an A/B.
 static bool llama_cp_split_sync_relax() {
     const char * il    = getenv("LLAMA_CP_LAYER");
+    const char * ils   = getenv("LLAMA_CP_LAYERS");
     const char * relax = getenv("LLAMA_CP_SYNC_RELAX");
-    return il && atoi(il) >= 0 && !(relax && atoi(relax) == 0);
+    return ((il && atoi(il) >= 0) || (ils && *ils)) && !(relax && atoi(relax) == 0);
 }
 
 // [CP] LLAMA_CP_CHECK=1: per ubatch, the merged two-card attention of the cp layer against the single-card FA over
@@ -175,6 +176,7 @@ static bool llama_cp_split_sync_relax() {
 // < 0.999 once 1000 rows counted. Reference: the emit_lse merge test measured nmse 3e-6, max abs 4.9e-3 on Vulkan
 // (f32 KV). A row counts for argmax only if its reference top-2 margin exceeds 2x the row's max abs error (near ties
 // flip on rounding alone). Summary every LLAMA_CP_CHECK_EVERY (default 64) steps. Costs a sync + D2H per step.
+// N ranges / several layers (2026-10-23): every checked layer's pair is compared, the stats run over all of them.
 static void llama_cp_check_step(ggml_backend_sched_t sched, const llm_graph_result * res) {
     struct stats {
         uint64_t n_steps = 0;
@@ -194,39 +196,47 @@ static void llama_cp_check_step(ggml_backend_sched_t sched, const llm_graph_resu
 
     ggml_backend_sched_synchronize(sched);
 
-    const ggml_tensor * tm = res->t_cp_merged;
-    const ggml_tensor * tf = res->t_cp_full;
-    GGML_ASSERT(ggml_are_same_shape(tm, tf) && ggml_is_contiguous(tm) && ggml_is_contiguous(tf));
-
-    std::vector<float> m(ggml_nelements(tm));
-    std::vector<float> f(ggml_nelements(tf));
-    ggml_backend_tensor_get(tm, m.data(), 0, ggml_nbytes(tm));
-    ggml_backend_tensor_get(tf, f.data(), 0, ggml_nbytes(tf));
-
-    const int64_t D = tm->ne[0];
-    const int64_t R = ggml_nrows(tm);
+    GGML_ASSERT(res->t_cp_merged.size() == res->t_cp_full.size());
 
     double e2 = 0.0, r2 = 0.0, mx = 0.0;
     uint64_t cnt = 0, agree = 0;
-    for (int64_t r = 0; r < R; ++r) {
-        const float * a = m.data() + r*D;
-        const float * b = f.data() + r*D;
-        double rmx = 0.0;
-        int64_t ia = 0, ib = 0;
-        float b1 = -INFINITY, b2 = -INFINITY;
-        for (int64_t d = 0; d < D; ++d) {
-            const double err = (double) a[d] - b[d];
-            e2 += err*err;
-            r2 += (double) b[d]*b[d];
-            rmx = std::max(rmx, std::fabs(err));
-            if (a[d] > a[ia]) { ia = d; }
-            if (b[d] > b[ib]) { ib = d; }
-            if (b[d] > b1) { b2 = b1; b1 = b[d]; } else if (b[d] > b2) { b2 = b[d]; }
-        }
-        mx = std::max(mx, rmx);
-        if (b1 - b2 > 2.0*rmx) {
-            cnt++;
-            agree += ia == ib;
+    int64_t R = 0;
+    std::vector<float> m;
+    std::vector<float> f;
+    for (size_t il = 0; il < res->t_cp_merged.size(); ++il) {
+        const ggml_tensor * tm = res->t_cp_merged[il];
+        const ggml_tensor * tf = res->t_cp_full[il];
+        GGML_ASSERT(ggml_are_same_shape(tm, tf) && ggml_is_contiguous(tm) && ggml_is_contiguous(tf));
+
+        m.resize(ggml_nelements(tm));
+        f.resize(ggml_nelements(tf));
+        ggml_backend_tensor_get(tm, m.data(), 0, ggml_nbytes(tm));
+        ggml_backend_tensor_get(tf, f.data(), 0, ggml_nbytes(tf));
+
+        const int64_t D  = tm->ne[0];
+        const int64_t Rl = ggml_nrows(tm);
+        R += Rl;
+
+        for (int64_t r = 0; r < Rl; ++r) {
+            const float * a = m.data() + r*D;
+            const float * b = f.data() + r*D;
+            double rmx = 0.0;
+            int64_t ia = 0, ib = 0;
+            float b1 = -INFINITY, b2 = -INFINITY;
+            for (int64_t d = 0; d < D; ++d) {
+                const double err = (double) a[d] - b[d];
+                e2 += err*err;
+                r2 += (double) b[d]*b[d];
+                rmx = std::max(rmx, std::fabs(err));
+                if (a[d] > a[ia]) { ia = d; }
+                if (b[d] > b[ib]) { ib = d; }
+                if (b[d] > b1) { b2 = b1; b1 = b[d]; } else if (b[d] > b2) { b2 = b[d]; }
+            }
+            mx = std::max(mx, rmx);
+            if (b1 - b2 > 2.0*rmx) {
+                cnt++;
+                agree += ia == ib;
+            }
         }
     }
 
@@ -1950,7 +1960,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    if (res->t_cp_merged && res->t_cp_full) {
+    if (!res->t_cp_merged.empty()) {
         llama_cp_check_step(sched.get(), res);
     }
 
@@ -2724,6 +2734,11 @@ void llama_context::dstats_fold_sched() {
     d.s_n_copies_skipped                   += st->n_copies_skipped;
     d.s_t_split_graph                      += st->t_split_graph_us;
     d.s_t_alloc_splits                     += st->t_alloc_splits_us;
+    d.s_n_d2d_hop_fold                     += st->n_d2d_hop_fold;
+    d.s_n_d2d_hop_sep                      += st->n_d2d_hop_sep;
+    d.s_n_d2d_hop2_fold                    += st->n_d2d_hop2_fold;
+    d.s_n_fold_flush                       += st->n_fold_flush;
+    d.s_n_queue_submit                     += std::max<int64_t>(0, st->n_queue_submit);
     d.s_bytes_skipped                      += (int64_t) st->nbytes_skipped;
 
     // 2026-10-22 (design-kq-mask-on-device.md 3.6b): one re-plan per pp ubatch is the expected state before the
@@ -2797,6 +2812,11 @@ void llama_context::dstats_fold_sched() {
                         c.d2d.t_hop_queue_submit_us, c.d2d.n_bwd_wait_elided, c.d2d.n_ring_grow_wait, c.d2d.ring_cap_mib,
                         c.d2d.bwd_signaled_at_submit, c.d2d.bwd_dst_signaled_at_submit, c.d2d.bwd_submitted_at_submit,
                         c.d2d.bwd_lag, c.d2d.src_submit_pending, c.d2d.n_src_submit_infos, c.d2d.n_src_wait_sems);
+            }
+            // 2026-10-23: GGML_VK_D2D_HOP_FOLD, hop_fold 0 own submit / 1 in the src tail's command buffer / 2 same
+            // vkQueueSubmit, own VkSubmitInfo (bwd wait); hop2_fold 1 = merged into the dst's open submission
+            if (r == 0 && n > 0 && n < (int) sizeof(buf)) {
+                n += snprintf(buf + n, sizeof(buf) - n, ",\"hop_fold\":%d,\"hop2_fold\":%d", c.d2d.hop_fold, c.d2d.hop2_fold);
             }
         }
         if (n > 0 && n < (int) sizeof(buf) - 1) {
@@ -3045,7 +3065,7 @@ void llama_context::dstats_emit(int ret, int64_t t_start_us, uint32_t n_tokens, 
     }
     // scheduler hop timings (dstats_fold_sched), absent when no graph was computed in this call
     if (d.s_n_graphs > 0) {
-        char sb[1536]; // 2026-10-22 evening: 512 -> 1536, the D2D sums alone are ~700 chars of keys
+        char sb[2048]; // 2026-10-22 evening: 512 -> 1536, the D2D sums alone are ~700 chars of keys; 2026-10-23 -> 2048 (hop fold)
         snprintf(sb, sizeof(sb),
                 ",\"sched\":{\"n_graphs\":%d,\"n_splits\":%d,\"n_cross_copies\":%d,\"n_copies_dropped\":%d,\"n_splits_dropped\":%d,"
                 "\"bytes\":%" PRId64 ",\"t_dst_wait_us\":%" PRId64 ",\"t_src_sync_us\":%" PRId64 ",\"t_copy_us\":%" PRId64 ","
@@ -3057,7 +3077,8 @@ void llama_context::dstats_emit(int ret, int64_t t_start_us, uint32_t n_tokens, 
                 "\"n_bwd_unsignaled_at_submit\":%d,\"n_bwd_dst_unsignaled_at_submit\":%d,\"n_bwd_unsubmitted_at_submit\":%d,"
                 "\"n_src_submit_pending\":%d,\"bwd_lag\":%" PRId64 ","
                 "\"ring_kind\":\"%s\",\"n_ring_export\":%d,\"n_ring_userptr\":%d,"
-                "\"n_copies_skipped\":%d,\"bytes_skipped\":%" PRId64 "}",
+                "\"n_copies_skipped\":%d,\"bytes_skipped\":%" PRId64 ","
+                "\"n_hop_fold\":%d,\"n_hop_sep\":%d,\"n_hop2_fold\":%d,\"n_fold_flush\":%d,\"n_queue_submit\":%" PRId64 "}",
                 d.s_n_graphs, d.s_n_splits, d.s_n_copies, d.s_n_copies_drop, d.s_n_splits_drop,
                 d.s_bytes, d.s_t_dst_wait, d.s_t_src_sync, d.s_t_copy, d.s_t_split_sync, d.s_t_wall,
                 d.s_n_realloc, d.s_t_realloc_sync, d.s_t_realloc_reserve,
@@ -3071,7 +3092,9 @@ void llama_context::dstats_emit(int ret, int64_t t_start_us, uint32_t n_tokens, 
                     d.s_n_d2d_ring_export > 0 ? "export" : d.s_n_d2d_ring_userptr > 0 ? "userptr" : "none",
                 d.s_n_d2d_ring_export, d.s_n_d2d_ring_userptr,
                 // 2026-10-22 night: dead split inputs (GGML_SCHED_SKIP_DEAD_INPUTS), 2 per text decode expected
-                d.s_n_copies_skipped, d.s_bytes_skipped);
+                d.s_n_copies_skipped, d.s_bytes_skipped,
+                // 2026-10-23: GGML_VK_D2D_HOP_FOLD counters + vkQueueSubmit calls per decode call (all graphs of the line)
+                d.s_n_d2d_hop_fold, d.s_n_d2d_hop_sep, d.s_n_d2d_hop2_fold, d.s_n_fold_flush, d.s_n_queue_submit);
         line += sb;
         line += ",\"realloc\":[" + d.s_realloc_json + "]";
         line += ",\"copies\":[" + d.s_copies_json + "]";
@@ -5004,16 +5027,23 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
     std::unique_ptr<llama_io_read_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         // create a temporary io to read the magic and the src seq_id
-        io = std::make_unique<llama_io_read_host>(src, size);
+        // [fork, 2026-10-23] inside a try like the host path: an empty/short blob (a refused ON_DEVICE save, e.g. with
+        // context-parallel ranges on two buffer types) threw "unexpectedly reached end of buffer" out of the C API
+        llama_seq_id seq_id_read = -1;
+        try {
+            io = std::make_unique<llama_io_read_host>(src, size);
 
-        uint32_t magic_read;
-        io->read(&magic_read, sizeof(magic_read));
-        if (io_magic != magic_read) {
-            throw std::runtime_error("wrong sequence state magic");
+            uint32_t magic_read;
+            io->read(&magic_read, sizeof(magic_read));
+            if (io_magic != magic_read) {
+                throw std::runtime_error("wrong sequence state magic");
+            }
+
+            io->read(&seq_id_read, sizeof(seq_id_read));
+        } catch (const std::exception & err) {
+            LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
+            return 0;
         }
-
-        llama_seq_id seq_id_read;
-        io->read(&seq_id_read, sizeof(seq_id_read));
 
         GGML_ASSERT(mem_storage.find(seq_id_read) != mem_storage.end());
 

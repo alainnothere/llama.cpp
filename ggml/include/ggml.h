@@ -602,6 +602,7 @@ extern "C" {
         GGML_OP_GLU,
 
         GGML_OP_KQ_MASK_BUILD, // [fork, 2026-10-22] ggml_kq_mask_build
+        GGML_OP_FLASH_ATTN_MERGE, // [fork, 2026-10-23] ggml_flash_attn_merge
 
         GGML_OP_COUNT,
     };
@@ -2535,6 +2536,21 @@ extern "C" {
 
     GGML_API bool ggml_flash_attn_ext_get_emit_lse(
             const struct ggml_tensor * a);
+
+    // [fork, 2026-10-23] N-way merge of emit_lse partials (context-parallel attention over N disjoint KV ranges).
+    //   parts[i]  F32 [D + 4, n_head, n_batch, ne3], the layout of a ggml_flash_attn_ext_set_emit_lse result (rows
+    //             must be contiguous: nb[0] == 4; the row stride may differ from D + 4), 2 <= n_parts <= GGML_MAX_SRC
+    //   result    F32 [D, n_head, n_batch, ne3], or [D + 4, ...] with emit_lse (then it is again a valid partial)
+    // Per row: m = max_i lse_i, e_i = exp(lse_i - m), s = sum_i e_i (i ascending), O = sum_i (e_i/s)*O_i (i ascending),
+    // lse = m + log(s). A partial with e_i == 0 (lse_i = -INF: its range has no attended key) is skipped, so its O
+    // is never read into the sum (0*NaN would poison the row). All lse_i = -INF -> O = 0, lse = -INF.
+    // Equal to folding the partials pairwise up to f32 rounding (softmax over a union = softmax of the per-group
+    // logsumexp, see tests/test-flash-attn-merge.cpp). Implemented: CPU, Vulkan (n_parts <= 4).
+    GGML_API struct ggml_tensor * ggml_flash_attn_merge(
+            struct ggml_context * ctx,
+            struct ggml_tensor ** parts,
+            int                   n_parts,
+            bool                  emit_lse);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

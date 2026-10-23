@@ -8633,6 +8633,92 @@ struct test_fill : public test_case {
     }
 };
 
+// GGML_OP_FLASH_ATTN_MERGE [fork, 2026-10-23]
+// N emit_lse partials [D + 4, nh, nt] merged by softmax over their lse (ggml.h ggml_flash_attn_merge). lse values are
+// uniform in [-spread, spread]; with empty >= 0 that part has lse = -inf on every 3rd row (a context-parallel helper whose
+// KV range is beyond n_kv: the common case early in a conversation) and NaN in its O there (contiguous parts only: a
+// view node is compared too and the compare rejects NaN), so a backend that multiplies 0*O instead of skipping fails.
+// Every 17th row has all parts -inf (O must be 0, lse -inf). strided: parts are views with row stride D + 12.
+struct test_flash_attn_merge : public test_case {
+    const int64_t D;
+    const int64_t nh;
+    const int64_t nt;
+    const int     n_parts;
+    const float   spread;
+    const int     empty;
+    const bool    emit_lse;
+    const bool    strided;
+
+    std::string vars() override { return VARS_TO_STR8(D, nh, nt, n_parts, spread, empty, emit_lse, strided); }
+
+    test_flash_attn_merge(int64_t D = 256, int64_t nh = 24, int64_t nt = 6, int n_parts = 3, float spread = 4.0f,
+                          int empty = -1, bool emit_lse = false, bool strided = false)
+        : D(D), nh(nh), nt(nt), n_parts(n_parts), spread(spread), empty(empty), emit_lse(emit_lse), strided(strided) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        std::vector<ggml_tensor *> parts;
+        for (int i = 0; i < n_parts; ++i) {
+            ggml_tensor * t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D + 4 + (strided ? 8 : 0), nh, nt);
+            ggml_set_name(t, ("p" + std::to_string(i)).c_str());
+            if (strided) {
+                t = ggml_view_3d(ctx, t, D + 4, nh, nt, t->nb[1], t->nb[2], 0);
+            }
+            parts.push_back(t);
+        }
+        ggml_tensor * out = ggml_flash_attn_merge(ctx, parts.data(), n_parts, emit_lse);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(4321 + (uint32_t) (n_parts*31 + nt*7 + (int) spread + empty*3));
+        std::uniform_real_distribution<float> uo(-1.0f, 1.0f), ul(-spread, spread);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->name[0] != 'p' || t->view_src) {
+                continue;
+            }
+            const int part = atoi(t->name + 1);
+            const int64_t row = t->ne[0];
+            std::vector<float> v(ggml_nelements(t));
+            for (int64_t r = 0; r < nh*nt; ++r) {
+                float * x = v.data() + r*row;
+                for (int64_t j = 0; j < row; ++j) {
+                    x[j] = uo(rng);
+                }
+                x[D] = ul(rng);
+                x[D + 1] = x[D + 2] = x[D + 3] = 0.0f;
+                if ((r % 17 == 5) || (part == empty && r % 3 == 0)) {
+                    x[D] = -INFINITY;
+                    if (!strided) {
+                        for (int64_t j = 0; j < D; ++j) {
+                            x[j] = NAN;
+                        }
+                    }
+                }
+            }
+            ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+        }
+    }
+
+    // NMSE over the elements that are not -inf on both sides (the lse of empty rows; one-sided inf is rejected before)
+    double err(const float * a, const float * b, size_t n) override {
+        double e = 0.0, r = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            if (std::isinf(a[i]) && std::isinf(b[i])) {
+                continue;
+            }
+            e += (double) (a[i] - b[i]) * (a[i] - b[i]);
+            r += (double) a[i] * a[i];
+        }
+        return e / std::max(r, 1e-30);
+    }
+
+    // f32 throughout; CPU expf vs GPU exp differ by a few ulp
+    double max_nmse_err() override {
+        return 1e-10;
+    }
+};
+
 // GGML_OP_KQ_MASK_BUILD [fork, 2026-10-22]
 // cells with holes (pos -1, empty bitmap), random multi-seq bitmaps, rows of seqs that may or may not be in a cell.
 // Exact compare (f16 0 / -inf, no tolerance): the device mask replaces a host build that FA consumes bit for bit.
@@ -11430,6 +11516,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // [fork, 2026-10-23] N-way context-parallel merge (Vulkan gate: test-backend-ops -o FLASH_ATTN_MERGE -b Vulkan<n>)
+    for (int n_parts : { 2, 3, 4 }) {
+        for (int64_t nt : { 1, 6, 12, 33, 512 }) {
+            test_cases.emplace_back(new test_flash_attn_merge(256, 24, nt, n_parts, 4.0f));
+        }
+        for (float spread : { 0.0f, 30.0f, 200.0f }) {
+            test_cases.emplace_back(new test_flash_attn_merge(256, 24, 12, n_parts, spread));
+        }
+        for (int empty = 0; empty < n_parts; ++empty) {
+            test_cases.emplace_back(new test_flash_attn_merge(256, 24, 12, n_parts, 4.0f, empty));
+        }
+        test_cases.emplace_back(new test_flash_attn_merge(256, 24, 12, n_parts, 4.0f, n_parts - 1, true));
+        test_cases.emplace_back(new test_flash_attn_merge(256, 24, 12, n_parts, 4.0f, 1, true, true));
+        test_cases.emplace_back(new test_flash_attn_merge(128, 32, 7, n_parts, 4.0f, 0, false, true));
+    }
+    test_cases.emplace_back(new test_flash_attn_merge(64, 4, 3, 5, 4.0f, 2)); // n_parts > 4: CPU only, Vulkan supports_op false
+
     test_cases.emplace_back(new test_diag());
     test_cases.emplace_back(new test_diag(GGML_TYPE_F32, { 79, 1, 19, 13 }));
     test_cases.emplace_back(new test_diag(GGML_TYPE_F32, { 256, 1, 8, 16 }));
@@ -11897,6 +12000,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_kq_mask_build(65536,  2048, true));
     test_cases.emplace_back(new test_kq_mask_build(229376, 2048, true));
     test_cases.emplace_back(new test_kq_mask_build(229376, 12,   true));
+    // [fork, 2026-10-23] N-way context-parallel merge at the 27B layer shape (hs 256, 24 heads): decode, MTP verify, ubatch
+    for (int n_parts : { 2, 3 }) {
+        for (int64_t nt : { 1, 12, 512 }) {
+            test_cases.emplace_back(new test_flash_attn_merge(256, 24, nt, n_parts, 4.0f));
+        }
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

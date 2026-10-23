@@ -589,6 +589,13 @@ public:
         // 2026-10-22 night (scout item 5): t_sched_alloc split, ggml_backend_sched_stats t_split_graph_us / t_alloc_splits_us
         int64_t s_t_split_graph                      = 0;
         int64_t s_t_alloc_splits                     = 0;
+        // 2026-10-23: GGML_VK_D2D_HOP_FOLD (ggml_backend_sched_stats n_d2d_hop_fold / _sep / n_d2d_hop2_fold / n_fold_flush)
+        // and the vkQueueSubmit calls the sched thread made in compute_splits (-1 summed as 0 when no backend counts them)
+        int32_t s_n_d2d_hop_fold                     = 0;
+        int32_t s_n_d2d_hop_sep                      = 0;
+        int32_t s_n_d2d_hop2_fold                    = 0;
+        int32_t s_n_fold_flush                       = 0;
+        int64_t s_n_queue_submit                     = 0;
         // 2026-10-22 night: bytes the output extraction enqueued for D2H (logits / embd / nextn / backend-sampled
         // rows); the copies are async, their wait + memcpy show up in the next line's "sync_prev"
         int64_t b_output                             = 0;

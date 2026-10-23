@@ -12495,3 +12495,74 @@ void ggml_compute_forward_kq_mask_build(
         }
     }
 }
+
+// ggml_compute_forward_flash_attn_merge
+// [fork, 2026-10-23] reference for the N-way context-parallel merge (ggml.h ggml_flash_attn_merge), threaded over rows.
+// The Vulkan shader (flash_attn_merge.comp) does the same f32 arithmetic in the same order; test-backend-ops compares.
+
+void ggml_compute_forward_flash_attn_merge(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const int  n_parts  = ggml_get_op_params_i32(dst, 0);
+    const bool emit_lse = ggml_get_op_params_i32(dst, 1) != 0;
+
+    const ggml_tensor * p0 = dst->src[0];
+    const int64_t D  = p0->ne[0] - 4;
+    const int64_t n1 = p0->ne[1];
+    const int64_t n2 = p0->ne[2];
+    const int64_t n3 = p0->ne[3];
+    const int64_t nr = n1*n2*n3;
+
+    for (int64_t ir = params->ith; ir < nr; ir += params->nth) {
+        const int64_t i3 = ir/(n1*n2);
+        const int64_t i2 = (ir - i3*n1*n2)/n1;
+        const int64_t i1 = ir - i3*n1*n2 - i2*n1;
+
+        const float * o[GGML_MAX_SRC];
+        float         e[GGML_MAX_SRC];
+        float m = -INFINITY;
+        for (int i = 0; i < n_parts; ++i) {
+            const ggml_tensor * p = dst->src[i];
+            o[i] = (const float *) ((const char *) p->data + i1*p->nb[1] + i2*p->nb[2] + i3*p->nb[3]);
+            m = std::max(m, o[i][D]);
+        }
+
+        float * d = (float *) ((char *) dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]);
+
+        if (m == -INFINITY) {
+            // no partial attended a key (a row masked everywhere, e.g. padding): O = 0 as a single FA reports it
+            for (int64_t j = 0; j < D; ++j) {
+                d[j] = 0.0f;
+            }
+            if (emit_lse) {
+                d[D] = -INFINITY;
+                d[D + 1] = d[D + 2] = d[D + 3] = 0.0f;
+            }
+            continue;
+        }
+
+        float s = 0.0f;
+        for (int i = 0; i < n_parts; ++i) {
+            e[i] = expf(o[i][D] - m);
+            s += e[i];
+        }
+        for (int i = 0; i < n_parts; ++i) {
+            e[i] /= s;
+        }
+
+        for (int64_t j = 0; j < D; ++j) {
+            float acc = 0.0f;
+            for (int i = 0; i < n_parts; ++i) {
+                // skip, not multiply: an empty partial (lse -INF, e 0) may hold any O
+                if (e[i] != 0.0f) {
+                    acc += e[i]*o[i][j];
+                }
+            }
+            d[j] = acc;
+        }
+        if (emit_lse) {
+            d[D] = m + logf(s);
+            d[D + 1] = d[D + 2] = d[D + 3] = 0.0f;
+        }
+    }
+}

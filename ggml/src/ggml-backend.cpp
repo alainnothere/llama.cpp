@@ -1013,6 +1013,9 @@ struct ggml_backend_sched {
     // [fork, 2026-10-22] per backend: split GPU timeline + D2D hop pieces (ggml_backend_fork_stats_i in
     // ggml-backend-impl.h), looked up when stats are enabled, NULL for backends without it (CPU, BLAS, ...)
     const struct ggml_backend_fork_stats_i * fork_stats[GGML_SCHED_MAX_BACKENDS];
+    // [fork, 2026-10-23] per backend: hop fold hooks (ggml_backend_fork_fold_i, ggml-backend-impl.h), looked up at
+    // sched_new; NULL unless the backend has the fold on (Vulkan: GGML_VK_D2D_HOP_FOLD >= 1)
+    const struct ggml_backend_fork_fold_i * fork_fold[GGML_SCHED_MAX_BACKENDS];
     // [fork, 2026-10-22 night] per backend: what ggml_backend_sched_synchronize waited on since the last take
     // (ggml_backend_sched_sync_take, ggml-backend.h). Only touched while stats is non-NULL
     struct ggml_backend_sched_sync_stats sync_acc[GGML_SCHED_MAX_BACKENDS];
@@ -1965,6 +1968,10 @@ static void ggml_backend_sched_stats_add_copy(ggml_backend_sched_t sched, int sp
             st->t_d2d_hop_queue_submit_us          += d2d.t_hop_queue_submit_us;
             st->n_d2d_ring_export                  += d2d.ring_kind == GGML_BACKEND_D2D_RING_EXPORT;
             st->n_d2d_ring_userptr                 += d2d.ring_kind == GGML_BACKEND_D2D_RING_USERPTR;
+            // [fork, 2026-10-23] GGML_VK_D2D_HOP_FOLD
+            st->n_d2d_hop_fold                     += d2d.hop_fold != 0;
+            st->n_d2d_hop_sep                      += d2d.hop_fold == 0;
+            st->n_d2d_hop2_fold                    += d2d.hop2_fold;
         }
     }
     if (st->n_copies < GGML_BACKEND_SCHED_STATS_MAX_COPIES) {
@@ -2067,6 +2074,29 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, int split_
     }
 }
 
+// [fork, 2026-10-23] hop fold window (ggml_backend_fork_fold_i): split split_id's backend may leave its final batch open
+// when the next split runs on another fold-capable backend and copies a live input produced on it (a hop 1 from it will
+// follow in the next split's copy loop). The live input also keeps the next split off the input-less host sync, which
+// would wait on this backend's event inside the window
+static bool ggml_backend_sched_fold_window(ggml_backend_sched_t sched, int split_id) {
+    const int b = sched->splits[split_id].backend_id;
+    if (split_id + 1 >= sched->n_splits || sched->fork_fold[b] == NULL) {
+        return false;
+    }
+    const struct ggml_backend_sched_split * next = &sched->splits[split_id + 1];
+    if (next->backend_id == b || sched->fork_fold[next->backend_id] == NULL) {
+        return false;
+    }
+    for (int i = 0; i < next->n_inputs; i++) {
+        struct ggml_tensor * in = next->inputs[i];
+        if (next->inputs_live[i] && !(in->flags & GGML_TENSOR_FLAG_INPUT) && !ggml_backend_sched_is_host_weight(in) &&
+            tensor_backend_id(in) == b) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -2123,7 +2153,34 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         sched->realloc_pending.realloc_reason[0]    = '\0';
         sched->stats_pending_split = -1;
         t_wall_start = ggml_time_us();
+        st->n_d2d_hop_fold  = 0;
+        st->n_d2d_hop_sep   = 0;
+        st->n_d2d_hop2_fold = 0;
+        st->n_fold_flush    = 0;
+        st->n_queue_submit  = -1;
     }
+    // [fork, 2026-10-23] vkQueueSubmit calls on this thread across the whole call (any backend that counts them)
+    int64_t (*n_queue_submit_fn)(void) = NULL;
+    int64_t n_queue_submit0 = 0;
+    if (st) {
+        for (int b = 0; b < sched->n_backends && !n_queue_submit_fn; b++) {
+            if (sched->fork_stats[b] && sched->fork_stats[b]->n_queue_submit) {
+                n_queue_submit_fn = sched->fork_stats[b]->n_queue_submit;
+            }
+        }
+        n_queue_submit0 = n_queue_submit_fn ? n_queue_submit_fn() : 0;
+    }
+    // [fork, 2026-10-23] hop fold: the backend whose previous split's tail is open, -1 none (ggml_backend_fork_fold_i)
+    int fold_open = -1;
+    auto fold_close = [&]() {
+        if (fold_open >= 0) {
+            const bool flushed = sched->fork_fold[fold_open]->flush(sched->backends[fold_open]);
+            if (st && flushed) {
+                st->n_fold_flush++;
+            }
+            fold_open = -1;
+        }
+    };
 
     int prev_backend_id = -1;
 
@@ -2172,6 +2229,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_sched_copy_input(sched, split_id, split, split->inputs[input_id]);
             }
         }
+        // [fork, 2026-10-23] hop fold: the previous split's tail went out with its hop 1 above; if no hop took it, now
+        fold_close();
+        if (!sched->callback_eval && ggml_backend_sched_fold_window(sched, split_id)) {
+            sched->fork_fold[split_backend_id]->defer_next(split_backend);
+            fold_open = split_backend_id;
+        }
 
         // a split that neither waited nor copied closes the previous window at its issue
         int64_t t_issue_start = 0;
@@ -2190,6 +2253,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
+                fold_close();
                 return ec;
             }
         } else {
@@ -2255,10 +2319,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         prev_backend_id = split_backend_id;
     }
 
+    fold_close();   // never open here (the last split has no next split), kept for the invariant
+
     // the last split's window runs into the caller (llama: output extraction / synchronize), left at -1
     if (st) {
         sched->stats_pending_split = -1;
         st->t_wall_us = ggml_time_us() - t_wall_start;
+        st->n_queue_submit = n_queue_submit_fn ? n_queue_submit_fn() - n_queue_submit0 : -1;
     }
 
     return GGML_STATUS_SUCCESS;
@@ -2333,6 +2400,19 @@ ggml_backend_sched_t ggml_backend_sched_new(
         if (sched->n_copies > 1) {
             for (int c = 0; c < sched->n_copies; c++) {
                 sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
+            }
+        }
+    }
+
+    // [fork, 2026-10-23] hop fold hooks, independent of the stats (comment at ggml_backend_fork_fold_i)
+    for (int b = 0; b < n_backends; b++) {
+        sched->fork_fold[b] = NULL;
+        ggml_backend_dev_t dev = ggml_backend_get_device(backends[b]);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : NULL;
+        if (reg && reg->iface.get_proc_address) {
+            auto fn = (ggml_backend_fork_fold_iface_t) reg->iface.get_proc_address(reg, GGML_BACKEND_FORK_FOLD_PROC);
+            if (fn) {
+                sched->fork_fold[b] = fn(backends[b]);
             }
         }
     }

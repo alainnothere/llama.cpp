@@ -5,6 +5,8 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <algorithm>
+#include <map>
 #include <unordered_map>
 #include <vector>
 
@@ -206,15 +208,17 @@ public:
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
 
-    // [CP] context-parallel attention, range-split KV, see cp_state
+    // [CP] context-parallel attention, range-split KV, see cp_state. Range bounds are shared by every CP layer.
     bool               cp_active(int32_t il) const;            // layer il's K/V is split into ranges
-    uint32_t           cp_split(int32_t il, uint32_t n_kv) const; // boundary cell h when n_kv > h, 0: attend on range 0 only
-    bool               cp_check() const;
-    ggml_backend_dev_t cp_dev(bool helper) const;               // device of range 1 (helper) or range 0 (owner)
-    ggml_tensor *      cp_kq_mask_dev() const;                 // the helper's persistent mask (nullptr: graph input)
+    uint32_t           cp_split(int32_t il, uint32_t n_kv) const; // h_1 (end of range 0) when n_kv > h_1, 0: attend on range 0 only
+    int                cp_n_live(int32_t il, uint32_t n_kv) const; // ranges that hold cells < n_kv (1..N)
+    uint32_t           cp_bound(int r) const;                  // first cell of range r (r = N: kv_size)
+    bool               cp_check(int32_t il) const;             // layer il has the LLAMA_CP_CHECK reference
+    ggml_backend_dev_t cp_dev(int32_t il, int r) const;        // device of range r of layer il (r = 0: the owner)
+    ggml_tensor *      cp_kq_mask_dev(int32_t il, int r) const; // range r's persistent mask (nullptr: graph input)
     bool               cp_pack() const;                        // LLAMA_CP_PACK (default 1), see cp_state::pack
-    int                cp_kq_build_dev() const;                // kq_build anchor index of the helper's device, -1: none
-    int                cp_n_ranges() const;                    // 0: no CP layer in this cache
+    int                cp_kq_build_dev(int32_t il, int r) const; // kq_build anchor index of range r's device, -1: none
+    int                cp_n_ranges() const;                    // N, 0: no CP layer in this cache
     bool               cp_ref_dirty() const;                   // LLAMA_CP_CHECK reference waits for the next update
     bool               cp_on_device_ok() const;                // ON_DEVICE state works (all ranges on one buffer type)
     // K/V cells [i0, i1) of layer il: from the range that holds them (must be one range), or from the
@@ -438,29 +442,52 @@ private:
 
     mutable kq_mask_inc_state kq_inc;
 
-    // [CP] context-parallel attention for ONE layer (env LLAMA_CP_LAYER=<il>, default -1 = off), RANGE-SPLIT KV
-    // (2026-10-22 night, design-cp-range-split-kv.md in ~/Documents/contextFiles; replaces the 2026-10-21 full mirror).
+    // [CP] context-parallel attention, RANGE-SPLIT KV. 2026-10-22 night: one layer, two ranges (design-cp-range-split-kv.md
+    // in ~/Documents/contextFiles; replaced the 2026-10-21 full mirror). 2026-10-23: N ranges, any set of layers
+    // (design-context-parallel-at-scale.md steps 2 and 3).
     //
-    // What: layer il's K/V cells are split at h: range 0 = cells [0, h) on the owner A (model.dev_layer(il), whatever
-    // device the fit gives it), range 1 = cells [h, kv_size) on the helper B (LLAMA_CP_DEV=<device name>, mandatory, a
-    // fixed device; "CPU" = the CPU test mode). Nothing is duplicated. h = LLAMA_CP_SPLIT_FRAC (default 0.5) of kv_size
-    // rounded to 256 (every FA KV tile divides 256 and n_kv is padded to 256, so h and n_kv - h stay tile aligned),
-    // fixed at construction; LLAMA_CP_SPLIT_CELL=<h> overrides it (tests). While n_kv <= h the graph is the plain one
-    // over range 0; above, FA_A runs over [0, h) on A and FA_B over [h, n_kv) on B, A merges (build_attn_cp).
-    // Why: the mirror cost one layer's full K/V on B (1056 MiB per layer at -c 270336, 16 layers = 17 GB, Vulkan1 has
-    // ~3 GB), the production fit summary printed est. free -1658 MiB on Vulkan1, and cp_resync re-copied it through the
-    // host after every host K/V write (410 MiB / 233 ms per layer, ~4 s per restore at 16 layers).
+    // Knobs (all off by default):
+    //   LLAMA_CP_LAYERS=all|<il,il,...>  CP layers ("all" = every K/V layer of this cache below hparams.n_layer, so no
+    //                                    MTP/nextn layer); LLAMA_CP_LAYER=<il> (legacy) adds one layer.
+    //   LLAMA_CP_DEVS=<dev,dev,...>      devices in range order. Per layer the owner (model.dev_layer(il), it holds the
+    //                                    weights) takes range 0 and is taken out of the list once; the rest keep their
+    //                                    order. A layer whose owner is not in the list stays plain. N = list length.
+    //                                    "CPU" = the CPU test mode (repeat it: CPU,CPU,CPU = 3 ranges in host memory).
+    //   LLAMA_CP_DEV=<dev>               (legacy) one helper: ranges = [owner, dev], N = 2, for any owner.
+    //   LLAMA_CP_FRACS=<f,f,...>         N range fractions (normalized), default equal; LLAMA_CP_SPLIT_FRAC=<f> (legacy,
+    //                                    N = 2) = f, 1 - f. Bounds round to 256 cells, each range >= 256.
+    //   LLAMA_CP_SPLIT_CELL=<h,h,...>    explicit N - 1 bounds (tests), overrides the fractions.
+    //   LLAMA_CP_MIN_KV=<n>              range 0 holds at least [0, n) (h_1 = max(h_1, n rounded up to 256)); the other
+    //                                    ranges share the rest by their fractions. See "Threshold" below.
+    //   LLAMA_CP_CHECK=1                 full reference K/V per CP layer on its owner (LLAMA_CP_CHECK_LAYERS=<il,...>
+    //                                    limits it: each reference is a full layer of K/V), see llama_cp_check_step.
+    //
+    // What: bounds [h_0 = 0, h_1, ..., h_N = kv_size) are shared by every CP layer (one cp idxs input per range serves
+    // all of them); range r of layer il = cells [h_r, h_r+1) on its device, nothing duplicated. While n_kv <= h_1 the
+    // layer's graph is the plain one over range 0; above, each range with h_r < n_kv runs FA over [h_r, min(h_r+1, n_kv))
+    // on its device and the owner merges the partials (build_attn_cp, build_attn_cp_merge).
+    // Threshold: the owner can only run the whole layer while every live cell is in range 0, so "CP off below n_kv X"
+    // is a memory layout, not a graph switch: LLAMA_CP_MIN_KV makes range 0 at least X. The switch is a function of
+    // n_kv only (n_kv > h_1), and n_kv moves in 256-cell steps that already rebuild the graph (can_reuse pins n_kv), so
+    // there is no per-ubatch flip and no hysteresis: one re-plan at the crossing, monotone while a session grows
+    // (a rollback across h_1 flips it back once, same as any n_kv step down). Equal thirds of -c 350000 put h_1 at
+    // ~116k, near the design's ~100k break-even, without MIN_KV.
+    // Why ranges: the mirror cost one layer's full K/V on the helper (1056 MiB per layer at -c 270336, 16 layers = 17 GB,
+    // Vulkan1 has ~3 GB), the production fit summary printed est. free -1658 MiB on Vulkan1, and cp_resync re-copied it
+    // through the host after every host K/V write (410 MiB / 233 ms per layer, ~4 s per restore at 16 layers).
     // Layout: each range tensor has (c1 - c0) + 1 rows; the last row is the TRASH row: a ubatch's tokens are stored by
-    // one fixed-shape set_rows per range (build_input_cp_idxs), tokens of the other range go to the trash row (the CPU
-    // set_rows asserts 0 <= idx < ne1, and a per-ubatch token split would change the graph shape every step). FA never
-    // reads it (reads are [0, n_kv - c0) of a range, n_kv <= kv_size).
+    // one fixed-shape set_rows per live range (build_input_cp_idxs), tokens of other ranges go to the trash row (the CPU
+    // set_rows asserts 0 <= idx < ne1, and a per-ubatch token split would change the graph shape every step), so a
+    // boundary ubatch is split by the indices, not by the graph. FA never reads the trash row.
     // Host side: every cell-indexed K/V access (state write/read/clear, K-shift) goes through cp_rows, which splits a cell
-    // range at the bounds; the blob bytes are identical to a no-CP cache's. ON_DEVICE state is refused across two buffer types (per-buft
-    // byte counts depend on where the restored cells land). The helper's range is allocated on B in every fit probe
-    // whatever device A is (2026-10-21: a helper share that moved between probes was sized out of Vulkan1 -> GTT).
-    // LLAMA_CP_CHECK=1 adds a full reference copy on A (ref_k / ref_v, global set_rows) that cp_fa_full reads.
-    // Not supported (cp stays off, logged): n_stream > 1, v_trans (no FA), SWA, MLA, offload off, kv_size < 512, a shared
-    // layer. LLAMA_CP_DEV missing or not a device of the split: throws.
+    // range at the bounds; the blob bytes are identical to a no-CP cache's. ON_DEVICE state is refused across two buffer
+    // types (per-buft byte counts depend on where the restored cells land).
+    // Fit: each range tensor is allocated on its own buffer type in every fit probe, so llama_get_memory_breakdown (what
+    // common/fit.cpp reads) counts each device's share of each CP layer; common/fit.cpp needs no change. With equal
+    // fractions and every model device in LLAMA_CP_DEVS a device holds 1/N of every CP layer whoever owns it, so the
+    // share does not move between probes (the 2026-10-21 helper share that moved was sized out of Vulkan1 -> GTT).
+    // Not supported (cp stays off, logged): n_stream > 1, v_trans (no FA), SWA, MLA, offload off, ranges < 256 cells
+    // without LLAMA_CP_SPLIT_CELL, a shared/reused layer. A device name that is not a device of the split: throws.
     struct cp_range {
         uint32_t c0 = 0;  // global cells [c0, c1)
         uint32_t c1 = 0;
@@ -468,28 +495,38 @@ private:
         ggml_backend_buffer_type_t buft = nullptr;
         ggml_tensor * k = nullptr; // [n_embd_k_gqa, c1 - c0 + 1]
         ggml_tensor * v = nullptr; // [n_embd_v_gqa, c1 - c0 + 1]
+        ggml_tensor * kq_mask_dev = nullptr; // [KQ_MASK_INC] tensor of this range's buffer type
+    };
+
+    struct cp_layer {
+        int32_t il = -1;
+        std::vector<cp_range> ranges;  // N, range 0 = layers[].k / .v on the owner
+        ggml_tensor * ref_k = nullptr; // LLAMA_CP_CHECK reference [n_embd_k_gqa, kv_size] on the owner
+        ggml_tensor * ref_v = nullptr;
     };
 
     struct cp_state {
-        int32_t  il    = -1;
-        float    frac  = 0.5f;
-        uint32_t h     = 0;
+        std::vector<uint32_t> bounds;       // N + 1 cells, bounds[0] = 0, bounds[N] = kv_size
         bool     check = false;             // LLAMA_CP_CHECK=1, see llama_context::cp_check_step
-        // LLAMA_CP_PACK (default 1; 0 = the 2026-10-21 graph). 2026-10-22 evening: one D2D hop each way instead of
-        // 4 + 2 (Q|K|V packed on the owner, mask built on the helper, the helper's partial as one tensor), because each
+        // LLAMA_CP_PACK (default 1; 0 = the 2026-10-21 graph). 2026-10-22 evening: one D2D hop each way per helper instead
+        // of 4 + 2 (Q|K|V packed on the owner, mask built on the helper, the helper's partial as one tensor), because each
         // hop costs ~0.13 ms of queue time on the card that submits it. Measurements: llm_graph_context::build_attn_cp.
         bool     pack  = true;
 
-        std::vector<cp_range> ranges;       // empty: no CP layer in this cache
-
-        ggml_tensor * ref_k = nullptr;      // LLAMA_CP_CHECK reference [n_embd_k_gqa, kv_size] on A
-        ggml_tensor * ref_v = nullptr;
-        ggml_tensor * kq_mask_dev = nullptr; // B's [KQ_MASK_INC] tensor
+        std::vector<cp_layer>      layers;  // empty: no CP layer in this cache
+        std::map<int32_t, size_t>  idx;     // il -> layers
 
         // LLAMA_CP_CHECK: cells written from the host since the last update, copied ranges -> reference in update()
         mutable std::vector<std::pair<uint32_t, uint32_t>> ref_dirty;
 
-        bool active() const { return !ranges.empty(); }
+        bool active() const { return !layers.empty(); }
+        bool has_ref() const {
+            return std::any_of(layers.begin(), layers.end(), [](const cp_layer & l) { return l.ref_k != nullptr; });
+        }
+        const cp_layer * get(int32_t il) const {
+            const auto it = idx.find(il);
+            return it == idx.end() ? nullptr : &layers[it->second];
+        }
     };
 
     cp_state cp;
@@ -657,11 +694,13 @@ public:
     // [CP] see llama_kv_cache::cp_state
     bool               cp_active(int32_t il) const;
     uint32_t           cp_split(int32_t il) const;
-    bool               cp_check() const;
-    ggml_backend_dev_t cp_dev(bool helper) const;
-    ggml_tensor *      cp_kq_mask_dev() const;
+    int                cp_n_live(int32_t il) const;
+    uint32_t           cp_bound(int r) const;
+    bool               cp_check(int32_t il) const;
+    ggml_backend_dev_t cp_dev(int32_t il, int r) const;
+    ggml_tensor *      cp_kq_mask_dev(int32_t il, int r) const;
     bool               cp_pack() const;
-    int                cp_kq_build_dev() const;
+    int                cp_kq_build_dev(int32_t il, int r) const;
     int                cp_n_ranges() const;
     ggml_tensor *      get_k_range(ggml_context * ctx, int32_t il, uint32_t i0, uint32_t i1, bool ref) const;
     ggml_tensor *      get_v_range(ggml_context * ctx, int32_t il, uint32_t i0, uint32_t i1, bool ref) const;

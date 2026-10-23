@@ -870,6 +870,16 @@ struct vk_op_flash_attn_split_k_reduce_push_constants {
     uint32_t emit_lse; // ggml_flash_attn_ext_set_emit_lse: dst rows are D + 4, [D] = lse
 };
 
+// [fork, 2026-10-23] GGML_OP_FLASH_ATTN_MERGE, layout of flash_attn_merge.comp
+struct vk_op_flash_attn_merge_push_constants {
+    uint32_t n_parts;
+    uint32_t D;
+    uint32_t emit_lse;
+    uint32_t s1, s2, s3;
+    uint32_t d1, d2, d3;
+    uint32_t off0, off1, off2, off3, offd;
+};
+
 struct vk_op_flash_attn_mask_opt_push_constants {
     uint32_t nem0;
     uint32_t nem1;

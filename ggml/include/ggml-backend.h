@@ -417,6 +417,13 @@ extern "C" {
         int64_t bwd_lag;                    // waited bwd value - src counter (hop 2s outstanding), 0 if reached
         int64_t t_hop_queue_submit_us;      // the vkQueueSubmit calls alone inside t_hop_submit_us
         int32_t ring_kind;                  // [fork, 2026-10-22 evening] enum ggml_backend_d2d_ring_kind, async copies
+        // [fork, 2026-10-23] GGML_VK_D2D_HOP_FOLD (ggml-vulkan.cpp ggml_vk_hop_fold_level), async copies only.
+        // hop_fold: 0 hop 1 got its own vkQueueSubmit (as before), 1 hop 1 was recorded into the src split's still-open
+        // last command buffer (one submit, one job), 2 same vkQueueSubmit as that tail but its own VkSubmitInfo
+        // because it waits on bwd (ring WAR at the cap), i.e. two kernel jobs. hop2_fold: 1 hop 2 was appended to the
+        // dst's open command buffer with its fwd wait merged into that submission (no extra VkSubmitInfo)
+        int32_t hop_fold;
+        int32_t hop2_fold;
     };
 
     struct ggml_backend_sched_copy_stats {
@@ -500,6 +507,15 @@ extern "C" {
         // (wrong-tool scout item 5, 5429 of 10351 production steps); which half dominates decides cache vs faster split
         int64_t t_split_graph_us;
         int64_t t_alloc_splits_us;
+        // [fork, 2026-10-23] GGML_VK_D2D_HOP_FOLD: async hop 1s folded into the src split's tail submit (hop_fold 1 or 2)
+        // vs separate; hop 2s merged into the dst's open submission; deferred tails the scheduler had to submit itself
+        // (no hop took them: bounce, or the hop was refused); vkQueueSubmit calls made on the scheduler thread during
+        // compute_splits (all backends: graph batches, event records, hops; -1 without a backend that counts them)
+        int32_t n_d2d_hop_fold;
+        int32_t n_d2d_hop_sep;
+        int32_t n_d2d_hop2_fold;
+        int32_t n_fold_flush;
+        int64_t n_queue_submit;
         struct ggml_backend_sched_copy_stats  copies[GGML_BACKEND_SCHED_STATS_MAX_COPIES];
         struct ggml_backend_sched_split_stats splits[GGML_BACKEND_SCHED_STATS_MAX_SPLITS];
     };

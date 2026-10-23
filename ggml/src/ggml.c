@@ -1101,9 +1101,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 
     "KQ_MASK_BUILD",
+    "FLASH_ATTN_MERGE",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1218,9 +1219,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 
     "kq_mask_build(c,r)",
+    "flash_attn_merge(p...)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6106,6 +6108,35 @@ struct ggml_tensor * ggml_kq_mask_build(
     result->src[0] = cells;
     result->src[1] = rows;
     result->src[2] = anchor;
+
+    return result;
+}
+
+// ggml_flash_attn_merge
+
+struct ggml_tensor * ggml_flash_attn_merge(
+        struct ggml_context * ctx,
+        struct ggml_tensor ** parts,
+        int                   n_parts,
+        bool                  emit_lse) {
+    GGML_ASSERT(n_parts >= 2 && n_parts <= GGML_MAX_SRC);
+    const struct ggml_tensor * p0 = parts[0];
+    GGML_ASSERT(p0->ne[0] > 4);
+    for (int i = 0; i < n_parts; ++i) {
+        GGML_ASSERT(parts[i]->type == GGML_TYPE_F32 && parts[i]->nb[0] == sizeof(float));
+        GGML_ASSERT(ggml_are_same_shape(parts[i], p0));
+    }
+
+    const int64_t D = p0->ne[0] - 4;
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, emit_lse ? D + 4 : D, p0->ne[1], p0->ne[2], p0->ne[3]);
+
+    const int32_t params[] = { n_parts, emit_lse ? 1 : 0 };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op = GGML_OP_FLASH_ATTN_MERGE;
+    for (int i = 0; i < n_parts; ++i) {
+        result->src[i] = parts[i];
+    }
 
     return result;
 }

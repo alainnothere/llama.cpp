@@ -979,6 +979,7 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_arange_f32;
     vk_pipeline pipeline_kq_mask_build[2]; // [fork, 2026-10-22] [0] = 256x1 workgroup, [1] = 16x16, see ggml_vk_kq_mask_build
+    vk_pipeline pipeline_flash_attn_merge; // [fork, 2026-10-23] GGML_OP_FLASH_ATTN_MERGE, up to 4 parts
 
     vk_pipeline pipeline_fill_f32;
     vk_pipeline pipeline_fill_f16;
@@ -1511,6 +1512,14 @@ struct ggml_backend_vk_context {
     bool         dts_probe_ok {};
     // D2D hop pieces of the copy in flight (scheduler copy_arm), NULL = off
     struct ggml_backend_d2d_copy_stats * d2d_stats {};
+    // [fork, 2026-10-23] GGML_VK_D2D_HOP_FOLD (comment at ggml_vk_hop_fold_level, ggml-vulkan.cpp). fold_defer_req: set by
+    // the scheduler (ggml_backend_fork_fold_i.defer_next) right before a graph_compute whose output the next split pulls
+    // through an async hop; consumed by that graph_compute. fold_defer_active: inside that graph_compute, the final
+    // batch is left open. fold_tail_ctx: the compute_ctx holding that unsubmitted tail (plus event_record's set/signal);
+    // the next submit of compute_ctx (hop 1, the scheduler's fold flush, synchronize, any later graph) carries it
+    bool fold_defer_req {};
+    bool fold_defer_active {};
+    vk_context_ref fold_tail_ctx;   // open iff it is still compute_ctx (ggml_vk_fold_tail_is_open)
     // [fork, 2026-10-22 night] synchronize totals for LLAMA_DECODE_STATS "sync_prev" (ggml_backend_fork_stats_i.sync_totals,
     // ggml-backend.h ggml_backend_sync_totals): fence wait vs deferred memcpys. Off until the scheduler first asks
     bool sync_stats_on {};

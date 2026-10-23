@@ -993,9 +993,9 @@ public:
     // [KQ_MASK_DEV] inputs whose device masks LLAMA_KQ_MASK_DEV_CHECK verifies after compute (empty when the check is off)
     std::vector<const llm_graph_input_attn_kv *> kq_build_check;
 
-    // [CP] LLAMA_CP_CHECK: merged and single-card attention of the cp layer, [n_embd_head_v, n_head, n_tokens]
-    ggml_tensor * t_cp_merged = nullptr;
-    ggml_tensor * t_cp_full   = nullptr;
+    // [CP] LLAMA_CP_CHECK: merged and single-card attention of each checked cp layer, [n_embd_head_v, n_head, n_tokens]
+    std::vector<ggml_tensor *> t_cp_merged;
+    std::vector<ggml_tensor *> t_cp_full;
 
     std::vector<ggml_tensor *> t_sampled;
     std::vector<ggml_tensor *> t_sampled_probs;
@@ -1037,6 +1037,13 @@ struct llm_graph_qkv {
     ggml_tensor * q; // [n_embd_head, n_head,    n_tokens]
     ggml_tensor * k; // [n_embd_head, n_head_kv, n_tokens]
     ggml_tensor * v; // [n_embd_head, n_head_kv, n_tokens]
+};
+
+// [CP] one context-parallel partial attention (FLASH_ATTN_EXT with emit_lse) as the owner's merge reads it
+struct llm_cp_partial {
+    ggml_tensor * p;   // the whole [D + 4, nh, nt] partial on the owner (nullptr: not available, 2-way ops merge only)
+    ggml_tensor * o;   // [D, nh, nt] view of the O columns
+    ggml_tensor * lse; // [1, nh, nt] lse column (cont)
 };
 
 struct llm_graph_context {
@@ -1301,28 +1308,37 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
-    // [CP] LLAMA_CP_PACK: Q|K|V of the cp layer packed on the owner and hopped once; sets q_b / k_b / v_b to views of the
-    // helper's copy (leaves them as they are when the shapes do not allow it). See the comment above build_attn_cp
+    // [CP] LLAMA_CP_PACK: Q|K|V of the cp layer packed on the owner and hopped once per helper; sets q_h[r] / k_h[r] /
+    // v_h[r] (r = 1 .. n_live - 1, helpers on another device than the owner) to views of helper r's copy, leaves the
+    // others as they are (also when the shapes do not allow it). See the comment above build_attn_cp
     void cp_pack_qkv(
             const llama_kv_cache_context * mctx_cur,
             ggml_tensor * q_cur,
             ggml_tensor * k_cur,
             ggml_tensor * v_cur,
-            ggml_tensor *& q_b,
-            ggml_tensor *& k_b,
-            ggml_tensor *& v_b,
+            std::vector<ggml_tensor *> & q_h,
+            std::vector<ggml_tensor *> & k_h,
+            std::vector<ggml_tensor *> & v_h,
+                    int   n_live,
                     int   il) const;
 
-    // [CP] context-parallel attention for one layer, see llama_kv_cache::cp_state. Replaces get_k/get_v + build_attn_mha
-    // of build_attn (the K/V store into the owner's cache is done by the caller). Returns [n_embd_head_v*n_head, n_tokens]
+    // [CP] context-parallel attention for one layer over its n_live ranges, see llama_kv_cache::cp_state. Replaces
+    // get_k/get_v + build_attn_mha of build_attn (the K/V stores are done by the caller). Returns [n_embd_head_v*n_head, n_tokens]
     ggml_tensor * build_attn_cp(
             llm_graph_input_attn_kv * inp,
             ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]
-            ggml_tensor * q_b,     // the same Q already on the helper (LLAMA_CP_PACK), nullptr: the sched hops q
+            const std::vector<ggml_tensor *> & q_h, // q_h[r]: the same Q already on helper r (LLAMA_CP_PACK), nullptr: the sched hops q
             ggml_tensor * kq_mask, // what build_attn_mha would get
-               uint32_t   h,
+                    int   n_live,
                   float   kq_scale,
                     int   il) const;
+
+    // [CP] merge of N context-parallel partials on the owner backend `be`, see the comment above its definition.
+    // Returns [n_embd_head_v, n_head, n_tokens]
+    ggml_tensor * build_attn_cp_merge(
+            const std::vector<llm_cp_partial> & parts,
+            ggml_backend_t be,
+                       int il) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

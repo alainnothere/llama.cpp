@@ -4188,6 +4188,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_fill_f16, "fill_f16", fill_f16_len, fill_f16_data, "main", 1, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_kq_mask_build[0], "kq_mask_build_256x1", kq_mask_build_len, kq_mask_build_data, "main", 3, 4*sizeof(uint32_t), {256, 1, 1}, {256, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_kq_mask_build[1], "kq_mask_build_16x16", kq_mask_build_len, kq_mask_build_data, "main", 3, 4*sizeof(uint32_t), {16, 16, 1}, {16, 16}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_flash_attn_merge, "flash_attn_merge", flash_attn_merge_len, flash_attn_merge_data, "main", 5, sizeof(vk_op_flash_attn_merge_push_constants), {1, 1, 1}, {64}, 1);
 
 #define CREATE_GLU(name)  \
     ggml_vk_create_pipeline(device, device->pipeline_ ## name [0], #name "_f32", name ## _f32_len, name ## _f32_data, "main", 3, sizeof(vk_op_glu_push_constants), {512, 1, 1}, {}, 1, true);   \
@@ -12040,6 +12041,59 @@ static void ggml_vk_kq_mask_build(ggml_backend_vk_context * ctx, vk_context& sub
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { c_buf, r_buf, d_buf }, pc, { pc.n_kv, pc.n_rows, 1 });
 }
 
+// [fork, 2026-10-23] GGML_OP_FLASH_ATTN_MERGE (ggml.h ggml_flash_attn_merge): the N-way context-parallel merge in one
+// dispatch, one workgroup per (head, token, ne3) row. The 2-way production merge (build_attn_cp) is still concat +
+// soft_max + 2 mul + add; this op is for N >= 3 and for LLAMA_CP_MERGE_OP=1. Compiled 2026-10-23, NOT gated on a GPU:
+// gate = test-backend-ops -o FLASH_ATTN_MERGE -b Vulkan<n> (CPU reference, ops.cpp).
+static bool ggml_vk_flash_attn_merge_supported(const ggml_tensor * op) {
+    const int n_parts = ggml_get_op_params_i32(op, 0);
+    if (n_parts < 2 || n_parts > 4 || op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op)) {
+        return false;
+    }
+    for (int i = 0; i < n_parts; ++i) {
+        const ggml_tensor * t = op->src[i];
+        if (t->type != GGML_TYPE_F32 || t->nb[0] != sizeof(float) ||
+            t->nb[1] != op->src[0]->nb[1] || t->nb[2] != op->src[0]->nb[2] || t->nb[3] != op->src[0]->nb[3]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void ggml_vk_flash_attn_merge(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const int n_parts = ggml_get_op_params_i32(dst, 0);
+    const ggml_tensor * p0 = dst->src[0];
+
+    vk_op_flash_attn_merge_push_constants pc = {};
+    pc.n_parts  = (uint32_t) n_parts;
+    pc.D        = (uint32_t) (p0->ne[0] - 4);
+    pc.emit_lse = (uint32_t) ggml_get_op_params_i32(dst, 1);
+    pc.s1 = (uint32_t) (p0->nb[1]/sizeof(float));
+    pc.s2 = (uint32_t) (p0->nb[2]/sizeof(float));
+    pc.s3 = (uint32_t) (p0->nb[3]/sizeof(float));
+    pc.d1 = (uint32_t) (dst->nb[1]/sizeof(float));
+    pc.d2 = (uint32_t) (dst->nb[2]/sizeof(float));
+    pc.d3 = (uint32_t) (dst->nb[3]/sizeof(float));
+
+    vk_pipeline pipeline = ctx->device->pipeline_flash_attn_merge;
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_subbuffer b[4];
+    uint32_t * offs[4] = { &pc.off0, &pc.off1, &pc.off2, &pc.off3 };
+    for (int i = 0; i < 4; ++i) {
+        const ggml_tensor * t = dst->src[i < n_parts ? i : 0];
+        b[i] = ggml_vk_tensor_subbuffer(ctx, t, true);
+        *offs[i] = get_misalign_bytes(ctx, t)/sizeof(float);
+    }
+    const vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, dst, true);
+    pc.offd = get_misalign_bytes(ctx, dst)/sizeof(float);
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { b[0], b[1], b[2], b[3], d_buf }, pc,
+            { (uint32_t) p0->ne[1], (uint32_t) p0->ne[2], (uint32_t) p0->ne[3] });
+}
+
 void ggml_vk_fill(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_vk_fill(dst=" << dst << ", ne=" << ggml_nelements(dst) << ")");
     const uint64_t n = ggml_nelements(dst);
@@ -14204,6 +14258,12 @@ static void ggml_backend_vk_fork_sync_totals(ggml_backend_t backend, struct ggml
     *out = ctx->sync_tot;
 }
 
+// [fork, 2026-10-23] vkQueueSubmit calls (ggml_vk_submit) on this thread so far: the scheduler's per-graph submit count
+// (ggml_backend_sched_stats n_queue_submit), so the tape shows GGML_VK_D2D_HOP_FOLD taking jobs off the queues
+static int64_t ggml_backend_vk_fork_n_queue_submit(void) {
+    return (int64_t) vk_queue_submit_counter;
+}
+
 static const struct ggml_backend_fork_stats_i ggml_backend_vk_fork_stats_i = {
     /* .ts_arm   = */ ggml_backend_vk_fork_ts_arm,
     /* .ts_take  = */ ggml_backend_vk_fork_ts_take,
@@ -14211,6 +14271,7 @@ static const struct ggml_backend_fork_stats_i ggml_backend_vk_fork_stats_i = {
     /* .ts_calib = */ ggml_backend_vk_fork_ts_calib,
     /* .copy_arm = */ ggml_backend_vk_fork_copy_arm,
     /* .sync_totals = */ ggml_backend_vk_fork_sync_totals,
+    /* .n_queue_submit = */ ggml_backend_vk_fork_n_queue_submit,
 };
 
 // GGML_BACKEND_FORK_STATS_PROC, via ggml_backend_vk_reg_get_proc_address
@@ -14441,6 +14502,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         break;
     case GGML_OP_KQ_MASK_BUILD:
         ggml_vk_kq_mask_build(ctx, compute_ctx, node);
+
+        break;
+    case GGML_OP_FLASH_ATTN_MERGE:
+        ggml_vk_flash_attn_merge(ctx, compute_ctx, node);
 
         break;
     case GGML_OP_SCALE:
@@ -14788,6 +14853,20 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
     // and can be run and compared to its CPU equivalent separately
     last_node = true;
 #endif
+
+    if (last_node && ctx->fold_defer_active) {
+        // [fork, 2026-10-23] GGML_VK_D2D_HOP_FOLD (comment at ggml_vk_hop_fold_level): the final batch stays open for the
+        // next split's hop 1 (or the scheduler's fold flush). The split's end timestamp still goes in here, so the tape's
+        // t_gpu_end_us is the compute's end and the hop copy shows up in gap_A1_A2 as before. Staging memcpys stay on
+        // the context: ggml_vk_submit_compute_ctx_nowait does in_memcpys/memsets and synchronizes for out_memcpys
+        if (ctx->dts_end_pending) {
+            ggml_vk_dts_write_end(ctx, compute_ctx);
+        }
+        compute_ctx->exit_tensor_idx = node_idx_begin;
+        ctx->fold_tail_ctx     = compute_ctx;
+        ctx->fold_defer_active = false;
+        return true;
+    }
 
     if (submit || last_node) {
         // [fork, 2026-10-22] split GPU timeline end, into the graph's final command buffer (comment at VK_DTS_RING).
@@ -15457,6 +15536,88 @@ static void ggml_backend_vk_get_tensor_async(ggml_backend_t backend, const ggml_
 //
 // Links are per (source device, destination backend context): bwd is signaled from that context's submissions,
 // so two contexts on one device (target + draft) must not share a timeline.
+// [fork, 2026-10-23] HOP FOLD (GGML_VK_D2D_HOP_FOLD, default 1 since the GPU gate = fold hop 1; 2 = also fold hop 2;
+// 0 = off). Step 4 of contextFiles/design-context-parallel-at-scale.md ("hop tax").
+// GATE 2026-10-23 12:40 (claude_scratch/cp_gate/run_hop_fold.sh, layer 27 owner Vulkan3 helper Vulkan1, 120.5k, -ub 1024;
+// Q arms = CP off at production -ub 512), off | 1 | 2:
+//   gap_A1_A2 p50 0.117 | 0.078 | 0.078 ms (p90 0.101); hop_back p50 0.131 | 0.109 | 0.110; gap_A2_A3 0.200 both
+//   submits per graph 45 | 37 | 37 (CP), 30 | 26 (CP off, Q0 -> Q2); t_hop_submit_us/step 69 | 68
+//   pp(first 120k) 542.8 | 542.8 | 543.2 t/s; Q0/Q2 846.2 | 847.2; text identical in every arm; GGML_VK_D2D_CHECK=1
+//   on level 2: 0 mismatches, 6 ok-lines, no abort; n_hop_fold 924 = every hop, n_fold_flush 0
+// So the job count was a third of the tax, not all of it: a folded hop still costs ~0.08 ms on the owner's clock
+// (the design's 0.03 was a guess). Level 2 adds nothing over level 1 (hop 2 was already inside the receiver's first
+// submit; merging it into an open batch removes no job the tape can see), so the default is 1. 64 hops/step at 0.08
+// instead of 0.13 = ~5 ms, not 8, for the three-way all-layers split (step 3).
+// Why: the 2026-10-22 21:56 CP pack gate (layer 27, owner Vulkan3, helper Vulkan1, 120k) reads gap_A1_A2 p50 0.122 ms
+// on the owner's own clock: A1 ends, then the queue runs three kernel jobs before A2's first batch: A1's last batch
+// (the graph's final submit), event_record's own submit (set event + timeline signal, empty otherwise) and hop 1
+// (barrier, 20 KiB copy into the ring, barrier, fwd signal). Each job pays amdgpu scheduling + IB preamble + the
+// end-of-job fence/cache flush; the per-job cost is NOT measured on its own (the design's estimate is ~0.03 ms per hop
+// once folded, i.e. most of the 0.122 is the two extra jobs), and every job counts against the 32 (128 since the
+// reboot) sched_jobs per context. Step 3 (16 layers, 3 ways) is 64 hops per step: ~8 ms of this at 0.13 ms per hop,
+// the difference between +40% and +20% at 229k.
+// What it does (no new GPU sync, the order of commands on the queue is unchanged):
+//   1: the scheduler (ggml_backend_fork_fold_i, ggml-backend-impl.h) tells the src backend, before graph_compute of a
+//      split whose output the next split pulls through an async hop, to leave the final batch open. event_record
+//      appends its vkCmdSetEvent + timeline signal to that open batch instead of submitting; hop 1 (ggml_vk_d2d_copy_async)
+//      records its barrier/copy/barrier into the SAME command buffer and adds fwd to the same submission's signals;
+//      ggml_vk_submit_compute_ctx_nowait then sends tail + event + hop 1 as ONE VkSubmitInfo = one kernel job. When
+//      hop 1 must wait on bwd (ring WAR, only at VK_D2D_RING_MAX) it keeps its own VkSubmitInfo inside the same
+//      vkQueueSubmit (hop_fold 2): a semaphore wait applies to the whole submission, and the compute tail must not
+//      be held behind a ring wait. The scheduler flushes the tail itself after the next split's copies if no hop took it
+//      (bounce, refused async, a hop from another backend only): n_fold_flush.
+//   2: also hop 2: when the dst compute context is already open (event_wait / host input copies recorded ahead of the
+//      graph), hop 2 appends to that command buffer and merges its fwd wait into the open submission instead of
+//      starting a new VkSubmitInfo; the dst graph's first batch then goes out as one job instead of two. Hop 2 was
+//      already in the dst graph's first vkQueueSubmit before this (it is recorded into the dst compute context that
+//      graph_compute flushes); what level 2 removes is the separate VkSubmitInfo, i.e. the second kernel job.
+// Read from the code (2026-10-23), the questions the design left open:
+//   - queue: hop 1 is on the src COMPUTE queue already (comment above ggml_vk_d2d_copy_async; the async transfer queue
+//     carries only host uploads), and hop 2 on the dst compute queue. Folding changes no queue family, no ownership
+//     transfer and no buffer sharing mode. The transfer_semaphore wait hop 1 adds (uploads into the src tensor) lands
+//     on the folded submission: it covers only uploads already submitted, and get_compute_ctx puts the same kind of
+//     wait on every compute batch anyway.
+//   - "a folded hop waits for the whole split": it already did. Hop 1 has always been queued after everything earlier
+//     on the src compute queue with a full barrier in front (its first scope is all prior submissions), so the copy
+//     never left before A1's last node finished. Folding moves the SUBMIT of A1's last batch from the end of
+//     graph_compute to the hop 1 call a few us later on the host (event_record + the next split's earlier input
+//     copies); the GPU only sees that if it had drained A1's earlier batches by then. No size threshold: the pipelined pp
+//     path (-b 8192 -ub 512) has the host far ahead of every queue, and its 20 KiB..40 MiB hops are ordered the same.
+//   - deadlock rule (hop 1 never waits on a bwd whose hop 2 is unsubmitted; every fwd a submitted hop 2 waits on is
+//     already submitted): unchanged. Hop 1 is still submitted inside ggml_vk_d2d_copy_async, before hop 2 is recorded
+//     on the dst, and the presubmit of the dst context still happens before hop 1's submit. The deferred tail adds
+//     unsubmitted work on the src between its graph_compute and the next split's copies; nothing waits on it there:
+//     its event's timeline value is only host-waited by an input-less next split (excluded: the scheduler only defers
+//     when the next split has a live input from this backend) or by this backend as a copy dst (it is not the next
+//     split's backend), and vkCmdWaitEvents on its VkEvent only comes from this backend's own later splits, after the
+//     flush. A dst presubmit that lands on the src (the src is also the dst of another link) just submits the tail early.
+//   - ring accounting: one fwd value per hop 1 and one bwd value per hop 2 as before (the bwd signal merge per batch
+//     already existed); live regions, bwd_pending_mark (n_submits of the context, i.e. vkQueueSubmit calls) and the
+//     elide rule see the same values. Fewer submits change nothing there.
+// Off (0): the scheduler never gets the fold interface (get_proc_address returns NULL), the backend never defers.
+// Not with GGML_VK_PERF_LOGGER / GGML_VK_MMVQ_SLOPE_STATS / serialized submissions / GGML_VULKAN_CHECK_RESULTS (they own
+// the final submit of a graph): the fold silently stays off there.
+static int ggml_vk_hop_fold_level() {
+#ifdef __linux__
+    static const int lvl = [] {
+        const char * v = getenv("GGML_VK_D2D_HOP_FOLD");
+        return v ? std::max(0, std::min(2, atoi(v))) : 1;
+    }();
+    return lvl;
+#else
+    return 0;   // the async D2D path is Linux-only
+#endif
+}
+
+// the tail a deferred graph_compute left open is still the context's open compute context (nothing submitted it)
+static bool ggml_vk_fold_tail_is_open(ggml_backend_vk_context * ctx) {
+    if (ctx->compute_ctx.expired()) {
+        return false;
+    }
+    vk_context t = ctx->fold_tail_ctx.lock();
+    return t && t == ctx->compute_ctx.lock() && t->s != nullptr;
+}
+
 #ifdef __linux__
 #include <unistd.h>
 #include <sys/mman.h>
@@ -16156,6 +16317,7 @@ static void ggml_vk_submit_compute_ctx_nowait(ggml_backend_vk_context * ctx) {
     ggml_vk_submit(c, {});
     ctx->submit_pending = true;
     ctx->compute_ctx.reset();
+    ctx->fold_tail_ctx.reset();   // [fork, 2026-10-23] a deferred tail (GGML_VK_D2D_HOP_FOLD) went out with this submit
 }
 
 // true if every recorded hop 2 signal is on the dst queue
@@ -16493,10 +16655,19 @@ static bool ggml_vk_d2d_copy_async(ggml_backend_vk_context * src_ctx, ggml_backe
         rec->t_hop_submit_us += ggml_time_us() - t_sub0;
     }
     const bool src_fresh = src_ctx->compute_ctx.expired();
+    // [fork, 2026-10-23] GGML_VK_D2D_HOP_FOLD (comment at ggml_vk_hop_fold_level): the src split's last batch (and its
+    // event record) is still open; hop 1 goes into that command buffer and out with it, one job. With a bwd wait it
+    // keeps its own batch (hop_fold 2): the wait would otherwise hold the compute tail back
+    const int  fold_lvl  = ggml_vk_hop_fold_level();
+    const bool fold_tail = fold_lvl >= 1 && ggml_vk_fold_tail_is_open(src_ctx);
+    int32_t    hop_fold  = 0;
     vk_context sc = ggml_vk_get_compute_ctx(src_ctx);
-    if (!src_fresh) {
+    if (fold_tail && wait_bwd == 0) {
+        hop_fold = 1;
+    } else if (!src_fresh) {
         // own batch, so the semaphore wait does not hold back work recorded before it
         ggml_vk_ctx_begin(src_ctx->device, sc);
+        hop_fold = fold_tail ? 2 : 0;
     }
     if (src_ctx->device->async_use_transfer_queue && src_ctx->transfer_semaphore.value > 0) {
         // uploads into the src tensor on the transfer queue; a wait on an already reached value is free
@@ -16566,6 +16737,7 @@ static bool ggml_vk_d2d_copy_async(ggml_backend_vk_context * src_ctx, ggml_backe
         }
         rec->n_src_submit_infos = n_infos;
         rec->n_src_wait_sems    = n_waits;
+        rec->hop_fold           = hop_fold;
     }
     const int64_t t_sub1 = rec ? ggml_time_us() : 0;
     ggml_vk_submit_compute_ctx_nowait(src_ctx);
@@ -16579,10 +16751,35 @@ static bool ggml_vk_d2d_copy_async(ggml_backend_vk_context * src_ctx, ggml_backe
     ggml_vk_d2d_bwd_all_submitted(l);   // retire the previous pending context before tracking a new one
     const bool dst_fresh = dst_ctx->compute_ctx.expired();
     vk_context dc = ggml_vk_get_compute_ctx(dst_ctx);
+    // [fork, 2026-10-23] GGML_VK_D2D_HOP_FOLD=2: an open dst context here holds only what the scheduler recorded for this
+    // split's inputs (event_wait, host/same-device input copies, earlier hop 2s): append to it and merge the fwd wait
+    // into its submission (one VkSubmitInfo, one job, for the graph's first batch). Holding those few commands behind
+    // fwd costs at most the hop's latency; the graph's first nodes waited on it anyway. Not onto a deferred tail of the
+    // dst's own (cannot happen under the scheduler's window rule; a wait must not hold compute back)
+    bool hop2_fold = false;
     if (!dst_fresh) {
-        ggml_vk_ctx_begin(dst_ctx->device, dc);
+        if (fold_lvl >= 2 && !ggml_vk_fold_tail_is_open(dst_ctx)) {
+            hop2_fold = true;
+        } else {
+            ggml_vk_ctx_begin(dst_ctx->device, dc);
+        }
     }
-    dc->s->wait_semaphores.push_back({ l->fwd_dst, l->fwd_value });
+    {
+        // a timeline wait on the same semaphore twice in one submission: keep the larger value
+        bool merged_wait = false;
+        for (auto & sem : dc->s->wait_semaphores) {
+            if (sem.s == l->fwd_dst) {
+                sem.value   = std::max(sem.value, l->fwd_value);
+                merged_wait = true;
+            }
+        }
+        if (!merged_wait) {
+            dc->s->wait_semaphores.push_back({ l->fwd_dst, l->fwd_value });
+        }
+    }
+    if (rec) {
+        rec->hop2_fold = hop2_fold ? 1 : 0;
+    }
     ggml_vk_sync_buffers(nullptr, dc);
     {
         VkBufferCopy bc{ off, dst_offset, size };
@@ -17673,6 +17870,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     ggml_vk_submit_transfer_ctx(ctx);
 
+    // [fork, 2026-10-23] GGML_VK_D2D_HOP_FOLD: the scheduler asked for this graph's final batch to stay open (comment at
+    // ggml_vk_hop_fold_level). Not with the instruments that own the final submit/wait or force per-node submits
+    bool fold_defer = ctx->fold_defer_req && ggml_vk_hop_fold_level() >= 1 && !vk_perf_logger_enabled && !vk_mmvq_slope_stats &&
+                      !ctx->device->serialize_submissions;
+#if defined(GGML_VULKAN_CHECK_RESULTS)
+    fold_defer = false;
+#endif
+    ctx->fold_defer_req    = false;
+    ctx->fold_defer_active = fold_defer;
+
     // [fork, 2026-10-22] split GPU timeline start (LLAMA_DECODE_STATS, comment at VK_DTS_RING); one bool test when off
     if (ctx->dts_armed) {
         ggml_vk_dts_begin(ctx);
@@ -18233,13 +18440,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     if (ctx->dts_end_pending) {
         vk_context cc = ggml_vk_get_compute_ctx(ctx);
         ggml_vk_dts_write_end(ctx, cc);
-        if (!vk_perf_logger_enabled) {
+        if (ctx->fold_defer_active) {
+            ctx->fold_tail_ctx = cc;   // [fork, 2026-10-23] hop fold: stays open like a node tail (build_graph)
+        } else if (!vk_perf_logger_enabled) {
             ggml_vk_ctx_end(cc);
             ggml_vk_submit(cc, {});
             ctx->submit_pending = true;
             ctx->compute_ctx.reset();
         }
     }
+    ctx->fold_defer_active = false;
     vk_slope_phases_cur = nullptr;   // recording done: freeze the phase sums (collect reads them)
 
     if (vk_perf_logger_enabled || (vk_mmvq_slope_stats && ctx->query_idx > 0)) {
@@ -18727,6 +18937,11 @@ static void ggml_backend_vk_event_record(ggml_backend_t backend, ggml_backend_ev
 
     ggml_vk_submit_transfer_ctx(ctx);
 
+    // [fork, 2026-10-23] GGML_VK_D2D_HOP_FOLD: the graph's final batch is still open (comment at ggml_vk_hop_fold_level);
+    // set the event and add its timeline signal there, and leave the submit to the hop 1 that follows (or the
+    // scheduler's fold flush). Nothing host-waits on this event's value before that flush (window rule, ggml-backend-impl.h)
+    const bool fold_tail = ggml_vk_fold_tail_is_open(ctx);
+
     vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
     auto* cmd_buf = compute_ctx->s->buffer; // retrieve pointer before it gets reset
 
@@ -18749,12 +18964,15 @@ static void ggml_backend_vk_event_record(ggml_backend_t backend, ggml_backend_ev
 
     vkev->tl_semaphore.value++;
     compute_ctx->s->signal_semaphores.push_back(vkev->tl_semaphore);
+    vkev->cmd_buffer = cmd_buf;
+    vkev->cmd_buffer_use_counter = cmd_buf->use_counter;
+    if (fold_tail) {
+        return;
+    }
     ggml_vk_ctx_end(compute_ctx);
 
     ggml_vk_submit(compute_ctx, {});
     ctx->submit_pending = true;
-    vkev->cmd_buffer = cmd_buf;
-    vkev->cmd_buffer_use_counter = cmd_buf->use_counter;
     ctx->compute_ctx.reset();
 }
 
@@ -19403,6 +19621,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             return op->type == GGML_TYPE_F32;
         case GGML_OP_FILL:
             return op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16;
+        case GGML_OP_FLASH_ATTN_MERGE:
+            return ggml_vk_flash_attn_merge_supported(op);
         case GGML_OP_KQ_MASK_BUILD:
             return op->type == GGML_TYPE_F16 &&
                    op->src[0]->type == GGML_TYPE_I32 && ggml_is_contiguous(op->src[0]) &&
@@ -19816,11 +20036,48 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
-// [fork, 2026-10-22] only the LLAMA_DECODE_STATS hooks (ggml_backend_fork_stats_i, ggml-backend-impl.h)
+// [fork, 2026-10-23] GGML_VK_D2D_HOP_FOLD scheduler hooks (ggml_backend_fork_fold_i, ggml-backend-impl.h; comment at
+// ggml_vk_hop_fold_level)
+#ifdef __linux__
+static void ggml_backend_vk_fold_defer_next(ggml_backend_t backend) {
+    ((ggml_backend_vk_context *)backend->context)->fold_defer_req = true;
+}
+
+static bool ggml_backend_vk_fold_flush(ggml_backend_t backend) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    ctx->fold_defer_req = false;   // a request whose graph_compute never ran must not leak into a later graph
+    if (!ggml_vk_fold_tail_is_open(ctx)) {
+        return false;
+    }
+    ggml_vk_submit_compute_ctx_nowait(ctx);
+    return true;
+}
+
+static const struct ggml_backend_fork_fold_i ggml_backend_vk_fork_fold_i = {
+    /* .defer_next = */ ggml_backend_vk_fold_defer_next,
+    /* .flush      = */ ggml_backend_vk_fold_flush,
+};
+#endif
+
+static const struct ggml_backend_fork_fold_i * ggml_backend_vk_fork_fold(ggml_backend_t backend) {
+#ifdef __linux__
+    if (ggml_vk_hop_fold_level() >= 1 && ggml_vk_d2d_async_enabled() && backend && ggml_backend_is_vk(backend)) {
+        return &ggml_backend_vk_fork_fold_i;
+    }
+#endif
+    GGML_UNUSED(backend);
+    return nullptr;
+}
+
+// [fork, 2026-10-22] the LLAMA_DECODE_STATS hooks (ggml_backend_fork_stats_i, ggml-backend-impl.h); 2026-10-23 the hop
+// fold hooks (ggml_backend_fork_fold_i)
 static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, GGML_BACKEND_FORK_STATS_PROC) == 0) {
         return (void *)ggml_backend_vk_fork_stats;
+    }
+    if (strcmp(name, GGML_BACKEND_FORK_FOLD_PROC) == 0) {
+        return (void *)ggml_backend_vk_fork_fold;
     }
     return NULL;
 }
