@@ -155,8 +155,11 @@ struct llama_context {
 
     // [fork, 2026-10-22 night] llama_decode_prebuild: build + sched-alloc the graph a coming decode of this batch shape
     // would build, so that decode finds it reusable. 1 built, 0 the current graph already fits, -1 not applicable
-    int decode_prebuild(const llama_batch_ext & batch_inp);
+    // [fork, 2026-10-23] inflight = LLAMA_VERIFY_PREBUILD_EARLY: may run while the previous decode is still executing
+    // (between llama_process and llama_synchronize), see the comment at the definition
+    int decode_prebuild(const llama_batch_ext & batch_inp, bool inflight = false);
     void decode_prebuild_stats(int32_t * n_built, int32_t * n_hit, int32_t * n_miss) const;
+    void decode_prebuild_early_stats(int32_t * n_built, int32_t * n_fit, int32_t * n_hit, int32_t * n_miss, int32_t * n_abort, int64_t * t_us) const;
 
     // compat version
     int encode(const llama_batch & batch_inp);
@@ -465,6 +468,16 @@ private:
     int32_t n_prebuild_miss  = 0; // the next ubatch rebuilt anyway (shape or n_kv/head differed)
     int64_t dstats_t_prebuild_us = 0; // [LLAMA_DECODE_STATS] host time of the prebuild before the next decode line
     int32_t dstats_prebuild = -1;     // 1 hit, 0 miss, -1 no prebuild before this decode
+
+    // [fork, 2026-10-23] LLAMA_VERIFY_PREBUILD_EARLY (decode_prebuild inflight): counts since context creation.
+    // built = a graph was planned while the verify ran; fit = the in-flight graph already fit the prediction (nothing to
+    // do); hit = the next ubatch reused an early graph; miss = the late prebuild or the decode rebuilt it; abort = the
+    // plan needed a compute buffer to grow (or alloc failed) and was dropped (ggml_backend_sched_alloc_graph_inflight)
+    bool    prebuild_early_pending = false;
+    int32_t n_early_built = 0, n_early_fit = 0, n_early_hit = 0, n_early_miss = 0, n_early_abort = 0;
+    int64_t t_early_us = 0;                // host time of all early prebuilds (built + fit + abort)
+    int64_t dstats_t_prebuild_early_us = 0; // [LLAMA_DECODE_STATS] early prebuild time before the next decode line
+    int32_t dstats_prebuild_early = -1;     // 1 hit, 0 miss, 2 fit, -2 aborted, -1 none
 
     // debug timing breakdown of decode() / process_ubatch() (see DEBUG_TIMINGS in server-context.cpp)
     mutable int64_t t_build_graph  = 0;

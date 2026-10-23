@@ -72,6 +72,11 @@ GGML_API bool ggml_gallocr_reserve_n(
 GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph);
 // [fork, 2026-10-22] first reason the last alloc_graph found the plan invalid, "" when it was valid
 GGML_API const char * ggml_gallocr_get_last_realloc_reason(ggml_gallocr_t galloc);
+// [fork, 2026-10-23] no_grow: a reserve (explicit, or the automatic one of a single-buffer alloc_graph) that would
+// allocate, grow or free a compute buffer returns false instead and leaves every buffer untouched; the plan is then
+// invalidated, so the next alloc_graph without the flag re-plans normally. For planning while a previous graph that
+// uses these buffers is still executing (ggml_backend_sched_alloc_graph_inflight)
+GGML_API void ggml_gallocr_set_no_grow(ggml_gallocr_t galloc, bool no_grow);
 
 GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
 

@@ -1851,11 +1851,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             n_prebuild_hit++;
             dstats_prebuild = 1;
         }
+        if (prebuild_early_pending) {
+            prebuild_early_pending = false;
+            n_early_hit++;
+            dstats_prebuild_early = 1;
+        }
     } else {
         if (prebuild_pending) {
             prebuild_pending = false;
             n_prebuild_miss++;
             dstats_prebuild = 0;
+        }
+        if (prebuild_early_pending) {
+            prebuild_early_pending = false;
+            n_early_miss++;
+            dstats_prebuild_early = 0;
         }
         gf_res_prev_active = nullptr;
         res->reset();
@@ -2249,13 +2259,41 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 // the reuse branch. Correctness guard is the same as for any reuse: can_reuse() against the real, applied mctx.
 // The memory context only runs init_batch (a dry run that restores the memory) + prepare_graph() (n_kv as after
 // apply). Callers: tools/server (LLAMA_VERIFY_PREBUILD=1, default off until the GPU gate).
-int llama_context::decode_prebuild(const llama_batch_ext & batch_inp) {
+// [fork, 2026-10-23] inflight = true (LLAMA_VERIFY_PREBUILD_EARLY, tools/server decode()): called right after
+// llama_process(ctx_tgt) submitted the verify and before llama_synchronize(ctx_tgt), so the ~3.5 ms of build + sched
+// hide behind the target's own ~60-80 ms verify instead of the ~2.7 ms MTP catch-up (gate 2026-10-23 01:30: prebuild
+// t_us 3.50 ms p50 vs that 2.7 ms window, ~1.1 ms of it stuck out, net 2.1 of 3.3 ms/step). Safety, read 2026-10-23:
+//   - every output readback of the in-flight decode is already enqueued (decode_impl: tensor_get_async of logits /
+//     h_nextn into host buffers with the device address resolved at record time). Nothing after llama_process reads
+//     the in-flight res: res->reset() overwrites its tensor structs in buf_compute_meta (no free), the next reader is
+//     the next decode's can_reuse/set_inputs, after the synchronize
+//   - init_batch + prepare_graph: host cell metadata, restored (kv prepare(), recurrent prepare()); rs_z is recomputed
+//     by the real apply. Run on the post-verify memory (rejected drafts not yet removed), so the caller predicts pos0 =
+//     the end of the verify ("all accepted"): consecutive for the recurrent find_slot, and n_kv is off only by the
+//     rejected rows, a miss only when that crosses a 256 pad
+//   - sched alloc: ggml_backend_sched_alloc_graph_inflight (no drain, no buffer growth/free; comment there). A plan that
+//     needs growth is dropped (n_early_abort) and the late prebuild / decode re-plans after the sync
+//   - build_graph writes no device memory (the persistent KQ mask is a KV-cache tensor written in set_inputs only)
+// Precondition (caller): ctx is synchronized before anything executes on it again; the server syncs in the same
+// yield lambda. The counters are separate from the late prebuild's so its 32-step hit-rate backoff is not fed early
+// misses. The late prebuild (inflight = false) finds an early graph that fits in can_reuse (ret 0, early stays
+// pending and is credited at the decode) and rebuilds over a wrong one (n_early_miss), so the early path is additive.
+int llama_context::decode_prebuild(const llama_batch_ext & batch_inp, bool inflight) {
     if (!memory || graph_reuse_disable || batch_inp.tokens.empty() || batch_inp.n_embd > 0 ||
-            sched_need_reserve || cparams.embeddings || !sampling.samplers.empty() || synced_gen != async_gen) {
+            sched_need_reserve || cparams.embeddings || !sampling.samplers.empty() || (!inflight && synced_gen != async_gen)) {
         return -1;
     }
 
     const int64_t t_start = ggml_time_us();
+    auto t_book = [&]() {
+        const int64_t dt = ggml_time_us() - t_start;
+        if (inflight) {
+            t_early_us                 += dt;
+            dstats_t_prebuild_early_us += dt;
+        } else {
+            dstats_t_prebuild_us += dt;
+        }
+    };
 
     if (!balloc->init(batch_inp, model.vocab, false)) {
         return -1;
@@ -2287,16 +2325,33 @@ int llama_context::decode_prebuild(const llama_batch_ext & batch_inp) {
     int ret = 0;
     if (gf_res_prev_active == res && res->can_reuse(gparams)) {
         ret = 0;
+        if (inflight) {
+            n_early_fit++;
+            dstats_prebuild_early = 2;
+        }
     } else {
+        if (!inflight && prebuild_early_pending) {
+            // the early prediction (made before acceptance and the auto-tuner) was wrong: rebuilt here as before
+            prebuild_early_pending = false;
+            n_early_miss++;
+            dstats_prebuild_early = 0;
+        }
         gf_res_prev_active = nullptr;
         res->reset();
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
         ggml_cgraph * gf = model.build_graph(gparams);
-        if (!gf || !ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+        const bool ok = gf && (inflight ? ggml_backend_sched_alloc_graph_inflight(sched.get(), gf)
+                                        : ggml_backend_sched_alloc_graph(sched.get(), gf));
+        if (!ok) {
             // nothing active: the real decode builds as usual
             n_outputs = n_outputs_save;
+            if (inflight && gf) {
+                n_early_abort++;
+                dstats_prebuild_early = -2;
+            }
+            t_book();
             return -1;
         }
         if (dstats_on) {
@@ -2307,15 +2362,29 @@ int llama_context::decode_prebuild(const llama_batch_ext & batch_inp) {
             check_cpu_placement(gf);
         }
         gf_res_prev_active = res;
-        prebuild_pending   = true;
-        n_prebuild_built++;
+        if (inflight) {
+            prebuild_early_pending = true;
+            n_early_built++;
+        } else {
+            prebuild_pending = true;
+            n_prebuild_built++;
+        }
         ret = 1;
     }
 
     n_outputs = n_outputs_save;
-    dstats_t_prebuild_us += ggml_time_us() - t_start;
+    t_book();
 
     return ret;
+}
+
+void llama_context::decode_prebuild_early_stats(int32_t * n_built, int32_t * n_fit, int32_t * n_hit, int32_t * n_miss, int32_t * n_abort, int64_t * t_us) const {
+    if (n_built) { *n_built = n_early_built; }
+    if (n_fit)   { *n_fit   = n_early_fit;   }
+    if (n_hit)   { *n_hit   = n_early_hit;   }
+    if (n_miss)  { *n_miss  = n_early_miss;  }
+    if (n_abort) { *n_abort = n_early_abort; }
+    if (t_us)    { *t_us    = t_early_us;    }
 }
 
 void llama_context::decode_prebuild_stats(int32_t * n_built, int32_t * n_hit, int32_t * n_miss) const {
@@ -2878,12 +2947,20 @@ void llama_context::dstats_emit(int ret, int64_t t_start_us, uint32_t n_tokens, 
     // [fork, 2026-10-22 night] scout item 5: a verify-graph prebuild ran before this call (llama_decode_prebuild).
     // hit = this call reused it. Its build + sched time is NOT in t_graph_build/t_sched_alloc of this line, but the
     // sched's split/galloc timers carry over into this line's t_sched_split_us / t_sched_galloc_us
-    char pb[96] = "";
+    char pb[192] = "";
     if (dstats_prebuild >= 0 || dstats_t_prebuild_us > 0) {
         snprintf(pb, sizeof(pb), ",\"prebuild\":{\"hit\":%d,\"t_us\":%" PRId64 "}", dstats_prebuild, dstats_t_prebuild_us);
     }
     dstats_prebuild      = -1;
     dstats_t_prebuild_us = 0;
+    // [fork, 2026-10-23] LLAMA_VERIFY_PREBUILD_EARLY: r = 1 hit, 0 miss (late prebuild or this call rebuilt it), 2 the
+    // in-flight graph already fit, -2 aborted (buffer growth); t_us = early host time, spent while the verify ran
+    if (dstats_prebuild_early != -1 || dstats_t_prebuild_early_us > 0) {
+        const size_t l = strlen(pb);
+        snprintf(pb + l, sizeof(pb) - l, ",\"prebuild_early\":{\"r\":%d,\"t_us\":%" PRId64 "}", dstats_prebuild_early, dstats_t_prebuild_early_us);
+    }
+    dstats_prebuild_early      = -1;
+    dstats_t_prebuild_early_us = 0;
 
     // 2026-10-22 night: output bytes enqueued (async D2H, waited for in the next line's sync_prev), blocking host-source
     // input copies (the input_embed bounce), the syncs inside this call, and the sync_prev detail (see synchronize())
@@ -6246,6 +6323,14 @@ int32_t llama_decode_prebuild(llama_context * ctx, llama_batch_ext * batch) {
 
 void llama_decode_prebuild_stats(const llama_context * ctx, int32_t * n_built, int32_t * n_hit, int32_t * n_miss) {
     ctx->decode_prebuild_stats(n_built, n_hit, n_miss);
+}
+
+int32_t llama_decode_prebuild_early(llama_context * ctx, llama_batch_ext * batch) {
+    return ctx->decode_prebuild(*batch, /*inflight =*/ true);
+}
+
+void llama_decode_prebuild_early_stats(const llama_context * ctx, int32_t * n_built, int32_t * n_fit, int32_t * n_hit, int32_t * n_miss, int32_t * n_abort, int64_t * t_us) {
+    ctx->decode_prebuild_early_stats(n_built, n_fit, n_hit, n_miss, n_abort, t_us);
 }
 
 int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_ext * batch) {

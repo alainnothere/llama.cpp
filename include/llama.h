@@ -598,6 +598,14 @@ extern "C" {
     LLAMA_API int32_t  llama_decode_prebuild(struct llama_context * ctx, struct llama_batch_ext * batch);
     // counts since context creation: prebuilds, and whether the next ubatch reused (hit) or rebuilt (miss) it
     LLAMA_API void     llama_decode_prebuild_stats(const struct llama_context * ctx, int32_t * n_built, int32_t * n_hit, int32_t * n_miss);
+    // [fork, 2026-10-23] the same prebuild while the previous decode may still be executing (call it between
+    // llama_process and llama_synchronize, and synchronize before anything else runs on ctx): never drains the
+    // devices and never grows a compute buffer (-1 instead). Separate counters: built, fit (the in-flight graph already
+    // fits), hit/miss of the next ubatch (a later llama_decode_prebuild that rebuilds counts as a miss), aborted
+    // (buffer growth), and the host time of all calls
+    LLAMA_API int32_t  llama_decode_prebuild_early(struct llama_context * ctx, struct llama_batch_ext * batch);
+    LLAMA_API void     llama_decode_prebuild_early_stats(const struct llama_context * ctx, int32_t * n_built, int32_t * n_fit,
+                                                         int32_t * n_hit, int32_t * n_miss, int32_t * n_abort, int64_t * t_us);
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
 

@@ -933,6 +933,9 @@ struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
 
+    // [fork, 2026-10-23] set only inside ggml_backend_sched_alloc_graph_inflight (see there)
+    bool alloc_inflight;
+
     // [fork, 2026-10-21] see ggml_backend_sched_set_split_sync_relax
     bool split_sync_relax;
 
@@ -1873,13 +1876,18 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         // [fork, 2026-10-22] this drain is the pipeline killer of design-kq-mask-on-device.md 1b: every in-flight
         // ubatch of every backend must finish before the re-plan, timed into t_realloc_sync_us
         const int64_t t_sync0 = st ? ggml_time_us() : 0;
-        for (int i = 0; i < sched->n_backends; i++) {
+        // [fork, 2026-10-23] alloc_graph_inflight: no drain. The galloc is in no_grow mode, so the reserve below only
+        // re-plans host-side offsets inside the existing buffers or fails; the caller guarantees no graph of this
+        // sched executes before a full synchronize (comment at ggml_backend_sched_alloc_graph_inflight)
+        for (int i = 0; !sched->alloc_inflight && i < sched->n_backends; i++) {
             ggml_backend_synchronize(sched->backends[i]);
         }
         const int64_t t_sync1 = st ? ggml_time_us() : 0;
 
         if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
-            GGML_LOG_ERROR("%s: failed to reserve graph buffers\n", __func__);
+            if (!sched->alloc_inflight) { // inflight: an expected outcome (no_grow), counted by the caller
+                GGML_LOG_ERROR("%s: failed to reserve graph buffers\n", __func__);
+            }
             return false;
         }
         if (st) {
@@ -2437,6 +2445,38 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->is_alloc = true;
 
     return true;
+}
+
+// [fork, 2026-10-23] LLAMA_VERIFY_PREBUILD_EARLY (llama_context::decode_prebuild, inflight = true). What a plain
+// alloc_graph can do to a graph of this sched that is still executing on the GPU (read 2026-10-23):
+//   - ggml_backend_sched_reset / split_graph: host only (hash set, backend ids, sched->ctx is a no_alloc ggml context
+//     over sched->context_buffer, so the in-flight graph's split-copy tensor structs are overwritten, never freed).
+//     Backends keep no tensor pointers past graph_compute except Vulkan's unsynced_nodes_* barrier lists, which are
+//     only read while recording on that backend and cleared by its next synchronize; nothing records in between
+//   - alloc_splits realloc branch (backend_ids_changed or a plan that no longer fits; it fired on every prebuild of
+//     the 2026-10-23 01:30 gate): ggml_backend_synchronize of every backend = a full drain of the in-flight verify,
+//     which would put the whole prebuild back on the critical path. Skipped here
+//   - ggml_gallocr_reserve_n: ggml_vbuffer_free + alloc of a compute buffer that grows = use-after-free on the GPU
+//     (the submitted command buffers have the old VkBuffer + offsets baked in). Forbidden here (no_grow): returns
+//     false, the plan is invalidated and the next plain alloc_graph (after the caller's synchronize) does it
+//   - ggml_gallocr_alloc_graph with a single buffer reserves automatically, same path, same guard
+//   - ggml_gallocr_init_tensor: tensor->data/buffer assignment + buffer init_tensor (Vulkan: assert only, no
+//     device access); buffer reset is NULL for Vulkan buffers. No device memory is written by alloc
+//   - cur_copy advances: the copies are interchangeable once the caller has synchronized
+// Precondition: the caller synchronizes every backend of this sched before any graph of it executes again (and
+// before anything else writes inputs). Returns false when the graph would need a buffer to grow (or on any other
+// alloc failure): nothing is allocated then, the sched is reset
+bool ggml_backend_sched_alloc_graph_inflight(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    GGML_ASSERT(sched);
+    sched->alloc_inflight = true;
+    ggml_gallocr_set_no_grow(sched->galloc, true);
+    const bool ok = ggml_backend_sched_alloc_graph(sched, graph);
+    ggml_gallocr_set_no_grow(sched->galloc, false);
+    sched->alloc_inflight = false;
+    if (!ok) {
+        ggml_backend_sched_reset(sched);
+    }
+    return ok;
 }
 
 enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {

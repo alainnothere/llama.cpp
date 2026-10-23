@@ -497,6 +497,9 @@ struct ggml_gallocr {
     // [fork, 2026-10-22] why the last ggml_gallocr_needs_realloc said yes ("" = it did not), read by the sched
     // stats (LLAMA_DECODE_STATS "realloc_reason") to check which nodes grow between graphs, see design-kq-mask-on-device.md 3.6b
     char realloc_reason[128];
+
+    // [fork, 2026-10-23] ggml_gallocr_set_no_grow: a reserve that would free/grow a buffer fails instead (see there)
+    bool no_grow;
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -905,6 +908,34 @@ static bool ggml_gallocr_reserve_n_impl(
         }
     }
 
+    // [fork, 2026-10-23] no_grow (ggml_gallocr_set_no_grow): the plan above is host-only; the loop below is the one
+    // place that frees device memory (ggml_vbuffer_free of a buffer an in-flight graph may still be reading). Check
+    // first, fail without touching any buffer, and invalidate the plan so the next alloc_graph re-plans from scratch
+    // (n_nodes = 0 makes ggml_gallocr_needs_realloc say yes; the node_allocs above describe addresses past the end
+    // of the current buffers and must never be used)
+    if (galloc->no_grow) {
+        for (int i = 0; i < galloc->n_buffers; i++) {
+            bool shared = false;
+            for (int j = 0; j < i; j++) {
+                shared |= galloc->buf_tallocs[j] == galloc->buf_tallocs[i];
+            }
+            if (shared) {
+                continue;
+            }
+            bool grow = galloc->buffers[i] == NULL;
+            for (int c = 0; !grow && c < galloc->buf_tallocs[i]->n_chunks; c++) {
+                grow = ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c) > ggml_vbuffer_chunk_size(galloc->buffers[i], c);
+            }
+            if (grow) {
+                snprintf(galloc->realloc_reason, sizeof(galloc->realloc_reason), "no_grow: %s would grow",
+                    ggml_backend_buft_name(galloc->bufts[i]));
+                galloc->n_nodes = 0;
+                galloc->n_leafs = 0;
+                return false;
+            }
+        }
+    }
+
     // reallocate buffers if needed
     for (int i = 0; i < galloc->n_buffers; i++) {
         // if the buffer type is used multiple times, we reuse the same buffer
@@ -1058,6 +1089,10 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 
 const char * ggml_gallocr_get_last_realloc_reason(ggml_gallocr_t galloc) {
     return galloc->realloc_reason;
+}
+
+void ggml_gallocr_set_no_grow(ggml_gallocr_t galloc, bool no_grow) {
+    galloc->no_grow = no_grow;
 }
 
 bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {

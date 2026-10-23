@@ -126,6 +126,9 @@ struct server_ubatch_stats {
     // 2026-10-22 night, see the header: of-which fields and the prompt-path checkpoint restore
     int64_t t_draft_prep = 0, t_draft = 0, t_draft_yield = 0, t_draft_post = 0;
     int64_t t_decode_submit = 0, t_decode_sync = 0;
+    // [fork, 2026-10-23] t_prebuild_us: verify_prebuild() (of t_batch_build_us, late, in the MTP catch-up window);
+    // t_prebuild_early_us: llama_decode_prebuild_early between submit and sync (of t_decode_us, not in submit or sync)
+    int64_t t_prebuild = 0, t_prebuild_early = 0;
     int64_t t_sample = 0, t_accept = 0, t_spec_restore = 0, t_stream = 0, t_release = 0, t_spec_begin = 0;
     int64_t t_iter_gap = 0, t_tasks = 0, t_iter_head = 0;
     int64_t t_ckpt_restore = 0, n_ckpt_restore = 0, ckpt_restore_bytes = 0;
@@ -173,6 +176,7 @@ struct server_ubatch_stats {
                 "\"n_ckpt_rec_reuse\":%" PRId64 ",\"t_release_flush_us\":%" PRId64 ","
                 "\"t_draft_prep_us\":%" PRId64 ",\"t_draft_us\":%" PRId64 ",\"t_draft_yield_us\":%" PRId64 ",\"t_draft_post_us\":%" PRId64 ","
                 "\"t_decode_submit_us\":%" PRId64 ",\"t_decode_sync_us\":%" PRId64 ","
+                "\"t_prebuild_us\":%" PRId64 ",\"t_prebuild_early_us\":%" PRId64 ","
                 "\"t_sample_us\":%" PRId64 ",\"t_accept_us\":%" PRId64 ",\"t_spec_restore_us\":%" PRId64 ",\"t_stream_us\":%" PRId64 ","
                 "\"t_release_us\":%" PRId64 ",\"t_spec_begin_us\":%" PRId64 ","
                 "\"t_iter_gap_us\":%" PRId64 ",\"t_tasks_us\":%" PRId64 ",\"t_iter_head_us\":%" PRId64 ","
@@ -183,6 +187,7 @@ struct server_ubatch_stats {
                 n_ckpt_rec_reuse, t_release_flush,
                 t_draft_prep, t_draft, t_draft_yield, t_draft_post,
                 t_decode_submit, t_decode_sync,
+                t_prebuild, t_prebuild_early,
                 t_sample, t_accept, t_spec_restore, t_stream,
                 t_release, t_spec_begin,
                 t_iter_gap, t_tasks, t_iter_head,
@@ -194,6 +199,7 @@ struct server_ubatch_stats {
         t_prompt_cache = t_batch_build = t_spec_process = t_post_decode = 0;
         t_draft_prep = t_draft = t_draft_yield = t_draft_post = 0;
         t_decode_submit = t_decode_sync = 0;
+        t_prebuild = t_prebuild_early = 0;
         t_sample = t_accept = t_spec_restore = t_stream = t_release = t_spec_begin = 0;
         t_iter_gap = t_tasks = t_iter_head = 0;
         t_ckpt_restore = n_ckpt_restore = ckpt_restore_bytes = 0;
@@ -1435,6 +1441,8 @@ struct server_slot {
     // this is for printing timings with slot progress, not part of metrics
     int64_t t_print_last = 0;
     int32_t n_gen_last = 0;
+    double   pp_print_t_last_ms = 0.0; // [fork, 2026-10-23] window for the pp_last rate on the prompt progress line
+    uint64_t pp_print_n_last    = 0;
 
     void reset() {
         SLT_DBG(*this, "%s", "\n");
@@ -1824,18 +1832,29 @@ struct server_slot {
         SLT_INF(*this, "n_gen = %6d, tg = %6.2f t/s, tg_3s = %6.2f t/s\n", (int) stats.n_gen, n_gen_second, n_gen_second_win);
     }
 
-    void print_timings_pp() const {
+    void print_timings_pp() {
         const double t_prompt_total = stats.t_prompt_ms();
 
-        if (t_prompt_total < 3000.0) {
+        // [fork, 2026-10-23] LLAMA_SERVER_PP_PRINT_MS: the prompt line used to need 3 s of total prompt time before
+        // it printed once; after the tail split / pipeline work most turns finish under that and the number never
+        // appeared. Default 500 ms (upstream: 3000). The line is per batch, so a long paste prints every batch.
+        static const double t_min = [] { const char * e = getenv("LLAMA_SERVER_PP_PRINT_MS"); return e ? atof(e) : 500.0; }();
+        if (t_prompt_total < t_min) {
             return;
         }
 
         const double n_prompt_second = stats.n_prompt_tps();
         const double f_progress = task->n_tokens() > 0 ? (double) prompt.n_tokens() / task->n_tokens() : 0.0;
 
-        SLT_INF(*this, "prompt processing, n_tokens = %6d, progress = %.2f, t = %6.2f s / %.2f tokens per second\n",
-                (int) stats.n_prompt_processed, f_progress, t_prompt_total / 1e3, n_prompt_second);
+        // window rate since the previous print (the pp twin of tg_3s): with 8k pipelined batches the whole-prompt
+        // average hides a slow batch behind the fast first one
+        const double dt = t_prompt_total - pp_print_t_last_ms;
+        const double n_prompt_second_win = dt > 0.0 ? (stats.n_prompt_processed - pp_print_n_last) * 1e3 / dt : n_prompt_second;
+        pp_print_t_last_ms = t_prompt_total;
+        pp_print_n_last    = stats.n_prompt_processed;
+
+        SLT_INF(*this, "prompt processing, n_tokens = %6d, progress = %.2f, t = %6.2f s / %.2f tokens per second, pp_last = %.2f t/s\n",
+                (int) stats.n_prompt_processed, f_progress, t_prompt_total / 1e3, n_prompt_second, n_prompt_second_win);
     }
 
     void print_timings() const {
@@ -1870,6 +1889,14 @@ struct server_slot {
             llama_decode_prebuild_stats(ctx_tgt, &n_pb, &n_hit, &n_miss);
             if (n_pb > 0) {
                 SLT_INF(*this, " graphs prebuilt = %10d (hit %d, miss %d)\n", n_pb, n_hit, n_miss);
+            }
+            // [fork, 2026-10-23] LLAMA_VERIFY_PREBUILD_EARLY
+            int32_t e_built = 0, e_fit = 0, e_hit = 0, e_miss = 0, e_abort = 0;
+            int64_t e_t_us = 0;
+            llama_decode_prebuild_early_stats(ctx_tgt, &e_built, &e_fit, &e_hit, &e_miss, &e_abort, &e_t_us);
+            if (e_built + e_fit + e_abort > 0) {
+                SLT_INF(*this, "  early prebuilt = %10d (fit %d, hit %d, miss %d, aborted %d, %.1f ms host)\n",
+                        e_built, e_fit, e_hit, e_miss, e_abort, e_t_us / 1000.0);
             }
         }
 
@@ -2549,6 +2576,10 @@ private:
 
     // [fork, 2026-10-22 night] LLAMA_VERIFY_PREBUILD=1: the predicted verify batch (shape only), see verify_prebuild()
     common_batch batch_prebuild;
+    // [fork, 2026-10-23] LLAMA_VERIFY_PREBUILD_EARLY: the slot verify_prebuild() ran for this iteration (single generating
+    // + drafting slot), -1 otherwise; read by verify_prebuild_early_prepare() in decode()
+    int32_t      verify_prebuild_slot = -1;
+    common_batch batch_prebuild_early;
     int32_t prebuild_pause     = 0;
     int32_t prebuild_win_built = 0;
     int32_t prebuild_win_hit   = 0;
@@ -3182,6 +3213,7 @@ private:
             const int32_t n_embd  = llama_model_n_embd_inp(model_tgt);
             batch.init(ctx_tgt, std::max(n_batch, params_base.n_parallel), n_embd);
             batch_prebuild = common_batch(ctx_tgt);
+            batch_prebuild_early = common_batch(ctx_tgt);
         }
 
         // decision requests rarely repeat a state, the prompt cache is opt-in for decision models
@@ -5497,8 +5529,14 @@ private:
         if (ust.on) {
             ust.t_draft_prep += ggml_time_us() - ust_dprep_t0 - (ust.t_checkpoint - ust_dprep_n0);
         }
+        verify_prebuild_slot = -1;
         if (drafting.size() == 1 && generating.size() == 1) {
+            verify_prebuild_slot = drafting[0]->id;
+            const int64_t t_pb0 = ust.on ? ggml_time_us() : 0;
             verify_prebuild(*drafting[0]);
+            if (ust.on) {
+                ust.t_prebuild += ggml_time_us() - t_pb0;
+            }
         }
         if (!drafting.empty()) {
             const int64_t t_y0 = ust.on ? ggml_time_us() : 0;
@@ -6021,6 +6059,8 @@ private:
 
                         slot.stats.n_prompt_cached    = n_past;
                         slot.stats.n_prompt_processed = 0;
+                        slot.pp_print_t_last_ms       = 0.0; // pp_last window restarts with the prompt
+                        slot.pp_print_n_last          = 0;
 
                         metrics.add_prompt_cached(n_past);
 
@@ -6525,6 +6565,97 @@ private:
         return (uint32_t) ((n_view + pieces - 1) / pieces);
     }
 
+    // [fork, 2026-10-23] LLAMA_VERIFY_PREBUILD_EARLY (default ON since the GPU gate; =0 turns it off; gate script
+    // run_prebuild_early.sh in ~/ai/claude_scratch/gates1023, report agent-reports/2026-10-23-1013-verify-prebuild-early.md).
+    // GATE 2026-10-23 10:45, 120k session, -b 8192 -ub 512 -c 150000, late prebuild ON in both arms, off | on:
+    //   early hit/miss/fit/abort 208/23/3/0 (90.0% hit, 231 built, 752 ms host over the run), early t_us p50 3.24 ms
+    //   late prebuild t_us p50 3.38 -> 0.017 ms (27 of 235 lines rebuilt), batch build p50 18.31 -> 17.46 ms
+    //   t_decode_sync p50 60.23 -> 56.79 ms, t_decode 63.39 -> 63.40 (the GPU work did not move, the host wait did)
+    //   step p50 at 7 rows 83.33 -> 82.48 ms, all rows 3..12 faster by 0.8-1.6 ms, GPU gap before verify 0.966 -> 0.966
+    //   n_realloc 133 -> 130, graphs reused 100% both, text identical r0..t4, zero error markers, 0 aborts
+    // i.e. the 3.3 ms moved off the critical path, the remaining 0.85 ms/step is the batch-build share it had leaked.
+    // The same prebuild as verify_prebuild() below, issued one window earlier, between
+    // llama_process(ctx_tgt) of THIS verify and its llama_synchronize, where the host otherwise sleeps ~60-80 ms on the
+    // fence. verify_prebuild() then becomes the fallback: llama_decode_prebuild finds the early graph in can_reuse
+    // (cheap, ret 0) or rebuilds a wrong one in its 2.7 ms window exactly as before. Why: gate 2026-10-23 01:30, prebuild
+    // t_us 3.50 ms p50 (p90 3.85) vs the ~2.7 ms MTP catch-up it hides behind, ~1.1 ms landed on batch build, net
+    // 2.1 ms/step of a possible 3.3.
+    // What is unknown here and how it is predicted:
+    //   - n_max of the next draft: the auto-tuner chooses it after acceptance (spec_step_end -> observe, then choose()
+    //     in the next iteration). Its choice is mostly schedule, not outcome: probe vs best alternates by n_step, the
+    //     probe target is coldest()/probe_dir, and observe() moves only one bucket's EMA. A copy of the tuner gets a
+    //     neutral observe (count +1, EMAs unchanged; a never-seen bucket gets tps 0) and choose() is run on it. The
+    //     gate tape alternates 7, k, 7, k+1, ... (sweep), so "last n" would miss every step; the replica gets the
+    //     sweep right and misses only where the new observation flips best()
+    //   - pos0: the end of this verify (every draft accepted). The memory still holds this verify's rows, so that is
+    //     the only consecutive position for the recurrent find_slot dry run; the real n_kv is lower by the rejected
+    //     rows, a miss only when the 256 pad lies between them (~E[rejected]/256 of steps, ~1-2%)
+    //   - the drafter: as verify_prebuild(), a model drafter runs to the cap; n-gram drafts skip
+    // Same gates as verify_prebuild(): model drafter configured, last draft not n-gram, backoff not pausing (read only:
+    // the pause counts down there). The early counters do not feed that backoff.
+    bool verify_prebuild_early_prepare(int32_t off) {
+        static const bool on = [] { const char * e = getenv("LLAMA_VERIFY_PREBUILD_EARLY"); return !e || atoi(e) != 0; }();
+        if (!on || !spec || verify_prebuild_slot < 0 || verify_prebuild_slot >= (int32_t) slots.size() || prebuild_pause > 0) {
+            return false;
+        }
+        const server_slot & slot = slots[verify_prebuild_slot];
+        if (slot.state != SLOT_STATE_GENERATING || slot.spec_draft.empty() || slot.spec_i_batch.empty() || slot.spec_is_replay) {
+            return false;
+        }
+        bool any_model_drafter = false;
+        for (const auto t : params_base.speculative.types) {
+            any_model_drafter |= t != COMMON_SPECULATIVE_TYPE_NONE && !common_speculative_type_is_ngram(t);
+        }
+        if (!any_model_drafter || common_speculative_type_is_ngram(common_speculative_type_last(spec.get(), slot.id))) {
+            return false;
+        }
+        // the view must be exactly this slot's rows (the verify), and hold all of them
+        const int32_t n_view = batch.view.size();
+        llama_pos pos_end = -1;
+        for (int32_t i = off; i < off + n_view; ++i) {
+            if (batch.tokens[i].id_slot != slot.id) {
+                return false;
+            }
+            pos_end = std::max(pos_end, batch.tokens[i].pos[0] + 1);
+        }
+        for (const auto i : slot.spec_i_batch) {
+            if (i < off || i >= off + n_view) {
+                return false;
+            }
+        }
+        int n_pred = common_speculative_get_draft_params(spec.get(), slot.id).n_max;
+        if (slot.spec_auto_enabled) {
+            server_spec_autotune t = slot.spec_auto;
+            const int nc = t.n_chosen;
+            if (t.t_start_us != 0 && nc >= 1 && nc <= t.n_ceiling) {
+                if (!t.has(nc)) {
+                    t.t_step_us[nc] = 1e12;
+                    t.n_landed [nc] = 0.0;
+                }
+                t.n_count[nc]++;
+                t.n_obs++;
+                t.n_cur      = t.best();
+                t.t_start_us = 0;
+            }
+            const int n_seed = slot.spec_ctx_step > 0
+                ? std::max(1, slot.spec_n_max - slot.prompt.n_tokens()/slot.spec_ctx_step)
+                : (slot.spec_n_max + 1)/2;
+            n_pred = std::min(slot.get_n_draft_max(), t.choose(n_seed));
+        }
+        if (n_pred <= 0 || pos_end < 0) {
+            return false;
+        }
+        const int32_t n = 1 + n_pred;
+        if (n > (int32_t) llama_n_ubatch(ctx_tgt) || slot.prompt.n_tokens() + n_view + n > slot.n_ctx) {
+            return false;
+        }
+        batch_prebuild_early.clear();
+        for (int32_t i = 0; i < n; ++i) {
+            batch_prebuild_early.add(slot.sampled, pos_end + i, slot.id, true);
+        }
+        return true;
+    }
+
     // [fork, 2026-10-22 night] wrong-tool scout item 5 (whatifs "2026-10-22 night: wrong-tool scout"; measurements at
     // llama_context::decode_prebuild): 4922 of 10351 production verify steps reused the target graph, each miss 3.4 ms
     // of build + sched split/alloc with every card idle (1.8 ms/step average, 2.2% tg). The verify length is
@@ -6540,6 +6671,8 @@ private:
     // 3.50 ms p50 (p90 3.85), above the ~2.7 ms the MTP catch-up hides, ~1.1 ms lands on batch build (17.5 -> 18.5 ms)
     // so the net is 2.1 ms/step, not 3.3. OPEN: that gate's baseline reused graphs on 0.3% of steps, the scout tape
     // said 48%, n_realloc 175 in both arms; something moved between the tapes.
+    // [fork, 2026-10-23] with LLAMA_VERIFY_PREBUILD_EARLY=1 this is the fallback: an early graph that fits is found by
+    // llama_decode_prebuild's can_reuse (ret 0, ~init_batch dry run only), a wrong one is rebuilt here as before
     void verify_prebuild(const server_slot & slot) {
         static const bool on = [] { const char * e = getenv("LLAMA_VERIFY_PREBUILD"); return !e || atoi(e) != 0; }();
         if (!on || !spec) {
@@ -6679,6 +6812,9 @@ private:
         // handshake + this function's bookkeeping
         auto & ust = server_ustats();
         const uint32_t n_ub_cap = prompt_tail_ubatch_cap(off);
+        // [fork, 2026-10-23] LLAMA_VERIFY_PREBUILD_EARLY: predicted on this thread, built on the worker between the
+        // verify submit and its sync (comment at verify_prebuild_early_prepare)
+        const bool pb_early = has_output && verify_prebuild_early_prepare(off);
         queue_tasks.yield_to_queue([&]() {
             const int64_t t0 = ust.on ? ggml_time_us() : 0;
             if (n_ub_cap > 0) {
@@ -6689,14 +6825,22 @@ private:
                 llama_set_n_ubatch_cap(ctx_tgt, 0);
             }
             const int64_t t1 = ust.on ? ggml_time_us() : 0;
+            // PRECONDITION (llama_decode_prebuild_early): the llama_synchronize right below must follow before anything
+            // else runs on ctx_tgt. Keep the two together and keep has_output in the condition
+            if (pb_early && ret == 0) {
+                llama_decode_prebuild_early(ctx_tgt, batch_prebuild_early.get());
+            }
+            const int64_t t2 = ust.on ? ggml_time_us() : 0;
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
             if (ust.on) {
-                ust.t_decode_submit += t1 - t0;
-                ust.t_decode_sync   += ggml_time_us() - t1;
+                ust.t_decode_submit  += t1 - t0;
+                ust.t_prebuild_early += t2 - t1;
+                ust.t_decode_sync    += ggml_time_us() - t2;
             }
         });
+        verify_prebuild_slot = -1;
 
         if (ret != 0) {
             {

@@ -579,6 +579,10 @@ extern "C" {
 
     // Allocate and compute graph on the backend scheduler
     GGML_API bool                 ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph); // returns success
+    // [fork, 2026-10-23] alloc_graph while a previous graph of this sched may still be executing: never drains, never
+    // allocates/grows/frees a compute buffer (false instead, the sched is then reset). The caller must synchronize the
+    // sched before any graph of it executes again. Preconditions and the paths read: comment at the definition
+    GGML_API bool                 ggml_backend_sched_alloc_graph_inflight(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
