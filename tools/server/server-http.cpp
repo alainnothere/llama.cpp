@@ -934,6 +934,7 @@ static void process_handler_response(server_http_req_ptr && request, server_http
 void server_http_context::get(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
     auto callback = [handler](const httplib::Request & req, httplib::Response & res) {
+        const int64_t t_arrival_us = ggml_time_us();
         server_http_req_ptr request = std::make_unique<server_http_req>(server_http_req{
             get_params(req),
             get_headers(req),
@@ -941,7 +942,8 @@ void server_http_context::get(const std::string & path, const server_http_contex
             build_query_string(req),
             req.body,
             {},
-            req.is_connection_closed
+            req.is_connection_closed,
+            t_arrival_us
         });
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
@@ -955,6 +957,7 @@ void server_http_context::get(const std::string & path, const server_http_contex
 void server_http_context::post(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
     auto callback = [this, handler](const httplib::Request & req, httplib::Response & res) {
+        const int64_t t_arrival_us = ggml_time_us();
         std::string body = req.body;
         std::map<std::string, uploaded_file> files;
 
@@ -1047,7 +1050,8 @@ void server_http_context::post(const std::string & path, const server_http_conte
             build_query_string(req),
             body,
             std::move(files),
-            req.is_connection_closed
+            req.is_connection_closed,
+            t_arrival_us
         });
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
@@ -1061,6 +1065,7 @@ void server_http_context::post(const std::string & path, const server_http_conte
 void server_http_context::del(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
     auto callback = [handler](const httplib::Request & req, httplib::Response & res) {
+        const int64_t t_arrival_us = ggml_time_us();
         server_http_req_ptr request = std::make_unique<server_http_req>(server_http_req{
             get_params(req),
             get_headers(req),
@@ -1068,7 +1073,8 @@ void server_http_context::del(const std::string & path, const server_http_contex
             build_query_string(req),
             req.body,
             {},
-            req.is_connection_closed
+            req.is_connection_closed,
+            t_arrival_us
         });
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
@@ -1228,6 +1234,7 @@ void server_http_context::register_gcp_compat() const {
                         payload.dump(),
                         {},
                         req.should_stop,
+                        req.t_arrival_us,
                     };
 
                     server_http_res_ptr internal_res = handlers.at(dispatch_path)(internal_req);

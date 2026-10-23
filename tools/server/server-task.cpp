@@ -1989,6 +1989,12 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, const std::string & conversation_id, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+    // [LLAMA_SERVER_UBATCH_STATS] 2026-10-22 night: which tier served the restore, read by the per-request line
+    last_load_src   = 0;
+    last_load_bytes = 0;
+    last_load_lcp_us = 0;
+    static const bool lcp_timed = getenv("LLAMA_SERVER_UBATCH_STATS") != nullptr; // no clock reads when off
+    const int64_t t_lcp0 = lcp_timed ? ggml_time_us() : 0;
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -2023,8 +2029,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
     }
 
+    last_load_lcp_us = lcp_timed ? ggml_time_us() - t_lcp0 : 0;
+
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+        last_load_src   = 1;
+        last_load_bytes = (int64_t) (it_best->data.main.size() + it_best->data.drft.size());
 
         // NON-CONSUMING RESTORE — copy bytes into the live context, leave
         // the cached entry intact in `states` so future requests can match
@@ -2086,6 +2096,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     // Phase 3: disk fallback - direct lookup by conversation_id
     if (!disk_path.empty() && !conversation_id.empty()) {
         if (load_from_disk(prompt, conversation_id, ctx_tgt, ctx_dft, id_slot)) {
+            last_load_src = 2;
             SRV_INF("load: restored '%s' from disk\n", conversation_id.c_str());
             merge_checkpoint_spills(prompt);
             return true;
@@ -3461,6 +3472,9 @@ bool server_prompt_cache::load_from_disk(server_prompt & prompt, const std::stri
     }
     prompt.checkpoints.clear();
     prompt.conversation_id = conversation_id;
+
+    // [LLAMA_SERVER_UBATCH_STATS] 2026-10-22 night: per-request restore size (load() sets last_load_src)
+    last_load_bytes = (int64_t) (st.kv_size + st.drft_size + st.rec_size);
 
     // seed the in-RAM mirror so the next flush appends instead of re-reading the header
     {

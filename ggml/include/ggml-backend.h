@@ -430,6 +430,12 @@ extern "C" {
         int64_t t_src_sync_us;       // ggml_backend_synchronize(src), bounce path only
         int64_t t_copy_us;           // the copy itself (enqueue only on the async path)
         struct ggml_backend_d2d_copy_stats d2d; // [fork, 2026-10-22] see above
+        // [fork, 2026-10-22 night] 1: the source backend is synchronous (CPU, no iface.synchronize), i.e. the bytes are
+        // host memory the host may rewrite as soon as the copy call returns. Why: model.input_embed (CPU get_rows,
+        // 2048 x 5120 x f32 = 40 MiB per ubatch) into Vulkan2 is refused by the GPU path since the ppl-gate race fix
+        // (ggml_backend_vk_cpy_tensor_async) and takes the bounce: a blocking staging write + fence wait per ubatch,
+        // the one synchronous host copy left on the pipelined pp path. path "bounce" + src_sync 1 names it on the tape.
+        int32_t src_sync;
     };
 
     struct ggml_backend_sched_split_stats {
@@ -499,6 +505,36 @@ extern "C" {
     };
 
     GGML_API void ggml_backend_sched_set_stats_enabled(ggml_backend_sched_t sched, bool enabled);
+
+    // [fork, 2026-10-22 night] where a host synchronize of a context waits, per backend (LLAMA_DECODE_STATS "sync_prev").
+    // Why: the MTP draft context reports t_sync_prev_us ~3.1 ms per draft step for a ~0.3 ms graph (whatifs doc,
+    // 2026-10-22 open items) and t_sync_prev_us is one number over every backend of the sched: it cannot say which
+    // queue the host waited on, nor whether the wait was the fence or the deferred D2H memcpys of the output
+    // readback (Vulkan copies logits into a staging buffer and memcpys them out inside synchronize). Filled while the
+    // scheduler has stats on: ggml_backend_sched_synchronize times each backend's synchronize (wait_us, n), and a
+    // backend exporting ggml_backend_fork_stats_i.sync_totals adds its own split of that wait (Vulkan: fence wait vs
+    // out/in memcpy, bytes). Totals are monotonic per backend context; the sched keeps the sync-only diff.
+    struct ggml_backend_sync_totals {
+        int64_t n_sync;            // ggml_vk_synchronize calls that found work (submit_pending or a transfer)
+        int64_t t_fence_us;        // host waiting on the fence (GPU still running, or the queue's earlier work)
+        int64_t t_memcpy_out_us;   // deferred D2H memcpys (staging -> user memory, e.g. non-pinned logits)
+        int64_t bytes_memcpy_out;
+        int64_t t_memcpy_in_us;    // deferred H2D memcpys (user memory -> staging) done at submit
+        int64_t bytes_memcpy_in;
+        int64_t n_read_fallback;   // get_tensor_async that could not DMA into the destination: staging + full sync inside
+        int64_t bytes_read_fallback;
+        int64_t t_read_fallback_us;
+    };
+    struct ggml_backend_sched_sync_stats {
+        int64_t n;                 // backend synchronize calls from ggml_backend_sched_synchronize
+        int64_t t_wait_us;         // their wall time
+        int32_t has_totals;        // the backend fills the split below
+        struct ggml_backend_sync_totals vk; // diff of the backend's totals over those calls only
+    };
+    // returns and resets backend backend_id's accumulators; -1 when stats are off or out of range
+    GGML_API int ggml_backend_sched_sync_take(ggml_backend_sched_t sched, int backend_id, struct ggml_backend_sched_sync_stats * out);
+    // backend backend_id's monotonic totals (also syncs inside graph_compute / get_tensor fallbacks); -1 = not exported
+    GGML_API int ggml_backend_sched_sync_totals(ggml_backend_sched_t sched, int backend_id, struct ggml_backend_sync_totals * out);
 
     // [fork, 2026-10-21] context-parallel attention (llama LLAMA_CP_LAYER): a split with no input copies normally waits
     // on the host for the previous split's backend. With relax on, that wait is skipped when neither split reads the

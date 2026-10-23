@@ -208,6 +208,13 @@ struct server_response_reader {
     bool cancelled = false;
     int polling_interval_seconds;
 
+    // [LLAMA_SERVER_UBATCH_STATS] 2026-10-22 night, HTTP thread: result->update() (the incremental chat parse of the
+    // whole generated text per streamed chunk) in next(); set stats_on before the first next()
+    bool    stats_on    = false;
+    int64_t t_update_us = 0;
+    int64_t n_update    = 0;
+    int64_t t_first_us  = 0; // first result received (ggml_time_us)
+
     // tracking generation state and partial tool calls
     // only used by streaming completions
     std::vector<task_result_state> states;

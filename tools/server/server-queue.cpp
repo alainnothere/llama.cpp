@@ -561,11 +561,19 @@ server_task_result_ptr server_response_reader::next(const std::function<bool()> 
                 SRV_DBG("%s", "received error result, stopping further processing\n");
                 return result;
             }
+            const int64_t t_upd0 = stats_on ? ggml_time_us() : 0;
+            if (stats_on && t_first_us == 0) {
+                t_first_us = t_upd0;
+            }
             if (!states.empty()) {
                 // update the generation state if needed
                 const size_t idx = result->index;
                 GGML_ASSERT(idx < states.size());
                 result->update(states[idx]);
+            }
+            if (stats_on) {
+                t_update_us += ggml_time_us() - t_upd0;
+                n_update++;
             }
             if (result->is_stop()) {
                 received_count++;

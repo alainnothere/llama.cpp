@@ -299,6 +299,7 @@ extern "C" {
     //   - copy_arm(dst, rec) before cpy_tensor_async on the destination backend and copy_arm(dst, NULL) after: the
     //     backend writes rec only between the two.
     struct ggml_backend_d2d_copy_stats;
+    struct ggml_backend_sync_totals;
     struct ggml_backend_fork_stats_i {
         void    (*ts_arm)  (ggml_backend_t backend);
         // ticket >= 0, -1 nothing armed/recorded, -2 the ring was full (dropped)
@@ -306,6 +307,9 @@ extern "C" {
         int     (*ts_read) (ggml_backend_t backend, int64_t ticket, int64_t * t_start_us, int64_t * t_end_us, int32_t * n_submit);
         int     (*ts_calib)(ggml_backend_t backend, struct ggml_backend_ts_calib_info * info);
         void    (*copy_arm)(ggml_backend_t backend_dst, struct ggml_backend_d2d_copy_stats * rec);
+        // [fork, 2026-10-22 night] monotonic synchronize totals of this backend context (ggml_backend_sync_totals in
+        // ggml-backend.h); the first call turns the accounting on (one bool test per synchronize until then)
+        void    (*sync_totals)(ggml_backend_t backend, struct ggml_backend_sync_totals * out);
     };
     #define GGML_BACKEND_FORK_STATS_PROC "ggml_backend_fork_stats"
     typedef const struct ggml_backend_fork_stats_i * (*ggml_backend_fork_stats_iface_t)(ggml_backend_t backend);

@@ -167,6 +167,13 @@ struct server_task {
       // Computed at task creation, used for deterministic cache file naming.
       std::string conversation_id;
 
+    // [LLAMA_SERVER_UBATCH_STATS] 2026-10-22 night per-request timeline, HTTP thread side (ggml_time_us, 0 = unset):
+    // arrival = HTTP callback entry (body received), impl = handle_completions_impl entry (arrival -> impl = JSON
+    // parse + chat template), queued = post_tasks (impl -> queued = tokenize + delimiters + spans + conversation id)
+    int64_t t_arrival_us = 0;
+    int64_t t_impl_us    = 0;
+    int64_t t_queued_us  = 0;
+
     // only used by CLI, this allow tokenizing CLI inputs on server side
     // we need this because mtmd_context and vocab are not accessible outside of server_context
     bool                    cli = false;
@@ -746,6 +753,12 @@ struct server_prompt_cache {
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, const std::string & conversation_id, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+
+    // [LLAMA_SERVER_UBATCH_STATS] 2026-10-22 night, set by the last load(): 0 = nothing restored (the slot's own state
+    // stays), 1 = RAM entry, 2 = disk tier; bytes restored; the LCP scan over the RAM entries (us)
+    int     last_load_src    = 0;
+    int64_t last_load_bytes  = 0;
+    int64_t last_load_lcp_us = 0;
 
     void update();
 

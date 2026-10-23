@@ -1511,6 +1511,10 @@ struct ggml_backend_vk_context {
     bool         dts_probe_ok {};
     // D2D hop pieces of the copy in flight (scheduler copy_arm), NULL = off
     struct ggml_backend_d2d_copy_stats * d2d_stats {};
+    // [fork, 2026-10-22 night] synchronize totals for LLAMA_DECODE_STATS "sync_prev" (ggml_backend_fork_stats_i.sync_totals,
+    // ggml-backend.h ggml_backend_sync_totals): fence wait vs deferred memcpys. Off until the scheduler first asks
+    bool sync_stats_on {};
+    struct ggml_backend_sync_totals sync_tot {};
 
     std::vector<vk::DescriptorPool> descriptor_pools;
     std::vector<vk::DescriptorSet> descriptor_sets;

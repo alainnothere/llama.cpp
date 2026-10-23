@@ -14197,12 +14197,20 @@ static void ggml_backend_vk_fork_copy_arm(ggml_backend_t backend_dst, struct ggm
     ((ggml_backend_vk_context *)backend_dst->context)->d2d_stats = rec;
 }
 
+// [fork, 2026-10-22 night] see ggml_backend_sync_totals (ggml-backend.h); the first call turns the accounting on
+static void ggml_backend_vk_fork_sync_totals(ggml_backend_t backend, struct ggml_backend_sync_totals * out) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    ctx->sync_stats_on = true;
+    *out = ctx->sync_tot;
+}
+
 static const struct ggml_backend_fork_stats_i ggml_backend_vk_fork_stats_i = {
     /* .ts_arm   = */ ggml_backend_vk_fork_ts_arm,
     /* .ts_take  = */ ggml_backend_vk_fork_ts_take,
     /* .ts_read  = */ ggml_backend_vk_fork_ts_read,
     /* .ts_calib = */ ggml_backend_vk_fork_ts_calib,
     /* .copy_arm = */ ggml_backend_vk_fork_copy_arm,
+    /* .sync_totals = */ ggml_backend_vk_fork_sync_totals,
 };
 
 // GGML_BACKEND_FORK_STATS_PROC, via ggml_backend_vk_reg_get_proc_address
@@ -15342,6 +15350,9 @@ static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const gg
     bool ret = ggml_vk_buffer_read_2d_async(compute_ctx, buf, src_offset, data, stride_tensor, stride_data, size, n_copies);
 
     if (!ret) {
+        // [fork, 2026-10-22 night] LLAMA_DECODE_STATS: this fallback synchronizes the whole context inside an "async"
+        // read (staging + ggml_vk_synchronize below), so it lands in the caller's t_output_us, not in t_sync_prev_us
+        const int64_t t_fb0 = ctx->sync_stats_on ? ggml_time_us() : 0;
         // One-time diagnostic: confirm device mismatch for pinned memory
         static bool logged_fallback = false;
         if (!logged_fallback && size > 100000) {  // only log for large copies (logits-sized)
@@ -15391,6 +15402,11 @@ static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const gg
             }
         }
         ggml_vk_synchronize(ctx);
+        if (ctx->sync_stats_on) {
+            ctx->sync_tot.n_read_fallback++;
+            ctx->sync_tot.bytes_read_fallback += (int64_t) (size * n_copies);
+            ctx->sync_tot.t_read_fallback_us  += ggml_time_us() - t_fb0;
+        }
     }
 }
 
@@ -16749,6 +16765,12 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
 
     bool do_transfer = !ctx->compute_ctx.expired();
 
+    // [fork, 2026-10-22 night] LLAMA_DECODE_STATS "sync_prev" split (comment at ggml_backend_sync_totals, ggml-backend.h):
+    // the MTP draft ctx waits ~3.1 ms here per draft step for a ~0.3 ms graph; fence vs memcpy says whether that is
+    // the GPU (or the shared queue's earlier work) or the D2H copies of the output readback. one bool test when off
+    const bool sst = ctx->sync_stats_on;
+    auto & stot = ctx->sync_tot;
+
     if (ggml_vk_submit_transfer_ctx(ctx)) {
         ctx->submit_pending = true;
     }
@@ -16765,16 +16787,27 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
 
         if (!compute_ctx->in_memcpys.empty()) {
             vk_slope_timer slope_t(VK_SLOPE_CPY_HOST);   // GGML_VK_MMVQ_SLOPE_STATS t_cpy_host_us
+            const int64_t t0 = sst ? ggml_time_us() : 0;
             for (auto& cpy : compute_ctx->in_memcpys) {
                 memcpy(cpy.dst, cpy.src, cpy.n);
+                if (sst) {
+                    stot.bytes_memcpy_in += (int64_t) cpy.n;
+                }
+            }
+            if (sst) {
+                stot.t_memcpy_in_us += ggml_time_us() - t0;
             }
         }
 
         if (ctx->device->serialize_submissions) {
             ggml_vk_submit(compute_ctx, ctx->fence);
             vk_slope_timer slope_t(VK_SLOPE_WAIT);   // GGML_VK_MMVQ_SLOPE_STATS t_wait_us
+            const int64_t t0 = sst ? ggml_time_us() : 0;
             VK_CHECK(ctx->device->device.waitForFences({ ctx->fence }, true, UINT64_MAX), "synchronize waitForFences", ctx->device);
             ctx->device->device.resetFences({ ctx->fence });
+            if (sst) {
+                stot.t_fence_us += ggml_time_us() - t0;
+            }
         } else {
             ggml_vk_submit(compute_ctx, {});
         }
@@ -16802,7 +16835,12 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
             ctx->device->compute_queue->handle->submit({}, ctx->fence);
         }
         if (!ctx->device->serialize_submissions) {
+            const int64_t t0 = sst ? ggml_time_us() : 0;
             ggml_vk_wait_for_fence(ctx);
+            if (sst) {
+                stot.t_fence_us += ggml_time_us() - t0;
+                stot.n_sync++;
+            }
         }
         ctx->submit_pending = false;
         if (cmd_buf) {
@@ -16814,8 +16852,15 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
     if (do_transfer) {
         if (!compute_ctx->out_memcpys.empty()) {
             vk_slope_timer slope_t(VK_SLOPE_CPY_HOST);   // GGML_VK_MMVQ_SLOPE_STATS t_cpy_host_us
+            const int64_t t0 = sst ? ggml_time_us() : 0;
             for (auto& cpy : compute_ctx->out_memcpys) {
                 memcpy(cpy.dst, cpy.src, cpy.n);
+                if (sst) {
+                    stot.bytes_memcpy_out += (int64_t) cpy.n;
+                }
+            }
+            if (sst) {
+                stot.t_memcpy_out_us += ggml_time_us() - t0;
             }
         }
         ctx->compute_ctx.reset();

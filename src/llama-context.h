@@ -58,7 +58,8 @@ struct llama_context {
     //   - etc.
     void sched_reserve();
 
-    void synchronize();
+    // why: caller tag for LLAMA_DECODE_STATS "sync_prev" (the public API wrappers pass __func__), nullptr = internal
+    void synchronize(const char * why = nullptr);
 
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
@@ -575,12 +576,35 @@ public:
         // 2026-10-22 night (scout item 5): t_sched_alloc split, ggml_backend_sched_stats t_split_graph_us / t_alloc_splits_us
         int64_t s_t_split_graph                      = 0;
         int64_t s_t_alloc_splits                     = 0;
+        // 2026-10-22 night: bytes the output extraction enqueued for D2H (logits / embd / nextn / backend-sampled
+        // rows); the copies are async, their wait + memcpy show up in the next line's "sync_prev"
+        int64_t b_output                             = 0;
+        // 2026-10-22 night: blocking input copies from a synchronous (CPU) source, i.e. the model.input_embed bounce
+        int32_t s_n_hsync          = 0;
+        int64_t s_hsync_bytes      = 0;
+        int64_t s_t_hsync_dst_wait = 0;
+        int64_t s_t_hsync_copy     = 0;
+        // 2026-10-22 night: backend synchronize totals at call start (ggml_backend_sched_sync_totals), so the line can
+        // report the syncs that ran INSIDE the call (staging reads, get_tensor fallbacks) apart from sync_prev
+        std::vector<ggml_backend_sync_totals> vk_at_start;
+        std::vector<int8_t>                   vk_has;
     };
 private:
     bool             dstats_on     = false;
     int32_t          dstats_ctx_id = -1;
     decode_stats_acc dstats;
     int64_t          dstats_t_sync   = 0;  // synchronize() wait since the previous line of this context
+    // 2026-10-22 night: "sync_prev" detail since the previous line: per-backend wait (+ Vulkan fence / memcpy split),
+    // the longest single wait, its caller tag and which other contexts had unsynchronized graphs when it started
+    std::vector<ggml_backend_sched_sync_stats> dstats_sync_acc;
+    int32_t          dstats_sync_n        = 0;
+    int64_t          dstats_sync_max      = 0;
+    const char *     dstats_sync_max_why  = nullptr;
+    uint64_t         dstats_sync_max_peer = 0;  // bit i = ctx i had a graph in flight
+    // the sync that is resolving pending lines right now (dstats_flush(true) attaches it as "resolved_by_sync")
+    int64_t          dstats_rs_t0 = 0, dstats_rs_t1 = 0;
+    const char *     dstats_rs_why = nullptr;
+    uint64_t         dstats_rs_peer = 0;
     int32_t          dstats_n_nodes  = -1; // of the last built graph (cached, reused graphs keep it)
     int32_t          dstats_n_splits = -1;
     int32_t          dstats_n_cpu    = -1; // nodes the scheduler put on a CPU backend

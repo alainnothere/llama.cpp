@@ -54,6 +54,8 @@ struct server_http_req {
     std::string body;
     std::map<std::string, uploaded_file> files; // used for file uploads (form data)
     const std::function<bool()> & should_stop;
+    // [LLAMA_SERVER_UBATCH_STATS] 2026-10-22 night: ggml_time_us() at the route callback entry (body already read)
+    int64_t t_arrival_us;
 
     std::string get_param(const std::string & key, const std::string & def = "") const {
         auto it = params.find(key);

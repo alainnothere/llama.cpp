@@ -137,6 +137,11 @@ static llama_decode_stats_sink & llama_decode_stats() {
 
 static std::atomic<int32_t> g_llama_ctx_seq_id{0};
 
+// [LLAMA_DECODE_STATS] 2026-10-22 night: per ctx id (< 64), 1 while the context has a graph submitted and not yet
+// synchronized. Read at the start of a synchronize() to name the other contexts in flight ("peers_inflight"): the
+// target and the MTP draft context share a Vulkan device queue, so a draft sync can be waiting on target work
+static std::atomic<uint8_t> g_dstats_inflight[64];
+
 // see llama_fit_set_assume_full_offload (llama-ext.h) and its use in common/fit.cpp
 static std::atomic<bool> g_llama_fit_assume_full_offload{false};
 
@@ -892,7 +897,7 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
-    synchronize();
+    synchronize("sched_reserve");
 
     const int64_t t_start_us = ggml_time_us();
 
@@ -1044,7 +1049,7 @@ void llama_context::sched_reserve() {
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
 }
 
-void llama_context::synchronize() {
+void llama_context::synchronize(const char * why) {
     if (!sched) {
         return;
     }
@@ -1061,6 +1066,15 @@ void llama_context::synchronize() {
     }
 
     const bool instr = cparams.perf_instrumentation;
+    // [LLAMA_DECODE_STATS] 2026-10-22 night: who else is in flight when this wait starts (see g_dstats_inflight)
+    uint64_t peers = 0;
+    if (dstats_on) {
+        for (int i = 0; i < 64; ++i) {
+            if (i != dstats_ctx_id && g_dstats_inflight[i].load(std::memory_order_relaxed)) {
+                peers |= 1ull << i;
+            }
+        }
+    }
     const int64_t t_sync_start = (instr || dstats_on) ? ggml_time_us() : 0;
     ggml_backend_sched_synchronize(sched.get());
     if (instr) {
@@ -1068,6 +1082,46 @@ void llama_context::synchronize() {
         n_sync++;
     }
     if (dstats_on) {
+        const int64_t t_sync_end = ggml_time_us();
+        // [LLAMA_DECODE_STATS] 2026-10-22 night "sync_prev" detail. Why: the MTP draft ctx shows t_sync_prev_us ~3.1 ms
+        // per draft step for a ~0.3 ms graph (whatifs doc, 2026-10-22 open items). Suspects: its own graph starting late
+        // behind target work on the shared Vulkan2 queue (peers_inflight names a target still in flight), the D2H
+        // memcpy of the readback (vk memcpy_out_us), or fence wake-up latency (resolved_by_sync.t_end vs the split's
+        // t_gpu_end_us on the line it resolves). Per-backend split from ggml_backend_sched_sync_take, no new sync
+        if (dstats_ctx_id >= 0 && dstats_ctx_id < 64) {
+            g_dstats_inflight[dstats_ctx_id].store(0, std::memory_order_relaxed);
+        }
+        const int n_be = ggml_backend_sched_get_n_backends(sched.get());
+        dstats_sync_acc.resize(n_be);
+        for (int i = 0; i < n_be; ++i) {
+            ggml_backend_sched_sync_stats ss = {};
+            if (ggml_backend_sched_sync_take(sched.get(), i, &ss) == 0) {
+                auto & a = dstats_sync_acc[i];
+                a.n += ss.n;
+                a.t_wait_us += ss.t_wait_us;
+                a.has_totals |= ss.has_totals;
+                a.vk.n_sync              += ss.vk.n_sync;
+                a.vk.t_fence_us          += ss.vk.t_fence_us;
+                a.vk.t_memcpy_out_us     += ss.vk.t_memcpy_out_us;
+                a.vk.bytes_memcpy_out    += ss.vk.bytes_memcpy_out;
+                a.vk.t_memcpy_in_us      += ss.vk.t_memcpy_in_us;
+                a.vk.bytes_memcpy_in     += ss.vk.bytes_memcpy_in;
+                a.vk.n_read_fallback     += ss.vk.n_read_fallback;
+                a.vk.bytes_read_fallback += ss.vk.bytes_read_fallback;
+                a.vk.t_read_fallback_us  += ss.vk.t_read_fallback_us;
+            }
+        }
+        const int64_t dt_sync = t_sync_end - t_sync_start;
+        dstats_sync_n++;
+        if (dt_sync >= dstats_sync_max) {
+            dstats_sync_max      = dt_sync;
+            dstats_sync_max_why  = why;
+            dstats_sync_max_peer = peers;
+        }
+        dstats_rs_t0   = t_sync_start;
+        dstats_rs_t1   = t_sync_end;
+        dstats_rs_why  = why;
+        dstats_rs_peer = peers;
         // [LLAMA_DECODE_STATS] reported as t_sync_prev_us on the next line of this context
         dstats_t_sync += ggml_time_us() - t_sync_start;
         // 2026-10-22: the fences are waited, the split GPU timestamps can be read (dstats_flush); after the
@@ -2161,8 +2215,22 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         dstats_flush(false);
     }
 
+    // 2026-10-22 night: backend sync totals at entry, the line reports the syncs that ran inside the call
+    if (sched) {
+        const int n_be = ggml_backend_sched_get_n_backends(sched.get());
+        dstats.vk_at_start.assign(n_be, ggml_backend_sync_totals{});
+        dstats.vk_has.assign(n_be, 0);
+        for (int i = 0; i < n_be; ++i) {
+            dstats.vk_has[i] = ggml_backend_sched_sync_totals(sched.get(), i, &dstats.vk_at_start[i]) == 0 ? 1 : 0;
+        }
+    }
+
     const int64_t t_start_us = ggml_time_us();
     const int     ret        = decode_impl(batch_inp);
+
+    if (dstats_ctx_id >= 0 && dstats_ctx_id < 64) {
+        g_dstats_inflight[dstats_ctx_id].store(synced_gen != async_gen ? 1 : 0, std::memory_order_relaxed);
+    }
 
     dstats_emit(ret, t_start_us, (uint32_t) batch_inp.tokens.size(), ret == 0 ? (uint32_t) n_outputs : 0u);
 
@@ -2611,6 +2679,17 @@ void llama_context::dstats_fold_sched() {
     static const char * path_names[] = { "in", "async", "bounce", "cb" };
 
     const int n_copies_rec = std::min<int>(st->n_copies, GGML_BACKEND_SCHED_STATS_MAX_COPIES);
+    // 2026-10-22 night: the blocking copies from a synchronous source (model.input_embed into Vulkan2 since the ppl-gate
+    // race fix: 2048 x 5120 x f32 = 40 MiB per pp ubatch through staging + fence wait), summed over the recorded copies
+    for (int i = 0; i < n_copies_rec; ++i) {
+        const auto & c = st->copies[i];
+        if (c.src_sync && (c.path == GGML_BACKEND_SCHED_COPY_PATH_BOUNCE || c.path == GGML_BACKEND_SCHED_COPY_PATH_INPUT)) {
+            d.s_n_hsync++;
+            d.s_hsync_bytes      += (int64_t) c.nbytes;
+            d.s_t_hsync_dst_wait += c.t_dst_wait_us;
+            d.s_t_hsync_copy     += c.t_copy_us + c.t_src_sync_us;
+        }
+    }
     for (int i = 0; i < n_copies_rec; ++i) {
         if (d.s_n_copies_rec >= max_copies_line) {
             d.s_n_copies_drop += n_copies_rec - i;
@@ -2619,8 +2698,8 @@ void llama_context::dstats_fold_sched() {
         const auto & c = st->copies[i];
         char buf[1024]; // 2026-10-22 evening: 640 -> 1024 for the hop 1 at-submit fields (~330 chars)
         int n = snprintf(buf, sizeof(buf),
-                ",\"path\":\"%s\",\"bytes\":%zu,\"t_dst_wait_us\":%" PRId64 ",\"t_src_sync_us\":%" PRId64 ",\"t_copy_us\":%" PRId64,
-                (c.path >= 0 && c.path < 4) ? path_names[c.path] : "?", c.nbytes, c.t_dst_wait_us, c.t_src_sync_us, c.t_copy_us);
+                ",\"path\":\"%s\",\"bytes\":%zu,\"t_dst_wait_us\":%" PRId64 ",\"t_src_sync_us\":%" PRId64 ",\"t_copy_us\":%" PRId64 ",\"src_sync\":%d",
+                (c.path >= 0 && c.path < 4) ? path_names[c.path] : "?", c.nbytes, c.t_dst_wait_us, c.t_src_sync_us, c.t_copy_us, c.src_sync);
         // 2026-10-22: the dst backend's view of a cross-device copy (Vulkan only, ggml_vk_d2d_copy_async): absent
         // for graph inputs, same-device copies and non-Vulkan destinations
         if (c.d2d.filled && n > 0 && n < (int) sizeof(buf)) {
@@ -2806,7 +2885,79 @@ void llama_context::dstats_emit(int ret, int64_t t_start_us, uint32_t n_tokens, 
     dstats_prebuild      = -1;
     dstats_t_prebuild_us = 0;
 
+    // 2026-10-22 night: output bytes enqueued (async D2H, waited for in the next line's sync_prev), blocking host-source
+    // input copies (the input_embed bounce), the syncs inside this call, and the sync_prev detail (see synchronize())
     std::string extra = pb;
+    {
+        char eb[512];
+        snprintf(eb, sizeof(eb), ",\"b_output\":%" PRId64, d.b_output);
+        extra += eb;
+        if (d.s_n_hsync > 0) {
+            snprintf(eb, sizeof(eb), ",\"in_host_sync\":{\"n\":%d,\"bytes\":%" PRId64 ",\"t_dst_wait_us\":%" PRId64 ",\"t_copy_us\":%" PRId64 "}",
+                    d.s_n_hsync, d.s_hsync_bytes, d.s_t_hsync_dst_wait, d.s_t_hsync_copy);
+            extra += eb;
+        }
+        ggml_backend_sched_t s = sched.get();
+        auto bname = [&](int i) { return dstats_json_str(ggml_backend_name(ggml_backend_sched_get_backend(s, i))); };
+        std::string in_call;
+        for (size_t i = 0; s && i < d.vk_has.size(); ++i) {
+            if (!d.vk_has[i]) {
+                continue;
+            }
+            ggml_backend_sync_totals b = {};
+            if (ggml_backend_sched_sync_totals(s, (int) i, &b) != 0) {
+                continue;
+            }
+            const auto & a = d.vk_at_start[i];
+            if (b.n_sync == a.n_sync && b.n_read_fallback == a.n_read_fallback) {
+                continue;
+            }
+            snprintf(eb, sizeof(eb), "%s%s:{\"n_sync\":%" PRId64 ",\"fence_us\":%" PRId64 ",\"memcpy_out_us\":%" PRId64 ",\"bytes_out\":%" PRId64
+                    ",\"n_read_fallback\":%" PRId64 ",\"t_read_fallback_us\":%" PRId64 ",\"bytes_read_fallback\":%" PRId64 "}",
+                    in_call.empty() ? "" : ",", bname((int) i).c_str(), b.n_sync - a.n_sync, b.t_fence_us - a.t_fence_us,
+                    b.t_memcpy_out_us - a.t_memcpy_out_us, b.bytes_memcpy_out - a.bytes_memcpy_out,
+                    b.n_read_fallback - a.n_read_fallback, b.t_read_fallback_us - a.t_read_fallback_us, b.bytes_read_fallback - a.bytes_read_fallback);
+            in_call += eb;
+        }
+        if (!in_call.empty()) {
+            extra += ",\"sync_in_call\":{" + in_call + "}";
+        }
+        if (dstats_sync_n > 0) {
+            std::string peers;
+            for (int i = 0; i < 64; ++i) {
+                if (dstats_sync_max_peer & (1ull << i)) {
+                    peers += (peers.empty() ? "" : ",") + std::to_string(i);
+                }
+            }
+            snprintf(eb, sizeof(eb), ",\"sync_prev\":{\"n\":%d,\"max_us\":%" PRId64 ",\"why\":%s,\"peers_inflight\":[%s],\"by_backend\":{",
+                    dstats_sync_n, dstats_sync_max, dstats_json_str(dstats_sync_max_why ? dstats_sync_max_why : "internal").c_str(), peers.c_str());
+            extra += eb;
+            bool first = true;
+            for (size_t i = 0; s && i < dstats_sync_acc.size(); ++i) {
+                const auto & a = dstats_sync_acc[i];
+                if (a.n == 0) {
+                    continue;
+                }
+                snprintf(eb, sizeof(eb), "%s%s:{\"n\":%" PRId64 ",\"wait_us\":%" PRId64, first ? "" : ",", bname((int) i).c_str(), a.n, a.t_wait_us);
+                extra += eb;
+                if (a.has_totals) {
+                    snprintf(eb, sizeof(eb), ",\"fence_us\":%" PRId64 ",\"memcpy_out_us\":%" PRId64 ",\"bytes_out\":%" PRId64
+                            ",\"memcpy_in_us\":%" PRId64 ",\"bytes_in\":%" PRId64,
+                            a.vk.t_fence_us, a.vk.t_memcpy_out_us, a.vk.bytes_memcpy_out, a.vk.t_memcpy_in_us, a.vk.bytes_memcpy_in);
+                    extra += eb;
+                }
+                extra += '}';
+                first = false;
+            }
+            extra += "}}";
+        }
+        dstats_sync_acc.clear();
+        dstats_sync_n        = 0;
+        dstats_sync_max      = 0;
+        dstats_sync_max_why  = nullptr;
+        dstats_sync_max_peer = 0;
+    }
+
     // placement fragment of the last built graph (dstats_capture_placement): can be a few hundred
     // bytes, so it is appended here instead of growing the fixed snprintf buffer
     std::string line = buf;
@@ -2946,6 +3097,20 @@ void llama_context::dstats_flush(bool synced) {
         }
 
         std::string line = std::move(pl.head);
+        // 2026-10-22 night: the sync that made this line's timestamps readable (host clock, unix us base), so the
+        // reader can put decode return -> sync start -> GPU end -> sync return on one axis (the draft ctx's 3.1 ms)
+        if (synced && dstats_rs_t1 > 0) {
+            const int64_t m2u = (int64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count() - ggml_time_us();
+            std::string peers;
+            for (int i = 0; i < 64; ++i) {
+                if (dstats_rs_peer & (1ull << i)) {
+                    peers += (peers.empty() ? "" : ",") + std::to_string(i);
+                }
+            }
+            line += ",\"resolved_by_sync\":{\"t_start_us\":" + std::to_string(dstats_rs_t0 + m2u) + ",\"t_end_us\":" + std::to_string(dstats_rs_t1 + m2u) +
+                    ",\"why\":" + dstats_json_str(dstats_rs_why ? dstats_rs_why : "internal") + ",\"peers_inflight\":[" + peers + "]}";
+        }
         if (pl.n_ts_dropped >= 0) {
             const int64_t mono_to_unix = (int64_t) std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count() - ggml_time_us();
@@ -3337,6 +3502,10 @@ int llama_context::decode_impl(const llama_batch_ext & batch_inp) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
                 bz_x_logits += (int64_t) n_outputs * n_vocab * sizeof(float);
+                // [LLAMA_DECODE_STATS] 2026-10-22 night: 248320 x 4 B = 993 KB per target row (verify step: n+1 rows)
+                if (dstats_on) {
+                    dstats.b_output += (int64_t) n_outputs * n_vocab * sizeof(float);
+                }
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
             }
         }
@@ -3358,6 +3527,9 @@ int llama_context::decode_impl(const llama_batch_ext & batch_inp) {
                         if (n_outputs) {
                             GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                             GGML_ASSERT((n_outputs_prev + n_outputs)*n_embd_out <= (int64_t) embd.size);
+                            if (dstats_on) {
+                                dstats.b_output += (int64_t) n_outputs * n_embd_out * sizeof(float);
+                            }
                             ggml_backend_tensor_get_async(backend_embd, t_embd, embd_out, 0, n_outputs*n_embd_out*sizeof(float));
                         }
                     } break;
@@ -3426,6 +3598,9 @@ int llama_context::decode_impl(const llama_batch_ext & batch_inp) {
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                 bz_x_nextn += (int64_t) n_rows * n_embd * sizeof(float);
+                if (dstats_on) {
+                    dstats.b_output += (int64_t) n_rows * n_embd * sizeof(float);
+                }
                 ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
                 extract_all_idxs = extract_all_idxs || !masked;
             }
@@ -3609,7 +3784,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             // This doesn't happen often, but may be annoying in some cases (like the HellaSwag benchmark)
             LLAMA_LOG_DEBUG("%s: reallocating output buffer from size %.02f MiB to %.02f MiB\n", __func__, prev_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
 #endif
-            synchronize();
+            synchronize("output_reserve");
 
             // TODO: not needed?
             buf_output = nullptr;
@@ -5537,17 +5712,17 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
 }
 
 void llama_synchronize(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 }
 
 float * llama_get_logits(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return ctx->get_logits();
 }
 
 float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     float * res = nullptr;
 
@@ -5561,19 +5736,19 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
 }
 
 float * llama_get_embeddings(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return ctx->get_embeddings();
 }
 
 float * llama_get_embeddings_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return ctx->get_embeddings_ith(i);
 }
 
 float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return ctx->get_embeddings_seq(seq_id);
 }
@@ -5599,19 +5774,19 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
 }
 
 float * llama_get_embeddings_nextn(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return ctx->get_embeddings_nextn();
 }
 
 float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return ctx->get_embeddings_nextn_ith(i);
 }
 
 float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return ctx->get_embeddings_layer_inp(lid);
 }
@@ -5621,43 +5796,43 @@ bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler *
 }
 
 llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return ctx->get_sampled_token_ith(i);
 }
 
 float * llama_get_sampled_probs_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return ctx->get_sampled_probs_ith(i);
 }
 
 float * llama_get_sampled_logits_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return ctx->get_sampled_logits_ith(i);
 }
 
 llama_token * llama_get_sampled_candidates_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return const_cast<llama_token *>(ctx->get_sampled_candidates_ith(i));
 }
 
 uint32_t llama_get_sampled_candidates_count_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return static_cast<uint32_t>(ctx->get_sampled_candidates_count(i));
 }
 
 uint32_t llama_get_sampled_logits_count_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return static_cast<uint32_t>(ctx->get_sampled_logits_count(i));
 }
 
 uint32_t llama_get_sampled_probs_count_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return static_cast<uint32_t>(ctx->get_sampled_probs_count(i));
 }
@@ -5867,20 +6042,20 @@ size_t llama_state_get_size(llama_context * ctx) {
 }
 
 size_t llama_state_get_data(llama_context * ctx, uint8_t * dst, size_t size) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return ctx->state_get_data(dst, size);
 }
 
 // Sets the state reading from the specified source address
 size_t llama_state_set_data(llama_context * ctx, const uint8_t * src, size_t size) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return ctx->state_set_data(src, size);
 }
 
 bool llama_state_load_file(llama_context * ctx, const char * path_session, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     try {
         return ctx->state_load_file(path_session, tokens_out, n_token_capacity, n_token_count_out);
@@ -5891,7 +6066,7 @@ bool llama_state_load_file(llama_context * ctx, const char * path_session, llama
 }
 
 bool llama_state_save_file(llama_context * ctx, const char * path_session, const llama_token * tokens, size_t n_token_count) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     try {
         return ctx->state_save_file(path_session, tokens, n_token_count);
@@ -5918,12 +6093,12 @@ size_t llama_state_seq_get_size_ext(llama_context * ctx, llama_seq_id seq_id, ll
 }
 
 size_t llama_state_seq_get_data_ext(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return ctx->state_seq_get_data(seq_id, dst, size, flags);
 }
 size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return ctx->state_seq_set_data(seq_id, src, size, flags);
 }
@@ -5933,13 +6108,13 @@ size_t llama_state_seq_get_size_range(llama_context * ctx, llama_seq_id seq_id, 
 }
 
 size_t llama_state_seq_get_data_range(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_state_seq_flags flags) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return ctx->state_seq_get_data(seq_id, dst, size, flags, p0, p1);
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     try {
         return ctx->state_seq_save_file(seq_id, filepath, tokens, n_token_count);
@@ -5950,7 +6125,7 @@ size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, lla
 }
 
 size_t llama_state_seq_load_file(llama_context * ctx, const char * filepath, llama_seq_id dest_seq_id, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     try {
         return ctx->state_seq_load_file(dest_seq_id, filepath, tokens_out, n_token_capacity, n_token_count_out);

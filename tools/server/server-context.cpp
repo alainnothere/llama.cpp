@@ -80,6 +80,33 @@ constexpr int HTTP_POLLING_SECONDS = 1;
 //   python3 ~/Documents/contextFiles/llama.cpp_bench/decode_stats.py --server /tmp/us.jsonl --decode /tmp/ds.jsonl
 // The ~900 ms must show up in one column of the 512+ bucket; t_other_us growing alone would put it
 // outside update_slots().
+//
+// 2026-10-22 night additions (instrumentation audit, whatifs doc "2026-10-22 night: instrumentation audit"). Open
+// items the old fields could not split: 'other' 100-400 ms on short turns, the host sampler over 248k logits per row
+// (one row = 248320 x 12 B llama_token_data = 3 MB written by set_logits + the chain's top-k, (n+1) rows per verify
+// step), draft-side host work, and no end-to-end turn timeline. New per-line fields, all "of which" parts of an
+// existing phase (t_other_us is unchanged except for the fix below):
+//   of t_batch_build_us: t_draft_prep_us (draft params, spec_prompt copy = n_ctx x 4 B per step, auto tuner),
+//     t_draft_us (common_speculative_draft, work only), t_draft_yield_us (yield_to_queue handshake around it),
+//     t_draft_post_us (draft bookkeeping, ctx_dft seq_rm, rollback plan)
+//   of t_decode_us: t_decode_submit_us (llama_process), t_decode_sync_us (llama_synchronize when the view has outputs)
+//   of t_post_decode_us: t_sample_us (verify accept_n incl. the sampler clone, or the single-row sample+accept),
+//     t_accept_us (applying the verification: accept(), prompt token insert, seq_rm, spec checkpoint restores),
+//     t_spec_restore_us (of t_accept_us: load_tgt/load_dft of the spec checkpoint after a deep partial landing),
+//     t_stream_us (token_to_piece + probs + process_token + the partial-response push), t_release_us (print_timings
+//     + final response + slot release, flush excluded), t_spec_begin_us (common_speculative_begin at the first token:
+//     n-gram indexing of the whole prompt)
+//   of t_other_us: t_iter_gap_us (previous update_slots return -> this one's entry: process_new_tasks, queue wait,
+//     idle time between requests; named cache/checkpoint time inside it excluded), t_tasks_us (of t_iter_gap_us:
+//     completion-task handling = idle-slot save, slot selection, launch; cache time excluded), t_iter_head_us
+//     (update_slots entry -> pre_decode: perf window print, idle check, NEXT_RESPONSE post)
+//   named (new): t_ckpt_restore_us / n_ckpt_restore / ckpt_restore_bytes (context-checkpoint restore in the prompt
+//     path, lazy ones fault in from disk; was inside t_batch_build_us)
+// Fix 2026-10-22 night: t_post_decode_us now excludes t_release_flush_us (it did not, so t_other_us came out low by
+// the flush on every release line).
+// Plus one {"req":1,...} line per finished task (server_req_stats below) and one {"http_req":1,...} line per
+// completion request from the HTTP thread (chat-parse cost of streaming). Reader: decode_stats.py --server (prints
+// the of-which columns per bucket, then the request table).
 struct server_ubatch_stats {
     bool        on        = false;
     bool        to_stderr = false;
@@ -96,6 +123,16 @@ struct server_ubatch_stats {
     int64_t t_post_decode   = 0;
     int64_t n_ckpt_rec_reuse = 0; // [TAG_REC_REUSE] checkpoints published from the .rec snapshot (no readback)
     int64_t t_release_flush  = 0; // [TAG_RELEASE_FLUSH] flush_from_context run at slot release, off the request path
+    // 2026-10-22 night, see the header: of-which fields and the prompt-path checkpoint restore
+    int64_t t_draft_prep = 0, t_draft = 0, t_draft_yield = 0, t_draft_post = 0;
+    int64_t t_decode_submit = 0, t_decode_sync = 0;
+    int64_t t_sample = 0, t_accept = 0, t_spec_restore = 0, t_stream = 0, t_release = 0, t_spec_begin = 0;
+    int64_t t_iter_gap = 0, t_tasks = 0, t_iter_head = 0;
+    int64_t t_ckpt_restore = 0, n_ckpt_restore = 0, ckpt_restore_bytes = 0;
+    int64_t t_iter_exit = 0;      // last update_slots return
+    int64_t named_at_exit = 0;    // named() at that return
+    // the named accumulators that can also run between update_slots calls (tasks, release flushes)
+    int64_t named() const { return t_checkpoint + t_prompt_cache + t_release_flush + t_ckpt_restore; }
 
     server_ubatch_stats() {
         const char * v = getenv("LLAMA_SERVER_UBATCH_STATS");
@@ -124,25 +161,42 @@ struct server_ubatch_stats {
     void emit(int slot, int n_tokens, int n_past, int64_t t_decode) {
         const int64_t now   = ggml_time_us();
         const int64_t since = t_prev_end > 0 ? now - t_prev_end : 0;
-        const int64_t named = t_decode + t_spec_process + t_post_decode + t_checkpoint + t_prompt_cache + t_batch_build;
+        const int64_t named = t_decode + t_spec_process + t_post_decode + t_checkpoint + t_prompt_cache + t_batch_build + t_ckpt_restore;
 
         const double t_unix = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
 
-        char buf[1024];
+        char buf[2048];
         snprintf(buf, sizeof(buf),
                 "{\"t\":%.6f,\"slot\":%d,\"n_tokens\":%d,\"n_past\":%d,\"t_decode_us\":%" PRId64 ",\"t_spec_process_us\":%" PRId64 ","
                 "\"t_post_decode_us\":%" PRId64 ",\"t_checkpoint_us\":%" PRId64 ",\"n_checkpoints_created\":%" PRId64 ",\"checkpoint_bytes\":%" PRId64 ","
                 "\"t_prompt_cache_us\":%" PRId64 ",\"t_batch_build_us\":%" PRId64 ",\"t_since_prev_us\":%" PRId64 ",\"t_other_us\":%" PRId64 ","
-                "\"n_ckpt_rec_reuse\":%" PRId64 ",\"t_release_flush_us\":%" PRId64 "}\n",
+                "\"n_ckpt_rec_reuse\":%" PRId64 ",\"t_release_flush_us\":%" PRId64 ","
+                "\"t_draft_prep_us\":%" PRId64 ",\"t_draft_us\":%" PRId64 ",\"t_draft_yield_us\":%" PRId64 ",\"t_draft_post_us\":%" PRId64 ","
+                "\"t_decode_submit_us\":%" PRId64 ",\"t_decode_sync_us\":%" PRId64 ","
+                "\"t_sample_us\":%" PRId64 ",\"t_accept_us\":%" PRId64 ",\"t_spec_restore_us\":%" PRId64 ",\"t_stream_us\":%" PRId64 ","
+                "\"t_release_us\":%" PRId64 ",\"t_spec_begin_us\":%" PRId64 ","
+                "\"t_iter_gap_us\":%" PRId64 ",\"t_tasks_us\":%" PRId64 ",\"t_iter_head_us\":%" PRId64 ","
+                "\"t_ckpt_restore_us\":%" PRId64 ",\"n_ckpt_restore\":%" PRId64 ",\"ckpt_restore_bytes\":%" PRId64 "}\n",
                 t_unix, slot, n_tokens, n_past, t_decode, t_spec_process,
                 t_post_decode, t_checkpoint, n_checkpoints, checkpoint_bytes,
                 t_prompt_cache, t_batch_build, since, t_prev_end > 0 ? since - named - t_release_flush : 0,
-                n_ckpt_rec_reuse, t_release_flush);
+                n_ckpt_rec_reuse, t_release_flush,
+                t_draft_prep, t_draft, t_draft_yield, t_draft_post,
+                t_decode_submit, t_decode_sync,
+                t_sample, t_accept, t_spec_restore, t_stream,
+                t_release, t_spec_begin,
+                t_iter_gap, t_tasks, t_iter_head,
+                t_ckpt_restore, n_ckpt_restore, ckpt_restore_bytes);
         write(buf);
 
         t_checkpoint = n_checkpoints = checkpoint_bytes = 0;
         n_ckpt_rec_reuse = t_release_flush = 0;
         t_prompt_cache = t_batch_build = t_spec_process = t_post_decode = 0;
+        t_draft_prep = t_draft = t_draft_yield = t_draft_post = 0;
+        t_decode_submit = t_decode_sync = 0;
+        t_sample = t_accept = t_spec_restore = t_stream = t_release = t_spec_begin = 0;
+        t_iter_gap = t_tasks = t_iter_head = 0;
+        t_ckpt_restore = n_ckpt_restore = ckpt_restore_bytes = 0;
         t_prev_end = ggml_time_us();
     }
 };
@@ -161,6 +215,115 @@ struct server_ustats_timer {
         if (t) {
             *t += ggml_time_us() - t_start;
         }
+    }
+};
+
+// [LLAMA_SERVER_UBATCH_STATS] 2026-10-22 night - per-request timeline, one {"req":1,...} line per finished task
+//
+// Why. The turn from request arrival to first token was not timed end to end anywhere (whatifs doc, 2026-10-22 open
+// items): tokenize, slot selection (LCP over every slot and cache entry), RAM / disk restore, checkpoint restore,
+// the prompt batches and the first decode each live in a different instrument or in none, and the short-turn 'other'
+// (100-400 ms) has no owner. This record follows one task: HTTP-side stamps ride on the server_task (t_arrival_us /
+// t_impl_us / t_queued_us), process_single_task fills the dequeue / select / restore / launch pieces, every
+// LLAMA_SERVER_UBATCH_STATS line is folded into the slots that had tokens in its view (prompt or gen phase by the
+// slot's state at decode time; with several slots in one batch each gets the batch's full time, production is np=1),
+// and the line is written after the line of the step that released the slot (or at the next update_slots for
+// cancels). Fields: see req_line(); all us, abs stamps are ggml_time_us.
+struct server_req_stats {
+    bool    active   = false;
+    bool    finished = false;
+    int     id_task  = -1;
+    int     type     = -1;
+    int64_t t_arrival = 0, t_impl = 0, t_queued = 0, t_dequeue = 0, t_launched = 0;
+    int64_t t_idle_save = 0, t_select = 0, t_cache_save = 0, t_cache_restore = 0, t_cache_lcp = 0;
+    int     restore_src   = -1; // -1 slot reused in place, 0 load found nothing better, 1 RAM, 2 disk, 3 load failed
+    int64_t restore_bytes = 0;
+    int64_t t_launch = 0, t_post_launch_save = 0;
+    int64_t t_prompt_start = 0, t_first_token = 0, t_end = 0;
+    int64_t t_ckpt_restore = 0, ckpt_restore_bytes = 0;
+    int     n_ckpt_restore = 0, ckpt_restore_disk = 0;
+    // folded from the per-line fields, by phase
+    int64_t n_prompt_lines = 0, t_prompt_build = 0, t_prompt_decode = 0, t_prompt_spec_process = 0, t_prompt_ckpt = 0, n_prompt_ckpt = 0;
+    int64_t t_prompt_post = 0, t_prompt_cache_line = 0;
+    int64_t n_gen_lines = 0, t_gen_build = 0, t_gen_decode = 0, t_gen_decode_sync = 0, t_gen_spec_process = 0, t_gen_ckpt = 0, n_gen_ckpt = 0;
+    int64_t t_gen_post = 0, t_gen_other = 0;
+    int64_t t_sample = 0, t_draft = 0, t_draft_prep = 0, t_draft_post = 0, t_draft_yield = 0, t_accept = 0, t_spec_restore = 0;
+    int64_t t_stream = 0, t_release = 0, t_release_flush = 0, t_spec_begin = 0;
+    int64_t n_prompt = 0, n_cached = 0, n_gen = 0;
+
+    void fold_line(const server_ubatch_stats & u, int64_t t_decode, int64_t t_post_decode, int64_t t_other, bool gen) {
+        if (gen) {
+            n_gen_lines++;
+            t_gen_build        += u.t_batch_build;
+            t_gen_decode       += t_decode;
+            t_gen_decode_sync  += u.t_decode_sync;
+            t_gen_spec_process += u.t_spec_process;
+            t_gen_ckpt         += u.t_checkpoint;
+            n_gen_ckpt         += u.n_checkpoints;
+            t_gen_post         += t_post_decode;
+            t_gen_other        += t_other;
+        } else {
+            n_prompt_lines++;
+            t_prompt_build        += u.t_batch_build;
+            t_prompt_decode       += t_decode;
+            t_prompt_spec_process += u.t_spec_process;
+            t_prompt_ckpt         += u.t_checkpoint;
+            n_prompt_ckpt         += u.n_checkpoints;
+            t_prompt_post         += t_post_decode;
+            t_prompt_cache_line   += u.t_prompt_cache;
+        }
+        t_sample        += u.t_sample;
+        t_draft         += u.t_draft;
+        t_draft_prep    += u.t_draft_prep;
+        t_draft_post    += u.t_draft_post;
+        t_draft_yield   += u.t_draft_yield;
+        t_accept        += u.t_accept;
+        t_spec_restore  += u.t_spec_restore;
+        t_stream        += u.t_stream;
+        t_release       += u.t_release;
+        t_release_flush += u.t_release_flush;
+        t_spec_begin    += u.t_spec_begin;
+    }
+
+    std::string line(int slot) const {
+        static const char * src_names[] = { "slot", "none", "ram", "disk", "fail" };
+        auto d = [](int64_t a, int64_t b) -> int64_t { return (a > 0 && b > 0) ? a - b : -1; };
+        const double t_unix = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+        char buf[3072];
+        snprintf(buf, sizeof(buf),
+                "{\"req\":1,\"t\":%.6f,\"slot\":%d,\"id_task\":%d,\"type\":%d,\"n_prompt\":%" PRId64 ",\"n_cached\":%" PRId64 ",\"n_gen\":%" PRId64 ","
+                "\"n_prompt_lines\":%" PRId64 ",\"n_gen_lines\":%" PRId64 ","
+                "\"t_http_parse_us\":%" PRId64 ",\"t_tokenize_us\":%" PRId64 ",\"t_queue_wait_us\":%" PRId64 ","
+                "\"t_idle_save_us\":%" PRId64 ",\"t_slot_select_us\":%" PRId64 ",\"t_cache_lcp_us\":%" PRId64 ",\"t_cache_save_us\":%" PRId64 ","
+                "\"t_cache_restore_us\":%" PRId64 ",\"restore_src\":\"%s\",\"restore_bytes\":%" PRId64 ","
+                "\"t_launch_us\":%" PRId64 ",\"t_post_launch_save_us\":%" PRId64 ",\"t_launch_to_prompt_us\":%" PRId64 ","
+                "\"t_ckpt_restore_us\":%" PRId64 ",\"n_ckpt_restore\":%d,\"ckpt_restore_disk\":%d,\"ckpt_restore_bytes\":%" PRId64 ","
+                "\"t_prompt_build_us\":%" PRId64 ",\"t_prompt_decode_us\":%" PRId64 ",\"t_prompt_spec_process_us\":%" PRId64 ","
+                "\"t_prompt_ckpt_us\":%" PRId64 ",\"n_prompt_ckpt\":%" PRId64 ",\"t_prompt_post_us\":%" PRId64 ",\"t_prompt_cache_us\":%" PRId64 ","
+                "\"t_prompt_total_us\":%" PRId64 ",\"t_first_token_us\":%" PRId64 ",\"t_spec_begin_us\":%" PRId64 ","
+                "\"t_decode_total_us\":%" PRId64 ",\"t_decode_sync_us\":%" PRId64 ",\"t_sample_total_us\":%" PRId64 ","
+                "\"t_draft_total_us\":%" PRId64 ",\"t_draft_prep_us\":%" PRId64 ",\"t_draft_post_us\":%" PRId64 ",\"t_draft_yield_us\":%" PRId64 ","
+                "\"t_accept_total_us\":%" PRId64 ",\"t_spec_restore_us\":%" PRId64 ",\"t_stream_total_us\":%" PRId64 ","
+                "\"t_spec_process_gen_us\":%" PRId64 ",\"t_gen_ckpt_us\":%" PRId64 ",\"n_gen_ckpt\":%" PRId64 ","
+                "\"t_gen_build_us\":%" PRId64 ",\"t_gen_post_us\":%" PRId64 ",\"t_gen_other_us\":%" PRId64 ",\"t_gen_wall_us\":%" PRId64 ","
+                "\"t_release_total_us\":%" PRId64 ",\"t_release_flush_us\":%" PRId64 ",\"t_wall_us\":%" PRId64 "}\n",
+                t_unix, slot, id_task, type, n_prompt, n_cached, n_gen,
+                n_prompt_lines, n_gen_lines,
+                d(t_impl, t_arrival), d(t_queued, t_impl), d(t_dequeue, t_queued),
+                t_idle_save, t_select, t_cache_lcp, t_cache_save,
+                t_cache_restore, src_names[std::min(4, std::max(0, restore_src + 1))], restore_bytes,
+                t_launch, t_post_launch_save, d(t_prompt_start, t_launched),
+                t_ckpt_restore, n_ckpt_restore, ckpt_restore_disk, ckpt_restore_bytes,
+                t_prompt_build, t_prompt_decode, t_prompt_spec_process,
+                t_prompt_ckpt, n_prompt_ckpt, t_prompt_post, t_prompt_cache_line,
+                d(t_first_token, t_prompt_start), d(t_first_token, t_arrival > 0 ? t_arrival : t_dequeue), t_spec_begin,
+                t_gen_decode, t_gen_decode_sync, t_sample,
+                t_draft, t_draft_prep, t_draft_post, t_draft_yield,
+                t_accept, t_spec_restore, t_stream,
+                t_gen_spec_process, t_gen_ckpt, n_gen_ckpt,
+                t_gen_build, t_gen_post, t_gen_other, d(t_end, t_first_token),
+                t_release, t_release_flush, d(t_end, t_arrival > 0 ? t_arrival : t_dequeue));
+        return buf;
     }
 };
 
@@ -1116,6 +1279,9 @@ struct server_slot {
     // used to determine the slot that has been used the longest
     int64_t t_last_used = -1;
 
+    // [LLAMA_SERVER_UBATCH_STATS] 2026-10-22 night: the task's timeline, kept across reset() until it is written
+    server_req_stats rq;
+
     // generation props
     int32_t n_ctx   = 0;  // context size per slot
     int32_t n_keep  = 0;
@@ -1572,6 +1738,15 @@ struct server_slot {
     void release() {
         if (is_processing()) {
             GGML_ASSERT(task);
+
+            // [LLAMA_SERVER_UBATCH_STATS] close the request record; written after the line of this step is folded in
+            if (rq.active && !rq.finished) {
+                rq.finished = true;
+                rq.t_end    = ggml_time_us();
+                rq.n_prompt = task->n_tokens();
+                rq.n_cached = (int64_t) stats.n_prompt_cached;
+                rq.n_gen    = (int64_t) stats.n_gen;
+            }
 
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
 
@@ -2404,6 +2579,28 @@ private:
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
 
     int n_empty_consecutive = 0;
+
+    // [LLAMA_SERVER_UBATCH_STATS] 2026-10-22 night: request record of the task being dispatched (process_single_task)
+    server_req_stats rq_pre;
+    // per slot of the view being decoded: 0 not in it, 1 prompt phase, 2 generating (update_slots)
+    std::vector<int8_t> rq_view;
+
+    // writes a finished request record (one JSON line in the stats file + one log line) and clears it
+    void rq_write_finished(server_slot & slot) {
+        if (!slot.rq.finished) {
+            return;
+        }
+        const auto & r = slot.rq;
+        server_ustats().write(r.line(slot.id).c_str());
+        auto ms = [](int64_t a, int64_t b) { return (a > 0 && b > 0) ? (a - b) / 1000.0 : -1.0; };
+        SLT_INF(slot, "request timeline: task %d, ttft %.1f ms (http %.1f, tokenize %.1f, queue %.1f, select %.1f, restore %.1f, prompt %.1f), "
+                "gen %" PRId64 " tok in %.1f ms (decode %.1f, sample %.1f, draft %.1f, accept %.1f, stream %.1f), release %.1f ms\n",
+                r.id_task, ms(r.t_first_token, r.t_arrival > 0 ? r.t_arrival : r.t_dequeue), ms(r.t_impl, r.t_arrival), ms(r.t_queued, r.t_impl),
+                ms(r.t_dequeue, r.t_queued), r.t_select / 1000.0, r.t_cache_restore / 1000.0, ms(r.t_first_token, r.t_prompt_start),
+                r.n_gen, ms(r.t_end, r.t_first_token), r.t_gen_decode / 1000.0, r.t_sample / 1000.0, r.t_draft / 1000.0,
+                r.t_accept / 1000.0, r.t_stream / 1000.0, (r.t_release + r.t_release_flush) / 1000.0);
+        slot.rq = {};
+    }
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
@@ -3351,6 +3548,18 @@ private:
             // cache prompts only for the tasks that reuse them
             update_cache = update_cache && !task.is_stateless();
 
+            // [LLAMA_SERVER_UBATCH_STATS] 2026-10-22 night per-request pieces (rq_pre): save of the outgoing state,
+            // restore of the incoming one and which tier served it. one bool test when off
+            const bool rq_on = server_ustats().on;
+            int64_t rq_t0 = rq_on ? ggml_time_us() : 0;
+            auto rq_lap = [&](int64_t & acc) {
+                if (rq_on) {
+                    const int64_t t = ggml_time_us();
+                    acc += t - rq_t0;
+                    rq_t0 = t;
+                }
+            };
+
             if (update_cache) {
                 SRV_TRC("%s", "updating prompt cache\n");
 
@@ -3369,12 +3578,20 @@ private:
                 if (prompt_cache->over_budget()) {
                     { server_ustats_timer ut(server_ustats().t_prompt_cache); prompt_cache->spill_all_to_disk(); }
                 }
+                rq_lap(rq_pre.t_cache_save);
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens, task.conversation_id)) {
                     ret->prompt_clear();
+                    rq_pre.restore_src = 3;
+                } else {
+                    rq_pre.restore_src   = prompt_cache->last_load_src;
+                    rq_pre.restore_bytes = prompt_cache->last_load_bytes;
                 }
+                rq_pre.t_cache_lcp = prompt_cache->last_load_lcp_us;
+                rq_lap(rq_pre.t_cache_restore);
 
                 { server_ustats_timer ut(server_ustats().t_prompt_cache); prompt_cache->update(); }
+                rq_lap(rq_pre.t_cache_save);
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             } else if (prompt_cache) {
@@ -3387,10 +3604,13 @@ private:
                     ret->prompt_save(*prompt_cache);
                     { server_ustats_timer ut(server_ustats().t_prompt_cache); prompt_cache->update(); }
                 }
+                rq_lap(rq_pre.t_cache_save);
                 // prompt_load() is never called on this path, so merge_checkpoint_spills()
                 // must be called explicitly to make disk-spilled checkpoints visible to the
                 // rewind logic in update_slots().
                 { server_ustats_timer ut(server_ustats().t_prompt_cache); prompt_cache->merge_checkpoint_spills(ret->prompt); }
+                rq_lap(rq_pre.t_cache_restore);
+                rq_pre.restore_src = -1;
             }
         }
 
@@ -4312,6 +4532,26 @@ private:
 
                     const int id_task = task.id;
 
+                    // [LLAMA_SERVER_UBATCH_STATS] 2026-10-22 night: request record staged here, copied into the slot at
+                    // launch. t_tasks (per line, of t_iter_gap) = this branch minus the named cache time inside it
+                    auto & ust = server_ustats();
+                    const int64_t rq_task_t0     = ust.on ? ggml_time_us() : 0;
+                    const int64_t rq_task_named0 = ust.on ? ust.named() : 0;
+                    if (ust.on) {
+                        rq_pre = {};
+                        rq_pre.active    = true;
+                        rq_pre.id_task   = task.id;
+                        rq_pre.type      = (int) task.type;
+                        rq_pre.t_arrival = task.t_arrival_us;
+                        rq_pre.t_impl    = task.t_impl_us;
+                        rq_pre.t_queued  = task.t_queued_us;
+                        rq_pre.t_dequeue = rq_task_t0;
+                    }
+                    struct rq_task_end {
+                        server_ubatch_stats & u; int64_t t0, n0;
+                        ~rq_task_end() { if (u.on) { u.t_tasks += ggml_time_us() - t0 - (u.named() - n0); } }
+                    } rq_task_end_guard { ust, rq_task_t0, rq_task_named0 };
+
                     // Save and clear all idle slots before slot selection so the KV pool is
                     // free when prompt_load() runs inside get_available_slot().  Doing this
                     // after launch (the old location) meant the load could fail with "no
@@ -4341,9 +4581,17 @@ private:
                             }
                         }
                     }
+                    const int64_t rq_sel_t0 = ust.on ? ggml_time_us() : 0;
+                    if (ust.on) {
+                        rq_pre.t_idle_save = rq_sel_t0 - rq_task_t0;
+                    }
 
                     // get_available_slot() now dispatches on task.id_slot internally
                     server_slot * slot = get_available_slot(task);
+                    const int64_t rq_launch_t0 = ust.on ? ggml_time_us() : 0;
+                    if (ust.on) {
+                        rq_pre.t_select = rq_launch_t0 - rq_sel_t0 - rq_pre.t_cache_save - rq_pre.t_cache_restore;
+                    }
 
                     //
                     // slot scheduling logic
@@ -4381,6 +4629,16 @@ private:
                         break; // drop the task
                     }
 
+                    const int64_t rq_post_t0 = ust.on ? ggml_time_us() : 0;
+                    if (ust.on) {
+                        // a finished record of the previous task on this slot that no line flushed yet goes out first
+                        rq_write_finished(*slot);
+                        rq_pre.t_launch   = rq_post_t0 - rq_launch_t0;
+                        rq_pre.t_launched = rq_post_t0;
+                        slot->rq = rq_pre;
+                        rq_pre   = {};
+                    }
+
                     if (params_base.cache_idle_slots) {
                         for (auto & slot : slots) {
                             if (!slot.is_processing()) {
@@ -4397,6 +4655,9 @@ private:
                                 }
                             }
                         }
+                    }
+                    if (ust.on && slot->rq.active) {
+                        slot->rq.t_post_launch_save = ggml_time_us() - rq_post_t0;
                     }
                 } break;
             case SERVER_TASK_TYPE_CANCEL:
@@ -4752,6 +5013,32 @@ private:
     };
 
     void update_slots() {
+        // [LLAMA_SERVER_UBATCH_STATS] 2026-10-22 night: the wall between two update_slots calls (t_iter_gap_us) and this
+        // call's head (t_iter_head_us) are the parts of t_other_us the short turns (100-400 ms) could be hiding in
+        auto & ust = server_ustats();
+        const int64_t ust_entry = ust.on ? ggml_time_us() : 0;
+        if (ust.on) {
+            // only after the first line: t_other_us of the first line is 0 (no previous line to measure from)
+            if (ust.t_iter_exit > 0 && ust.t_prev_end > 0) {
+                ust.t_iter_gap += ust_entry - ust.t_iter_exit - (ust.named() - ust.named_at_exit);
+            }
+            // records closed outside a decode line (cancel, errors before the batch) go out here
+            for (auto & slot : slots) {
+                if (slot.rq.finished && !slot.is_processing()) {
+                    rq_write_finished(slot);
+                }
+            }
+        }
+        struct ust_exit_mark {
+            server_ubatch_stats & u;
+            ~ust_exit_mark() {
+                if (u.on) {
+                    u.t_iter_exit   = ggml_time_us();
+                    u.named_at_exit = u.named();
+                }
+            }
+        } ust_exit_guard { ust };
+
         const bool perf_instr = params_base.perf_instrumentation;
         static int64_t t_prev = 0;
         int64_t t_start = perf_instr ? ggml_time_us() : 0;
@@ -4842,9 +5129,12 @@ private:
         const int64_t it_t_post0 = w_t_post_decode;
 
         // [LLAMA_SERVER_UBATCH_STATS] pre_decode wall minus the checkpoint/cache time spent inside it
-        auto & ust = server_ustats();
+        // (2026-10-22 night: and minus the prompt-path checkpoint restore, now its own named field)
         const int64_t ust_pre_start = ust.on ? ggml_time_us() : 0;
-        const int64_t ust_pre_named = ust.t_checkpoint + ust.t_prompt_cache;
+        const int64_t ust_pre_named = ust.t_checkpoint + ust.t_prompt_cache + ust.t_ckpt_restore;
+        if (ust.on) {
+            ust.t_iter_head += ust_pre_start - ust_entry;
+        }
 
         try {
             scoped_timer t(perf_instr, w_t_pre_decode, w_n_pre_decode);
@@ -4858,7 +5148,7 @@ private:
         }
 
         if (ust.on) {
-            ust.t_batch_build += ggml_time_us() - ust_pre_start - (ust.t_checkpoint + ust.t_prompt_cache - ust_pre_named);
+            ust.t_batch_build += ggml_time_us() - ust_pre_start - (ust.t_checkpoint + ust.t_prompt_cache + ust.t_ckpt_restore - ust_pre_named);
         }
 
         GGML_ASSERT(batch.slot_batched || batch.size() == 0);
@@ -4892,6 +5182,16 @@ private:
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
 
                 batch.render(off, n_tokens);
+                // [LLAMA_SERVER_UBATCH_STATS] 2026-10-22 night: which slots this view feeds, and in which phase (2 = gen)
+                if (ust.on) {
+                    rq_view.assign(slots.size(), 0);
+                    for (int32_t i = off; i < off + n_tokens && i < (int32_t) batch.tokens.size(); ++i) {
+                        const int32_t sid = batch.tokens[i].id_slot;
+                        if (sid >= 0 && sid < (int32_t) slots.size()) {
+                            rq_view[sid] = slots[sid].state == SLOT_STATE_GENERATING ? 2 : 1;
+                        }
+                    }
+                }
                 const int64_t ust_dec_start = ust.on ? ggml_time_us() : 0;
                 bool ok = decode(n_batch, off);
                 ust_t_decode = ust.on ? ggml_time_us() - ust_dec_start : 0;
@@ -4925,7 +5225,9 @@ private:
             }
 
             const int64_t ust_post_start = ust.on ? ggml_time_us() : 0;
-            const int64_t ust_post_named = ust.t_checkpoint + ust.t_prompt_cache + ust.t_spec_process;
+            // 2026-10-22 night: t_release_flush joins the subtracted set (it runs inside post_decode and t_other_us
+            // already subtracts it, so it was counted twice and t_other_us read low on every release line)
+            const int64_t ust_post_named = ust.t_checkpoint + ust.t_prompt_cache + ust.t_spec_process + ust.t_release_flush;
 
             try {
                 scoped_timer t(perf_instr, w_t_post_decode, w_n_post_decode);
@@ -4938,9 +5240,27 @@ private:
 
             // [LLAMA_SERVER_UBATCH_STATS] one line per target decode, after its post_decode
             if (ust.on) {
-                ust.t_post_decode += ggml_time_us() - ust_post_start - (ust.t_checkpoint + ust.t_prompt_cache + ust.t_spec_process - ust_post_named);
+                ust.t_post_decode += ggml_time_us() - ust_post_start - (ust.t_checkpoint + ust.t_prompt_cache + ust.t_spec_process + ust.t_release_flush - ust_post_named);
+                // 2026-10-22 night: fold this line into the request records of the slots it fed, before emit() resets it
+                {
+                    const int64_t now   = ggml_time_us();
+                    const int64_t since = ust.t_prev_end > 0 ? now - ust.t_prev_end : 0;
+                    const int64_t named = ust_t_decode + ust.t_spec_process + ust.t_post_decode + ust.t_checkpoint + ust.t_prompt_cache +
+                                          ust.t_batch_build + ust.t_ckpt_restore + ust.t_release_flush;
+                    const int64_t other = ust.t_prev_end > 0 ? since - named : 0;
+                    for (size_t sid = 0; sid < rq_view.size() && sid < slots.size(); ++sid) {
+                        if (rq_view[sid] && slots[sid].rq.active) {
+                            slots[sid].rq.fold_line(ust, ust_t_decode, ust.t_post_decode, other, rq_view[sid] == 2);
+                        }
+                    }
+                }
                 ust.emit(batch.slot_batched ? batch.slot_batched->id : -1, n_tokens,
                         off < (int32_t) batch.tokens.size() ? (int) batch.tokens[off].pos[0] : -1, ust_t_decode);
+                for (size_t sid = 0; sid < rq_view.size() && sid < slots.size(); ++sid) {
+                    if (rq_view[sid]) {
+                        rq_write_finished(slots[sid]);
+                    }
+                }
             }
         }
 
@@ -5050,6 +5370,13 @@ private:
         std::vector<server_slot *> drafting;
         std::vector<server_slot *> replaying; // re-verify the accepted prefix after a rollback, no draft() call
 
+        // [LLAMA_SERVER_UBATCH_STATS] 2026-10-22 night: the host work around the draft, per line (of t_batch_build_us).
+        // suspected because the step budget leaves 4-5 ms of non-GPU time per ~85 ms step unowned, and this block
+        // copies the whole prompt into spec_prompt on every draft step (get_text_tokens: n_ctx x 4 B, 400 KB at 100k)
+        auto & ust = server_ustats();
+        const int64_t ust_dprep_t0 = ust.on ? ggml_time_us() : 0;
+        const int64_t ust_dprep_n0 = ust.on ? ust.t_checkpoint : 0;
+
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING) {
@@ -5104,6 +5431,8 @@ private:
                             //       overlap window opened by the previous iteration's
                             //       common_speculative_process() [TAG_SPEC_OVERLAP]. only recurrent
                             //       draft models take this path
+                            // [LLAMA_SERVER_UBATCH_STATS] 2026-10-22 night: was untimed (inside t_batch_build_us)
+                            server_ustats_timer ut(server_ustats().t_checkpoint);
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, slot.state_pool.get());
                         }
 
@@ -5165,14 +5494,29 @@ private:
         // note: this is where the draft batch submitted by the previous iteration's
         //       common_speculative_process() is finally waited on - the draft loop reads ctx_dft
         //       logits on its first step [TAG_SPEC_OVERLAP]
+        if (ust.on) {
+            ust.t_draft_prep += ggml_time_us() - ust_dprep_t0 - (ust.t_checkpoint - ust_dprep_n0);
+        }
         if (drafting.size() == 1 && generating.size() == 1) {
             verify_prebuild(*drafting[0]);
         }
         if (!drafting.empty()) {
+            const int64_t t_y0 = ust.on ? ggml_time_us() : 0;
+            int64_t t_work = 0;
             queue_tasks.yield_to_queue([&]() {
+                const int64_t t_w0 = ust.on ? ggml_time_us() : 0;
                 common_speculative_draft(spec.get());
+                if (ust.on) {
+                    t_work = ggml_time_us() - t_w0;
+                }
             });
+            if (ust.on) {
+                ust.t_draft       += t_work;
+                ust.t_draft_yield += ggml_time_us() - t_y0 - t_work;
+            }
         }
+        const int64_t ust_dpost_t0 = ust.on ? ggml_time_us() : 0;
+        const int64_t ust_dpost_n0 = ust.on ? ust.t_checkpoint : 0;
 
         // make checkpoints if needed
         iterate(drafting, [&](server_slot & slot) {
@@ -5221,6 +5565,9 @@ private:
         iterate(replaying, [&](server_slot & slot) {
             spec_plan_tgt_rollback(slot, slot.spec_draft.size());
         });
+        if (ust.on) {
+            ust.t_draft_post += ggml_time_us() - ust_dpost_t0 - (ust.t_checkpoint - ust_dpost_n0);
+        }
 
         // update the batch with the sampled/drafted tokens
         iterate(generating, [&](server_slot & slot) {
@@ -5268,6 +5615,9 @@ private:
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
                         slot.stats.update_prompt_start();
+                        if (slot.rq.active) {
+                            slot.rq.t_prompt_start = slot.stats.t_start; // [LLAMA_SERVER_UBATCH_STATS]
+                        }
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
@@ -5595,8 +5945,24 @@ private:
                                         // read failure (e.g. the spill file was evicted under us)
                                         // returns false and we keep searching older checkpoints.
                                         slot.state_changed(); // [TAG_REC_REUSE] a restore, or a partial one on failure
+                                        // [LLAMA_SERVER_UBATCH_STATS] 2026-10-22 night: was untimed inside t_batch_build_us. per turn
+                                        // on the hybrid 27B a checkpoint is the recurrent planes + the SWA/attention tail
+                                        // (~150 MB blobs on this box), and a lazy one is read from the disk tier here
+                                        const int64_t t_cr0 = ust.on ? ggml_time_us() : 0;
                                         const bool ok_tgt = it->load_tgt(ctx_tgt,       slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         const bool ok_dft = it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        if (ust.on) {
+                                            const int64_t dt = ggml_time_us() - t_cr0;
+                                            ust.t_ckpt_restore     += dt;
+                                            ust.n_ckpt_restore     += 1;
+                                            ust.ckpt_restore_bytes += (int64_t) it->size();
+                                            if (slot.rq.active) {
+                                                slot.rq.t_ckpt_restore     += dt;
+                                                slot.rq.n_ckpt_restore     += 1;
+                                                slot.rq.ckpt_restore_bytes += (int64_t) it->size();
+                                                slot.rq.ckpt_restore_disk  += it->src_path.empty() ? 0 : 1;
+                                            }
+                                        }
 
                                         if (!ok_tgt || !ok_dft) {
                                             SLT_WRN(slot, "failed to load context checkpoint from disk (pos_min = %d, pos_max = %d) - falling back to an older checkpoint\n", it->pos_min, it->pos_max);
@@ -6297,8 +6663,13 @@ private:
         // batch stays in flight across post_decode(), where common_speculative_process() submits the
         // same chunk to ctx_dft, so target and draft prefill overlap
         int ret = 0;
+        // [LLAMA_SERVER_UBATCH_STATS] 2026-10-22 night: t_decode_us split into the submit (llama_process: graph build,
+        // sched alloc, set_inputs, issue) and the wait for the target GPU; the rest of t_decode_us is the yield
+        // handshake + this function's bookkeeping
+        auto & ust = server_ustats();
         const uint32_t n_ub_cap = prompt_tail_ubatch_cap(off);
         queue_tasks.yield_to_queue([&]() {
+            const int64_t t0 = ust.on ? ggml_time_us() : 0;
             if (n_ub_cap > 0) {
                 llama_set_n_ubatch_cap(ctx_tgt, n_ub_cap);
             }
@@ -6306,8 +6677,13 @@ private:
             if (n_ub_cap > 0) {
                 llama_set_n_ubatch_cap(ctx_tgt, 0);
             }
+            const int64_t t1 = ust.on ? ggml_time_us() : 0;
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
+            }
+            if (ust.on) {
+                ust.t_decode_submit += t1 - t0;
+                ust.t_decode_sync   += ggml_time_us() - t1;
             }
         });
 
@@ -6474,6 +6850,9 @@ private:
             // it is not cheap: common_sampler_clone() clones the grammar and copies an n_vocab-sized
             // candidate array (~1.8 MiB for a 151k vocab) on every verification step. only take it
             // when the rollback path that consumes it can actually be reached
+            // [LLAMA_SERVER_UBATCH_STATS] 2026-10-22 night t_sample_us: the clone + the (n+1)-row host sampler. with backend
+            // sampling off on the target every row is a 248320-entry set_logits (3 MB of llama_token_data) + the chain
+            const int64_t t_smp0 = server_ustats().on ? ggml_time_us() : 0;
             common_sampler_ptr smpl_save;
             if (may_restore) {
                 smpl_save.reset(common_sampler_clone(slot.smpl.get()));
@@ -6500,6 +6879,9 @@ private:
             }
 
             GGML_ASSERT(accepted.size() >= 1);
+            if (server_ustats().on) {
+                server_ustats().t_sample += ggml_time_us() - t_smp0;
+            }
 
             const uint32_t n_rollback = n_draft + 1 - accepted.size();
 
@@ -6583,10 +6965,13 @@ private:
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
         };
 
+        auto & ust = server_ustats();
+
         iterate(slots, [&](server_slot & slot) {
             // optionally send prompt processing progress
             if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
                 if (slot.task->params.stream && slot.task->params.return_progress) {
+                    server_ustats_timer ut(ust.t_stream);
                     send_partial_response(slot, {}, true);
                 }
             }
@@ -6625,6 +7010,9 @@ private:
                 slot.state = SLOT_STATE_GENERATING;
 
                 if (slot.can_speculate()) {
+                    // [LLAMA_SERVER_UBATCH_STATS] 2026-10-22 night: on the first-token path; the n-gram impls index the
+                    // whole prompt here (100k+ tokens on a long turn)
+                    server_ustats_timer ut(ust.t_spec_begin);
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
 
                     // best draft length depends on the task (code vs prose) - estimates from the previous request are stale
@@ -6646,6 +7034,7 @@ private:
             const int tok_idx = slot.i_batch - off;
 
             llama_token id;
+            const int64_t t_smp0 = ust.on ? ggml_time_us() : 0;
             {
                 scoped_timer timer(params_base.perf_instrumentation, w_t_sampl, w_n_sampl);
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
@@ -6654,6 +7043,9 @@ private:
             slot.i_batch = -1;
 
             common_sampler_accept(slot.smpl.get(), id, true);
+            if (ust.on) {
+                ust.t_sample += ggml_time_us() - t_smp0; // [LLAMA_SERVER_UBATCH_STATS] incl. the sync inside sample
+            }
 
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
             const int64_t t_now = ggml_time_us();
@@ -6674,6 +7066,7 @@ private:
                 slot.spec_step_end(0);
             }
 
+            const int64_t t_str0 = ust.on ? ggml_time_us() : 0;
             completion_token_output result;
             result.tok          = id;
             result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
@@ -6683,17 +7076,27 @@ private:
                 populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
             }
 
-            if (!process_token(result, slot)) {
+            const bool cont = process_token(result, slot);
+            if (ust.on) {
+                const int64_t t_now_s = ggml_time_us();
+                ust.t_stream += t_now_s - t_str0;
+                if (slot.rq.active && slot.rq.t_first_token == 0) {
+                    slot.rq.t_first_token = t_now_s; // [LLAMA_SERVER_UBATCH_STATS] first token pushed to the stream
+                }
+            }
+            if (!cont) {
                 // release slot because of stop condition
-                slot.print_timings();
-                send_final_response(slot);
-                release_and_flush(slot); // [TAG_RELEASE_FLUSH]
+                finish_request(slot);
 
                 return;
             }
 
             slot.print_timings_tg();
         });
+
+        // [LLAMA_SERVER_UBATCH_STATS] 2026-10-22 night t_accept_us: this pass minus the streaming and release inside it
+        const int64_t ust_acc_t0 = ust.on ? ggml_time_us() : 0;
+        const int64_t ust_acc_n0 = ust.on ? ust.t_stream + ust.t_release + ust.t_release_flush : 0;
 
         // speculative decoding - apply the verification result computed above
         iterate(slots, [&](server_slot & slot) {
@@ -6760,7 +7163,10 @@ private:
                         GGML_ASSERT(slot.spec_ckpt_tgt_pos >= 0 && slot.spec_ckpt_tgt_pos == ckpt.pos_max);
                         GGML_ASSERT(ckpt.pos_max + 1 == slot.spec_batch_pos0);
 
-                        ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        {
+                            server_ustats_timer ut(ust.t_spec_restore); // [LLAMA_SERVER_UBATCH_STATS] was untimed
+                            ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        }
 
                         slot.stats.n_spec_ckpt_restore += 1;
                     }
@@ -6770,6 +7176,7 @@ private:
                         //       above and then throws its rows away [TAG_SPEC_OVERLAP]. it is the one
                         //       step that does not get the draft decode for free, and it is reachable
                         //       only for contexts that cannot roll back by range
+                        server_ustats_timer ut(ust.t_spec_restore); // [LLAMA_SERVER_UBATCH_STATS] incl. the ctx_dft wait
                         ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                     }
 
@@ -6855,6 +7262,7 @@ private:
             }
 
             for (size_t i = 0; i < ids.size(); ++i) {
+                const int64_t t_str0 = ust.on ? ggml_time_us() : 0;
                 completion_token_output result;
 
                 result.tok          = ids[i];
@@ -6865,10 +7273,12 @@ private:
 
                 slot.stats.n_gen += 1;
 
-                if (!process_token(result, slot)) {
-                    slot.print_timings();
-                    send_final_response(slot);
-                    release_and_flush(slot); // [TAG_RELEASE_FLUSH]
+                const bool cont = process_token(result, slot);
+                if (ust.on) {
+                    ust.t_stream += ggml_time_us() - t_str0;
+                }
+                if (!cont) {
+                    finish_request(slot);
 
                     return;
                 }
@@ -6878,6 +7288,23 @@ private:
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
         });
+        if (ust.on) {
+            ust.t_accept += ggml_time_us() - ust_acc_t0 - (ust.t_stream + ust.t_release + ust.t_release_flush - ust_acc_n0);
+        }
+    }
+
+    // stop condition reached: timings, final response, release + disk-tier flush ([TAG_RELEASE_FLUSH]).
+    // [LLAMA_SERVER_UBATCH_STATS] 2026-10-22 night t_release_us = this minus the flush (t_release_flush_us)
+    void finish_request(server_slot & slot) {
+        auto & ust = server_ustats();
+        const int64_t t0 = ust.on ? ggml_time_us() : 0;
+        const int64_t f0 = ust.on ? ust.t_release_flush : 0;
+        slot.print_timings();
+        send_final_response(slot);
+        release_and_flush(slot); // [TAG_RELEASE_FLUSH]
+        if (ust.on) {
+            ust.t_release += ggml_time_us() - t0 - (ust.t_release_flush - f0);
+        }
     }
 
     // context size of a single slot, capped by --kv-unified-per-slot and by the training context of the model
@@ -7153,6 +7580,25 @@ void server_context::set_state_callback(server_state_callback_t callback) {
 // server_routes
 //
 
+// [LLAMA_SERVER_UBATCH_STATS] 2026-10-22 night: one {"http_req":1,...} line per completion request, HTTP thread. Why: the
+// streamed chunks are turned into OAI deltas by result->update() (server_response_reader::next), which re-parses the
+// whole generated text with the chat parser on every chunk; that is O(n_gen^2) over a long reasoning reply and runs
+// off the main loop, so no other instrument can see it falling behind. t_first_result_us = arrival -> first result.
+static void server_http_stats_line(const server_response_reader & rd, int64_t t_arrival_us, const std::string & cmpl_id, int n_chunks) {
+    if (!rd.stats_on) {
+        return;
+    }
+    const double t_unix = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+            "{\"http_req\":1,\"t\":%.6f,\"cmpl_id\":\"%s\",\"n_results\":%" PRId64 ",\"n_chunks\":%d,\"t_update_us\":%" PRId64 ","
+            "\"t_first_result_us\":%" PRId64 ",\"t_wall_us\":%" PRId64 "}\n",
+            t_unix, cmpl_id.c_str(), rd.n_update, n_chunks, rd.t_update_us,
+            (rd.t_first_us > 0 && t_arrival_us > 0) ? rd.t_first_us - t_arrival_us : -1,
+            t_arrival_us > 0 ? ggml_time_us() - t_arrival_us : -1);
+    server_ustats().write(buf);
+}
+
 std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             const server_http_req & req,
             server_task_type type,
@@ -7161,12 +7607,16 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task_response_type res_type) {
     GGML_ASSERT(type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL);
 
+    // [LLAMA_SERVER_UBATCH_STATS] 2026-10-22 night: HTTP-side stamps of the per-request timeline (server_req_stats)
+    const int64_t t_impl_us = server_ustats().on ? ggml_time_us() : 0;
+
     auto res = create_response();
     auto completion_id = gen_chatcmplid();
     auto & rd = res->rd;
     auto & params = this->params;
 
     res->set_req(&req); // will also set spipe if needed
+    rd.stats_on = server_ustats().on;
 
     int32_t sse_ping_interval = params.sse_ping_interval;
 
@@ -7254,6 +7704,15 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             tasks.push_back(std::move(task));
         }
 
+        if (server_ustats().on) {
+            const int64_t t_queued_us = ggml_time_us();
+            for (auto & t : tasks) {
+                t.t_arrival_us = req.t_arrival_us;
+                t.t_impl_us    = t_impl_us;
+                t.t_queued_us  = t_queued_us;
+            }
+        }
+
         rd.post_tasks(std::move(tasks));
     } catch (const std::exception & e) {
         res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
@@ -7265,6 +7724,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
     if (!stream) {
         // non-stream, wait for the results
         auto all_results = rd.wait_for_all(req.should_stop);
+        server_http_stats_line(rd, req.t_arrival_us, completion_id, 0);
         if (all_results.is_terminated) {
             return res; // connection is closed
         } else if (all_results.error) {
@@ -7326,7 +7786,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         }
         res->status = 200;
         res->content_type = "text/event-stream";
-        res->set_next([res_this = res.get(), res_type, sse_ping_interval](std::string & output) -> bool {
+        res->set_next([res_this = res.get(), res_type, sse_ping_interval, t_arrival_us = req.t_arrival_us, completion_id, n_chunks = 0](std::string & output) mutable -> bool {
             static auto format_error = [](task_response_type res_type, const json & res_json) {
                 if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
                     return format_anthropic_sse({
@@ -7371,6 +7831,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                             break;
                     }
                     SRV_DBG("%s", "all results received, terminating stream\n");
+                    server_http_stats_line(rd, t_arrival_us, completion_id, n_chunks);
                     return false; // no more data, terminate
                 }
 
@@ -7422,6 +7883,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 }
 
                 // has next data, continue
+                n_chunks++;
                 return true;
 
             } catch (const std::exception & e) {

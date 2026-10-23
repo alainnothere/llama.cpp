@@ -1010,6 +1010,9 @@ struct ggml_backend_sched {
     // [fork, 2026-10-22] per backend: split GPU timeline + D2D hop pieces (ggml_backend_fork_stats_i in
     // ggml-backend-impl.h), looked up when stats are enabled, NULL for backends without it (CPU, BLAS, ...)
     const struct ggml_backend_fork_stats_i * fork_stats[GGML_SCHED_MAX_BACKENDS];
+    // [fork, 2026-10-22 night] per backend: what ggml_backend_sched_synchronize waited on since the last take
+    // (ggml_backend_sched_sync_take, ggml-backend.h). Only touched while stats is non-NULL
+    struct ggml_backend_sched_sync_stats sync_acc[GGML_SCHED_MAX_BACKENDS];
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -1924,7 +1927,7 @@ static void ggml_backend_sched_stats_close_pending(ggml_backend_sched_t sched) {
 
 static void ggml_backend_sched_stats_add_copy(ggml_backend_sched_t sched, int split_id, const struct ggml_tensor * input,
         int src_backend, int dst_backend, int path, int64_t t_dst_wait, int64_t t_src_sync, int64_t t_copy,
-        const struct ggml_backend_d2d_copy_stats & d2d) {
+        const struct ggml_backend_d2d_copy_stats & d2d, int src_sync) {
     struct ggml_backend_sched_stats * st = sched->stats;
     const size_t nbytes = ggml_nbytes(input);
     st->nbytes        += nbytes;
@@ -1968,6 +1971,7 @@ static void ggml_backend_sched_stats_add_copy(ggml_backend_sched_t sched, int sp
         c.t_src_sync_us = t_src_sync;
         c.t_copy_us     = t_copy;
         c.d2d           = d2d;
+        c.src_sync      = src_sync;
     }
     st->n_copies++;
 }
@@ -2049,7 +2053,9 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, int split_
 
     if (stats_on) {
         const int src_backend = input_backend ? ggml_backend_sched_backend_id(sched, input_backend) : -1;
-        ggml_backend_sched_stats_add_copy(sched, split_id, input, src_backend, split_backend_id, path, t_dst_wait, t_src_sync, t_copy, d2d);
+        // [fork, 2026-10-22 night] src_sync: see ggml_backend_sched_copy_stats (the model.input_embed bounce)
+        const int src_sync = (input_backend && input_backend->iface.synchronize == NULL) ? 1 : 0;
+        ggml_backend_sched_stats_add_copy(sched, split_id, input, src_backend, split_backend_id, path, t_dst_wait, t_src_sync, t_copy, d2d, src_sync);
     }
 }
 
@@ -2452,8 +2458,39 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
-    for (int i = 0; i < sched->n_backends; i++) {
-        ggml_backend_synchronize(sched->backends[i]);
+    // [fork, 2026-10-22 night] LLAMA_DECODE_STATS "sync_prev": which backend the host waited on, and (Vulkan) fence vs
+    // deferred memcpy. Off = the plain loop, one pointer test
+    if (sched->stats != NULL) {
+        for (int i = 0; i < sched->n_backends; i++) {
+            const struct ggml_backend_fork_stats_i * fs = sched->fork_stats[i];
+            struct ggml_backend_sync_totals a = {}, b = {};
+            if (fs && fs->sync_totals) {
+                fs->sync_totals(sched->backends[i], &a);
+            }
+            const int64_t t0 = ggml_time_us();
+            ggml_backend_synchronize(sched->backends[i]);
+            const int64_t t1 = ggml_time_us();
+            struct ggml_backend_sched_sync_stats & acc = sched->sync_acc[i];
+            acc.n++;
+            acc.t_wait_us += t1 - t0;
+            if (fs && fs->sync_totals) {
+                fs->sync_totals(sched->backends[i], &b);
+                acc.has_totals = 1;
+                acc.vk.n_sync              += b.n_sync              - a.n_sync;
+                acc.vk.t_fence_us          += b.t_fence_us          - a.t_fence_us;
+                acc.vk.t_memcpy_out_us     += b.t_memcpy_out_us     - a.t_memcpy_out_us;
+                acc.vk.bytes_memcpy_out    += b.bytes_memcpy_out    - a.bytes_memcpy_out;
+                acc.vk.t_memcpy_in_us      += b.t_memcpy_in_us      - a.t_memcpy_in_us;
+                acc.vk.bytes_memcpy_in     += b.bytes_memcpy_in     - a.bytes_memcpy_in;
+                acc.vk.n_read_fallback     += b.n_read_fallback     - a.n_read_fallback;
+                acc.vk.bytes_read_fallback += b.bytes_read_fallback - a.bytes_read_fallback;
+                acc.vk.t_read_fallback_us  += b.t_read_fallback_us  - a.t_read_fallback_us;
+            }
+        }
+    } else {
+        for (int i = 0; i < sched->n_backends; i++) {
+            ggml_backend_synchronize(sched->backends[i]);
+        }
     }
     if (!sched->is_alloc) {
         // if the graph is not already allocated, always use copy 0 after a synchronization
@@ -2513,6 +2550,7 @@ void ggml_backend_sched_set_stats_enabled(ggml_backend_sched_t sched, bool enabl
     if (enabled && sched->stats == NULL) {
         sched->stats = (struct ggml_backend_sched_stats *) calloc(1, sizeof(struct ggml_backend_sched_stats));
         sched->stats_pending_split = -1;
+        memset(sched->sync_acc, 0, sizeof(sched->sync_acc));
         // [fork, 2026-10-22] the backends that can timestamp their splits / describe their D2D hops
         for (int i = 0; i < sched->n_backends; i++) {
             sched->fork_stats[i] = NULL;
@@ -2548,6 +2586,25 @@ int ggml_backend_sched_split_ts_calib(ggml_backend_sched_t sched, int backend_id
         return -1;
     }
     return sched->fork_stats[backend_id]->ts_calib(sched->backends[backend_id], info);
+}
+
+int ggml_backend_sched_sync_take(ggml_backend_sched_t sched, int backend_id, struct ggml_backend_sched_sync_stats * out) {
+    GGML_ASSERT(sched);
+    if (sched->stats == NULL || backend_id < 0 || backend_id >= sched->n_backends) {
+        return -1;
+    }
+    *out = sched->sync_acc[backend_id];
+    sched->sync_acc[backend_id] = {};
+    return 0;
+}
+
+int ggml_backend_sched_sync_totals(ggml_backend_sched_t sched, int backend_id, struct ggml_backend_sync_totals * out) {
+    GGML_ASSERT(sched);
+    if (backend_id < 0 || backend_id >= sched->n_backends || !sched->fork_stats[backend_id] || !sched->fork_stats[backend_id]->sync_totals) {
+        return -1;
+    }
+    sched->fork_stats[backend_id]->sync_totals(sched->backends[backend_id], out);
+    return 0;
 }
 
 const struct ggml_backend_sched_stats * ggml_backend_sched_get_last_stats(ggml_backend_sched_t sched) {
