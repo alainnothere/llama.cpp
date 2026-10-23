@@ -8312,6 +8312,35 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     }
 };
 
+// FLASH_ATTN_EXT with a speculative-verify decode mask: token r of nb sees kv columns [0, kv - nb + r], the rest is
+// -inf, i.e. the causal tail of a real KV cache. The random mask of the base case makes every block "mixed" and
+// costs ~40% per 1k KV over production on the Vulkan cm1 decode path, where mask_opt marks all blocks but the
+// last one ALL_ZERO and skips the mask load; this case reproduces the production per-block work (2026-10-22).
+struct test_flash_attn_ext_decode_mask : public test_flash_attn_ext {
+    using test_flash_attn_ext::test_flash_attn_ext;
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",mask=decode";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+        ggml_tensor * m = ggml_get_tensor(ctx, "m");
+        GGML_ASSERT(m != nullptr && m->type == GGML_TYPE_F16);
+        const int64_t ne0 = m->ne[0], ne1 = m->ne[1], n23 = m->ne[2] * m->ne[3];
+        std::vector<ggml_fp16_t> data(ne0 * ne1 * n23);
+        for (int64_t i23 = 0; i23 < n23; i23++) {
+            for (int64_t r = 0; r < ne1; r++) {
+                for (int64_t c = 0; c < ne0; c++) {
+                    const bool visible = c <= kv - nb + r;
+                    data[(i23 * ne1 + r) * ne0 + c] = ggml_fp32_to_fp16(visible ? 0.0f : -INFINITY);
+                }
+            }
+        }
+        ggml_backend_tensor_set(m, data.data(), 0, data.size() * sizeof(ggml_fp16_t));
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -11597,6 +11626,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     }
 
+    // decode-mask verify widths at the 27B geometry (mask_opt ALL_ZERO blocks + the causal tail block)
+    for (int kv : {4096, 16384}) {
+        for (int nb : {1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 16}) {
+            test_cases.emplace_back(new test_flash_attn_ext_decode_mask(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},   512, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},  4096,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},  4096,  16, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
@@ -12148,6 +12183,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
+    // Qwen3.8-27B decode / verify at production KV (128k, 224k), decode mask (mask_opt skips the mask like in
+    // production; K/V permuted {0,2,1,3} = heads interleaved per cell like the real cache): the per-row-count FA
+    // matrix of 2026-10-22 (GGML_VK_FA_PV_PREFETCH)
+    for (int kv : {131072, 229376}) {
+        for (int nb : {1, 2, 4, 6, 8, 12, 16}) {
+            test_cases.emplace_back(new test_flash_attn_ext_decode_mask(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
+        }
+    }
     // long-context decode / speculative verify, Qwen3.x-27B-like: hs 256, 4 kv heads x 6, 32k ctx
     for (int nb : {1, 6, 12}) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 32768, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));

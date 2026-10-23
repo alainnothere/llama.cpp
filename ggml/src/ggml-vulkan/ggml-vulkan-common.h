@@ -32,6 +32,9 @@ extern int vk_fa_cm1_wave32;
 // 3 = 1 + transposed-V staging (step C), -1 auto (RDNA3: 3, else 1, else off). 1-3 include step B (row-major S/P).
 // Default 0 until a production read of mode 3; flipping to auto is the initializer in ggml-vulkan-debug.cpp.
 extern int vk_fa_pv_reg;
+// GGML_VK_FA_GQA_DENSE: coopmat1 GQA fold with continuously numbered (token, head) rows, full 16-row tiles
+// (flash_attn_cm1.comp GQA_DENSE). 0 off (default until the gate), 1 on.
+extern int vk_fa_gqa_dense;
 // GGML_VK_MMVQ_CHUNK: n in 13..cap batches of a 2D quantized/f16 MUL_MAT run as mmvq column chunks of
 // <= the chunk width instead of the MMQ tile path. stored value is the cap (0 = off).
 // unset/-1 on with cap 48 (default), 0 off, 1..12 cap 48, >= 13 cap = value

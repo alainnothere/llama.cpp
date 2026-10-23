@@ -6122,6 +6122,10 @@ void ggml_vk_instance_init() {
         const int v = atoi(e);
         vk_fa_pv_reg = v < 0 ? -1 : ((v == 2 || v == 3) ? v : (v != 0 ? 1 : 0));
     }
+    // GGML_VK_FA_GQA_DENSE (2026-10-22): see the dense fold in ggml_vk_flash_attn. 0 off, 1 on.
+    if (const char * e = getenv("GGML_VK_FA_GQA_DENSE")) {
+        vk_fa_gqa_dense = atoi(e) != 0 ? 1 : 0;
+    }
     // GGML_VK_MMVQ_CHUNK (on by default since 2026-10-19, see ggml_vk_mul_mat): unset/-1 (any negative) on
     // with cap 48, 0 off, 1..12 cap 48, >= 13 cap = value. The stored value is the column cap, 0 = off.
     if (const char * e = getenv("GGML_VK_MMVQ_CHUNK")) {
@@ -9364,6 +9368,52 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         }
     }
 
+    // GGML_VK_FA_GQA_DENSE (2026-10-22, flash_attn_cm1.comp GQA_DENSE): number the n x qk_ratio (token, head) rows of a
+    // KV head continuously and cut them into full 16-row tiles, ceil(n * qk / 16) tiles instead of ceil(n / T) (T = 16 / qk
+    // whole tokens per tile) or, unfolded, qk x ceil(n / 16). Br 16 only, no sparse (gqa_T > 1 semantics), n <= the fold
+    // limit (the mask_opt bitmap is per 16-row mask tile, every token must be in tile 0). Same LDS, same 2 WGs per CU.
+    // Measured 2026-10-22, 7900 XTX (Vulkan1), 27B shape (hs 256, 4 kv heads x 6, f16 K/V laid out like the cache),
+    // test-backend-ops perf, decode mask (mask_opt skips the mask as in production), us per call at 226k KV:
+    //   rows                  1     2     4     6     8    12    16
+    //   off (tiles/KV head)  1079  1080  1106  1178  1501  2202  2201   (1 / 1 / 2 / 3 / 4 / 6 / 6)
+    //   dense                1080  1084  1090  1200  1215  2097  2181   (8 rows 3 tiles, 12 rows 5)
+    // Why tiles and not bytes: past 2 tiles every tile adds ~370 us = ~5 us per KV block per workgroup at the 192-WG
+    // (2 per CU) grid, whatever the row count. Dead probes of the same session, do not repeat:
+    //   * more or fewer workgroups: GGML_VK_FA_SPLITK_PCT 50/75/125/150/200 at 1 and 12 rows: 1081/1075/1805/2013/2193 and
+    //     3047/2389/4995/6076/4927 us (logger) vs 1079 / 2202; mode 3 is 29,696 B LDS, 256 VGPR, 4 waves/SIMD = 2 WGs per
+    //     CU resident, any WG past 192 runs a second, slow round. PV_REG mode 1 (17 KB LDS, 7 waves/SIMD) + PCT 150/175:
+    //     12 rows 2846 -> 3226/4501. Occupancy is not the lever.
+    //   * sharing the K/V block between row blocks: PV_REG at Br 32/48 (one K B-operand load and one staged V slice
+    //     multiplied against 2/3 row blocks; built and correct, 2026-10-22): rows 1/4/6/8/12 = 1081/1064/1328/1333/2410.
+    //     1 WG per CU fits (46-63 KB LDS), and per CU it ran 2.7 us per 16-row block x KV block vs 2.5 at Br 16;
+    //     ablations unchanged (12 rows: P.V ~1200, Q.K ~715 us both ways), so the K/V bytes are not the cost.
+    //   * Q kept in registers across the KV loop (16 named A coopmats; built, correct): rows 1/8/12 = 1072/1695/2457,
+    //     the 128 VGPRs it takes from the 256 starve the K/V load prefetch.
+    //   * ablations, off, 12 rows: no P.V 994, no Q.K 1478, neither 317 (P.V ~1210 + Q.K ~720 + loop ~320 us). RADV ISA
+    //     of the mode-3 loop body: 893 instructions per wave per KV block, 32 WMMA, 72 ds_load_b128, 128 s_waitcnt:
+    //     the block is bound by its own instruction stream and waits, which only fewer row blocks or a rewrite fix.
+    bool gqa_dense = false;
+    if (vk_fa_gqa_dense == 1 && gqa_fold_ok && tuning_params.path == FA_COOPMAT1 && !use_dequant_kv &&
+        qk_ratio <= 16 && neq1 > 1 && (uint32_t)neq1 <= std::min<uint32_t>(vk_fa_fold_max_n, 16)) {
+        const uint32_t Br16 = 16;
+        const uint32_t dense_tiles = CEIL_DIV((uint32_t)neq1 * qk_ratio, Br16);
+        // tiles per KV head of the mapping chosen above: folded = workgroups_x, unfolded = qk x ceil(n / Br)
+        const uint32_t cur_tiles = gqa_ratio > 1 ? workgroups_x : qk_ratio * CEIL_DIV((uint32_t)neq1, tuning_params.block_rows);
+        if (dense_tiles < cur_tiles) {
+            if (gqa_ratio == 1) {
+                gqa_ratio = qk_ratio;
+                workgroups_y /= gqa_ratio;
+            }
+            tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, Br16, KV, k_type_eff, v_type_eff, f32acc);
+            tuning_params.block_rows = Br16;
+            gqa_dense    = tuning_params.path == FA_COOPMAT1;
+            GGML_ASSERT(gqa_dense);
+            gqa_T        = 2;   // any T > 1: no sparse, mask_opt per tile 0 (n <= 16), see below
+            N            = Br16;
+            workgroups_x = dense_tiles;
+        }
+    }
+
     float scale         = 1.0f;
     float max_bias      = 0.0f;
     float logit_softcap = 0.0f;
@@ -9499,6 +9549,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
                                                                    mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff);
+    if (gqa_dense) {
+        fa_pipeline_state.flags |= 16384; // GQA_DENSE, flash_attn_cm1.comp
+    }
     if (emit_lse) {
         GGML_ASSERT(tuning_params.path != FA_COOPMAT2 && "flash_attn_ext emit_lse: not implemented in flash_attn_cm2.comp");
         fa_pipeline_state.flags |= 8192; // EMIT_LSE, flash_attn_base.glsl: HSV + 4 dst row stride and the lse store
@@ -9708,7 +9761,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // the perf logger's node_desc; GGML_VK_MMVQ_SLOPE_STATS records the same string as its "fa" field
     if ((vk_perf_logger_enabled && ctx->perf_logger) || vk_mmvq_slope_stats) {
         char buf[384];
-        const char * path = tuning_params.path == FA_COOPMAT2 ? "cm2" : tuning_params.path == FA_COOPMAT1 ? "cm1" : "scalar";
+        const char * path = tuning_params.path == FA_COOPMAT2 ? "cm2" : tuning_params.path == FA_COOPMAT1 ? (gqa_dense ? "cm1 dense" : "cm1") : "scalar";
         const bool mmq = tuning_params.path == FA_SCALAR && ggml_vk_fa_scalar_uses_mmq(ctx->device, k_type_eff, v_type_eff);
         snprintf(buf, sizeof(buf), " [%s%s%s k=%s v=%s%s hs=%u/%u n=%u N=%u KV=%u qk=%u gqa=%u T=%u Br=%u Bc=%u Tr=%u wg=%ux%ux%u cores=%u splitk=%u splitkv=%u%s%s%s%s%s]",
                  xe_fa_opt ? "xe" : path,
