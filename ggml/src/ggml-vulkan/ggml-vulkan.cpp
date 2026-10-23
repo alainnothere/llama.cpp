@@ -13709,19 +13709,60 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
 //     submit; only a graph with no enqueued node pays one extra vkQueueSubmit for the end (rare: copy-only splits).
 //   - cost when on, per split: 2 queries (16 B of pool), one host vkResetQueryPool of 2 queries, two
 //     vkCmdWriteTimestamp, one vkGetQueryPoolResults of 32 B (2 x {value, availability}) at read time, plus one
-//     vkGetCalibratedTimestamps per VK_DTS_RECAL reads. ALL_COMMANDS timestamps drain the queue at that point, which
-//     a split boundary does anyway (the next split's first dispatch barriers on the previous one's outputs).
-//   - cost when off: ctx->dts_armed is false, one bool test per graph_compute and one per submit in build_graph.
-// Clock: device ticks -> host CLOCK_MONOTONIC ns through vkGetCalibratedTimestamps(DEVICE, CLOCK_MONOTONIC) every
-// VK_DTS_RECAL reads (max deviation kept, reported as calib_max_dev_ns); without the extension timestampPeriod plus
-// the offset that puts the first read ticket's start at its host arm time (later than the truth by the queue
-// latency, so every interval reads early by the same amount; overlap between cards is then only approximate, the
-// row says calib "approx").
+//     clock upkeep below (one ~10-17 us calibration call per 250 ms per context, one anchor submit per 100 ms per
+//     context). ALL_COMMANDS timestamps drain the queue at that point, which a split boundary does anyway (the next
+//     split's first dispatch barriers on the previous one's outputs).
+//   - cost when off: ctx->dts_armed is false, one bool test per graph_compute and one per submit in build_graph,
+//     one in ggml_vk_synchronize (dts_ok).
+// Clock, [fork, 2026-10-22 night] (was: one vkGetCalibratedTimestamps sample every 64 reads, used as offset with
+// rate 1). Device ticks -> host CLOCK_MONOTONIC ns in two parts:
+//   1. model: vkGetCalibratedTimestamps(DEVICE, CLOCK_MONOTONIC) sampled at read time at most every
+//      VK_DTS_CAL_EVERY_NS, the last VK_DTS_CAL_N samples within VK_DTS_CAL_WINDOW_NS fitted host = c + s * dev_ns
+//      (least squares; s = 1 below a 1 s span; samples with driver deviation > 50 us dropped from the fit unless
+//      that leaves none). Probe 2026-10-22 ~20:50 (scratchpad probe.c, 20 calibrations over 4.75 s, cards busy in
+//      production): drift Vulkan1 (7900 XTX, 03:00) -15.6 ppm, Vulkan2 (7900 XT, 09:00) -10.1 ppm, Vulkan3 (7900 XTX,
+//      13:00) -10.8 ppm, fit residual <= 0.4 / 4.1 / 1.2 us, max deviation 3.6-18.5 us (calib_max_dev_ns 7726 on the
+//      tapes), call 4-20 us. So the old scheme lost <= 16 ppm x 3 s ~ 50 us between recalibrations: NOT the
+//      1.2-1.6 ms below; the model is here so calibration age never matters (idle server, minutes between reads).
+//   2. anchor: the DEVICE domain on RADV is AMDGPU_INFO_TIMESTAMP, which the kernel answers on gfx11 by reading the
+//      SMUIO GOLDEN_TSC over MMIO (gfx_v11_0_get_gpu_clock_counter, linux 7.1.3), while vkCmdWriteTimestamp
+//      (ALL_COMMANDS = RELEASE_MEM EOP timestamp) is latched by the CP from the GC's own clock counter. Same 100 MHz
+//      rate (the offset below stays put over 200 s), different origin per card. Evidence, LLAMA_DECODE_STATS tapes
+//      ~/ai/claude_scratch/cp_overlap/pre_pack: arm A2 (CP off, serial chain Vulkan2 -> Vulkan3 -> Vulkan1 by
+//      l_out hops) reads Vulkan3 end -> Vulkan1 start -1.11..-1.24 ms on every decode step (impossible: the hop's
+//      semaphore gates the dst submission) and already -1.23 ms on the first line, when every context had just
+//      taken its first calibration; Vulkan2 -> Vulkan3 reads +0.3..+0.6 ms. Arm C2 brackets it from both sides:
+//      Vulkan3 -> Vulkan1 hops read -1.21 ms (p50), Vulkan1 -> Vulkan3 back hops +1.61 ms (p50), so Vulkan3's
+//      command-stream clock sits ~1.4 ms later than Vulkan1's after DEVICE-domain conversion, with ~0.2 ms per hop.
+//      No host-side clock read can see that offset, so the anchor measures it on the GPU: ggml_vk_dts_probe_issue
+//      (from ggml_vk_synchronize, the queue just drained, never inside an open split) submits a pre-recorded command
+//      buffer that only writes one ALL_COMMANDS timestamp, host time taken right before vkQueueSubmit; resolved
+//      later without waiting (availability poll). conv(tick) - t_submit = offset + latency, latency >= 0, so the
+//      correction is the min over the last VK_DTS_PROBE_WINDOW probes (busy-queue / GPU-wakeup probes only read
+//      high and lose the min). Residual error: converted times read early by the smallest submit-to-execute latency
+//      seen (tens of us, about equal on every card, so cross-card error is the difference of those).
+//      Preconditions: the probe goes on the same queue family as the splits (compute queue, same CP counter); the
+//      probe's own 4-slot query pool is reset from the host only after its last result was read available.
+//   Without the calibration extension: timestampPeriod plus the offset that puts the first read ticket's start at
+//   its host arm time, then the same anchor on top (row still says calib "approx").
 // Ring: ticket t is refused (-2) when t - dts_floor >= VK_DTS_RING, dts_floor = dts_next at every
 // ggml_vk_synchronize (fence waited, every earlier ticket is on the GPU's past). So a slot is host-reset only when
 // its previous write has landed; a ticket older than dts_next - VK_DTS_RING reads -1 (slot reused).
 static constexpr int64_t  VK_DTS_RING  = 256;
-static constexpr uint32_t VK_DTS_RECAL = 64;
+static constexpr int64_t  VK_DTS_CAL_EVERY_NS   = 250 * 1000 * 1000;    // calibration samples, at read time
+static constexpr size_t   VK_DTS_CAL_N          = 32;
+static constexpr int64_t  VK_DTS_CAL_WINDOW_NS  = 8000LL * 1000 * 1000; // samples older than newest - this drop out
+static constexpr int64_t  VK_DTS_CAL_BAD_DEV_NS = 50 * 1000;            // probe: 3.6-18.5 us; above = preempted call
+static constexpr uint32_t VK_DTS_PROBES         = 4;                    // anchor slots in flight
+static constexpr int64_t  VK_DTS_PROBE_EVERY_NS = 100 * 1000 * 1000;
+static constexpr size_t   VK_DTS_PROBE_WINDOW   = 16;                   // ~1.6 s of probes at full rate
+
+static int64_t ggml_vk_mono_ns() {
+    // CLOCK_MONOTONIC on Linux (libstdc++/libc++ steady_clock), the base of ggml_time_us and of the calibration
+    return (int64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static void ggml_vk_dts_probe_init(ggml_backend_vk_context * ctx);
 
 static bool ggml_vk_dts_init(ggml_backend_vk_context * ctx) {
     if (ctx->dts_init_done) {
@@ -13745,6 +13786,20 @@ static bool ggml_vk_dts_init(ggml_backend_vk_context * ctx) {
     ctx->dts_period_ns = dev->properties.limits.timestampPeriod;
     ctx->dts_mask      = dev->timestamp_valid_bits >= 64 ? ~0ull : ((1ull << dev->timestamp_valid_bits) - 1);
     ctx->dts_ok        = true;
+    // [fork, 2026-10-22 night] the GPU clock anchor (one timestamp-only submit per 100 ms per context, after a
+    // drain) is a submit-path change on the stats path, and the user's production server runs with
+    // LLAMA_DECODE_STATS set. House rule (feedback 2026-10-22: two unrun defaults cost an hour of garbage
+    // output): it ships OFF until the A2 gate in context-perf-step-budget-whatifs.md ("timeline clock offset")
+    // passes on a dry-road run. GGML_VK_DTS_ANCHOR=1 enables it; without it the tape keeps the per-device
+    // calibration fields and the uncorrected ~1.4 ms Vulkan1-vs-Vulkan3 offset the readers now flag as FAIL.
+    {
+        const char * e = getenv("GGML_VK_DTS_ANCHOR");
+        if (e && atoi(e) != 0) {
+            ggml_vk_dts_probe_init(ctx);
+        } else {
+            ctx->dts_probe_ok = false;
+        }
+    }
     return true;
 }
 
@@ -13758,12 +13813,66 @@ static int64_t ggml_vk_dts_delta(const ggml_backend_vk_context * ctx, uint64_t a
     return (d & sign) ? (int64_t)(d | ~ctx->dts_mask) : (int64_t)d;
 }
 
+// refit the clock model from dts_cal (see "Clock" above); reference = the newest sample
+static void ggml_vk_dts_fit(ggml_backend_vk_context * ctx) {
+    const size_t n = ctx->dts_cal.size();
+    if (n == 0) {
+        ctx->dts_calibrated = false;
+        return;
+    }
+    const auto & ref = ctx->dts_cal.back();
+    ctx->dts_cal_dev     = ref.dev;
+    ctx->dts_cal_last_ns = ref.host_ns;
+    size_t n_good = 0;
+    for (const auto & c : ctx->dts_cal) {
+        n_good += c.max_dev_ns <= VK_DTS_CAL_BAD_DEV_NS;
+    }
+    double sx = 0, sy = 0, sxx = 0, sxy = 0, m = 0;
+    double x_min = 0;
+    for (const auto & c : ctx->dts_cal) {
+        if (n_good > 0 && c.max_dev_ns > VK_DTS_CAL_BAD_DEV_NS) {
+            continue;
+        }
+        const double x = (double) ggml_vk_dts_delta(ctx, c.dev & ctx->dts_mask, ref.dev) * ctx->dts_period_ns;   // <= 0
+        const double y = (double) (c.host_ns - ref.host_ns);
+        sx += x; sy += y; sxx += x * x; sxy += x * y; m += 1;
+        x_min = std::min(x_min, x);
+    }
+    double slope = 1.0;
+    if (m >= 3 && -x_min >= 1e9) {
+        const double den = m * sxx - sx * sx;
+        if (den > 0) {
+            slope = (m * sxy - sx * sy) / den;
+        }
+        // > 1 %: a bad sample, not a clock. Probe 2026-10-22: Navi31 cards -16..-10 ppm, the Raphael iGPU -1893 ppm
+        // (its timestampPeriod 10 ns does not match its counter; a real rate, so the bound stays well above it)
+        if (!(std::fabs(slope - 1.0) < 1e-2)) {
+            slope = 1.0;
+        }
+    }
+    // slope 1 (short span): intercept from the newest good sample alone, so drift never biases it
+    ctx->dts_cal_s = slope;
+    if (slope == 1.0) {
+        double c0 = 0;
+        for (auto it = ctx->dts_cal.rbegin(); it != ctx->dts_cal.rend(); ++it) {
+            if (n_good == 0 || it->max_dev_ns <= VK_DTS_CAL_BAD_DEV_NS) {
+                c0 = (double) (it->host_ns - ref.host_ns) - (double) ggml_vk_dts_delta(ctx, it->dev & ctx->dts_mask, ref.dev) * ctx->dts_period_ns;
+                break;
+            }
+        }
+        ctx->dts_cal_c = (double) ref.host_ns + c0;
+    } else {
+        ctx->dts_cal_c = (double) ref.host_ns + (sy - slope * sx) / m;
+    }
+    ctx->dts_calibrated = true;
+}
+
 static void ggml_vk_dts_calibrate(ggml_backend_vk_context * ctx) {
-    ctx->dts_reads_since_cal = 0;
     PFN_vkGetCalibratedTimestampsEXT pfn = ctx->device->pfn_vkGetCalibratedTimestampsEXT;
     if (!pfn) {
         return;
     }
+    ctx->dts_cal_try_ns = ggml_vk_mono_ns();
     VkCalibratedTimestampInfoEXT info[2] = {};
     info[0].sType      = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT;
     info[0].timeDomain = VK_TIME_DOMAIN_DEVICE_EXT;
@@ -13772,20 +13881,155 @@ static void ggml_vk_dts_calibrate(ggml_backend_vk_context * ctx) {
     uint64_t ts[2]   = {};
     uint64_t max_dev = 0;
     if (pfn((VkDevice)ctx->device->device, 2, info, ts, &max_dev) != VK_SUCCESS) {
-        return;   // keep the previous calibration (or approx) rather than nothing
+        return;   // keep the previous model; retried after VK_DTS_CAL_EVERY_NS (dts_cal_try_ns)
     }
-    ctx->dts_cal_dev        = ts[0] & ctx->dts_mask;
-    ctx->dts_cal_host_ns    = (int64_t)ts[1];
-    ctx->dts_cal_max_dev_ns = std::max<int64_t>(ctx->dts_cal_max_dev_ns, (int64_t)max_dev);
-    ctx->dts_calibrated     = true;
+    ctx->dts_cal.push_back({ ts[0] & ctx->dts_mask, (int64_t) ts[1], (int64_t) max_dev });
+    while (ctx->dts_cal.size() > VK_DTS_CAL_N ||
+           (ctx->dts_cal.size() > 1 && ctx->dts_cal.back().host_ns - ctx->dts_cal.front().host_ns > VK_DTS_CAL_WINDOW_NS)) {
+        ctx->dts_cal.erase(ctx->dts_cal.begin());
+    }
+    int64_t md = -1;
+    for (const auto & c : ctx->dts_cal) {
+        md = std::max(md, c.max_dev_ns);
+    }
+    ctx->dts_cal_max_dev_ns = md;
+    ggml_vk_dts_fit(ctx);
 }
 
-static int64_t ggml_vk_dts_to_host_us(ggml_backend_vk_context * ctx, uint64_t ticks) {
+// device ticks -> host CLOCK_MONOTONIC ns before the anchor correction
+static double ggml_vk_dts_base_ns(const ggml_backend_vk_context * ctx, uint64_t ticks) {
     ticks &= ctx->dts_mask;
     if (ctx->dts_calibrated) {
-        return (ctx->dts_cal_host_ns + (int64_t)((double)ggml_vk_dts_delta(ctx, ticks, ctx->dts_cal_dev) * ctx->dts_period_ns)) / 1000;
+        return ctx->dts_cal_c + ctx->dts_cal_s * (double) ggml_vk_dts_delta(ctx, ticks, ctx->dts_cal_dev) * ctx->dts_period_ns;
     }
-    return ((int64_t)((double)ticks * ctx->dts_period_ns) + ctx->dts_approx_off_ns) / 1000;
+    return (double) ticks * ctx->dts_period_ns + (double) ctx->dts_approx_off_ns;
+}
+
+// the anchor correction (ns to subtract) over the probe window; *spread = max - min, -1 without probes
+static bool ggml_vk_dts_probe_corr(const ggml_backend_vk_context * ctx, double * corr, double * spread) {
+    if (ctx->dts_probe.empty() || (!ctx->dts_calibrated && !ctx->dts_approx_set)) {
+        *corr = 0;
+        *spread = -1;
+        return false;
+    }
+    double lo = 1e300, hi = -1e300;
+    for (const auto & p : ctx->dts_probe) {
+        const double d = ggml_vk_dts_base_ns(ctx, p.tick) - (double) p.host_ns;
+        lo = std::min(lo, d);
+        hi = std::max(hi, d);
+    }
+    *corr = lo;
+    *spread = hi - lo;
+    return true;
+}
+
+static int64_t ggml_vk_dts_to_host_us(const ggml_backend_vk_context * ctx, uint64_t ticks, double corr_ns) {
+    return (int64_t) std::llround((ggml_vk_dts_base_ns(ctx, ticks) - corr_ns) / 1000.0);
+}
+
+// the GPU anchor (see "Clock" 2. above). Off (dts_probe_ok false) when any piece fails: then the row's
+// calib_dev[...].n_probe stays 0 and the reader's causal self-check is the only offset estimate.
+static void ggml_vk_dts_probe_init(ggml_backend_vk_context * ctx) {
+    const vk_device & dev = ctx->device;
+    try {
+        vk::QueryPoolCreateInfo qci;
+        qci.queryType  = vk::QueryType::eTimestamp;
+        qci.queryCount = VK_DTS_PROBES;
+        ctx->dts_probe_pool = dev->device.createQueryPool(qci);
+        dev->device.resetQueryPool(ctx->dts_probe_pool, 0, VK_DTS_PROBES);
+        vk::CommandPoolCreateInfo pci({}, dev->compute_queue->queue_family_index);
+        ctx->dts_probe_cmd_pool = dev->device.createCommandPool(pci);
+        vk::CommandBufferAllocateInfo ai(ctx->dts_probe_cmd_pool, vk::CommandBufferLevel::ePrimary, VK_DTS_PROBES);
+        ctx->dts_probe_cmd = dev->device.allocateCommandBuffers(ai);
+        for (uint32_t i = 0; i < VK_DTS_PROBES; i++) {
+            // recorded once, resubmitted (no ONE_TIME_SUBMIT); a slot is only resubmitted after its result landed,
+            // so the buffer is never pending twice
+            ctx->dts_probe_cmd[i].begin(vk::CommandBufferBeginInfo{});
+            ctx->dts_probe_cmd[i].writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->dts_probe_pool, i);
+            ctx->dts_probe_cmd[i].end();
+        }
+        ctx->dts_probe_submit_ns.assign(VK_DTS_PROBES, 0);
+        ctx->dts_probe.clear();
+        ctx->dts_probe_ok = true;
+    } catch (const vk::SystemError & e) {
+        GGML_LOG_WARN("ggml_vulkan: %s: split GPU timeline clock anchor off (%s), cross-card offsets uncorrected\n", ctx->name.c_str(), e.what());
+        ctx->dts_probe_ok = false;
+    }
+}
+
+// resolve landed probes, never waits
+static void ggml_vk_dts_probe_poll(ggml_backend_vk_context * ctx) {
+    if (!ctx->dts_probe_ok) {
+        return;
+    }
+    for (uint32_t i = 0; i < VK_DTS_PROBES; i++) {
+        if (ctx->dts_probe_submit_ns[i] == 0) {
+            continue;
+        }
+        uint64_t r[2] = {};
+        const VkResult res = vkGetQueryPoolResults((VkDevice)ctx->device->device, (VkQueryPool)ctx->dts_probe_pool, i, 1, sizeof(r), r,
+                                                   sizeof(r), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+        if ((res != VK_SUCCESS && res != VK_NOT_READY) || r[1] == 0) {
+            continue;
+        }
+        ctx->dts_probe.push_back({ r[0] & ctx->dts_mask, ctx->dts_probe_submit_ns[i] });
+        ctx->dts_probe_submit_ns[i] = 0;
+    }
+    std::sort(ctx->dts_probe.begin(), ctx->dts_probe.end(), [](const auto & a, const auto & b) { return a.host_ns < b.host_ns; });
+    while (ctx->dts_probe.size() > VK_DTS_PROBE_WINDOW) {
+        ctx->dts_probe.erase(ctx->dts_probe.begin());
+    }
+}
+
+// from ggml_vk_synchronize after its fence wait: this context's work is done, the queue is (nearly always) idle
+static void ggml_vk_dts_probe_issue(ggml_backend_vk_context * ctx) {
+    if (!ctx->dts_probe_ok || ctx->dts_end_pending) {
+        return;   // never inside an open split: it would add a kernel job between that split's two timestamps
+    }
+    ggml_vk_dts_probe_poll(ctx);
+    const int64_t now = ggml_vk_mono_ns();
+    if (now - ctx->dts_probe_last_ns < VK_DTS_PROBE_EVERY_NS) {
+        return;
+    }
+    for (uint32_t i = 0; i < VK_DTS_PROBES; i++) {
+        if (ctx->dts_probe_submit_ns[i] != 0) {
+            continue;
+        }
+        ctx->device->device.resetQueryPool(ctx->dts_probe_pool, i, 1);
+        vk::SubmitInfo si(0, nullptr, nullptr, 1, &ctx->dts_probe_cmd[i]);
+        const int64_t t = ggml_vk_mono_ns();   // lower bound of when the timestamp latches
+        ctx->device->compute_queue->handle->submit({ si }, {});
+        ctx->dts_probe_submit_ns[i] = t;
+        ctx->dts_probe_last_ns      = t;
+        return;
+    }
+}
+
+static void ggml_vk_dts_probe_destroy(ggml_backend_vk_context * ctx) {
+    bool pending = false;
+    for (int64_t t : ctx->dts_probe_submit_ns) {
+        pending = pending || t != 0;
+    }
+    if (pending) {
+        // teardown only: a probe still on the queue would write into a destroyed pool from a freed command buffer
+        ctx->device->compute_queue->handle->lock();
+        ctx->device->compute_queue->handle->queue.waitIdle();
+        ctx->device->compute_queue->handle->unlock();
+    }
+    if (ctx->dts_probe_cmd_pool) {
+        ctx->device->device.destroyCommandPool(ctx->dts_probe_cmd_pool);   // frees dts_probe_cmd
+        ctx->dts_probe_cmd_pool = nullptr;
+    }
+    ctx->dts_probe_cmd.clear();
+    if (ctx->dts_probe_pool) {
+        ctx->device->device.destroyQueryPool(ctx->dts_probe_pool);
+        ctx->dts_probe_pool = nullptr;
+    }
+    ctx->dts_probe_submit_ns.clear();
+    ctx->dts_probe.clear();
+    ctx->dts_probe_ok = false;
+    ctx->dts_cal.clear();
+    ctx->dts_calibrated = false;
 }
 
 // graph_compute entry: consume the arm, reset the slot from the host, write the start timestamp
@@ -13851,26 +14095,45 @@ static int ggml_backend_vk_fork_ts_read(ggml_backend_t backend, int64_t ticket, 
     if (r[1] == 0 || r[3] == 0) {
         return 0;
     }
-    if (ctx->device->pfn_vkGetCalibratedTimestampsEXT && (!ctx->dts_calibrated || ctx->dts_reads_since_cal >= VK_DTS_RECAL)) {
+    // [fork, 2026-10-22 night] model sample at read time (the read follows the sync, so the ticks are fresh), at most
+    // every VK_DTS_CAL_EVERY_NS; was every 64 reads with no rate term
+    if (ctx->device->pfn_vkGetCalibratedTimestampsEXT && (ggml_vk_mono_ns() - ctx->dts_cal_try_ns >= (ctx->dts_calibrated ? VK_DTS_CAL_EVERY_NS : 0))) {
         ggml_vk_dts_calibrate(ctx);
     }
-    ctx->dts_reads_since_cal++;
     if (!ctx->dts_calibrated && !ctx->dts_approx_set) {
         ctx->dts_approx_off_ns = ctx->dts_host_arm_us[slot] * 1000 - (int64_t)((double)(r[0] & ctx->dts_mask) * ctx->dts_period_ns);
         ctx->dts_approx_set    = true;
     }
-    *t_start_us = ggml_vk_dts_to_host_us(ctx, r[0]);
-    *t_end_us   = ggml_vk_dts_to_host_us(ctx, r[2]);
+    ggml_vk_dts_probe_poll(ctx);
+    double corr = 0, spread = 0;
+    ggml_vk_dts_probe_corr(ctx, &corr, &spread);
+    *t_start_us = ggml_vk_dts_to_host_us(ctx, r[0], corr);
+    *t_end_us   = ggml_vk_dts_to_host_us(ctx, r[2], corr);
     return 1;
 }
 
-static int ggml_backend_vk_fork_ts_calib(ggml_backend_t backend, int64_t * max_dev_ns) {
+static int ggml_backend_vk_fork_ts_calib(ggml_backend_t backend, struct ggml_backend_ts_calib_info * info) {
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    *info = { -1, -1, 0.0, 0, -1, 0, -1, -1, -1 };
     if (!ctx->dts_ok) {
-        *max_dev_ns = -1;
         return -1;
     }
-    *max_dev_ns = ctx->dts_calibrated ? ctx->dts_cal_max_dev_ns : -1;
+    const int64_t now = ggml_vk_mono_ns();
+    if (ctx->dts_calibrated) {
+        info->max_dev_ns = ctx->dts_cal_max_dev_ns;
+        info->age_us     = (now - ctx->dts_cal_last_ns) / 1000;
+        info->drift_ppm  = (1.0 / ctx->dts_cal_s - 1.0) * 1e6;   // device ns per host ns - 1, as the probe prints it
+        info->n_samples  = (int32_t) ctx->dts_cal.size();
+        info->span_us    = (ctx->dts_cal.back().host_ns - ctx->dts_cal.front().host_ns) / 1000;
+    }
+    ggml_vk_dts_probe_poll(ctx);
+    double corr = 0, spread = -1;
+    if (ggml_vk_dts_probe_corr(ctx, &corr, &spread)) {
+        info->n_probe         = (int32_t) ctx->dts_probe.size();
+        info->probe_corr_ns   = (int64_t) std::llround(corr);
+        info->probe_spread_ns = (int64_t) std::llround(spread);
+        info->probe_age_us    = (now - ctx->dts_probe.back().host_ns) / 1000;
+    }
     return ctx->dts_calibrated ? 0 : 1;
 }
 
@@ -14597,6 +14860,7 @@ void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
 #endif
     ctx->d2d_links.clear();
 
+    ggml_vk_dts_probe_destroy(ctx);   // [fork, 2026-10-22 night] clock anchor + model
     if (ctx->dts_pool) {
         ctx->device->device.destroyQueryPool(ctx->dts_pool);
         ctx->dts_pool = nullptr;
@@ -16504,6 +16768,11 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
     // A sync from inside graph_compute (staging reads, ggml_vk_submit_compute_ctx_nowait) leaves the current ticket's
     // end unsubmitted: that ticket stays above the floor
     ctx->dts_floor = ctx->dts_end_pending ? ctx->dts_next - 1 : ctx->dts_next;
+    // [fork, 2026-10-22 night] clock anchor (comment at VK_DTS_RING, "Clock" 2.): the queue just drained, so a probe
+    // submitted now latches within the submit latency; rate-limited to one per VK_DTS_PROBE_EVERY_NS, never waited
+    if (ctx->dts_ok) {
+        ggml_vk_dts_probe_issue(ctx);
+    }
 #ifdef __linux__
     if (ggml_vk_d2d_check_on()) {
         ggml_vk_d2d_check_drain(ctx);   // the dst queue is idle: every hop 2 recorded here (and its hop 1) is done

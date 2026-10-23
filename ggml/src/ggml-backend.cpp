@@ -2474,12 +2474,12 @@ int ggml_backend_sched_split_ts_read(ggml_backend_sched_t sched, int backend_id,
     return sched->fork_stats[backend_id]->ts_read(sched->backends[backend_id], ticket, t_start_us, t_end_us, n_submit);
 }
 
-int ggml_backend_sched_split_ts_calib(ggml_backend_sched_t sched, int backend_id, int64_t * max_dev_ns) {
+int ggml_backend_sched_split_ts_calib(ggml_backend_sched_t sched, int backend_id, struct ggml_backend_ts_calib_info * info) {
     GGML_ASSERT(sched);
     if (backend_id < 0 || backend_id >= sched->n_backends || !sched->fork_stats[backend_id]) {
         return -1;
     }
-    return sched->fork_stats[backend_id]->ts_calib(sched->backends[backend_id], max_dev_ns);
+    return sched->fork_stats[backend_id]->ts_calib(sched->backends[backend_id], info);
 }
 
 const struct ggml_backend_sched_stats * ggml_backend_sched_get_last_stats(ggml_backend_sched_t sched) {

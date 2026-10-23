@@ -504,10 +504,23 @@ extern "C" {
     // synchronized (llama: in llama_context::synchronize, after ggml_backend_sched_synchronize) to get 1.
     // n_submit (nullable): vkQueueSubmit calls the split made (amdgpu.sched_jobs caps queued submissions per context)
     GGML_API int ggml_backend_sched_split_ts_read(ggml_backend_sched_t sched, int backend_id, int64_t ticket, int64_t * t_start_us, int64_t * t_end_us, int32_t * n_submit);
-    // clock conversion of backend backend_id: -1 = no timer, 0 = calibrated (VK_EXT/KHR_calibrated_timestamps,
-    // *max_dev_ns = largest deviation the driver reported over the calibrations so far), 1 = approx (timestampPeriod
-    // plus a one-time host offset, *max_dev_ns = -1)
-    GGML_API int ggml_backend_sched_split_ts_calib(ggml_backend_sched_t sched, int backend_id, int64_t * max_dev_ns);
+    // clock conversion of backend backend_id: -1 = no timer, 0 = calibrated (VK_EXT/KHR_calibrated_timestamps),
+    // 1 = approx (timestampPeriod plus a one-time host offset). [fork, 2026-10-22 night] the info struct says how
+    // much to trust it (see VK_DTS_RING in ggml-vulkan.cpp): the 2026-10-22 A2/C2 tapes read Vulkan1 1.2-1.6 ms
+    // early against Vulkan3 with max_dev_ns ~8 us, the per-card offset between the DEVICE time domain and the
+    // command-stream timestamps that the probe fields now measure and remove. Fields are -1 when unknown.
+    struct ggml_backend_ts_calib_info {
+        int64_t max_dev_ns;      // largest driver-reported deviation over the samples in the fit
+        int64_t age_us;          // now - newest calibration sample
+        double  drift_ppm;       // fitted device clock rate vs CLOCK_MONOTONIC (probe 2026-10-22: -10..-16 ppm)
+        int32_t n_samples;       // calibration samples in the fit
+        int64_t span_us;         // newest - oldest sample in the fit
+        int32_t n_probe;         // GPU anchor probes in the window (0 = offset uncorrected)
+        int64_t probe_corr_ns;   // offset removed from every conversion (min over the window)
+        int64_t probe_spread_ns; // max - min of the window (submit latency / busy queue), the anchor's noise
+        int64_t probe_age_us;    // now - newest resolved probe's submit
+    };
+    GGML_API int ggml_backend_sched_split_ts_calib(ggml_backend_sched_t sched, int backend_id, struct ggml_backend_ts_calib_info * info);
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);

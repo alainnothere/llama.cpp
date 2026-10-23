@@ -1481,13 +1481,34 @@ struct ggml_backend_vk_context {
     std::vector<uint32_t> dts_n_submit;        // per slot: vkQueueSubmit calls between start and ts_take
     double       dts_period_ns {};
     uint64_t     dts_mask {};
-    bool         dts_calibrated {};     // last calibration succeeded
-    uint64_t     dts_cal_dev {};
-    int64_t      dts_cal_host_ns {};
+    bool         dts_calibrated {};     // at least one calibration sample in the fit
+    // [fork, 2026-10-22 night] clock model (ggml_vk_dts_fit, comment at VK_DTS_RING): up to VK_DTS_CAL_N
+    // vkGetCalibratedTimestamps(DEVICE, CLOCK_MONOTONIC) samples, one every >= VK_DTS_CAL_EVERY_NS, least-squares
+    // host = cal_c + cal_s * device_ns(ticks - cal_dev); plus the GPU anchor (probe ring below) that removes the
+    // per-card offset between the DEVICE domain and what vkCmdWriteTimestamp writes (1.2-1.6 ms on Navi31, 2026-10-22).
+    struct dts_cal_sample { uint64_t dev; int64_t host_ns; int64_t max_dev_ns; };
+    std::vector<dts_cal_sample> dts_cal;    // ring, oldest first
+    uint64_t     dts_cal_dev {};        // reference tick of the fit (newest sample)
+    double       dts_cal_c {};          // host ns at dts_cal_dev
+    double       dts_cal_s {1.0};       // host ns per device ns (1 + rate)
+    int64_t      dts_cal_last_ns {};    // host time of the newest sample
+    int64_t      dts_cal_try_ns {};     // host time of the last calibration call (failed ones too)
     int64_t      dts_cal_max_dev_ns {-1};
-    uint32_t     dts_reads_since_cal {};
     bool         dts_approx_set {};
     int64_t      dts_approx_off_ns {};
+    // GPU anchor probes: a pre-recorded command buffer per slot that only writes an ALL_COMMANDS timestamp into
+    // dts_probe_pool, submitted from ggml_vk_synchronize (queue just drained) with the host time taken right before
+    // the submit; resolved without waiting. A probe executes at or after its submit time, so
+    // conv(probe tick) - host submit = (clock offset) + (submit-to-execute latency >= 0); the min over the window is
+    // the offset (+ the smallest latency seen).
+    vk::QueryPool dts_probe_pool;
+    vk::CommandPool dts_probe_cmd_pool;
+    std::vector<vk::CommandBuffer> dts_probe_cmd;
+    std::vector<int64_t>  dts_probe_submit_ns;   // per slot, 0 = free
+    struct dts_probe_sample { uint64_t tick; int64_t host_ns; };
+    std::vector<dts_probe_sample> dts_probe;     // resolved, ring oldest first
+    int64_t      dts_probe_last_ns {};
+    bool         dts_probe_ok {};
     // D2D hop pieces of the copy in flight (scheduler copy_arm), NULL = off
     struct ggml_backend_d2d_copy_stats * d2d_stats {};
 

@@ -2779,6 +2779,14 @@ void llama_context::dstats_emit(int ret, int64_t t_start_us, uint32_t n_tokens, 
 //   "gpu_n_ts", "n_ts_dropped" (ring refused / slot reused / over a cap), "n_ts_unavail" (not written yet at flush),
 //   "calib": "exact" (every timed backend calibrated) | "approx" (one used timestampPeriod + a one-time offset),
 //   "calib_max_dev_ns": the largest calibration deviation any backend reported (-1 approx).
+//   [fork, 2026-10-22 night] "calib_dev": {backend: {age_us, drift_ppm, n_cal, span_us, max_dev_ns, n_probe,
+//   probe_corr_ns, probe_spread_ns, probe_age_us}}, read at flush (ggml_backend_ts_calib_info). Why: the A2/C2 tapes
+//   (2026-10-22, CP off, serial V2 -> V3 -> V1) read Vulkan1 1.2-1.6 ms early against Vulkan3 with calib "exact"
+//   and calib_max_dev_ns ~8 us; the cause is a per-card offset between the Vulkan DEVICE time domain and the
+//   command-stream timestamps (ggml-vulkan.cpp, comment at VK_DTS_RING, "Clock"), which probe_corr_ns now
+//   measures on the GPU and removes. n_probe 0 = uncorrected; probe_spread_ns = the anchor's noise. Self-check:
+//   decode_stats.py --timeline prints the causal residual (a split cannot start before the split feeding its hop
+//   ended); gate: < 0.1 ms.
 // Busy intervals exclude the hops: hop 2 is recorded ahead of the dst split's start timestamp and hop 1 after the
 // src split's end, so a hop shows up as the gap between the two cards' bars.
 //
@@ -2820,6 +2828,7 @@ void llama_context::dstats_flush(bool synced) {
             bool approx = false;
             int64_t max_dev = -1;
             std::vector<bool> calib_seen(n_backends, false);
+            std::string calib_dev;   // [fork, 2026-10-22 night] per-backend clock model + anchor, see below
             for (size_t i = 0; i < pl.split_ts.size(); ++i) {
                 const auto & ts = pl.split_ts[i];
                 if (rs[i].rc < 0) {
@@ -2841,10 +2850,21 @@ void llama_context::dstats_flush(bool synced) {
                 }
                 if (ts.backend >= 0 && ts.backend < n_backends && !calib_seen[ts.backend]) {
                     calib_seen[ts.backend] = true;
-                    int64_t dev_ns = -1;
-                    const int c = ggml_backend_sched_split_ts_calib(s, ts.backend, &dev_ns);
+                    ggml_backend_ts_calib_info ci = {};
+                    const int c = ggml_backend_sched_split_ts_calib(s, ts.backend, &ci);
                     approx  = approx || c != 0;
-                    max_dev = std::max(max_dev, dev_ns);
+                    max_dev = std::max(max_dev, ci.max_dev_ns);
+                    if (c >= 0) {
+                        char buf[384];
+                        snprintf(buf, sizeof(buf),
+                                 "%s%s:{\"age_us\":%lld,\"drift_ppm\":%.3f,\"n_cal\":%d,\"span_us\":%lld,\"max_dev_ns\":%lld,"
+                                 "\"n_probe\":%d,\"probe_corr_ns\":%lld,\"probe_spread_ns\":%lld,\"probe_age_us\":%lld}",
+                                 calib_dev.empty() ? "" : ",",
+                                 dstats_json_str(ggml_backend_name(ggml_backend_sched_get_backend(s, ts.backend))).c_str(),
+                                 (long long) ci.age_us, ci.drift_ppm, ci.n_samples, (long long) ci.span_us, (long long) ci.max_dev_ns,
+                                 ci.n_probe, (long long) ci.probe_corr_ns, (long long) ci.probe_spread_ns, (long long) ci.probe_age_us);
+                        calib_dev += buf;
+                    }
                 }
             }
 
@@ -2881,6 +2901,9 @@ void llama_context::dstats_flush(bool synced) {
                     line += ",\"gpu_overlap_us\":" + std::to_string(busy_sum - (t_last - t_first));
                     line += std::string(",\"calib\":\"") + (approx ? "approx" : "exact") + "\"";
                     line += ",\"calib_max_dev_ns\":" + std::to_string(max_dev);
+                    if (!calib_dev.empty()) {
+                        line += ",\"calib_dev\":{" + calib_dev + "}";
+                    }
                 }
             }
         }
