@@ -210,6 +210,8 @@ public:
     bool               cp_check() const;
     ggml_backend_dev_t cp_dev(bool helper) const;
     ggml_tensor *      cp_kq_mask_dev() const;                 // the helper's persistent mask (nullptr: graph input)
+    bool               cp_pack() const;                        // LLAMA_CP_PACK (default 1), see cp_state::pack
+    int                cp_kq_build_dev() const;                // kq_build anchor index of the helper's device, -1: none
     bool               cp_needs_resync() const;
     // K/V cells [i0, i1) of layer il, from the owner's tensor or the helper's mirror
     ggml_tensor * get_k_range(ggml_context * ctx, int32_t il, uint32_t i0, uint32_t i1, bool mirror) const;
@@ -446,6 +448,10 @@ private:
         float   frac = 0.5f;
         bool    check = false;              // LLAMA_CP_CHECK=1, see llama_context::cp_check_step
         bool    active = false;             // owner is a GPU other than the helper (the mirror exists either way)
+        // LLAMA_CP_PACK (default 1; 0 = the 2026-10-21 graph). 2026-10-22 evening: one D2D hop each way instead of
+        // 4 + 2 (Q|K|V packed on the owner, mask built on the helper, the helper's partial as one tensor), because each
+        // hop costs ~0.13 ms of queue time on the card that submits it. Measurements: llm_graph_context::build_attn_cp.
+        bool    pack = true;
 
         ggml_backend_dev_t dev_a = nullptr;
         ggml_backend_dev_t dev_b = nullptr;
@@ -618,6 +624,8 @@ public:
     bool               cp_check() const;
     ggml_backend_dev_t cp_dev(bool helper) const;
     ggml_tensor *      cp_kq_mask_dev() const;
+    bool               cp_pack() const;
+    int                cp_kq_build_dev() const;
     ggml_tensor *      get_k_range(ggml_context * ctx, int32_t il, uint32_t i0, uint32_t i1, bool mirror) const;
     ggml_tensor *      get_v_range(ggml_context * ctx, int32_t il, uint32_t i0, uint32_t i1, bool mirror) const;
     ggml_tensor *      cpy_k_mirror(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;

@@ -142,37 +142,42 @@ ggml_tensor * llm_graph_input_attn_kv::get_kq_mask_dev_view(ggml_context * ctx, 
     return v;
 }
 
+ggml_tensor * llm_graph_input_attn_kv::get_kq_build_view(ggml_context * ctx, int idx) {
+    GGML_ASSERT(kq_build_on && idx >= 0);
+    if ((int) kq_build_out.size() <= idx) {
+        kq_build_out.resize(idx + 1, nullptr);
+        kq_build_view.resize(idx + 1, nullptr);
+    }
+    if (!kq_build_view[idx]) {
+        const int64_t n_kv     = self_kq_mask->ne[0];
+        const int64_t n_tokens = self_kq_mask->ne[1];
+        // fixed size: kv_size x n_ubatch whatever this graph's n_kv / n_tokens (no gallocr re-plan between ubatches);
+        // the reserve sizes it once per device (876 MiB at 224k/2048 replaces the sched's 4 input copies of that size)
+        const int64_t n_out = std::max<int64_t>((int64_t) mctx->kq_build_kv_size()*cparams.n_ubatch, n_kv*n_tokens);
+        ggml_tensor * out = ggml_kq_mask_build(ctx, kq_build_cells, kq_build_rows, mctx->kq_build_anchor(idx), n_out,
+                (int32_t) n_kv, (int32_t) n_tokens, mctx->kq_build_causal(cparams.causal_attn));
+        ggml_format_name(out, "kq_mask_build_d%d", idx);
+        if (mctx->kq_build_check()) {
+            ggml_set_output(out); // keep it alive past its last FA for the read-back
+        }
+        // dense view (row stride n_kv): the Vulkan FA indexes the mask with row stride KV and would copy a
+        // strided mask into a scratch per FA call (ggml_vk_flash_attn, mask_dense)
+        const size_t es = ggml_element_size(out);
+        ggml_tensor * v = ggml_view_4d(ctx, out, n_kv, n_tokens, 1, 1, n_kv*es, n_kv*n_tokens*es, n_kv*n_tokens*es, 0);
+        ggml_format_name(v, "kq_mask_build_d%d_view", idx);
+        kq_build_out[idx]  = out;
+        kq_build_view[idx] = v;
+    }
+    return kq_build_view[idx];
+}
+
 ggml_tensor * llm_graph_input_attn_kv::get_kq_mask_il(ggml_context * ctx, int il) {
     // [KQ_MASK_DEV] one op per attention device per graph, shared by all its layers: the Vulkan FA caches mask_opt /
     // sparse per mask tensor (ggml_vk_fa_mask_scratch), so one view per device also keeps that pre-pass at one per graph
     if (kq_build_on && self_kq_mask_cnv == self_kq_mask) {
         const int idx = mctx->kq_build_dev(il);
         if (idx >= 0) {
-            if ((int) kq_build_out.size() <= idx) {
-                kq_build_out.resize(idx + 1, nullptr);
-                kq_build_view.resize(idx + 1, nullptr);
-            }
-            if (!kq_build_view[idx]) {
-                const int64_t n_kv     = self_kq_mask->ne[0];
-                const int64_t n_tokens = self_kq_mask->ne[1];
-                // fixed size: kv_size x n_ubatch whatever this graph's n_kv / n_tokens (no gallocr re-plan between ubatches);
-                // the reserve sizes it once per device (876 MiB at 224k/2048 replaces the sched's 4 input copies of that size)
-                const int64_t n_out = std::max<int64_t>((int64_t) mctx->kq_build_kv_size()*cparams.n_ubatch, n_kv*n_tokens);
-                ggml_tensor * out = ggml_kq_mask_build(ctx, kq_build_cells, kq_build_rows, mctx->kq_build_anchor(idx), n_out,
-                        (int32_t) n_kv, (int32_t) n_tokens, mctx->kq_build_causal(cparams.causal_attn));
-                ggml_format_name(out, "kq_mask_build_d%d", idx);
-                if (mctx->kq_build_check()) {
-                    ggml_set_output(out); // keep it alive past its last FA for the read-back
-                }
-                // dense view (row stride n_kv): the Vulkan FA indexes the mask with row stride KV and would copy a
-                // strided mask into a scratch per FA call (ggml_vk_flash_attn, mask_dense)
-                const size_t es = ggml_element_size(out);
-                ggml_tensor * v = ggml_view_4d(ctx, out, n_kv, n_tokens, 1, 1, n_kv*es, n_kv*n_tokens*es, n_kv*n_tokens*es, 0);
-                ggml_format_name(v, "kq_mask_build_d%d_view", idx);
-                kq_build_out[idx]  = out;
-                kq_build_view[idx] = v;
-            }
-            return kq_build_view[idx];
+            return get_kq_build_view(ctx, idx);
         }
     }
 
@@ -3223,6 +3228,11 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k;
     ggml_tensor * v;
 
+    // [CP] split cell of the context-parallel layer (0: plain attention); a function of n_kv only, so it is known before
+    // the K/V store and the store can already feed the helper from the packed Q|K|V (cp_pack_qkv)
+    const uint32_t cp_h = cparams.training || kq_b || sinks || !cparams.flash_attn ? 0 : mctx_cur->cp_split(il);
+    ggml_tensor * q_b = nullptr; // [CP] Q on the helper when packed, else the sched hops q itself
+
     if (cparams.training) {
         GGML_ASSERT(mctx_cur->get_n_kv() == n_tokens);
 
@@ -3238,8 +3248,13 @@ ggml_tensor * llm_graph_context::build_attn(
 
             // [CP] every graph that writes the layer also writes the helper's mirror (even when h == 0 below), same rows
             if (mctx_cur->cp_active(il)) {
-                ggml_build_forward_expand(gf, mctx_cur->cpy_k_mirror(ctx0, k_cur, k_idxs, il));
-                ggml_build_forward_expand(gf, mctx_cur->cpy_v_mirror(ctx0, v_cur, v_idxs, il));
+                ggml_tensor * k_m = k_cur;
+                ggml_tensor * v_m = v_cur;
+                if (cp_h > 0 && mctx_cur->cp_pack()) {
+                    cp_pack_qkv(mctx_cur, q_cur, k_cur, v_cur, q_b, k_m, v_m, il);
+                }
+                ggml_build_forward_expand(gf, mctx_cur->cpy_k_mirror(ctx0, k_m, k_idxs, il));
+                ggml_build_forward_expand(gf, mctx_cur->cpy_v_mirror(ctx0, v_m, v_idxs, il));
             }
         }
 
@@ -3256,10 +3271,8 @@ ggml_tensor * llm_graph_context::build_attn(
         res->kq_build_check.push_back(inp);
     }
 
-    const uint32_t cp_h = cparams.training || kq_b || sinks || !cparams.flash_attn ? 0 : mctx_cur->cp_split(il);
-
     ggml_tensor * cur = cp_h > 0
-        ? build_attn_cp(inp, q, kq_mask, cp_h, kq_scale, il)
+        ? build_attn_cp(inp, q, q_b, kq_mask, cp_h, kq_scale, il)
         : build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
 
@@ -3291,34 +3304,120 @@ ggml_tensor * llm_graph_context::build_attn(
 //
 // Node order is the schedule: the sched runs splits in graph order and copies a split's inputs before issuing it.
 //   A1 [... Q/K/V, store into A's cache] -> B1 [mirror store, FA_B over [h, n_kv)] -> A2 [FA_A over [0, h)]
-//   -> B2 [lse_B] -> A3 [merge, then the rest of the layer]
-// B1's inputs (Q, K_cur, V_cur, idxs) wait for A1 only, so B starts FA_B before A has FA_A queued; A2 has no input
-// copies and with ggml_backend_sched_set_split_sync_relax its issue does not wait for B either; B2 (a tiny node on B)
-// is the split boundary that keeps the merge's wait for B's partial out of A2. Every node is pinned: FLASH_ATTN_EXT
-// is excluded from the sched's weight rule and the merge's neighbours would pull it anywhere.
+//   -> B2 [B's partial out] -> A3 [merge, then the rest of the layer]
+// B1's inputs wait for A1 only, so B starts FA_B before A has FA_A queued; A2 has no input copies and with
+// ggml_backend_sched_set_split_sync_relax its issue does not wait for B either; B2 (a tiny node on B) is the split
+// boundary that keeps the merge's wait for B's partial out of A2. Every node is pinned: FLASH_ATTN_EXT is excluded
+// from the sched's weight rule and the merge's neighbours would pull it anywhere.
 // Merge (the recipe tests/test-flash-attn-merge.cpp validates): w = softmax over the two lse, O = w_a*O_a + w_b*O_b.
+//
+// 2026-10-22 evening, LLAMA_CP_PACK (default 1, 0 = the graph above with one hop per tensor). Why, from the decode
+// tapes of ~/ai/claude_scratch/cp_overlap (Qwen 27B, -c 150000, ~120k context, 1-12 token steps, owner Vulkan3,
+// helper Vulkan1, layer 27; step = t_total + next t_sync_prev): A2 (CP off) 63.7 ms, C2 (CP on) 64.3, D2 (CP on,
+// LLAMA_CP_SYNC_RELAX=0) 65.2, B2 (CHECK) identical.
+//   - the host does NOT hold FA_A back: C2 t_split_sync_us p50 0 (D2: 30.3 ms), A2's t_issue_us 19 us, every CP-layer
+//     input t_dst_wait_us <= 3 us, no CPU-sourced CP input takes the synchronous bounce (k/v idxs go path "in"; the
+//     only bounces in the step are node_1 / model.input_embed into Vulkan2, the 2026-10-22 race fix). The relax is
+//     real: D2 starts FA_A 1.45 ms after A1 (C2 0.53 ms) and D2's step is 0.9 ms longer than C2's, the same 0.9 ms.
+//   - the "owner idles while the helper runs FA_B" picture of the --timeline bars is a cross-card clock offset:
+//     in A2 (CP off, strictly serial V2 -> V3 -> V1) Vulkan1's split starts 1.17 ms (p50) BEFORE the Vulkan3 split
+//     whose l_out it waits on, so the Vulkan3&Vulkan1 busy intersection reads 1.18 ms with zero real overlap;
+//     C2's 1.64 ms is that 1.18 plus FA_B (0.44 ms) landing inside A1's interval on the skewed clock. Bounded by
+//     causality (A3 waits for B2's hop, V1's next split waits for A3's) the V1 clock reads 1.21-1.61 ms early, so
+//     FA_B really runs at A1_end + [0.51, 0.91] ms against FA_A at A1_end + [0.53, 1.00]: the halves overlap.
+//   - what the owner does pay, on its own clock (same-card gaps, no offset): A1_end -> FA_A start 0.53 ms p50 =
+//     the 4 hop-1 copies (Qcur 172 KB, Kcur/Vcur 28 KB, kq_mask_build view 1.5 MB at 7 rows) the sched records on
+//     Vulkan3's queue for B1, each its own batch + submit + timeline signal (ggml_vk_d2d_copy_async); FA_A end ->
+//     A3 start 0.39 ms = the 2 hop-2 copies back (cp_lse_b, cp_fa_b view). Two splits on one card with no hop
+//     between run 0.027 ms apart (B1 -> B2), so ~0.13 ms per hop; 6 hops ~0.8 ms of owner bubble against ~0.45 ms
+//     of FA saved = the +0.6 ms of C2 over A2.
+// So the pack cuts the hops to one each way:
+//   - forward: Q|K|V concatenated on A (two concat kernels, ~250 KB at 7 rows), one hop, one cont on B (the sched
+//     copies the tensor a B node reads; views of an A tensor would be hopped one by one), mirror store and FA_B read
+//     views of it. Needs F32 Q/K/V with one head size (Qwen 3.x: 256/256/256); otherwise the per-tensor hops stay.
+//   - mask: with the device-built mask (KQ_MASK_DEV, kq_build_on) B reads the op of its own device instead of a
+//     1.5 MB view of A's (the op already exists when B holds attention layers, llama_kv_cache::cp_kq_build_dev; the
+//     same node then serves B's own layers 43-63, so no extra GPU work and its 482 KB cells input moves from B's last
+//     split into B1). Other mask modes are unchanged.
+//   - backward: B2 = cont(p_b) on B, A3 starts with cont of that on A (one hop of O|lse, ~175 KB), lse_b / O_b are
+//     views on A. The cont on B is the B2 split boundary that the old lse_b node was.
+// Expected on the owner: 4 -> 1 hop-1 submits before FA_A (~0.4 ms), 2 -> 1 hop-2 before A3 (~0.13 ms). Not yet
+// measured on GPU (the GPU gate is in contextFiles/context-perf-step-budget-whatifs.md, 2026-10-22 evening).
+// Preconditions elsewhere: ggml_backend_sched_split_graph copies an input once per (tensor, backend) and points
+// every later reader at the copy (tensor_id_copy), and a view is placed on its view_src's backend; the Vulkan
+// concat takes strided F32 (ggml_vk_concat_supported), set_rows takes the strided K/V views (row stride = the packed
+// token stride), FA takes a strided Q (q_stride = nbq1, ggml_vk_flash_attn).
+static ggml_backend_t cp_backend_of(ggml_backend_sched_t sched, ggml_backend_dev_t dev) {
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+        ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
+        if (ggml_backend_get_device(b) == dev) {
+            return b;
+        }
+    }
+    return nullptr;
+}
+
+// [CP] LLAMA_CP_PACK forward half (comment above build_attn_cp): Q|K|V as one tensor on the owner, one hop, views on
+// the helper. Leaves q_b / k_b / v_b untouched (per-tensor hops) when the shapes or types do not allow one concat.
+void llm_graph_context::cp_pack_qkv(
+        const llama_kv_cache_context * mctx_cur,
+        ggml_tensor * q_cur,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+        ggml_tensor *& q_b,
+        ggml_tensor *& k_b,
+        ggml_tensor *& v_b,
+                int   il) const {
+    const int64_t D = q_cur->ne[0];
+    const bool ok =
+        q_cur->type == GGML_TYPE_F32 && k_cur->type == GGML_TYPE_F32 && v_cur->type == GGML_TYPE_F32 &&
+        k_cur->ne[0] == D && v_cur->ne[0] == D &&
+        k_cur->ne[2] == q_cur->ne[2] && v_cur->ne[2] == q_cur->ne[2] &&
+        q_cur->ne[3] == 1 && k_cur->ne[3] == 1 && v_cur->ne[3] == 1;
+    if (!ok) {
+        return;
+    }
+
+    ggml_backend_t be_a = cp_backend_of(sched, mctx_cur->cp_dev(false));
+    ggml_backend_t be_b = cp_backend_of(sched, mctx_cur->cp_dev(true));
+    GGML_ASSERT(be_a && be_b && "context-parallel attention: owner or helper device has no backend in the scheduler");
+
+    ggml_tensor * qk = ggml_concat(ctx0, q_cur, k_cur, 1);
+    ggml_backend_sched_set_tensor_backend(sched, qk, be_a);
+    ggml_tensor * qkv = ggml_concat(ctx0, qk, v_cur, 1);  // [D, n_head + 2*n_head_kv, n_tokens], contiguous
+    ggml_backend_sched_set_tensor_backend(sched, qkv, be_a);
+    cb(qkv, "cp_qkv", il);
+
+    ggml_tensor * qkv_b = ggml_cont(ctx0, qkv);            // the one hop: the sched copies qkv into B for this node
+    ggml_backend_sched_set_tensor_backend(sched, qkv_b, be_b);
+    cb(qkv_b, "cp_qkv_b", il);
+
+    const int64_t nh    = q_cur->ne[1];
+    const int64_t nh_kv = k_cur->ne[1];
+    const int64_t nt    = q_cur->ne[2];
+    const size_t  nb1   = qkv_b->nb[1];
+    const size_t  nb2   = qkv_b->nb[2];
+
+    q_b = ggml_view_3d(ctx0, qkv_b, D, nh,    nt, nb1, nb2, 0);
+    k_b = ggml_view_3d(ctx0, qkv_b, D, nh_kv, nt, nb1, nb2, nh*nb1);
+    v_b = ggml_view_3d(ctx0, qkv_b, D, nh_kv, nt, nb1, nb2, (nh + nh_kv)*nb1);
+}
+
 ggml_tensor * llm_graph_context::build_attn_cp(
         llm_graph_input_attn_kv * inp,
         ggml_tensor * q,
+        ggml_tensor * q_b,
         ggml_tensor * kq_mask,
            uint32_t   h,
               float   kq_scale,
                 int   il) const {
     const auto * mctx_cur = inp->mctx;
 
-    auto backend_of = [&](ggml_backend_dev_t dev) -> ggml_backend_t {
-        for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
-            ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
-            if (ggml_backend_get_device(b) == dev) {
-                return b;
-            }
-        }
-        return nullptr;
-    };
-
-    ggml_backend_t be_a = backend_of(mctx_cur->cp_dev(false));
-    ggml_backend_t be_b = backend_of(mctx_cur->cp_dev(true));
+    ggml_backend_t be_a = cp_backend_of(sched, mctx_cur->cp_dev(false));
+    ggml_backend_t be_b = cp_backend_of(sched, mctx_cur->cp_dev(true));
     GGML_ASSERT(be_a && be_b && "context-parallel attention: owner or helper device has no backend in the scheduler");
+
+    const bool pack = mctx_cur->cp_pack();
 
     auto on = [&](ggml_tensor * t, ggml_backend_t be) {
         ggml_backend_sched_set_tensor_backend(sched, t, be);
@@ -3335,13 +3434,20 @@ ggml_tensor * llm_graph_context::build_attn_cp(
     GGML_ASSERT(h > 0 && h < n_kv);
 
     // the helper reads its own persistent mask when the owner does, else a column view of the graph input
-    // [KQ_MASK_DEV] with the device-built mask the helper reads the owner's op output (the sched copies it to B).
-    // Follow-up, not done: a second op instance anchored on the mirror's K (cp.k) so B builds its own (design 3.5)
+    // [KQ_MASK_DEV] with the device-built mask the helper reads the owner's op output (the sched copies it to B),
+    // unless LLAMA_CP_PACK and B's device has its own op (cp_kq_build_dev): then B reads that one, no 1.5 MB hop
     ggml_tensor * mask_b = kq_mask;
     if (kq_mask != inp->get_kq_mask() && !inp->kq_build_on) {
         ggml_tensor * dev_b = mctx_cur->cp_kq_mask_dev();
         GGML_ASSERT(dev_b);
         mask_b = inp->get_kq_mask_dev_view(ctx0, dev_b);
+    } else if (pack && inp->kq_build_on && kq_mask != inp->get_kq_mask()) {
+        const int idx_b = mctx_cur->cp_kq_build_dev();
+        if (idx_b >= 0) {
+            mask_b = inp->get_kq_build_view(ctx0, idx_b);
+            GGML_ASSERT(mask_b->ne[0] == kq_mask->ne[0] && mask_b->ne[1] == kq_mask->ne[1]);
+            on(mask_b->view_src, be_b);
+        }
     }
 
     // a column view keeps the row stride n_kv; FA takes strided masks (ggml.h)
@@ -3350,12 +3456,13 @@ ggml_tensor * llm_graph_context::build_attn_cp(
     };
 
     q = ggml_permute(ctx0, q, 0, 2, 1, 3);
+    ggml_tensor * qp_b = q_b ? ggml_permute(ctx0, q_b, 0, 2, 1, 3) : q;
 
-    auto fa = [&](uint32_t i0, uint32_t i1, bool mirror, ggml_tensor * m, bool lse) {
+    auto fa = [&](ggml_tensor * qq, uint32_t i0, uint32_t i1, bool mirror, ggml_tensor * m, bool lse) {
         ggml_tensor * k = ggml_permute(ctx0, mctx_cur->get_k_range(ctx0, il, i0, i1, mirror), 0, 2, 1, 3);
         ggml_tensor * v = ggml_permute(ctx0, mctx_cur->get_v_range(ctx0, il, i0, i1, mirror), 0, 2, 1, 3);
 
-        ggml_tensor * cur = ggml_flash_attn_ext(ctx0, q, k, v, m, kq_scale, hparams.f_max_alibi_bias,
+        ggml_tensor * cur = ggml_flash_attn_ext(ctx0, qq, k, v, m, kq_scale, hparams.f_max_alibi_bias,
                                                 hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         ggml_prec_set_acc(cur, GGML_PREC_F32);
         if (lse) {
@@ -3364,11 +3471,11 @@ ggml_tensor * llm_graph_context::build_attn_cp(
         return cur; // [D (+4), nh, nt]
     };
 
-    ggml_tensor * p_b = on(fa(h, n_kv, true, cols(mask_b, h, n_kv), true), be_b);
+    ggml_tensor * p_b = on(fa(qp_b, h, n_kv, true, cols(mask_b, h, n_kv), true), be_b);
     cb(p_b, "cp_fa_b", il);
     ggml_build_forward_expand(gf, p_b);
 
-    ggml_tensor * p_a = on(fa(0, h, false, cols(kq_mask, 0, h), true), be_a);
+    ggml_tensor * p_a = on(fa(q, 0, h, false, cols(kq_mask, 0, h), true), be_a);
     res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, p_a, il});
     cb(p_a, "cp_fa_a", il);
     ggml_build_forward_expand(gf, p_a);
@@ -3380,9 +3487,26 @@ ggml_tensor * llm_graph_context::build_attn_cp(
         return ggml_view_3d(ctx0, p, D, nh, nt, p->nb[1], p->nb[2], 0);
     };
 
-    ggml_tensor * lse_b = lse_of(p_b, be_b);
-    cb(lse_b, "cp_lse_b", il);
-    ggml_build_forward_expand(gf, lse_b);
+    // B2 and the hop back. Pack: B2 = cont(p_b) on B, A3 opens with a cont of it on A (the one hop: an A node reads
+    // the whole B tensor), lse_b / O_b are views on A. Else B2 = lse_b on B and A hops lse_b and the O_b view.
+    ggml_tensor * lse_b;
+    ggml_tensor * o_b;
+    if (pack) {
+        ggml_tensor * x = on(ggml_cont(ctx0, p_b), be_b);
+        cb(x, "cp_fa_b_out", il);
+        ggml_build_forward_expand(gf, x);
+
+        ggml_tensor * p_b_a = on(ggml_cont(ctx0, x), be_a);
+        cb(p_b_a, "cp_fa_b_on_a", il);
+
+        lse_b = lse_of(p_b_a, be_a);
+        o_b   = o_of(p_b_a);
+    } else {
+        lse_b = lse_of(p_b, be_b);
+        cb(lse_b, "cp_lse_b", il);
+        ggml_build_forward_expand(gf, lse_b);
+        o_b   = o_of(p_b);
+    }
 
     ggml_tensor * lse_a = lse_of(p_a, be_a);
     ggml_tensor * w     = on(ggml_soft_max(ctx0, on(ggml_concat(ctx0, lse_a, lse_b, 0), be_a)), be_a); // [2, nh, nt]
@@ -3391,12 +3515,12 @@ ggml_tensor * llm_graph_context::build_attn_cp(
 
     ggml_tensor * cur = on(ggml_add(ctx0,
             on(ggml_mul(ctx0, o_of(p_a), w_a), be_a),
-            on(ggml_mul(ctx0, o_of(p_b), w_b), be_a)), be_a);
+            on(ggml_mul(ctx0, o_b, w_b), be_a)), be_a);
     cb(cur, "cp_merged", il);
     ggml_build_forward_expand(gf, cur);
 
     if (mctx_cur->cp_check()) {
-        ggml_tensor * full = on(fa(0, n_kv, false, kq_mask, false), be_a);
+        ggml_tensor * full = on(fa(q, 0, n_kv, false, kq_mask, false), be_a);
         cb(full, "cp_fa_full", il);
         ggml_set_output(full);
         ggml_set_output(cur);

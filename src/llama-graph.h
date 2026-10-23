@@ -353,6 +353,9 @@ public:
     ggml_tensor * get_kq_mask_il(ggml_context * ctx, int il);
     // the [n_kv, n_tokens] view of one device mask tensor (one per tensor per graph)
     ggml_tensor * get_kq_mask_dev_view(ggml_context * ctx, ggml_tensor * dev);
+    // [KQ_MASK_DEV] the dense view of attention device idx's op output (created on first use), the body of get_kq_mask_il;
+    // [CP] build_attn_cp also asks for the helper's idx so the helper builds its own mask instead of a hop from the owner
+    ggml_tensor * get_kq_build_view(ggml_context * ctx, int idx);
 
     // fill whichever masks the graph uses (persistent views and/or the allocated graph input)
     // mctx is passed explicitly: the hybrid input does not refresh this->mctx on graph reuse
@@ -1293,11 +1296,24 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
+    // [CP] LLAMA_CP_PACK: Q|K|V of the cp layer packed on the owner and hopped once; sets q_b / k_b / v_b to views of the
+    // helper's copy (leaves them as they are when the shapes do not allow it). See the comment above build_attn_cp
+    void cp_pack_qkv(
+            const llama_kv_cache_context * mctx_cur,
+            ggml_tensor * q_cur,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
+            ggml_tensor *& q_b,
+            ggml_tensor *& k_b,
+            ggml_tensor *& v_b,
+                    int   il) const;
+
     // [CP] context-parallel attention for one layer, see llama_kv_cache::cp_state. Replaces get_k/get_v + build_attn_mha
     // of build_attn (the K/V store into the owner's cache is done by the caller). Returns [n_embd_head_v*n_head, n_tokens]
     ggml_tensor * build_attn_cp(
             llm_graph_input_attn_kv * inp,
             ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]
+            ggml_tensor * q_b,     // the same Q already on the helper (LLAMA_CP_PACK), nullptr: the sched hops q
             ggml_tensor * kq_mask, // what build_attn_mha would get
                uint32_t   h,
                   float   kq_scale,

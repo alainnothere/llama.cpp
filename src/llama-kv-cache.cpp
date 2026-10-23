@@ -346,6 +346,8 @@ llama_kv_cache::llama_kv_cache(
             const char * env_chk  = getenv("LLAMA_CP_CHECK");
             cp.frac  = env_frac ? std::clamp((float) atof(env_frac), 0.0f, 1.0f) : 0.5f;
             cp.check = env_chk && atoi(env_chk) != 0;
+            const char * env_pack = getenv("LLAMA_CP_PACK");
+            cp.pack  = !env_pack || atoi(env_pack) != 0;
 
             ggml_context * ctx = ctx_for_buft(cp.buft_b);
             if (!ctx) {
@@ -363,8 +365,8 @@ llama_kv_cache::llama_kv_cache(
             const double mib = (ggml_nbytes(cp.k) + ggml_nbytes(cp.v))/1024.0/1024.0;
             const ggml_log_level lvl = hparams.no_alloc ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_WARN;
             if (cp.active) {
-                llama_log_internal(lvl, "%s: context-parallel attention on layer %d: ACTIVE, owner %s, helper %s (full K/V mirror %.2f MiB on the helper), split frac %.3f, check %d\n",
-                        __func__, il, ggml_backend_dev_name(dev_a), ggml_backend_dev_name(dev_b), mib, cp.frac, cp.check);
+                llama_log_internal(lvl, "%s: context-parallel attention on layer %d: ACTIVE, owner %s, helper %s (full K/V mirror %.2f MiB on the helper), split frac %.3f, check %d, pack %d\n",
+                        __func__, il, ggml_backend_dev_name(dev_a), ggml_backend_dev_name(dev_b), mib, cp.frac, cp.check, cp.pack);
             } else {
                 llama_log_internal(lvl, "%s: context-parallel attention on layer %d: INACTIVE, owner %s (%s), helper %s; the %.2f MiB mirror is still allocated so every fit probe sees the same memory; pick a layer the fit puts on another GPU\n",
                         __func__, il, ggml_backend_dev_name(dev_a), dev_a == dev_b ? "is the helper" : "not a GPU", ggml_backend_dev_name(dev_b), mib);
@@ -1727,6 +1729,26 @@ ggml_backend_dev_t llama_kv_cache::cp_dev(bool helper) const {
 
 ggml_tensor * llama_kv_cache::cp_kq_mask_dev() const {
     return kq_inc.enabled ? cp.kq_mask_dev : nullptr;
+}
+
+bool llama_kv_cache::cp_pack() const {
+    return cp.pack;
+}
+
+// [CP] the helper builds its own mask only when its device already has a KQ_MASK_BUILD op (an attention layer of this
+// cache lives there): no new op, no new per-device reserve (kv_size x n_ubatch f16 per op, 876 MiB at 224k/2048), so
+// the fit is unchanged. On the 2026-10-22 production split (Vulkan1 holds layers 43-63) it exists; -1 keeps the hop.
+int llama_kv_cache::cp_kq_build_dev() const {
+    if (!kq_build.enabled || !cp.active) {
+        return -1;
+    }
+    for (size_t i = 0; i < kq_build.anchor.size(); i++) {
+        const ggml_tensor * a = kq_build.anchor[i];
+        if (a && a->buffer && ggml_backend_buft_get_device(ggml_backend_buffer_get_type(a->buffer)) == cp.dev_b) {
+            return (int) i;
+        }
+    }
+    return -1;
 }
 
 bool llama_kv_cache::cp_needs_resync() const {
@@ -3621,6 +3643,14 @@ ggml_backend_dev_t llama_kv_cache_context::cp_dev(bool helper) const {
 
 ggml_tensor * llama_kv_cache_context::cp_kq_mask_dev() const {
     return kv->cp_kq_mask_dev();
+}
+
+bool llama_kv_cache_context::cp_pack() const {
+    return kv->cp_pack();
+}
+
+int llama_kv_cache_context::cp_kq_build_dev() const {
+    return kv->cp_kq_build_dev();
 }
 
 ggml_tensor * llama_kv_cache_context::get_k_range(ggml_context * ctx, int32_t il, uint32_t i0, uint32_t i1, bool mirror) const {
