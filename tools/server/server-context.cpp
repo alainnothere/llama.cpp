@@ -6488,13 +6488,18 @@ private:
     // holds the start of the LAST ubatch), mtmd embd rows / non-causal / pooled embeddings need the single ubatch.
     // Checkpoints are untouched: create_checkpoint() runs before the call at the same positions, and the call still
     // decodes the same tokens; only the ubatch boundaries inside it move.
-    // Knobs: LLAMA_SERVER_TAIL_SPLIT = max pieces (default 1 = off, 4 = the scout's 4 x 128; off by default because a
+    // Knobs: LLAMA_SERVER_TAIL_SPLIT = max pieces (default 4 = the scout's 4 x 128, 1 = off; shipped OFF because a
     // different ubatch size is not bit-identical on Vulkan: the mul_mm/FA variant is picked by n rows; CPU A/B text and
-    // checkpoints identical, 2026-10-22 night), LLAMA_SERVER_TAIL_SPLIT_MIN = min rows per
+    // checkpoints identical, 2026-10-22 night. GPU gate 2026-10-23 01:30 PASSED and the default went to 4: 512-row
+    // tails at 120k 2.18-2.24 s -> 1.13-1.38 s span, 494 rows 2.01 -> 0.99, 413 rows 1.63 -> 1.32, tg per step
+    // unchanged 66.56 vs 66.66 ms p50, short-turn prompt 222-233 -> 310-350 t/s, checkpoint count identical; text
+    // differs from the unsplit arm as expected from the shape change. Only loss: a 256-row tail cut in 2 is 0.07 s
+    // slower (0.72 -> 0.79) because the XT re-reads its weights per piece; the busiest card moves from Vulkan1 to the
+    // XT, which is why fewer XT layers (-ts) and this knob compound), LLAMA_SERVER_TAIL_SPLIT_MIN = min rows per
     // piece (default 128: below that the per-piece weight read dominates and splitting loses). Only on a pipelined
     // target (llama_pipeline_parallel); LLAMA_SERVER_TAIL_SPLIT_FORCE=1 skips that gate (CPU tests of the path)
     uint32_t prompt_tail_ubatch_cap(int32_t off) const {
-        static const int  max_pieces = [] { const char * e = getenv("LLAMA_SERVER_TAIL_SPLIT");       return e ? atoi(e) : 1;   }();
+        static const int  max_pieces = [] { const char * e = getenv("LLAMA_SERVER_TAIL_SPLIT");       return e ? atoi(e) : 4;   }();
         static const int  min_rows   = [] { const char * e = getenv("LLAMA_SERVER_TAIL_SPLIT_MIN");   return e ? std::max(1, atoi(e)) : 128; }();
         static const bool force      = [] { const char * e = getenv("LLAMA_SERVER_TAIL_SPLIT_FORCE"); return e && atoi(e) != 0; }();
         const int32_t n_view = batch.view.size();
@@ -6528,9 +6533,15 @@ private:
     // on ctx_dft's queue and before common_speculative_draft() waits for it, so the ~3.4 ms of host work runs while the
     // MTP GPU work does. Single generating slot only (the verify batch is then exactly this slot's rows). A wrong
     // prediction (short draft, n-gram chain, replay, n_kv crossing a 256 pad) only wastes the prebuild: the decode's
-    // can_reuse rebuilds. LLAMA_VERIFY_PREBUILD=1 to enable, default off until the GPU gate.
+    // can_reuse rebuilds. Shipped OFF until the GPU gate; gate 2026-10-23 01:30 PASSED (120k session, draft-mtp +
+    // auto): prebuild hits 259/279 (92.8%), graphs reused 1/293 -> 260/293, verify host build + sched alloc 3.37 ->
+    // 0 ms p50, GPU gap before verify 4.44 -> 1.22 ms, target decode 66.8 -> 63.4 ms, full step 85.8 -> 83.6 ms,
+    // text identical in 5 turns. Default ON since; LLAMA_VERIFY_PREBUILD=0 turns it off. MISSED: prebuild t_us is
+    // 3.50 ms p50 (p90 3.85), above the ~2.7 ms the MTP catch-up hides, ~1.1 ms lands on batch build (17.5 -> 18.5 ms)
+    // so the net is 2.1 ms/step, not 3.3. OPEN: that gate's baseline reused graphs on 0.3% of steps, the scout tape
+    // said 48%, n_realloc 175 in both arms; something moved between the tapes.
     void verify_prebuild(const server_slot & slot) {
-        static const bool on = [] { const char * e = getenv("LLAMA_VERIFY_PREBUILD"); return e && atoi(e) != 0; }();
+        static const bool on = [] { const char * e = getenv("LLAMA_VERIFY_PREBUILD"); return !e || atoi(e) != 0; }();
         if (!on || !spec) {
             return;
         }

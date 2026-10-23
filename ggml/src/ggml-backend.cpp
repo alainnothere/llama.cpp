@@ -920,7 +920,7 @@ struct ggml_backend_sched_split {
     int n_inputs;
     int inputs_capacity;
     // [fork, 2026-10-22 night] inputs_live[j]: some node that is computed (COMPUTE or OUTPUT flag, or op NONE) reads
-    // inputs[j]'s copy on this backend; dead inputs are not copied (GGML_SCHED_SKIP_DEAD_INPUTS=1, default off)
+    // inputs[j]'s copy on this backend; dead inputs are not copied (GGML_SCHED_SKIP_DEAD_INPUTS, default ON since the 2026-10-23 gate)
     bool * inputs_live;
     int n_inputs_live;
     // a node reads a tensor of another backend in place (buffer supported, no copy)
@@ -942,7 +942,7 @@ struct ggml_backend_sched {
     // the sched still copied their split inputs. MEASURED: per text decode step node_1 (the mixed-path get_rows, CPU,
     // garbage) + inp_mixed_embd go to the x1 XT next to model.input_embed, 2 x 123-143 KB = 83 + 146 us (production
     // 20:34 tape) / 96 + 143 us (arm_A3) of host time on the critical path; in pp 2 x 20 MB per 1024-row ubatch =
-    // 118 + 120 ms of host on the issue path. On: GGML_SCHED_SKIP_DEAD_INPUTS=1. Default OFF until the pipelined ppl
+    // 118 + 120 ms of host on the issue path. Off: GGML_SCHED_SKIP_DEAD_INPUTS=0. Was OFF until the pipelined ppl
     // gate on the cards (house rule for sched-copy changes, 2026-10-22); CPU: test-backend-sched-stats run_dead
     bool skip_dead_inputs;
     uint8_t * hv_copy_live; // [hash_set.size][n_backends]: a live node reads the copy of this tensor on this backend
@@ -2289,8 +2289,12 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->hv_tensor_copies      = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
     sched->hv_copy_live          = (uint8_t *) malloc(sched->hash_set.size * sched->n_backends);
     {
+        // 2026-10-23 01:30 GPU gate PASSED (agent-reports/2026-10-23-0130-gpu-gates-*): pipelined ppl 2.8734 identical on/off
+        // (3 cards, -b 8192 -ub 512), 120k session text identical in 5 turns, 3 copies skipped per text step (node_1,
+        // inp_mixed_embd and inp_mixed_slots), XT host input per step 0.671 -> 0.481 ms, prompt copy per 8k batch
+        // 358 -> 121 ms (336 MB skipped). Default ON since; GGML_SCHED_SKIP_DEAD_INPUTS=0 turns it off
         const char * e = getenv("GGML_SCHED_SKIP_DEAD_INPUTS");
-        sched->skip_dead_inputs = e ? atoi(e) != 0 : false;
+        sched->skip_dead_inputs = e ? atoi(e) != 0 : true;
     }
 
     const size_t ggml_sched_max_splits = graph_size; // at most there is one split for each node in the graph
