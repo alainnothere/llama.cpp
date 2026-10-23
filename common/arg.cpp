@@ -4472,7 +4472,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--spec-ngram-mod-size"}, "N",
-        string_format("ngram-mod hash table size in slots, 4 bytes each (default: %zu = %.0f MB)",
+        // the rounding comes from the replicating load in common_ngram_mod::load(): only S' = k*S keeps every key reachable
+        string_format("ngram-mod hash table size in slots, 4 bytes each; rounded up to a multiple of the cache file's size when a cache file exists, a size smaller than the file's restarts the table empty (default: %zu = %.0f MB)",
             params.speculative.ngram_mod.size, (double) params.speculative.ngram_mod.size*sizeof(int32_t)/1024/1024),
         [](common_params & params, int value) {
             if (value < 1024 || value > (1 << 30)) {

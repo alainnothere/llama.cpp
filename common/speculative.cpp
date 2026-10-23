@@ -2342,12 +2342,6 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
             }
         }
 
-        SPC_TRC("- mod size=%zu (%.3f MB), reset_occupancy=%.2f, cache=%s, shadow n=%d (%.3f MB), cache=%s\n",
-                mod.size(), (float)(mod.size_bytes())/1024/1024, (double) this->params.reset_occupancy,
-                this->params.cache_path.empty() ? "none" : this->params.cache_path.c_str(),
-                this->params.shadow_n, alt ? (float)(alt->size_bytes())/1024/1024 : 0.0f,
-                alt_path.empty() ? "none" : alt_path.c_str());
-
         if (this->params.n_match < 16) {
             SPC_WRN("ngram_mod n_match=%d is too small - poor quality is possible, "
                     "see: https://github.com/ggml-org/llama.cpp/pull/19164\n", this->params.n_match);
@@ -2356,49 +2350,58 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         sinfos.resize(n_seq);
 
         if (!this->params.cache_path.empty()) {
-            const std::string & path = this->params.cache_path;
-
-            switch (mod.load(path)) {
-                case common_ngram_mod::LOAD_OK:
-                    SPC_INF("loaded ngram_mod table from '%s' (%zu/%zu entries used, %.2f)\n",
-                            path.c_str(), mod.get_used(), mod.size(), (double) mod.get_used() / (double) mod.size());
-                    break;
-                case common_ngram_mod::LOAD_MISSING:
-                    SPC_WRN("could not read ngram_mod table '%s' - starting with an empty one\n", path.c_str());
-                    break;
-                case common_ngram_mod::LOAD_CORRUPT:
-                    SPC_WRN("ngram_mod table '%s' is corrupt or truncated - starting with an empty one, "
-                            "it will be replaced on shutdown\n", path.c_str());
-                    break;
-                case common_ngram_mod::LOAD_MISMATCH:
-                    SPC_WRN("ngram_mod table '%s' was built with a different n_match/size (want n_match=%zu, size=%zu) - "
-                            "starting with an empty one, it will be replaced on shutdown\n",
-                            path.c_str(), mod.get_n(), mod.size());
-                    break;
-            }
+            load_table(mod, this->params.cache_path, "table");
         }
 
+        // the shadow table is sized by the same --spec-ngram-mod-size and rounded by its own file: with both files
+        // saved by the same run (the normal case) they end at the same k*S. they can differ when one file is missing
+        // or older - harmless, the two tables never share slots or indices
         if (alt && !alt_path.empty()) {
-            const std::string & path = alt_path;
+            load_table(*alt, alt_path, "shadow table");
+        }
 
-            switch (alt->load(path)) {
-                case common_ngram_mod::LOAD_OK:
-                    SPC_INF("loaded ngram_mod shadow table from '%s' (%zu/%zu entries used, %.2f)\n",
-                            path.c_str(), alt->get_used(), alt->size(), (double) alt->get_used() / (double) alt->size());
-                    break;
-                case common_ngram_mod::LOAD_MISSING:
-                    SPC_WRN("could not read ngram_mod shadow table '%s' - starting with an empty one\n", path.c_str());
-                    break;
-                case common_ngram_mod::LOAD_CORRUPT:
-                    SPC_WRN("ngram_mod shadow table '%s' is corrupt or truncated - starting with an empty one, "
-                            "it will be replaced on shutdown\n", path.c_str());
-                    break;
-                case common_ngram_mod::LOAD_MISMATCH:
-                    SPC_WRN("ngram_mod shadow table '%s' was built with a different n_match/size (want n_match=%zu, size=%zu) - "
-                            "starting with an empty one, it will be replaced on shutdown\n",
-                            path.c_str(), alt->get_n(), alt->size());
-                    break;
-            }
+        // after the loads, so it shows the size actually in use (an extending load may round it up)
+        SPC_TRC("- mod size=%zu (%.3f MB), reset_occupancy=%.2f, cache=%s, shadow n=%d (%.3f MB), cache=%s\n",
+                mod.size(), (float)(mod.size_bytes())/1024/1024, (double) this->params.reset_occupancy,
+                this->params.cache_path.empty() ? "none" : this->params.cache_path.c_str(),
+                this->params.shadow_n, alt ? (float)(alt->size_bytes())/1024/1024 : 0.0f,
+                alt_path.empty() ? "none" : alt_path.c_str());
+    }
+
+    // LOAD_EXTENDED and the mismatch hint: see the replication comment in common_ngram_mod::load()
+    void load_table(common_ngram_mod & t, const std::string & path, const char * what) {
+        const size_t size_req  = t.size();
+        uint64_t     size_file = 0;
+
+        switch (t.load(path, &size_file)) {
+            case common_ngram_mod::LOAD_OK:
+                SPC_INF("loaded ngram_mod %s from '%s' (%zu/%zu entries used, %.2f)\n",
+                        what, path.c_str(), t.get_used(), t.size(), (double) t.get_used() / (double) t.size());
+                break;
+            case common_ngram_mod::LOAD_EXTENDED:
+                if (t.size() != size_req) {
+                    SPC_WRN("ngram_mod %s '%s': requested size %zu is not a multiple of the file's %" PRIu64 ", using %zu - "
+                            "if you really want this exact size and hate what's stored in there, use a different --spec-ngram-mod-cache file name\n",
+                            what, path.c_str(), size_req, size_file, t.size());
+                }
+                SPC_INF("loaded ngram_mod %s from '%s', extended from %" PRIu64 " to %zu slots (%zu x), "
+                        "%zu/%zu entries used, %.3f - the copies answer lookups until new ngrams overwrite them\n",
+                        what, path.c_str(), size_file, t.size(), t.size() / (size_t) size_file,
+                        t.get_used(), t.size(), (double) t.get_used() / (double) t.size());
+                break;
+            case common_ngram_mod::LOAD_MISSING:
+                SPC_WRN("could not read ngram_mod %s '%s' - starting with an empty one\n", what, path.c_str());
+                break;
+            case common_ngram_mod::LOAD_CORRUPT:
+                SPC_WRN("ngram_mod %s '%s' is corrupt or truncated - starting with an empty one, "
+                        "it will be replaced on shutdown\n", what, path.c_str());
+                break;
+            case common_ngram_mod::LOAD_MISMATCH:
+                SPC_WRN("ngram_mod %s '%s' was built with a different n_match or a larger size (file size=%" PRIu64 ", want n_match=%zu, size=%zu) - "
+                        "the table restarts empty and will be replaced on shutdown; a --spec-ngram-mod-size >= %" PRIu64 " "
+                        "(with the same n_match) would have carried it over, a table cannot shrink without the keys\n",
+                        what, path.c_str(), size_file, t.get_n(), t.size(), size_file);
+                break;
         }
     }
 
