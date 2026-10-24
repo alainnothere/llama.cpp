@@ -9181,6 +9181,140 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
     return supported;
 }
 
+// [fork, 2026-10-24] GGML_VK_FA_KV_SCRATCH: copy the strided f16/bf16 K/V cache view into a per-head contiguous
+// scratch ([hs, n_kv, head]) and run FA on that. Upstream 733f57a999 does this unconditionally on AMD (not RDNA4).
+//   0 = off. Unset is 0 too: per the gate rule the default ships OFF until the owner's pipelined ppl gate passes
+//       on the cards; flipping the default = return -1 below for unset.
+//   1 = forced, the upstream gate (AMD except RDNA4, >= 256 Q rows, any strided raw layout).
+//  -1 = auto: RDNA3 with >= 96 CUs (the XTX; the XT loses, numbers in ggml_vk_fa_kv_scratch_layout), f16 K/V, heads interleaved per cell (nb[1] > nb[2]: the llama.cpp cache view, test case
+//       permute {0,2,1,3}), hs fitting PV_REG mode 3 (HSK % 16, HSV % 64, HSV <= 256, HSV <= HSK, PV_REG not
+//       disabled), >= 512 Q rows, coopmat1 with Br 16 / row_split 4 / no shmem staging (checked at the dispatch).
+// Numbers (agent-reports/2026-10-24-fa-strided-prefill-layout.md, ledger 2026-10-24 18:06):
+//   - 2026-10-18, old kernel (before PV_REG mode 3): XTX hs 256 nb 512 kv 64k strided 37.5 ms vs scratch 36.6, XTX
+//     10-13% slower with scratch at 16k, XT +13% slower. That is why the knob was opt-in.
+//   - 2026-10-24, PV_REG mode 3 kernel, XTX, same case: strided 48.2 ms vs scratch 24.2 (contiguous 22.8 + 1.4 copy).
+//     The contiguous kernel got ~1.5x faster since 10-18 and the strided address stream ~1.3x slower.
+//   - 2026-10-24 production, 3 cards, -c 180000, 162k-token paste, f16 KV: 641 t/s off; scratch first paste 586 t/s,
+//     second paste 1005 t/s (+57%). The first-paste loss was the scratch growing with n_kv (one prealloc_x
+//     growth per ubatch per card, each a mid-graph submit + wait + free + alloc: see the dispatch), which the
+//     reserve-time dst padding (ggml_backend_vk_buffer_type_get_alloc_size) removes.
+//   - 2026-10-24, same kernel, 7900 XT: scratch LOSES 10-34% (strided is not slow there), see the auto gate below.
+//   - Growth probe (one FA per graph, n_kv 512 -> 64k in 512 steps, XT, knob 1): old code 65 prealloc_x growths
+//     (counted above the 4 MiB log floor) and 2112 ms; now 0 growths, the reserved compute buffer is 76 -> 332 MiB
+//     (+256 MiB = K+V of the 64k cache, visible to the fit) and 2100 ms. Alone on an idle card a growth costs
+//     ~0.2 ms; the production loss is the drain breaking the cross-card pipeline, not the allocation.
+static int ggml_vk_fa_kv_scratch_mode() {
+    static const int mode = [] {
+        const char * e = getenv("GGML_VK_FA_KV_SCRATCH");
+        if (e == nullptr) {
+            return 0;   // default OFF (gate rule), see above
+        }
+        const int v = atoi(e);
+        return v < 0 ? -1 : (v != 0 ? 1 : 0);
+    }();
+    return mode;
+}
+
+// The part of the KV scratch decision that depends only on the K/V layout, not on the Q row count or the tuning.
+// Shared by the dispatch and by the reserve-time dst padding, so the padding exists whenever a dispatch may use it.
+static bool ggml_vk_fa_kv_scratch_layout(const vk_device & device, const ggml_tensor * k, const ggml_tensor * v) {
+    const int mode = ggml_vk_fa_kv_scratch_mode();
+    if (mode == 0 || k == nullptr || v == nullptr) {
+        return false;
+    }
+    if (device->vendor_id != VK_VENDOR_ID_AMD || device->architecture == vk_device_architecture::AMD_RDNA4 || device->coopmat2) {
+        return false;
+    }
+    if ((k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_BF16) || k->type != v->type) {
+        return false;
+    }
+    const uint64_t HSK = (uint64_t)k->ne[0];
+    const uint64_t HSV = (uint64_t)v->ne[0];
+    const size_t   ts  = ggml_type_size(k->type);
+    if ((HSK % 8) != 0 || (HSV % 8) != 0) {
+        return false;
+    }
+    // already per-head contiguous: nothing to gain
+    if (k->nb[1] == HSK * ts && v->nb[1] == HSV * ts) {
+        return false;
+    }
+    // the copy shader's view of the source is [hs, head, kv] dense (same test as is_dense_kv_cache in the dispatch)
+    auto dense = [](const ggml_tensor * t) {
+        return t->nb[0] == ggml_type_size(t->type) &&
+               t->nb[2] == ggml_row_size(t->type, t->ne[0]) &&
+               t->nb[1] == t->nb[2] * t->ne[2] &&
+               (t->ne[3] == 1 || t->nb[3] == t->nb[1] * t->ne[1]);
+    };
+    if (!dense(k) || !dense(v)) {
+        return false;
+    }
+    if (mode < 0) {
+        // auto = only what was measured. With the dense test above, "strided" already means nb[1] = nb[2] * n_head
+        // with n_head > 1, i.e. nb[1] > nb[2]; spelled out because that IS the slow pattern (one head's rows are
+        // 512 B chunks every 2 KB at hs 256 x 4 KV heads).
+        if (device->architecture != vk_device_architecture::AMD_RDNA3 || k->type != GGML_TYPE_F16) {
+            return false;
+        }
+        // Navi31 full die (96 CU, the 7900 XTX) only. The 7900 XT (84 CU, 320-bit) has no strided penalty to recover,
+        // measured 2026-10-24 on this kernel, hs 256 nh 4 qk 6, permute {0,2,1,3}: kv 64k nb 512 strided 31.5 ms vs
+        // contiguous 32.5 (strided is FASTER) and scratch 34.5 (+10%); kv 16k nb 512 7.79 -> 8.64 (+11%); kv 64k
+        // nb 256 17.5 -> 20.4 (+17%), nb 128 11.0 -> 13.6 (+23%), nb 64 5.68 -> 7.59 (+34%). The XTX numbers
+        // XTX re-measured 2026-10-24 19:40 on the merged build (same case, 64k, scratch off -> auto): nb 512 47.8 -> 24.1 ms,
+        // nb 256 12.1 -> 13.3 (+10%), nb 128 5.67 -> 7.52 (+33%), nb 64 2.90 -> 4.44 (+53%); contiguous nb 512 22.8 either way.
+        // The win exists at 512 rows only (the copy is amortized over the row tiles; below that the strided read is the
+        // cheaper of the two), hence the >= 512 row floor in the auto branch at the dispatch.
+        if (device->shader_core_count < 96) {
+            return false;
+        }
+        if (!(k->nb[1] > k->nb[2] && v->nb[1] > v->nb[2])) {
+            return false;
+        }
+        if (vk_fa_pv_reg == 0 || (HSK % 16) != 0 || (HSV % 64) != 0 || HSV > 256 || HSV > HSK) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Bytes the KV scratch can need for any n_kv: the whole cache tensors the K/V views live in (view_src = the
+// layer's cache tensor, kv_size cells). A dense view repacks a subset of its root's elements, so nelements(view) *
+// ts <= nbytes(root). It is constant per model, so a padded FA dst never grows with n_kv and never makes gallocr
+// re-plan (nothing per-graph may depend on n_kv, see the KQ mask build). k_part is rounded to the descriptor
+// offset alignment so V can start right after it.
+static uint64_t ggml_vk_fa_kv_scratch_bound(const vk_device & device, const ggml_tensor * k, const ggml_tensor * v, uint64_t * k_part) {
+    const uint64_t align = device->properties.limits.minStorageBufferOffsetAlignment;
+    const ggml_tensor * kr = k->view_src ? k->view_src : k;
+    const ggml_tensor * vr = v->view_src ? v->view_src : v;
+    const uint64_t kp = ROUNDUP_POW2((uint64_t)ggml_nbytes(kr), align);
+    if (k_part) {
+        *k_part = kp;
+    }
+    return kp + (uint64_t)ggml_nbytes(vr);
+}
+
+// Reserve-time padding of an FA dst that holds the KV scratch behind the output rows, or 0. The FA dst is
+// allocated by gallocr in the compute buffer, so the scratch is part of the reserved compute buffer the memory fit
+// measures (prealloc_x is created lazily after the fit and was invisible to it: 805 MB per card at 196k). Declined
+// when the padded tensor would exceed the buffer type's max size (suballocation block, 1 GiB by default): at the
+// 270k cap K+V is 1.1 GB, so that case falls back to a one-time presized prealloc_x (still outside the fit).
+static uint64_t ggml_vk_fa_kv_scratch_dst_pad(const vk_device & device, const ggml_tensor * dst) {
+    if (dst->op != GGML_OP_FLASH_ATTN_EXT || dst->view_src != nullptr) {
+        return 0;
+    }
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    if (!ggml_vk_fa_kv_scratch_layout(device, k, v)) {
+        return 0;
+    }
+    const uint64_t align = device->properties.limits.minStorageBufferOffsetAlignment;
+    const uint64_t nb    = ggml_nbytes(dst);
+    const uint64_t pad   = ROUNDUP_POW2(nb, align) - nb + ggml_vk_fa_kv_scratch_bound(device, k, v, nullptr);
+    if (nb + pad > device->suballocation_block_size) {
+        return 0;
+    }
+    return pad;
+}
+
 // Scratch for a mask-derived FA input (kind 0 = mask_opt bitmap, kind 1 = sparse index list).
 // Returns the subbuffer and sets `cached` when the same (mask, params) was already produced
 // earlier in this graph evaluation, in which case the caller must not re-dispatch the producer.
@@ -9303,36 +9437,40 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     };
     const bool k_quant = k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_BF16 && k->type != GGML_TYPE_F32;
     const bool v_quant = v->type != GGML_TYPE_F16 && v->type != GGML_TYPE_BF16 && v->type != GGML_TYPE_F32;
-    const bool kv_raw = (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_BF16) && k->type == v->type;
-    // gated to AMD, except RDNA4, which regressed in benchmarks
-    // upstream 733f57a999 copies strided f16 KV to scratch on AMD; measured 2026-10-18 on 7900 XTX/XT it is 10-13% slower at 16k and a wash at 65k, so it is opt-in here
-    static const bool enable_kv_scratch = getenv("GGML_VK_FA_KV_SCRATCH") != nullptr && atoi(getenv("GGML_VK_FA_KV_SCRATCH")) != 0;
-    const bool kv_raw_strided = enable_kv_scratch && ctx->device->vendor_id == VK_VENDOR_ID_AMD &&
-                                ctx->device->architecture != vk_device_architecture::AMD_RDNA4 &&
-                                neq1 >= 256 &&
-                                kv_raw &&
-                                (k->nb[1] != (uint64_t)HSK * ggml_type_size(k->type) ||
-                                 v->nb[1] != (uint64_t)HSV * ggml_type_size(v->type)) &&
-                                (HSK % 8) == 0 && (HSV % 8) == 0;
-    const size_t kv_scratch_ts = kv_raw_strided ? ggml_type_size(k->type) : sizeof(ggml_fp16_t);
-    const bool use_dequant_kv = ((k_quant && v_quant) || kv_raw_strided) && neq1 >= 64 &&
-                                is_dense_kv_cache(k) && is_dense_kv_cache(v) &&
-                                (uint64_t)ggml_nelements(k) * kv_scratch_ts <= ctx->device->properties.limits.maxStorageBufferRange &&
-                                (uint64_t)ggml_nelements(v) * kv_scratch_ts <= ctx->device->properties.limits.maxStorageBufferRange &&
-                                (kv_raw_strided ||
-                                 (ctx->device->pipeline_dequant_transpose[k->type] != nullptr &&
-                                  ctx->device->pipeline_dequant_transpose[v->type] != nullptr)) &&
-                                // coopmat2 path does not benefit from the f16 scratch
-                                !ctx->device->coopmat2 &&
-                                // Intel Xe1 regresses, see PR 25494
-                                (ctx->device->vendor_id != VK_VENDOR_ID_INTEL ||
-                                 (ctx->device->coopmat_support && ctx->device->architecture != vk_device_architecture::INTEL_XE1));
-    const ggml_type k_type_eff = (use_dequant_kv && !kv_raw_strided) ? GGML_TYPE_F16 : k->type;
-    const ggml_type v_type_eff = (use_dequant_kv && !kv_raw_strided) ? GGML_TYPE_F16 : v->type;
+    // The checks every dequant/copy scratch needs (quant transpose or strided raw copy): dense cache layout, each
+    // half within one descriptor range, no coopmat2 (it does not benefit), not Intel Xe1 (regresses, PR 25494).
+    const bool dq_kv_common = neq1 >= 64 &&
+                              is_dense_kv_cache(k) && is_dense_kv_cache(v) &&
+                              (uint64_t)ggml_nelements(k) * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange &&
+                              (uint64_t)ggml_nelements(v) * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange &&
+                              !ctx->device->coopmat2 &&
+                              (ctx->device->vendor_id != VK_VENDOR_ID_INTEL ||
+                               (ctx->device->coopmat_support && ctx->device->architecture != vk_device_architecture::INTEL_XE1));
+    const bool use_dequant_kv_quant = k_quant && v_quant && dq_kv_common &&
+                                      ctx->device->pipeline_dequant_transpose[k->type] != nullptr &&
+                                      ctx->device->pipeline_dequant_transpose[v->type] != nullptr;
+    // The strided raw copy keeps K/V in their own type (f16/bf16), so the tuning below does not depend on it and
+    // can be computed first; the auto mode of GGML_VK_FA_KV_SCRATCH reads it.
+    const ggml_type k_type_eff = use_dequant_kv_quant ? GGML_TYPE_F16 : k->type;
+    const ggml_type v_type_eff = use_dequant_kv_quant ? GGML_TYPE_F16 : v->type;
 
     // For scalar/coopmat1 FA, we can use the "large" size to accommodate qga.
     // For coopmat2 FA, we always use the small size (which is still pretty large for gqa).
     vk_fa_tuning_params tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, 512, KV, k_type_eff, v_type_eff, f32acc);
+
+    // GGML_VK_FA_KV_SCRATCH (ggml_vk_fa_kv_scratch_mode / ggml_vk_fa_kv_scratch_layout above have the measured numbers):
+    // copy the strided f16/bf16 cache view into a per-head contiguous scratch, then run FA on the scratch.
+    // Forced (1): the upstream 733f57a999 gate, >= 256 Q rows. Auto (-1): >= 512 Q rows (the XTX loses at 64..256,
+    // numbers in ggml_vk_fa_kv_scratch_layout) on the exact kernel the 2026-10-24 numbers were taken on (cm1, Br 16,
+    // row_split 4, no shmem staging = the PV_REG mode 3 shape; the final PV_REG choice is made further down and also
+    // needs aligned/no-sparse, which production prefill has). Production is -b 8192 -ub 512, so neq1 = 512 there.
+    const int kv_scratch_mode = ggml_vk_fa_kv_scratch_mode();
+    const bool kv_raw_strided = kv_scratch_mode != 0 && dq_kv_common && ggml_vk_fa_kv_scratch_layout(ctx->device, k, v) &&
+                                (kv_scratch_mode > 0 ? neq1 >= 256
+                                                     : (neq1 >= 512 && tuning_params.path == FA_COOPMAT1 && tuning_params.block_rows == 16 &&
+                                                        tuning_params.row_split == 4 && !tuning_params.shmem_staging));
+    const size_t kv_scratch_ts = kv_raw_strided ? ggml_type_size(k->type) : sizeof(ggml_fp16_t);
+    const bool use_dequant_kv = use_dequant_kv_quant || kv_raw_strided;
     const uint32_t max_gqa = std::min(tuning_params.block_rows, 32u);
 
     const bool gqa_fold_ok = qk_ratio > 1 && qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1;
@@ -9854,10 +9992,42 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                             xe_fa_opt ? "xe" : tuning_params.path == FA_COOPMAT2 ? "cm2" : tuning_params.path == FA_COOPMAT1 ? "cm1" : "scalar",
                             N, KV / 1024, Br, Bc, split_k);
 
-    // prealloc_x layout for this op: [K f16 scratch][V f16 scratch][dense mask scratch], sized once so no buffer is
-    // reallocated after a subbuffer of it was recorded
-    const uint64_t dq_kv_sz = use_dequant_kv ? (uint64_t)(ggml_nelements(k) + ggml_nelements(v)) * kv_scratch_ts : 0;
-    const uint64_t mask_scratch_off = mask_dense ? 0 : ROUNDUP_POW2(dq_kv_sz, (uint64_t)ctx->device->properties.limits.minStorageBufferOffsetAlignment);
+    // Where the K/V scratch lives.
+    // (a) Strided raw copy (GGML_VK_FA_KV_SCRATCH): behind the FA dst's output rows, in the padding
+    //     ggml_backend_vk_buffer_type_get_alloc_size reserved (ggml_vk_fa_kv_scratch_dst_pad). That padding is sized
+    //     for the whole cache during the reserve pass, so it is in the compute buffer the fit measures and nothing
+    //     grows at runtime.
+    // (b) Otherwise prealloc_x: [K f16 scratch][V f16 scratch][dense mask scratch].
+    // Why (a): before it, prealloc_x was grown to exactly 2 x n_kv x n_embd_kv x 2 B. n_kv grows by one ubatch (512)
+    // per ubatch during a paste, so every ubatch's first FA on each card grew it: ggml_vk_preallocate_buffers ends the
+    // command buffer mid-graph, submits it, WAITS for the device to idle (ggml_vk_synchronize), destroys prealloc_x
+    // and creates a bigger one (vkAllocateMemory of up to 805 MB at 196k). ~316 growths per card on the 162k paste,
+    // each a full drain of the pipelined pp: first paste 586 t/s vs 1005 t/s on the second paste (ledger
+    // 2026-10-24 18:06). No pipeline compile and no gallocr re-plan is involved (the cpy pipelines exist at startup,
+    // the FA dst size did not depend on n_kv). The micro-measure is in the 2026-10-24 kv-scratch-presize report.
+    const uint64_t kv_align = ctx->device->properties.limits.minStorageBufferOffsetAlignment;
+    const uint64_t k_sz = use_dequant_kv ? (uint64_t)ggml_nelements(k) * kv_scratch_ts : 0;
+    const uint64_t v_sz = use_dequant_kv ? (uint64_t)ggml_nelements(v) * kv_scratch_ts : 0;
+    vk_subbuffer k_dst{}, v_dst{};
+    bool kv_in_dst = false;
+    if (kv_raw_strided) {
+        const uint64_t pad = ggml_vk_fa_kv_scratch_dst_pad(ctx->device, dst);
+        // the dst must really have been allocated with the padding: same buffer type, not a view (dst_pad checks
+        // view_src), and the scratch must end inside the device buffer
+        if (pad > 0 && dst->buffer != nullptr && ggml_backend_buffer_is_vk(dst->buffer) &&
+            ggml_backend_buffer_get_alloc_size(dst->buffer, dst) >= ggml_nbytes(dst) + pad) {
+            const vk_subbuffer d = ggml_vk_tensor_subbuffer(ctx, dst);
+            const uint64_t tail = ROUNDUP_POW2((uint64_t)d.offset + ggml_nbytes(dst), kv_align);
+            const uint64_t v_off = tail + ROUNDUP_POW2(k_sz, kv_align);
+            if (v_off + v_sz <= (uint64_t)d.offset + ggml_nbytes(dst) + pad && v_off + v_sz <= d.buffer->size) {
+                k_dst = vk_subbuffer{ d.buffer, tail,  k_sz };
+                v_dst = vk_subbuffer{ d.buffer, v_off, v_sz };
+                kv_in_dst = true;
+            }
+        }
+    }
+    const uint64_t dq_kv_sz = (use_dequant_kv && !kv_in_dst) ? k_sz + v_sz : 0;
+    const uint64_t mask_scratch_off = mask_dense ? 0 : ROUNDUP_POW2(dq_kv_sz, kv_align);
     const uint64_t mask_scratch_sz  = mask_dense ? 0 : (uint64_t)KV * nem1 * nem2 * nem3 * sizeof(ggml_fp16_t);
     if (!mask_dense && ctx->prealloc_size_x < mask_scratch_off + mask_scratch_sz) {
         ctx->prealloc_size_x = mask_scratch_off + mask_scratch_sz;
@@ -9865,14 +10035,28 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     }
 
     if (use_dequant_kv) {
-        const uint64_t k_sz = (uint64_t)ggml_nelements(k) * kv_scratch_ts;
-        const uint64_t v_sz = (uint64_t)ggml_nelements(v) * kv_scratch_ts;
-        if (ctx->prealloc_size_x < k_sz + v_sz) {
-            ctx->prealloc_size_x = k_sz + v_sz;
-            ggml_vk_preallocate_buffers(ctx, subctx);
+        if (!kv_in_dst) {
+            if (ctx->prealloc_size_x < k_sz + v_sz) {
+                // Grow once, not per ubatch (see above). Strided raw copy without dst padding (padded dst over the
+                // 1 GiB suballocation block, e.g. the 270k cap): straight to the whole-cache bound, the presize the
+                // reserve path could not do. Quantized dequant path (ungated, also grew per ubatch): double, capped at
+                // the whole-cache f16 bound, so a short context does not take the full-context scratch up front.
+                uint64_t want = k_sz + v_sz;
+                const ggml_tensor * kr = k->view_src ? k->view_src : k;
+                const ggml_tensor * vr = v->view_src ? v->view_src : v;
+                const uint64_t bound = kv_raw_strided ? ggml_vk_fa_kv_scratch_bound(ctx->device, k, v, nullptr)
+                                                      : (uint64_t)(ggml_nelements(kr) + ggml_nelements(vr)) * sizeof(ggml_fp16_t);
+                if (kv_raw_strided) {
+                    want = std::max(want, bound);
+                } else {
+                    want = std::max(want, std::min(bound, (uint64_t)ctx->prealloc_size_x * 2));
+                }
+                ctx->prealloc_size_x = want;
+                ggml_vk_preallocate_buffers(ctx, subctx);
+            }
+            k_dst = vk_subbuffer{ ctx->prealloc_x, 0,    k_sz };
+            v_dst = vk_subbuffer{ ctx->prealloc_x, k_sz, v_sz };
         }
-        vk_subbuffer k_dst = vk_subbuffer{ ctx->prealloc_x, 0,    k_sz };
-        vk_subbuffer v_dst = vk_subbuffer{ ctx->prealloc_x, k_sz, v_sz };
         const uint32_t k_nel = (uint32_t)ggml_nelements(k);
         const uint32_t v_nel = (uint32_t)ggml_nelements(v);
         if (kv_raw_strided) {
@@ -9880,7 +10064,11 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
             vk_pipeline cp_v = ggml_vk_get_cpy_pipeline(ctx, v, nullptr, v->type);
             ggml_pipeline_request_descriptor_sets(ctx, cp_k, 1);
             ggml_pipeline_request_descriptor_sets(ctx, cp_v, 1);
-            if (ctx->prealloc_x_need_sync) {
+            // dst padding: the node-level hazard tracking (ggml_vk_build_graph overlaps_unsynced) only sees
+            // ggml_nbytes(dst), not the tail, and the tail reuses compute-buffer memory earlier nodes may still be
+            // reading or writing, so barrier unconditionally (one per FA call). After FA nothing extra is needed: the
+            // tail is freed together with dst, i.e. after dst's consumers, which barrier on dst themselves.
+            if (ctx->prealloc_x_need_sync || kv_in_dst) {
                 ggml_vk_sync_buffers(ctx, subctx);
             }
             auto make_pc = [](uint32_t hs, uint32_t nh, uint32_t kv, uint32_t nel) {
@@ -15283,9 +15471,13 @@ size_t ggml_backend_vk_buffer_type_get_max_size(ggml_backend_buffer_type_t buft)
 }
 
 size_t ggml_backend_vk_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+    // [fork, 2026-10-24] an FA dst that may run the strided-KV scratch carries it behind its rows, so the scratch
+    // is sized during the reserve pass and counted by the fit (ggml_vk_fa_kv_scratch_dst_pad). 0 with the knob off.
+    if (tensor->op == GGML_OP_FLASH_ATTN_EXT) {
+        ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
+        return ggml_nbytes(tensor) + (size_t)ggml_vk_fa_kv_scratch_dst_pad(ctx->device, tensor);
+    }
     return ggml_nbytes(tensor);
-
-    UNUSED(buft);
 }
 
 ggml_backend_buffer_type_t ggml_backend_vk_buffer_type(size_t dev_num) {
