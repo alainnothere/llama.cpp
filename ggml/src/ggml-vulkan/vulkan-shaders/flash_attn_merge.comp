@@ -1,0 +1,88 @@
+#version 450
+
+// [fork, 2026-10-23] GGML_OP_FLASH_ATTN_MERGE, see ggml_flash_attn_merge in ggml.h. One workgroup per output row
+// (head, token, ne3); every invocation computes the N weights itself (N <= 4 lse reads, cheaper than a barrier) and
+// writes D / BLOCK_SIZE elements. Same f32 arithmetic and order as the CPU reference (ops.cpp); unused bindings carry
+// part 0 again and are never read (i < n_parts).
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 64;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer P0 {float p0[];};
+layout (binding = 1) readonly  buffer P1 {float p1[];};
+layout (binding = 2) readonly  buffer P2 {float p2[];};
+layout (binding = 3) readonly  buffer P3 {float p3[];};
+layout (binding = 4) writeonly buffer D  {float dst[];};
+
+layout (push_constant) uniform parameter {
+    uint n_parts;
+    uint D;          // head size of O; a part row holds D + 4 floats, lse at D
+    uint emit_lse;
+    uint s1, s2, s3; // part strides in floats (all parts share them, ggml_vk_flash_attn_merge checks)
+    uint d1, d2, d3; // dst strides in floats
+    uint off0, off1, off2, off3, offd; // misalign offsets in floats
+} p;
+
+float rd(const uint i, const uint idx) {
+    if (i == 0u) { return p0[p.off0 + idx]; }
+    if (i == 1u) { return p1[p.off1 + idx]; }
+    if (i == 2u) { return p2[p.off2 + idx]; }
+    return p3[p.off3 + idx];
+}
+
+void main() {
+    const uint i1  = gl_WorkGroupID.x;
+    const uint i2  = gl_WorkGroupID.y;
+    const uint i3  = gl_WorkGroupID.z;
+    const uint tid = gl_LocalInvocationID.x;
+
+    const uint src_row = i1*p.s1 + i2*p.s2 + i3*p.s3;
+    const uint dst_row = p.offd + i1*p.d1 + i2*p.d2 + i3*p.d3;
+
+    float e[4];
+    float m = uintBitsToFloat(0xFF800000u); // -inf
+    for (uint i = 0u; i < p.n_parts; ++i) {
+        m = max(m, rd(i, src_row + p.D));
+    }
+
+    if (isinf(m) && m < 0.0) {
+        for (uint j = tid; j < p.D; j += BLOCK_SIZE) {
+            dst[dst_row + j] = 0.0;
+        }
+        if (p.emit_lse != 0u && tid == 0u) {
+            dst[dst_row + p.D]      = m;
+            dst[dst_row + p.D + 1u] = 0.0;
+            dst[dst_row + p.D + 2u] = 0.0;
+            dst[dst_row + p.D + 3u] = 0.0;
+        }
+        return;
+    }
+
+    float s = 0.0;
+    for (uint i = 0u; i < p.n_parts; ++i) {
+        e[i] = exp(rd(i, src_row + p.D) - m);
+        s += e[i];
+    }
+    for (uint i = 0u; i < p.n_parts; ++i) {
+        e[i] /= s;
+    }
+
+    for (uint j = tid; j < p.D; j += BLOCK_SIZE) {
+        float acc = 0.0;
+        for (uint i = 0u; i < p.n_parts; ++i) {
+            // skip, not multiply: an empty partial (lse -inf, weight 0) may hold any O
+            if (e[i] != 0.0) {
+                acc += e[i]*rd(i, src_row + j);
+            }
+        }
+        dst[dst_row + j] = acc;
+    }
+
+    if (p.emit_lse != 0u && tid == 0u) {
+        dst[dst_row + p.D]      = m + log(s);
+        dst[dst_row + p.D + 1u] = 0.0;
+        dst[dst_row + p.D + 2u] = 0.0;
+        dst[dst_row + p.D + 3u] = 0.0;
+    }
+}

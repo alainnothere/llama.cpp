@@ -36,7 +36,9 @@ const bool ABL_QK          = (Flags & 256) != 0; // skip the K loads and Q.K^T p
 // B lane a column, both along K; Q.K gets that (K A RowMajor, Q B ColumnMajor = 2 b128 per lane per tile), P.V
 // gets the opposite on both operands (16 scalar d16 loads per lane per tile). t(0) - t(512) is the most a layout
 // fix can win. cm1 aligned f16 only (the staged-V kvsh loads are not swapped). On the PV_REG path (steps A+B)
-// only the global V load is swapped (P is already contiguous); in mode 3 (step C) it is a no-op. See
+// only the global V load is swapped (P is already contiguous); in mode 3 (step C) it is a no-op for f16 V; for q8_0 V
+// under GGML_VK_FA_PV_REG_QUANT it restores the C2 (unrotated, 4-way bank conflict) step-C store mapping for A/B
+// (flash_attn_cm1.comp V_ROT, 2026-10-24; results stay correct). See
 // contextFiles/aiInstructionsAndResponses/fa-cm1-pv-partition-design.md sections 2 and 5.
 const bool ABL_PV_LAYOUT   = (Flags & 512) != 0;
 // Not an ablation: GGML_VK_FA_PV_REG=1|2 requests the cm1 persistent P.V accumulator path (flash_attn_cm1.comp, PV_REG).
@@ -52,6 +54,9 @@ const bool PV_REG_C_REQ    = (Flags & 4096) != 0;
 // Implemented in flash_attn.comp (scalar) and flash_attn_cm1.comp; split_k partials keep the HSV stride and
 // flash_attn_split_k_reduce.comp writes the lse. cm2 is refused in ggml_backend_vk_device_supports_op.
 const bool EMIT_LSE        = (Flags & 8192) != 0;
+// GGML_VK_FA_PV_REG_QUANT=1 adds bit 32768 (with 1024|4096, mode 3 only): q8_0 K and/or V allowed into the cm1 PV_REG
+// path, dequantized per subgroup into its private kvsh region (flash_attn_cm1.comp PV_REG_TYPES). Off by default.
+const bool PV_REG_Q8_REQ   = (Flags & 32768) != 0;
 const uint32_t HSV_out     = HSV + (EMIT_LSE ? 4 : 0);
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths

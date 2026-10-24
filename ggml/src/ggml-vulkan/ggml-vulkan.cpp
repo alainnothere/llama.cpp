@@ -2074,7 +2074,8 @@ vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_
                      (vk_fa_ablate & 0x3E0) |  // profiling only, see flash_attn_base.glsl (512 = ABL_PV_LAYOUT)
                      (params.pv_reg != 0 ? 1024 : 0) |   // GGML_VK_FA_PV_REG, flash_attn_cm1.comp PV_REG
                      (params.pv_reg == 2 ? 2048 : 0) |   // mode 2: f16 persistent accumulators
-                     (params.pv_reg == 3 ? 4096 : 0);    // mode 3: + step C, V transposed through kvsh
+                     (params.pv_reg == 3 ? 4096 : 0) |   // mode 3: + step C, V transposed through kvsh
+                     (params.pv_reg_quant ? 32768 : 0);  // GGML_VK_FA_PV_REG_QUANT: q8_0 K/V allowed into mode 3
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
@@ -6100,8 +6101,8 @@ void ggml_vk_instance_init() {
     // P.V in f16 throughout), 2 = A+B with f16 accumulators (perf probe), 3 = A+B+C (V staged transposed
     // through kvsh), -1 = auto: mode 3 on RDNA3 when eligible (dense aligned f16, nothing staged, the same
     // conditions as GGML_VK_FA_CM1_WAVE32 auto) and its shared memory fits, else mode 1 if it fits, else off.
-    // The default is 0 until one production read of mode 3; the flip is the initializer of vk_fa_pv_reg in
-    // ggml-vulkan-debug.cpp (0 -> -1).
+    // The default is -1 (auto) since the production read of mode 3 on 2026-10-20 (initializer of vk_fa_pv_reg in
+    // ggml-vulkan-debug.cpp, with the numbers).
     // Why: in production (GGML_VK_MMVQ_SLOPE_STATS, 7900 XTX, Qwen 27B-like hs 256, qk 6, f16 KV) FA costs
     // 5.1 us per 1k KV at 1 token and +1.1 us per 1k KV per extra 16-row tile (4 tok 6.4, 6 tok 8.3, 8 tok 10.5,
     // 10 tok 13.2, 12 tok 14.9); within a tile P.V cost ~2x Q.K at equal MMA count and equal global bytes,
@@ -6122,6 +6123,32 @@ void ggml_vk_instance_init() {
     if (const char * e = getenv("GGML_VK_FA_PV_REG")) {
         const int v = atoi(e);
         vk_fa_pv_reg = v < 0 ? -1 : ((v == 2 || v == 3) ? v : (v != 0 ? 1 : 0));
+    }
+    // GGML_VK_FA_PV_REG_QUANT (2026-10-24, candidate C1 of q8-kv-faster-than-f16.md.response): 0 off (default), 1 = q8_0
+    // K and/or V may take PV_REG mode 3 with per-subgroup dequant staging, and quant K/V in PV_REG get the wave32
+    // auto like f16. Ships off until the pipelined ppl gate passes on the cards (see ggml_vk_flash_attn).
+    // Measured 2026-10-24, 7900 XTX (GPU3), test-backend-ops perf, hs 256, 4 kv heads x 6, decode mask, K/V permuted
+    // like the cache, us at nb 1/2/4/6/8/12/16 (dense tiles 1/1/2/3/3/5/6):
+    //   kv 229376  f16 1095.9/1088.7/1112.9/1193.3/1204.0/2144.3/2290.0
+    //              q8 off 1255.7/1266.3/2425.5/3574.4/3582.0/6244.6/7033.3
+    //              q8 on  734.1/745.9/1359.7/2007.3/2015.5/3502.6/3939.4 (0.56-0.59x off; 0.67/0.69x f16 at 1/2 tokens,
+    //              1.22x at 4, 1.68x at 6, 1.72x at 16). kv 131072 same ratios; kv 32768 unpermuted nb 1/6/12:
+    //              f16 186.0/252.2/408.5, q8 off 206.8/566.3/983.3, on 124.7/324.2/576.6. Prefill (nb 512, scratch) 0.998x.
+    //   wave32: auto with the knob = forced 1 (re-gate works); forced 0 is +1..7% slower at every decode shape.
+    // Why it loses from 2 tiles on (GGML_VK_FA_ABLATE at kv 131072): f16 Q.K-only (128) is 338 us flat at 1-8 tokens
+    // (DRAM-bound, extra tiles hit L2 for free); q8 Q.K-only is 235/421/623 at 1/2/3 tiles, P.V-only (256)
+    // 249/472/693: every tile's workgroup dequantizes the same K and V again, ~190 us per side per extra tile at
+    // 131k (~1.45 us per 1k KV per side per tile). Levers: cheaper dequant (C2/C3) or one dequant shared by all tiles (C5).
+    // KEEP bar (plan step 1): q8 <= f16 at 1-2 tokens PASS; q8 at 6 tokens within 15% of f16 FAIL (1.68x); never
+    // slower than knob-off q8 PASS.
+    // C2 (same day, dequantize8_q8_0: 8 elements per scale load, packed 0x6400 magic convert, flash_attn_dequant.glsl):
+    //   kv 229376 q8 on 708.9/715.0/1231.6/1809.8/1812.5/3177.1/3561.2 = 0.90-0.97x C1, 0.65x f16 at 1-2 tokens,
+    //   1.11x at 4, 1.52x at 6. Plan bar ">= 10% over C1 at 4-6 tokens" missed narrowly (9.0-9.8%).
+    // C2b (same day, step-C V store bank rotation, flash_attn_cm1.comp V_ROT): kv 229376 q8 on
+    //   712.0/718.3/1206.7/1779.7/1782.0/3105.9/3495.7 = 0.978-0.983x C2 at 4-16 tokens, 1.00x at 1-2; f16 unchanged
+    //   (0.994-1.003x). Bar "V per-extra-tile -20%" missed: 208.8 -> 198.8 us; ~136 us/tile is P.V machinery, not LDS.
+    if (const char * e = getenv("GGML_VK_FA_PV_REG_QUANT")) {
+        vk_fa_pv_reg_quant = atoi(e) != 0 ? 1 : 0;
     }
     // GGML_VK_FA_GQA_DENSE (2026-10-22): see the dense fold in ggml_vk_flash_attn. 0 off, 1 on.
     if (const char * e = getenv("GGML_VK_FA_GQA_DENSE")) {
@@ -9132,6 +9159,9 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
     // under every RDNA/NVIDIA/Intel limit, and the host re-checks below).
     const uint32_t kvshstride = (params.shmem_staging ? std::max(hsk_pad, hsv_pad) : MatBr) / 4 + 2;
     const uint32_t vsh_stride = MatBc / 4 * row_split;
+    // GGML_VK_FA_PV_REG_QUANT adds nothing here: q8_0 K is dequantized per 16-d chunk into the subgroup's own
+    // transposed-V region (HSV_pad / 4 rows x 6 f16vec4 >= the 16 x 6 the K chunk needs, since HSV % 64 == 0), which
+    // is idle during Q.K (step C runs after the S and softmax barriers), and q8_0 V reuses the step-C layout as is.
     const uint32_t ksh = pv_reg ? (params.pv_reg == 3 ? hsv_pad * 6 * f16vec4 : f16vec4)
                                 : ((kvshstride >= vsh_stride) ? (Bc * kvshstride) : (Bc * vsh_stride)) * f16vec4;
 
@@ -9522,15 +9552,27 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // hardware it was measured on. Auto picks mode 3, then mode 1, by the shared-memory check.
     tuning_params.pv_reg = 0;
     tuning_params.pv_reg_auto = false;
+    tuning_params.pv_reg_quant = false;
     if (tuning_params.path == FA_COOPMAT1 && vk_fa_pv_reg != 0) {
-        const bool v_staged = use_sparse || !aligned || ggml_is_quantized(k_type_eff) || ggml_is_quantized(v_type_eff);
+        // GGML_VK_FA_PV_REG_QUANT=1: q8_0 K and/or V (the other side f16) count as not staged here, because mode 3
+        // dequantizes them subgroup-privately (flash_attn_cm1.comp PV_REG_TYPES). Q8_0 only: the shader path uses
+        // the q8_0 dequantize4, and F32/BF16/4-5 bit types were never measured in it. With the knob off q8_types is
+        // false and every expression below is the pre-knob one.
+        const bool k_q8_ok = k_type_eff == GGML_TYPE_F16 || k_type_eff == GGML_TYPE_Q8_0;
+        const bool v_q8_ok = v_type_eff == GGML_TYPE_F16 || v_type_eff == GGML_TYPE_Q8_0;
+        const bool q8_types = vk_fa_pv_reg_quant == 1 && k_q8_ok && v_q8_ok &&
+                              (k_type_eff == GGML_TYPE_Q8_0 || v_type_eff == GGML_TYPE_Q8_0);
+        const bool v_staged = use_sparse || !aligned || ((ggml_is_quantized(k_type_eff) || ggml_is_quantized(v_type_eff)) && !q8_types);
         const bool eligible = !v_staged && !tuning_params.shmem_staging &&
-                              k_type_eff == GGML_TYPE_F16 && v_type_eff == GGML_TYPE_F16 &&
+                              ((k_type_eff == GGML_TYPE_F16 && v_type_eff == GGML_TYPE_F16) || q8_types) &&
                               tuning_params.block_rows == 16 && tuning_params.row_split == 4 &&
                               HSK % 16 == 0 && HSV % 64 == 0 && HSV <= 256 && HSV <= HSK;
         const bool is_auto = vk_fa_pv_reg < 0;
         const bool rdna3 = ctx->device->vendor_id == VK_VENDOR_ID_AMD && ctx->device->architecture == AMD_RDNA3;
-        if (eligible && (!is_auto || rdna3)) {
+        // q8_0 needs mode 3: its K staging lives in the step-C region of kvsh, which modes 1/2 do not declare, so a
+        // forced GGML_VK_FA_PV_REG=1/2 keeps quant K/V on the old path and a mode 3 that does not fit has no fallback.
+        const bool mode_ok = !q8_types || is_auto || vk_fa_pv_reg == 3;
+        if (eligible && mode_ok && (!is_auto || rdna3)) {
             // forced: the requested mode, mode 3 falling back to 1 if it does not fit (29,328 vs 25,996 B at hs 256);
             // auto: 3, else 1, else off
             const uint32_t want = is_auto ? 3u : (uint32_t)vk_fa_pv_reg;
@@ -9539,12 +9581,28 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
             };
             tuning_params.pv_reg = want;
             if (!fits()) {
-                tuning_params.pv_reg = want == 3 ? 1u : 0u;   // only mode 3 has a fallback
+                tuning_params.pv_reg = (want == 3 && !q8_types) ? 1u : 0u;   // only f16 mode 3 has a fallback
                 if (tuning_params.pv_reg != 0 && !fits()) {
                     tuning_params.pv_reg = 0;
                 }
             }
             tuning_params.pv_reg_auto = is_auto && tuning_params.pv_reg != 0;
+            tuning_params.pv_reg_quant = q8_types && tuning_params.pv_reg == 3;
+        }
+    }
+
+    // GGML_VK_FA_PV_REG_QUANT wave32 re-gate: the auto above blocks wave32 for any quant K/V (v_staged) because on the
+    // old path V staging through kvsh made wave32 lose 5-37% (2026-10-18). q8_0 that took PV_REG mode 3 is staged
+    // subgroup-privately like f16 mode 3, so it gets the same auto rule as f16, decided here, after the PV_REG
+    // choice (the PV_REG choice and its shared-memory check do not depend on the subgroup size). Auto only: forced
+    // GGML_VK_FA_CM1_WAVE32=0/1 was already applied above. Same device conditions as the block above.
+    if (tuning_params.pv_reg_quant && vk_fa_cm1_wave32 < 0 && tuning_params.subgroup_size == 64 &&
+        ctx->device->subgroup_size == 64 && ctx->device->subgroup_size_control &&
+        ctx->device->subgroup_min_size <= 32 && ctx->device->subgroup_max_size >= 32) {
+        const bool rdna3 = ctx->device->vendor_id == VK_VENDOR_ID_AMD && ctx->device->architecture == AMD_RDNA3;
+        if (rdna3 && (HSV <= 256 || N > 16)) {   // PV_REG already implies dense (no sparse) and aligned
+            tuning_params.subgroup_size  = 32;
+            tuning_params.workgroup_size = tuning_params.row_split * 32;
         }
     }
 
@@ -9769,7 +9827,8 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                  mmq ? " mmq" : "",
                  tuning_params.pv_reg == 1 ? (tuning_params.pv_reg_auto ? " pvreg(auto)" : " pvreg")
                  : tuning_params.pv_reg == 2 ? " pvreg16"
-                 : tuning_params.pv_reg == 3 ? (tuning_params.pv_reg_auto ? " pvregC(auto)" : " pvregC")
+                 : tuning_params.pv_reg == 3 ? (tuning_params.pv_reg_quant ? (tuning_params.pv_reg_auto ? " pvregCq(auto)" : " pvregCq")
+                                                                            : (tuning_params.pv_reg_auto ? " pvregC(auto)" : " pvregC"))
                  : (tuning_params.shmem_staging ? " shmem" : ""),
                  ggml_type_name(k->type), ggml_type_name(v->type),
                  use_dequant_kv ? " dqkv->f16" : "",

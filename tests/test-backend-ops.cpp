@@ -11666,6 +11666,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 2},  1025,   1, true, true,  8, 30, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1025,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 16384,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    // (2026-10-24) 27B geometry q8_0 K/V at the verify widths: the gap noted in vulkan-quant-kv-cache-slow-path-analysis.md 28.1
+    for (int nb : {1, 6, 12, 16}) {
+        for (bool mask : {true, false}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, nb, mask, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
+        }
+    }
+    // (2026-10-24) mixed q8_0/f16 K/V at the 27B geometry: GGML_VK_FA_PV_REG_QUANT picks the K and V paths independently
+    for (int nb : {1, 6, 12}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_F16, {0, 2, 1, 3}));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
+    }
 
     // MLA shape: the V cache is a sub-view of the K cache, with quantized KV
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1},  113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
@@ -12298,6 +12309,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int kv : {131072, 229376}) {
         for (int nb : {1, 2, 4, 6, 8, 12, 16}) {
             test_cases.emplace_back(new test_flash_attn_ext_decode_mask(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
+        }
+    }
+    // q8_0 twins of the matrix above (2026-10-24, q8 KV speed work): same permuted layout, same row counts.
+    // No q8 number existed after PV_REG/wave32/GQA_DENSE; these are the baseline for GGML_VK_FA_PV_REG_QUANT.
+    for (int kv : {131072, 229376}) {
+        for (int nb : {1, 2, 4, 6, 8, 12, 16}) {
+            test_cases.emplace_back(new test_flash_attn_ext_decode_mask(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
         }
     }
     // long-context decode / speculative verify, Qwen3.x-27B-like: hs 256, 4 kv heads x 6, 32k ctx

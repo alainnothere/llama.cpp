@@ -144,3 +144,48 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
     }
     return FLOAT_TYPEV4(0);
 }
+
+#if defined(FA_WANT_DEQUANT8_Q8_0)
+// GGML_VK_FA_PV_REG_QUANT C2 (2026-10-24): 8 contiguous q8_0 elements per call for the cm1 PV_REG quant path
+// (flash_attn_cm1.comp only, which always has the f16 arithmetic extension). One scale load per 8 elements
+// instead of per 4, and no int -> float converts: each int16 holds two int8 quants; XOR 0x80 biases them to
+// u8 = q + 128, placing u8 in the low mantissa of f16 0x6400 (= 1024) gives the f16 value 1024 + u8 exactly,
+// so (packed - 1152) is q exactly and one packed f16 multiply by d finishes. Bit-identical to dequantize4
+// (int8 -> f16 is exact there too, and both round once, in the f16 multiply).
+// iqs must be a multiple of 8 (the 8 elements never straddle a 32-element block).
+// Measured 2026-10-24, 7900 XTX, 27B shape, knob on, vs the C1 dequantize4 version: 0.90-0.91x at 4-16 tokens
+// (229k nb 4/6 1359.7 -> 1231.6, 2007.3 -> 1809.8 us), 0.96-0.97x at 1-2, prefill unchanged. Per extra 16-row tile
+// at 131k (GGML_VK_FA_ABLATE): Q.K-only 186 -> 146 us (-21%), P.V-only 222 -> 210 us (-5%).
+// C2b: the V side calls dequantize8_q8_0_rot (rotated word order for conflict-free LDS stores): P.V-only per
+// extra tile 208.8 -> 198.8 us, full kernel 0.98x at 4-16 tokens; see flash_attn_cm1.comp step C.
+#define FA_Q8_0_PAIR(W) unpackFloat2x16((((W) & 0xFFu) | (((W) & 0xFF00u) << 8)) ^ 0x64806480u)
+// ROT (0..3) rotates the word order: register slot w holds word (w + ROT) & 3, i.e. element e of (lo, hi) is
+// d = (e + 2 * ROT) & 7 of the 8. ROT 0 is the plain loader (K side); the step-C V loop passes d8 & 3 so its
+// transposed stores land on distinct LDS banks (C2b, flash_attn_cm1.comp). Pure address arithmetic, no selects.
+#define FA_DEQUANT8_Q8_0(BUF, ROT) {                                                               \
+    const uint w0 = uint(BUF.data[a_offset + ib].qs[iqs / 2 + ((ROT)     & 3u)]);                  \
+    const uint w1 = uint(BUF.data[a_offset + ib].qs[iqs / 2 + ((ROT + 1) & 3u)]);                  \
+    const uint w2 = uint(BUF.data[a_offset + ib].qs[iqs / 2 + ((ROT + 2) & 3u)]);                  \
+    const uint w3 = uint(BUF.data[a_offset + ib].qs[iqs / 2 + ((ROT + 3) & 3u)]);                  \
+    const f16vec2 dd = f16vec2(BUF.data[a_offset + ib].d);                                         \
+    const f16vec2 bias = f16vec2(1152.0);                                                          \
+    lo = FLOAT_TYPEV4((FA_Q8_0_PAIR(w0) - bias) * dd, (FA_Q8_0_PAIR(w1) - bias) * dd);             \
+    hi = FLOAT_TYPEV4((FA_Q8_0_PAIR(w2) - bias) * dd, (FA_Q8_0_PAIR(w3) - bias) * dd);             \
+}
+
+void dequantize8_q8_0(uint ib, uint iqs, uint a_offset, uint binding_idx, out FLOAT_TYPEV4 lo, out FLOAT_TYPEV4 hi) {
+    if (binding_idx == BINDING_IDX_K) {
+        FA_DEQUANT8_Q8_0(k_packed_q8_0, 0u)
+    } else {
+        FA_DEQUANT8_Q8_0(v_packed_q8_0, 0u)
+    }
+}
+
+void dequantize8_q8_0_rot(uint ib, uint iqs, uint a_offset, uint binding_idx, uint rot, out FLOAT_TYPEV4 lo, out FLOAT_TYPEV4 hi) {
+    if (binding_idx == BINDING_IDX_K) {
+        FA_DEQUANT8_Q8_0(k_packed_q8_0, rot)
+    } else {
+        FA_DEQUANT8_Q8_0(v_packed_q8_0, rot)
+    }
+}
+#endif

@@ -1676,12 +1676,14 @@ struct vk_fa_tuning_params {
     uint32_t pv_reg;
     // pv_reg was chosen by GGML_VK_FA_PV_REG=-1 (auto) rather than forced; description only, not in the pipeline key
     bool pv_reg_auto;
+    // GGML_VK_FA_PV_REG_QUANT: q8_0 K and/or V took PV_REG mode 3 (Flags 32768, flash_attn_cm1.comp PV_REG_TYPES)
+    bool pv_reg_quant;
 
     void print() const {
         std::cerr << "path=" << path << " workgroup_size=" << workgroup_size << " subgroup_size=" << subgroup_size <<
                      " block_rows=" << block_rows << " block_cols=" << block_cols << " d_split=" << d_split <<
                      " row_split=" << row_split << " shmem_staging=" << shmem_staging << " disable_subgroups=" << disable_subgroups <<
-                     " limit_occupancy_shmem=" << limit_occupancy_shmem << " pv_reg=" << pv_reg << (pv_reg_auto ? "(auto)" : "") << std::endl;
+                     " limit_occupancy_shmem=" << limit_occupancy_shmem << " pv_reg=" << pv_reg << (pv_reg_auto ? "(auto)" : "") << (pv_reg_quant ? " q8" : "") << std::endl;
     }
 };
 

@@ -27,11 +27,14 @@ extern uint32_t vk_fa_sparse_min_ratio_f16;
 extern int vk_fa_quant_staging;
 // GGML_VK_FA_CM1_WAVE32: coopmat1 FA in wave32 on RDNA3. -1 auto (dense aligned f16 only), 0 off, 1 always
 extern int vk_fa_cm1_wave32;
-// GGML_VK_FA_PV_REG: coopmat1 persistent P.V accumulators (dense aligned f16 only). 0 off (default),
-// 1 on with ACC_TYPE (f32 under GGML_PREC_F32) accumulators, 2 on with f16 accumulators (perf probe),
-// 3 = 1 + transposed-V staging (step C), -1 auto (RDNA3: 3, else 1, else off). 1-3 include step B (row-major S/P).
-// Default 0 until a production read of mode 3; flipping to auto is the initializer in ggml-vulkan-debug.cpp.
+// GGML_VK_FA_PV_REG: coopmat1 persistent P.V accumulators (dense aligned f16; q8_0 too under GGML_VK_FA_PV_REG_QUANT).
+// 0 off, 1 on with ACC_TYPE (f32 under GGML_PREC_F32) accumulators, 2 on with f16 accumulators (perf probe),
+// 3 = 1 + transposed-V staging (step C), -1 auto (RDNA3: 3, else 1, else off; the default since 2026-10-20, see
+// the initializer in ggml-vulkan-debug.cpp). 1-3 include step B (row-major S/P).
 extern int vk_fa_pv_reg;
+// GGML_VK_FA_PV_REG_QUANT: let q8_0 K and/or V into PV_REG mode 3 (flash_attn_cm1.comp PV_REG_TYPES, Flags 32768)
+// and re-gate the RDNA3 wave32 auto for them. 0 off (default), 1 on.
+extern int vk_fa_pv_reg_quant;
 // GGML_VK_FA_GQA_DENSE: coopmat1 GQA fold with continuously numbered (token, head) rows, full 16-row tiles
 // (flash_attn_cm1.comp GQA_DENSE). 0 off (default until the gate), 1 on.
 extern int vk_fa_gqa_dense;
