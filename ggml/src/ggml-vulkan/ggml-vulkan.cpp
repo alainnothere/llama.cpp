@@ -9241,8 +9241,8 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
 
 // [fork, 2026-10-24] GGML_VK_FA_KV_SCRATCH: copy the strided f16/bf16 K/V cache view into a per-head contiguous
 // scratch ([hs, n_kv, head]) and run FA on that. Upstream 733f57a999 does this unconditionally on AMD (not RDNA4).
-//   0 = off. Unset is 0 too: per the gate rule the default ships OFF until the owner's pipelined ppl gate passes
-//       on the cards; flipping the default = return -1 below for unset.
+//   0 = off. Unset = -1 (auto) since 2026-10-24 20:00, when the 3-card ppl gate passed (2.8583 in every arm) and the
+//       163k paste read 1041 vs 641 t/s; it shipped OFF for the six hours before that, per the gate rule.
 //   1 = forced, the upstream gate (AMD except RDNA4, >= 256 Q rows, any strided raw layout).
 //  -1 = auto: RDNA3 with >= 96 CUs (the XTX; the XT loses, numbers in ggml_vk_fa_kv_scratch_layout), f16 K/V, heads interleaved per cell (nb[1] > nb[2]: the llama.cpp cache view, test case
 //       permute {0,2,1,3}), hs fitting PV_REG mode 3 (HSK % 16, HSV % 64, HSV <= 256, HSV <= HSK, PV_REG not
@@ -9265,7 +9265,10 @@ static int ggml_vk_fa_kv_scratch_mode() {
     static const int mode = [] {
         const char * e = getenv("GGML_VK_FA_KV_SCRATCH");
         if (e == nullptr) {
-            return 0;   // default OFF (gate rule), see above
+            // default AUTO since 2026-10-24 20:00: gate passed on the 3-card production split (ppl 2.8583 in all of
+            // unset / -1 / 1 at ub 512 and -1 at ub 2048, identical to the 4th decimal), 163k paste first run
+            // 1041 t/s vs 641 off (+62%), GTT flat. Set GGML_VK_FA_KV_SCRATCH=0 to get the old behaviour.
+            return -1;
         }
         const int v = atoi(e);
         return v < 0 ? -1 : (v != 0 ? 1 : 0);
