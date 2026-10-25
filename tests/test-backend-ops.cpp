@@ -11677,6 +11677,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_F16, {0, 2, 1, 3}));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
     }
+    // (2026-10-24) GGML_VK_FA_TILE_LOOP: 2 and 4 dense tiles (4 / 9 tokens x 6 heads), the T = 2 shapes without an empty slot
+    for (int nb : {4, 9}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
+    }
 
     // MLA shape: the V cache is a sub-view of the K cache, with quantized KV
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1},  113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
@@ -12316,6 +12320,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int kv : {131072, 229376}) {
         for (int nb : {1, 2, 4, 6, 8, 12, 16}) {
             test_cases.emplace_back(new test_flash_attn_ext_decode_mask(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
+        }
+    }
+    // 9 tokens = 54 rows = 4 dense tiles, the top of the production 5-9 token verify step (GGML_VK_FA_TILE_LOOP, 2026-10-24)
+    for (int kv : {131072, 229376}) {
+        for (ggml_type t : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_flash_attn_ext_decode_mask(256, 256, 4, {6, 1}, kv, 9, true, false, 0, 0, GGML_PREC_F32, t, t, {0, 2, 1, 3}));
         }
     }
     // long-context decode / speculative verify, Qwen3.x-27B-like: hs 256, 4 kv heads x 6, 32k ctx

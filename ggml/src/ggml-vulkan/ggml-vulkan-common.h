@@ -35,6 +35,9 @@ extern int vk_fa_pv_reg;
 // GGML_VK_FA_PV_REG_QUANT: let q8_0 K and/or V into PV_REG mode 3 (flash_attn_cm1.comp PV_REG_TYPES, Flags 32768)
 // and re-gate the RDNA3 wave32 auto for them. 0 off (default), 1 on.
 extern int vk_fa_pv_reg_quant;
+// GGML_VK_FA_TILE_LOOP: coopmat1 PV_REG mode 3 q8_0 K/V under the GQA dense fold, one workgroup per up to N 16-row tiles
+// sharing each K/V dequant (flash_attn_cm1.comp TILE_LOOP, Flags bits 16-17). 0 off (default), 2..3 = max tiles.
+extern int vk_fa_tile_loop;
 // GGML_VK_FA_GQA_DENSE: coopmat1 GQA fold with continuously numbered (token, head) rows, full 16-row tiles
 // (flash_attn_cm1.comp GQA_DENSE). 0 off (default until the gate), 1 on.
 extern int vk_fa_gqa_dense;
@@ -84,7 +87,7 @@ vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_
 uint32_t get_subgroup_size(const std::string &pipeline_name, const vk_device_architecture &arch);
 void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested = nullptr);
 bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type, ggml_type v_type);
-bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type = GGML_TYPE_F16, ggml_type v_type = GGML_TYPE_F16);
+bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type = GGML_TYPE_F16, ggml_type v_type = GGML_TYPE_F16, uint32_t * size_out = nullptr);
 
 // buffers
 vk_buffer ggml_vk_create_buffer_check(vk_device& device, size_t size, vk::MemoryPropertyFlags req_flags, vk::MemoryPropertyFlags fallback_flags = vk::MemoryPropertyFlags(0));

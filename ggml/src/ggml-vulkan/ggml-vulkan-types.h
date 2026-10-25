@@ -1678,12 +1678,15 @@ struct vk_fa_tuning_params {
     bool pv_reg_auto;
     // GGML_VK_FA_PV_REG_QUANT: q8_0 K and/or V took PV_REG mode 3 (Flags 32768, flash_attn_cm1.comp PV_REG_TYPES)
     bool pv_reg_quant;
+    // GGML_VK_FA_TILE_LOOP: 16-row tiles per workgroup (0/1 = one; 2..3 = flash_attn_cm1.comp TILE_LOOP, Flags bits 16-17).
+    // Shared memory grows with it (ggml_vk_flash_attn_coopmat_shmem_support); set only for pv_reg_quant + GQA dense.
+    uint32_t tile_loop;
 
     void print() const {
         std::cerr << "path=" << path << " workgroup_size=" << workgroup_size << " subgroup_size=" << subgroup_size <<
                      " block_rows=" << block_rows << " block_cols=" << block_cols << " d_split=" << d_split <<
                      " row_split=" << row_split << " shmem_staging=" << shmem_staging << " disable_subgroups=" << disable_subgroups <<
-                     " limit_occupancy_shmem=" << limit_occupancy_shmem << " pv_reg=" << pv_reg << (pv_reg_auto ? "(auto)" : "") << (pv_reg_quant ? " q8" : "") << std::endl;
+                     " limit_occupancy_shmem=" << limit_occupancy_shmem << " pv_reg=" << pv_reg << (pv_reg_auto ? "(auto)" : "") << (pv_reg_quant ? " q8" : "") << " tile_loop=" << tile_loop << std::endl;
     }
 };
 

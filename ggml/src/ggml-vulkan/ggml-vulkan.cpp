@@ -6150,6 +6150,51 @@ void ggml_vk_instance_init() {
     if (const char * e = getenv("GGML_VK_FA_PV_REG_QUANT")) {
         vk_fa_pv_reg_quant = atoi(e) != 0 ? 1 : 0;
     }
+    // GGML_VK_FA_TILE_LOOP (2026-10-24, C5 for q8_0 KV; flash_attn_cm1.comp TILE_LOOP): 0 off (default), N = max 16-row
+    // tiles per workgroup (2..3; 1 = off). Only with GGML_VK_FA_PV_REG_QUANT=1, q8_0 K and/or V, PV_REG mode 3, f32acc
+    // and the GQA dense fold (which it forces at an equal tile count). The rule picked per dispatch: 3 tiles -> TL 3 when
+    // N >= 3, every other tile count -> TL 2 (see the decision in ggml_vk_flash_attn).
+    // Measured 2026-10-24, 7900 XTX (GPU3), test-backend-ops perf, hs 256, 4 kv heads x 6, decode mask, K/V permuted,
+    // knob PV_REG_QUANT=1 in all arms, same binary, us per call (f16 = f16 K/V of the same run):
+    //   kv 131072 nb      1      2      4      6      8      9     12     16   (dense tiles 1 1 2 3 3 4 5 6)
+    //     f16          637.6  639.5  637.6  702.7  724.5  921.1 1224.8 1345.4
+    //     q8 off       409.3  414.6  732.0 1063.4 1047.0 1370.1 1803.7 2082.3
+    //     q8 TL 2      408.5  414.9  598.9 1111.5 1123.3 1125.8 1637.5 1647.1
+    //     q8 N=3 rule  408.8  415.1  598.0  946.5  959.8 1125.8 1637.7 1649.7
+    //   kv 229376
+    //     f16         1090.0 1086.0 1089.8 1202.6 1217.1 1581.5 2139.1 2300.3
+    //     q8 off       710.8  716.6 1249.4 1838.3 1793.4 2378.2 3130.5 3594.3
+    //     q8 TL 2      711.7  719.1 1003.3 1908.7 1915.0 1935.3 2827.8 2826.0
+    //     q8 N=3 rule  710.4  716.9 1004.4 1612.3 1617.8 1933.7 2830.1 2827.2
+    //   -> q8/f16 at 229k with the rule: 0.65 0.66 0.92 1.34 1.33 1.22 1.32 1.23 (off: 1.15 at 4, 1.53 at 6, 1.47 at 8).
+    //   32k unpermuted nb 6/12: off 298.1/516.4, rule 307.1/478.1 (+3% / -7%). Prefill nb 512 and 1-2 tokens untouched
+    //   (never dense). KEEP bar "4-8 tokens <= 1.15x f16 at 229k": 4 PASS (0.92), 6 and 8 FAIL (1.33-1.34).
+    // Ablation, kv 131072 (GGML_VK_FA_ABLATE 128 = Q.K-only, 256 = P.V-only), us at nb 1/4/6/9/16:
+    //   Q.K off 210.6/361.6/522.0/695.3/1024.3, TL 2 210.6/295.7/530.0/545.0/801.1 -> per extra tile 151-163 -> 85-118 us
+    //   P.V off 223.4/422.3/624.4/827.0/1218.3, TL 2 223.5/386.4/731.4/743.3/1082.4 -> per extra tile ~200 -> 163-173 us
+    //   TL 3 at 3 tiles: Q.K 528.0, P.V 592.9 (1 WG per CU: the sharing only pays back the occupancy).
+    //   What is left per extra tile (~112 K side + ~170 V side) is the per-tile MMA / LDS work (Q and P A-loads, S
+    //   store + softmax, V B-loads, 2 x 16 MMAs per 64-key block) that f16 pays too and hides under its 2x DRAM floor
+    //   up to ~3 tiles; sharing the dequant cannot remove it.
+    // RADV stats (shaderstats, FA pipeline): off 29,696 B LDS, 4 subgroups/SIMD, 103 pre-sched VGPR; TL 2 32,256 B, 4/SIMD,
+    // 154; TL 3 48,128 B, 2/SIMD, 203. 256 VGPR allocated in all three, no spills anywhere.
+    // Dead probes, do not repeat:
+    //   * iteration 1 (sfsh2 x TL + full 12 KB transposed-V kvsh: 46.3 KB at TL 2, 63 KB at TL 3, 1 WG per CU):
+    //     131k nb 4/6/8/12/16 TL 2 734.6/1385.8/1399.4/2060.2/2069.4, TL 3 733.7/950.5/963.7/1815.7/1826.5 vs off
+    //     705.4/1040.1/1039.6/1792.2/2021.0; Q.K-only at nb 4 387.5 vs off 361.9: the shared dequant bought nothing
+    //     at 1 WG per CU.
+    //   * occupancy probe (TL off, GGML_VK_FA_SPLITK_PCT=50 = 96 WGs = 1 per CU, same total work): 131k nb 4/6/8
+    //     1011.0/1487.4/1504.3 vs 705.4/1040.1/1039.6: one WG per CU costs 1.43x, which is what ate iteration 1. At equal
+    //     occupancy the TL 2 block was 27% cheaper per tile (8.6 vs 2 x 5.92 us per 64-key block), hence iteration 2:
+    //     S aliased into the per-subgroup kvsh regions + V staged in two 32-d halves to stay under 32 KB.
+    //   * TL 2 at 3 tiles (one empty tile slot in every second WG, 2 WGs per CU): 1111.5 / 1908.7 at 131k / 229k nb 6,
+    //     worse than off; TL 3 (1 WG per CU) is the better of the two there and still 1.34x f16. TL 3 cannot fit 32 KB:
+    //     3 x Qf (25,344 B) + 3 x Psh2 (6,912 B) are over it before any K/V staging. An empty-slot skip for TL 2 or a
+    //     per-tile split_k were not tried.
+    if (const char * e = getenv("GGML_VK_FA_TILE_LOOP")) {
+        const int v = atoi(e);
+        vk_fa_tile_loop = v <= 1 ? 0 : std::min(v, 3);
+    }
     // GGML_VK_FA_GQA_DENSE (2026-10-22): see the dense fold in ggml_vk_flash_attn. 0 off, 1 on.
     if (const char * e = getenv("GGML_VK_FA_GQA_DENSE")) {
         vk_fa_gqa_dense = atoi(e) != 0 ? 1 : 0;
@@ -9118,7 +9163,7 @@ bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, const vk_f
     return supported;
 }
 
-bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type, ggml_type v_type) {
+bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type, ggml_type v_type, uint32_t * size_out) {
     GGML_UNUSED(v_type);
     // Needs to be kept up to date on shader changes
     const uint32_t Br = params.block_rows;
@@ -9138,18 +9183,22 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
     // DATA_A_IQ4_NL is compiled into the FA shaders unconditionally, so its shared table is always allocated.
     const uint32_t iq_shmem = 16 * sizeof(ggml_fp16_t);
 
+    // GGML_VK_FA_TILE_LOOP (flash_attn_cm1.comp TILE_LOOP): Qf, Psh2, sfsh2, emsh and slope hold TL tiles each
+    const uint32_t TL = std::max(1u, params.tile_loop);
+
     const uint32_t qstride = hsk_pad / 4 + 2;
-    const uint32_t Qf = Br * qstride * f16vec4;
+    const uint32_t Qf = TL * Br * qstride * f16vec4;
 
     // PV_REG (GGML_VK_FA_PV_REG 1/2/3, flash_attn_cm1.comp) step B: Psh/sfsh shrink to one element and the
     // row-major Psh2 (f16vec2, row stride Bc/2 + 4) / sfsh2 (ACC vec2, row stride Bc/2 + 8) take over; the old
     // path declares one-element Psh2/sfsh2 placeholders.
     const bool pv_reg = params.pv_reg != 0;
     const uint32_t psh_stride = Br / 4 + 2;
-    const uint32_t Psh = pv_reg ? f16vec4 + Br * (Bc / 2 + 4) * 4 : Bc * psh_stride * f16vec4 + 4;
+    const uint32_t Psh = pv_reg ? f16vec4 + TL * Br * (Bc / 2 + 4) * 4 : Bc * psh_stride * f16vec4 + 4;
 
     const uint32_t sfshstride = (hsk <= 128) ? (Br + 8) : Br;
-    const uint32_t sfsh = pv_reg ? 4 * acctype + Br * (Bc / 2 + 8) * 2 * acctype : Bc * sfshstride * acctype + 2 * acctype;
+    // TILE_LOOP (TL > 1): S lives in the per-subgroup kvsh regions (flash_attn_cm1.comp S_ALIAS), sfsh2 is one element
+    const uint32_t sfsh = pv_reg ? 4 * acctype + (TL > 1 ? 2 * acctype : Br * (Bc / 2 + 8) * 2 * acctype) : Bc * sfshstride * acctype + 2 * acctype;
 
     // PV_REG: pvsh is one element (no per-slice bounce), emsh is 16x16 ACC_TYPE (1024 B f32acc, 512 B f16acc),
     // kvsh is one element in modes 1/2 and the transposed-V slices in mode 3 (HSV_pad rows x 6 f16vec4 =
@@ -9162,19 +9211,28 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
     // GGML_VK_FA_PV_REG_QUANT adds nothing here: q8_0 K is dequantized per 16-d chunk into the subgroup's own
     // transposed-V region (HSV_pad / 4 rows x 6 f16vec4 >= the 16 x 6 the K chunk needs, since HSV % 64 == 0), which
     // is idle during Q.K (step C runs after the S and softmax barriers), and q8_0 V reuses the step-C layout as is.
-    const uint32_t ksh = pv_reg ? (params.pv_reg == 3 ? hsv_pad * 6 * f16vec4 : f16vec4)
+    // TILE_LOOP: row_split regions of PV_REGION f16vec4 = max(TL x 16 x 8 S, PV_SLICE / PV_VPH x 6 V) padded to 8 mod 16
+    // (PV_VPH = 2 at TL 2): 264 at TL 2 (8,448 B), 392 at TL 3 (12,544 B); flash_attn_cm1.comp PV_REGION.
+    const uint32_t pv_slice = hsv_pad / row_split;
+    const uint32_t pv_vph = TL == 2 ? 2 : 1;
+    const uint32_t pv_rraw = std::max(TL * Br * (MatBc / 2), pv_slice / pv_vph * 6);
+    const uint32_t pv_region = TL > 1 ? ((pv_rraw + 7) / 16) * 16 + 8 : pv_slice * 6;
+    const uint32_t ksh = pv_reg ? (params.pv_reg == 3 ? row_split * pv_region * f16vec4 : f16vec4)
                                 : ((kvshstride >= vsh_stride) ? (Bc * kvshstride) : (Bc * vsh_stride)) * f16vec4;
 
     // BF16 PVMat accumulator is f32 (no bf16 accumulator support), so pvsh is vec4 (16 bytes)
     const uint32_t pvsh_elem_size = (k_type == GGML_TYPE_BF16) ? 16u : f16vec4;
     const uint32_t osh_stride = params.row_split * MatBr / 4;
     const uint32_t pvsh = pv_reg ? pvsh_elem_size : Br * osh_stride * pvsh_elem_size;
-    const uint32_t emsh = pv_reg ? 16 * 16 * acctype : 4 * acctype;
+    const uint32_t emsh = pv_reg ? TL * 16 * 16 * acctype : 4 * acctype;
 
-    const uint32_t slope = Br * acctype;
+    const uint32_t slope = TL * Br * acctype;
 
     const uint32_t total_size = tmpsh + iq_shmem + Qf + Psh + sfsh + ksh + pvsh + emsh + slope;
     const bool supported = total_size <= device->properties.limits.maxComputeSharedMemorySize;
+    if (size_out) {
+        *size_out = total_size;
+    }
 
     VK_LOG_DEBUG("ggml_vk_flash_attn_coopmat_shmem_support(HSK=" << hsk << ", HSV=" << hsv << ", f32acc=" << f32acc << ", total_size=" << total_size << ", supported=" << supported);
 
@@ -9568,7 +9626,15 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         const uint32_t dense_tiles = CEIL_DIV((uint32_t)neq1 * qk_ratio, Br16);
         // tiles per KV head of the mapping chosen above: folded = workgroups_x, unfolded = qk x ceil(n / Br)
         const uint32_t cur_tiles = gqa_ratio > 1 ? workgroups_x : qk_ratio * CEIL_DIV((uint32_t)neq1, tuning_params.block_rows);
-        if (dense_tiles < cur_tiles) {
+        // GGML_VK_FA_TILE_LOOP needs the dense numbering (tile t of a workgroup = rows t * 16 ..), so a q8_0 batch that
+        // may take it goes dense at an equal tile count too (4 and 6 tokens fold into 2 / 3 whole-token tiles, 16
+        // tokens unfold into 6: dense is the same tile count there). Same-count dense alone is a renumbering: f16
+        // 226k 6 rows 1178 (fold) vs 1200 us (dense, the table above); the tile loop is what pays.
+        const bool tl_wants_dense = vk_fa_tile_loop >= 2 && vk_fa_pv_reg_quant == 1 &&
+                                    (k_type_eff == GGML_TYPE_Q8_0 || v_type_eff == GGML_TYPE_Q8_0) &&
+                                    (k_type_eff == GGML_TYPE_Q8_0 || k_type_eff == GGML_TYPE_F16) &&
+                                    (v_type_eff == GGML_TYPE_Q8_0 || v_type_eff == GGML_TYPE_F16);
+        if (dense_tiles < cur_tiles || (tl_wants_dense && dense_tiles == cur_tiles && dense_tiles >= 2)) {
             if (gqa_ratio == 1) {
                 gqa_ratio = qk_ratio;
                 workgroups_y /= gqa_ratio;
@@ -9744,10 +9810,44 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         }
     }
 
+    // GGML_VK_FA_TILE_LOOP (2026-10-24, C5 for q8_0 KV; flash_attn_cm1.comp TILE_LOOP): under the GQA dense fold one
+    // workgroup takes up to N consecutive 16-row tiles of a KV head and dequantizes each K chunk / V slice once for all
+    // of them, instead of one workgroup per tile each dequantizing the same KV block. q8_0 under PV_REG_QUANT only (f16
+    // tiles beyond the first are L2 hits already, see the dense fold comment: Br 32/48 sharing lost for f16).
+    // Tiles are balanced (5 tiles at N 3 = 2 workgroups of 3, one slot empty; 4 at N 3 = 2 of 2); TL drops until the
+    // shared memory fits. The split_k target below uses 1 WG per CU when the TL-tile footprint no longer fits twice.
+    uint32_t tile_loop_wgs_per_cu = 2;
+    tuning_params.tile_loop = 0;
+    if (vk_fa_tile_loop >= 2 && tuning_params.pv_reg_quant && tuning_params.pv_reg == 3 && gqa_dense && workgroups_x >= 2) {
+        const uint32_t tiles = workgroups_x;
+        // T rule from the 2026-10-24 measurements (numbers at the knob in ggml_vk_instance_init): TL 2 fits 2 WGs per CU
+        // (32.2 KB) and wins at 2/4/6 tiles (-18..-23%) and 5 tiles (-10%, one empty slot); TL 3 is 48 KB = 1 WG per CU
+        // and only wins where TL 2 leaves a whole empty tile slot in half the workgroups: 3 tiles (6-8 tokens), TL 2
+        // 1104 vs TL 3 946 vs off 1081 us at 131k. So: 3 tiles -> 3 when allowed, everything else -> 2.
+        uint32_t T = (tiles == 3 && vk_fa_tile_loop >= 3) ? 3u : 2u;
+        T = std::min<uint32_t>(T, tiles);
+        vk_fa_tuning_params tp = tuning_params;
+        uint32_t shmem = 0;
+        for (; T >= 2; --T) {
+            tp.tile_loop = T;
+            if (ggml_vk_flash_attn_coopmat_shmem_support(ctx->device, tp, HSK, HSV, f32acc, k_type_eff, v_type_eff, &shmem)) {
+                break;
+            }
+        }
+        if (T >= 2) {
+            tuning_params.tile_loop = T;
+            workgroups_x = CEIL_DIV(tiles, T);
+            tile_loop_wgs_per_cu = 2 * shmem <= ctx->device->properties.limits.maxComputeSharedMemorySize ? 2 : 1;
+        }
+    }
+
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
                                                                    mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff);
     if (gqa_dense) {
         fa_pipeline_state.flags |= 16384; // GQA_DENSE, flash_attn_cm1.comp
+    }
+    if (tuning_params.tile_loop >= 2) {
+        fa_pipeline_state.flags |= (tuning_params.tile_loop - 1) << 16;   // TILE_LOOP TL - 1, flash_attn_cm1.comp
     }
     if (emit_lse) {
         GGML_ASSERT(tuning_params.path != FA_COOPMAT2 && "flash_attn_ext emit_lse: not implemented in flash_attn_cm2.comp");
@@ -9817,7 +9917,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         const uint32_t per_blocks = CEIL_DIV(total_blocks, split_k);
         split_k = CEIL_DIV(total_blocks, per_blocks);
     } else if (gqa_ratio > 1 && workgroups_x <= Br) {
-        split_k = shader_core_count * 2 / (workgroups_x * workgroups_y * workgroups_z);
+        // GGML_VK_FA_TILE_LOOP: target = the resident workgroups (1 per CU once TL tiles of LDS no longer fit twice)
+        const uint32_t wgs_per_cu = tuning_params.tile_loop >= 2 ? tile_loop_wgs_per_cu : 2;
+        split_k = shader_core_count * wgs_per_cu / (workgroups_x * workgroups_y * workgroups_z);
     } else if (gqa_ratio <= 1) {
         uint32_t total_wgs_no_split = Tr * workgroups_y * workgroups_z;
         // Unfolded coopmat1 verify batches (N > GGML_VK_FA_FOLD_MAX_N, more than one row tile). 27B (24 q / 4 kv heads,
@@ -9960,7 +10062,11 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         char buf[384];
         const char * path = tuning_params.path == FA_COOPMAT2 ? "cm2" : tuning_params.path == FA_COOPMAT1 ? (gqa_dense ? "cm1 dense" : "cm1") : "scalar";
         const bool mmq = tuning_params.path == FA_SCALAR && ggml_vk_fa_scalar_uses_mmq(ctx->device, k_type_eff, v_type_eff);
-        snprintf(buf, sizeof(buf), " [%s%s%s k=%s v=%s%s hs=%u/%u n=%u N=%u KV=%u qk=%u gqa=%u T=%u Br=%u Bc=%u Tr=%u wg=%ux%ux%u cores=%u splitk=%u splitkv=%u%s%s%s%s%s]",
+        char tl_buf[16] = "";
+        if (tuning_params.tile_loop >= 2) {
+            snprintf(tl_buf, sizeof(tl_buf), " tl%u", tuning_params.tile_loop);
+        }
+        snprintf(buf, sizeof(buf), " [%s%s%s%s k=%s v=%s%s hs=%u/%u n=%u N=%u KV=%u qk=%u gqa=%u T=%u Br=%u Bc=%u Tr=%u wg=%ux%ux%u cores=%u splitk=%u splitkv=%u%s%s%s%s%s]",
                  xe_fa_opt ? "xe" : path,
                  mmq ? " mmq" : "",
                  tuning_params.pv_reg == 1 ? (tuning_params.pv_reg_auto ? " pvreg(auto)" : " pvreg")
@@ -9968,6 +10074,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                  : tuning_params.pv_reg == 3 ? (tuning_params.pv_reg_quant ? (tuning_params.pv_reg_auto ? " pvregCq(auto)" : " pvregCq")
                                                                             : (tuning_params.pv_reg_auto ? " pvregC(auto)" : " pvregC"))
                  : (tuning_params.shmem_staging ? " shmem" : ""),
+                 tl_buf,
                  ggml_type_name(k->type), ggml_type_name(v->type),
                  use_dequant_kv ? " dqkv->f16" : "",
                  HSK, HSV, (uint32_t)neq1, N, KV, qk_ratio, gqa_ratio, gqa_T, Br, Bc, Tr,
