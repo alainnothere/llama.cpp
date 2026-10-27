@@ -3037,6 +3037,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         // we define this arg on both COMMON and EXPORT_LORA, so when showing help message of export-lora, it will be categorized as "example-specific" arg
     ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_EXPORT_LORA}));
     add_opt(common_arg(
+        {"--mtp-head"}, "FNAME",
+        "GGUF file with replacement NextN/MTP block tensors (e.g. a fine-tuned blk.64.*), written over the loaded weights;\n"
+        "names, types and shapes must match the model, any mismatch is an error",
+        [](common_params & params, const std::string & value) {
+            params.mtp_head = value;
+        }
+    ).set_env("LLAMA_ARG_MTP_HEAD"));
+    add_opt(common_arg(
         {"--control-vector"}, "FNAME",
         "add a control vector\nnote: use comma-separated values to add multiple control vectors",
         [](common_params & params, const std::string & value) {

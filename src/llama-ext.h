@@ -91,7 +91,16 @@ using llama_memory_breakdown = std::map<ggml_backend_buffer_type_t, llama_memory
 LLAMA_API int32_t llama_model_n_expert (const struct llama_model * model);
 LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 
+// [MTP_HEAD] Overwrite the NextN/MTP block tensors with the ones in the GGUF file at path (same names, types and
+// shapes, only blk.<n_layer>.. tensors allowed). All tensors are checked before the first write. Call it after
+// load and before decoding. Returns the number of replaced tensors, or < 0 on any mismatch (model unchanged).
+LLAMA_API int32_t llama_model_load_mtp_head(struct llama_model * model, const char * path);
+
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
+
+// [GRAPH_REUSE_PP] the graph-reuse rule of process_ubatch, pure for tests/test-graph-reuse-pp.cpp: false when
+// pipeline_parallel and the decode call has more than one ubatch, unless env_reuse_pp (LLAMA_GRAPH_REUSE_PP=1)
+LLAMA_API bool llama_graph_reuse_allowed(bool pipeline_parallel, uint32_t n_ubatches_in_batch, bool env_reuse_pp);
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 

@@ -1891,8 +1891,8 @@ struct server_slot {
                 t_prompt_total + t_gen_total, (int) (stats.n_prompt_processed + stats.n_gen));
 
         SLT_INF(*this,
-                "   graphs reused = %10d\n",
-                llama_perf_context(ctx_tgt).n_reused);
+                "   graphs reused = %10d (pp skipped %d)\n",
+                llama_perf_context(ctx_tgt).n_reused, llama_perf_context_n_reuse_skipped_pp(ctx_tgt));
 
         // [fork, 2026-10-22 night] LLAMA_VERIFY_PREBUILD (scout item 5): context totals, printed once any prebuild ran
         {
@@ -2110,6 +2110,7 @@ struct server_slot {
         j["pp_tps"]               = stats.n_prompt_tps();
         j["tg_tps"]               = stats.n_gen_tps();
         j["graphs_reused"]        = llama_perf_context(ctx_tgt).n_reused;
+        j["graphs_reuse_skipped_pp"] = llama_perf_context_n_reuse_skipped_pp(ctx_tgt);
 
         {
             const char * s = "none";

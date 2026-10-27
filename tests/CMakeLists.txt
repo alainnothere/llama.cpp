@@ -164,6 +164,11 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-grammar-integration.cpp)
     llama_build_and_test(test-llama-grammar.cpp)
     llama_build_and_test(test-batch-alloc.cpp)
+    # [GRAPH_REUSE_PP] truth table always; the decode part uses the generated dummy model when it exists (no fixture
+    # dependency: missing model = SKIP). Pipelined asserts only run with 2+ GPU devices
+    llama_build_and_test(test-graph-reuse-pp.cpp ARGS ${CMAKE_CURRENT_BINARY_DIR}/test-models/llama-dense.gguf)
+    # [MTP_CHUNK] 2026-10-27: common_batch_decode_chunked over n_batch + 7 entries, two seqs, CPU; missing model = SKIP
+    llama_build_and_test(test-speculative-batch-chunks.cpp ARGS ${CMAKE_CURRENT_BINARY_DIR}/test-models/llama-dense.gguf)
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-chat PRIVATE server-context)

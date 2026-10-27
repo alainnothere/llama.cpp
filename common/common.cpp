@@ -1303,6 +1303,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     pimpl->model.reset(model);
 
+    if (!params.mtp_head.empty() && llama_model_load_mtp_head(model, params.mtp_head.c_str()) < 0) {
+        COM_ERR("failed to apply --mtp-head '%s'\n", params.mtp_head.c_str());
+        pimpl->model.reset();
+        return;
+    }
+
     if (model_only) {
         return;
     }
@@ -2276,6 +2282,42 @@ llama_batch_ext * common_batch::get_sub_batch(int32_t off, int32_t n) {
     }
 
     return res;
+}
+
+int32_t common_batch_decode_chunked(llama_context * ctx, common_batch & batch, int32_t n_batch, int32_t * off_last, int32_t * n_chunks) {
+    const int32_t n_cap = (int32_t) llama_n_batch(ctx);
+    if (n_batch <= 0 || n_batch > n_cap) {
+        n_batch = n_cap;
+    }
+
+    const int32_t n_total = batch.size();
+
+    if (off_last) {
+        *off_last = 0;
+    }
+    if (n_chunks) {
+        *n_chunks = 0;
+    }
+
+    for (int32_t off = 0; off < n_total; off += n_batch) {
+        const int32_t n = std::min(n_batch, n_total - off);
+
+        if (off_last) {
+            *off_last = off;
+        }
+
+        const int32_t rc = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get_sub_batch(off, n));
+        if (n_chunks) {
+            (*n_chunks)++;
+        }
+        if (rc != 0) {
+            LOG_ERR("%s: llama_process failed rc=%d (chunk %d..%d of %d, n_batch %d)\n",
+                    __func__, (int) rc, (int) off, (int) (off + n), (int) n_total, (int) n_batch);
+            return rc;
+        }
+    }
+
+    return 0;
 }
 
 common_batch common_batch_get_one(llama_context * ctx, const llama_token * tokens, int32_t n_tokens) {

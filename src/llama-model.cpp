@@ -24,9 +24,11 @@
 
 #include "ggml.h"
 #include "ggml-cpp.h"
+#include "gguf.h"
 
 #include <algorithm>
 #include <cassert>
+#include <cinttypes>
 #include <cfloat>
 #include <cstdint>
 #include <cstring>
@@ -2433,6 +2435,10 @@ bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
 }
 
+bool llama_model::has_mmaps() const {
+    return !pimpl->mappings.empty();
+}
+
 const ggml_tensor * llama_model::get_tensor(const char * name) const {
     auto it = std::find_if(tensors_by_name.begin(), tensors_by_name.end(),
             [name](const std::pair<std::string, ggml_tensor *> & it) {
@@ -3480,6 +3486,129 @@ bool llama_model_is_diffusion(const llama_model * model) {
 
 const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_tensor_map(const llama_model * model) {
     return model->tensors_by_name;
+}
+
+// [MTP_HEAD] replace the NextN block weights in place (--mtp-head). The file must only hold tensors of the
+// appended NextN blocks (blk.<n_layer()>.. blk.<n_layer_all-1>), each with the same name and shape as the
+// loaded tensor. Everything is checked before the first write, so a bad file leaves the model as loaded.
+// The draft context of draft-mtp runs on the target model's tensors, so one write covers both contexts.
+// Type may differ (2026-10-27, user playing a Q8_0-trained head on the Q6 production file): the file tensor is
+// dequantized to f32 with the source type's to_float and requantized with ggml_quantize_chunk into the model's
+// type. Needs a source type with to_float (every quant and f16/bf16 have one) and a destination type that does
+// not want an imatrix (iq2/iq3 families refuse). Rows must be a multiple of the destination block size; the
+// NextN block's ne[0] are 5120/6144/10240/17408, all multiples of 256, so every K-quant works. The extra Q6_K
+// rounding on top of the Q8_0 head costs about what Q8 cost on top of f32: 0.00005 top-1 (measured 2026-10-26).
+int32_t llama_model_load_mtp_head(struct llama_model * model, const char * path) {
+    const auto & hp = model->hparams;
+    if (hp.n_layer_all <= hp.n_layer()) {
+        LLAMA_LOG_ERROR("%s: model has no NextN/MTP block, cannot load '%s'\n", __func__, path);
+        return -1;
+    }
+
+    ggml_context * meta_raw = nullptr;
+    gguf_init_params gparams = { /*.no_alloc =*/ true, /*.ctx =*/ &meta_raw };
+    gguf_context_ptr gctx(gguf_init_from_file(path, gparams));
+    ggml_context_ptr meta(meta_raw);
+    if (!gctx) {
+        LLAMA_LOG_ERROR("%s: failed to open '%s' as GGUF\n", __func__, path);
+        return -1;
+    }
+
+    struct item {
+        int64_t       idx;
+        ggml_tensor * dst;
+    };
+    std::vector<item> items;
+    int n_err = 0;
+
+    const int64_t n_tensors = gguf_get_n_tensors(gctx.get());
+    for (int64_t i = 0; i < n_tensors; ++i) {
+        const char * name = gguf_get_tensor_name(gctx.get(), i);
+
+        bool in_nextn = false;
+        for (uint32_t il = hp.n_layer(); il < hp.n_layer_all; ++il) {
+            const std::string pfx = "blk." + std::to_string(il) + ".";
+            in_nextn = in_nextn || strncmp(name, pfx.c_str(), pfx.size()) == 0;
+        }
+        if (!in_nextn) {
+            LLAMA_LOG_ERROR("%s: '%s': tensor '%s' is not in a NextN block (blk.%u..blk.%u)\n", __func__, path, name, hp.n_layer(), hp.n_layer_all - 1);
+            n_err++;
+            continue;
+        }
+
+        ggml_tensor * dst = const_cast<ggml_tensor *>(model->get_tensor(name));
+        const ggml_tensor * src = ggml_get_tensor(meta.get(), name);
+        if (dst == nullptr) {
+            LLAMA_LOG_ERROR("%s: '%s': tensor '%s' does not exist in the model\n", __func__, path, name);
+            n_err++;
+            continue;
+        }
+        const bool convert = src->type != dst->type;
+        const bool can_convert = convert && ggml_are_same_shape(src, dst)
+            && ggml_get_type_traits(src->type)->to_float != nullptr
+            && !ggml_quantize_requires_imatrix(dst->type)
+            && (dst->ne[0] % ggml_blck_size(dst->type)) == 0;
+        if (!ggml_are_same_shape(src, dst) || (convert && !can_convert)) {
+            LLAMA_LOG_ERROR("%s: '%s': tensor '%s' mismatch: file %s [%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "], model %s [%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "]\n",
+                    __func__, path, name,
+                    ggml_type_name(src->type), src->ne[0], src->ne[1], src->ne[2], src->ne[3],
+                    ggml_type_name(dst->type), dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
+            n_err++;
+            continue;
+        }
+        // a host buffer may be the read-only mmap of the model file
+        if (dst->buffer == nullptr || (ggml_backend_buffer_is_host(dst->buffer) && model->has_mmaps())) {
+            LLAMA_LOG_ERROR("%s: '%s': tensor '%s' sits in a host (possibly mmap) buffer, use --no-mmap or keep the MTP block on a GPU\n", __func__, path, name);
+            n_err++;
+            continue;
+        }
+        items.push_back({ i, dst });
+    }
+
+    if (n_err > 0 || items.empty()) {
+        LLAMA_LOG_ERROR("%s: '%s': %d error(s), %zu usable tensor(s), nothing written\n", __func__, path, n_err, items.size());
+        return -1;
+    }
+
+    try {
+        llama_file f(path, "rb");
+        const size_t data_off = gguf_get_data_offset(gctx.get());
+        std::vector<uint8_t> buf, out;
+        std::vector<float>   f32;
+        size_t n_conv = 0;
+        for (const auto & it : items) {
+            const ggml_tensor * src = ggml_get_tensor(meta.get(), ggml_get_name(it.dst));
+            const size_t nbytes_src = gguf_get_tensor_size(gctx.get(), it.idx);
+            GGML_ASSERT(nbytes_src == ggml_nbytes(src));
+            buf.resize(nbytes_src);
+            f.seek(data_off + gguf_get_tensor_offset(gctx.get(), it.idx), SEEK_SET);
+            f.read_raw(buf.data(), nbytes_src);
+            if (src->type == it.dst->type) {
+                ggml_backend_tensor_set(it.dst, buf.data(), 0, nbytes_src);
+                continue;
+            }
+            // type conversion: file -> f32 -> model type (see the header comment)
+            const int64_t n_el = ggml_nelements(src);
+            f32.resize(n_el);
+            ggml_get_type_traits(src->type)->to_float(buf.data(), f32.data(), n_el);
+            const size_t nbytes_dst = ggml_nbytes(it.dst);
+            out.resize(nbytes_dst);
+            const int64_t nrows = n_el / src->ne[0];
+            const size_t written = ggml_quantize_chunk(it.dst->type, f32.data(), out.data(), 0, nrows, src->ne[0], nullptr);
+            GGML_ASSERT(written == nbytes_dst);
+            ggml_backend_tensor_set(it.dst, out.data(), 0, nbytes_dst);
+            n_conv++;
+        }
+        if (n_conv > 0) {
+            LLAMA_LOG_WARN("%s: %zu tensor(s) requantized from the file type to the model type\n", __func__, n_conv);
+        }
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: '%s': read failed: %s\n", __func__, path, e.what());
+        return -1;
+    }
+
+    LLAMA_LOG_WARN("%s: replaced %zu NextN tensor(s) from '%s'\n", __func__, items.size(), path);
+    return (int32_t) items.size();
 }
 
 int32_t llama_model_n_expert(const struct llama_model * model) {

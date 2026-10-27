@@ -528,6 +528,10 @@ llama_context::llama_context(
         if (graph_reuse_disable) {
             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
         }
+
+        // [GRAPH_REUSE_PP] A/B knob, see llama_graph_reuse_allowed
+        const char * LLAMA_GRAPH_REUSE_PP = getenv("LLAMA_GRAPH_REUSE_PP");
+        graph_reuse_pp = LLAMA_GRAPH_REUSE_PP ? (atoi(LLAMA_GRAPH_REUSE_PP) != 0) : false;
     }
 
     // [LLAMA_DECODE_STATS] ids are handed out even when off, so they stay stable across runs
@@ -1964,6 +1968,28 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+// [GRAPH_REUSE_PP, fork 2026-10-27] may a ubatch reuse the previous graph? Not while pipeline parallelism is on and the
+// llama_decode call is split into more than one ubatch, unless LLAMA_GRAPH_REUSE_PP=1 (env_reuse_pp). Why: the reuse
+// branch of process_ubatch must drain the sched before set_inputs (the reused graph's input tensors are the ones the
+// previous, still running ubatch reads), and inside a multi-ubatch batch that drain serializes the cards. A rebuilt
+// graph goes through ggml_backend_sched_alloc_graph, which rotates cur_copy (n_copies input copies), so its inputs do
+// not alias the in-flight graph's and no drain is needed. Single-ubatch decodes keep reuse: the caller synchronized
+// (it read the logits) so the drain there is free. Measured 2026-10-27, Qwen3.8-27B Q6, Vulkan2,Vulkan3,Vulkan1,
+// -b 8192 -ub 512, 8192-token prompt batches (LLAMA_DECODE_STATS): n_reused 0 of 16 -> 6.97-7.6 s, cards overlap;
+// n_reused 14-15 of 16 -> 12.4-14.0 s, graph g+1 starts on the first card 14 ms after graph g ends on the LAST card
+// (fully serial, t_other_us = 12.4 s of waiting). Rebuild = ~3 ms/ubatch (t_graph_build_us) vs ~500 ms per drain.
+// Reuse vs no reuse per batch was luck (a realloc at batch start, e.g. model.input_embed GET_ROWS growth, forces a
+// rebuild; the early-prebuild work otherwise made reuse likely), hence 7 or 13 s for the same prompt. No reuse in
+// prompt batches is the path every earlier gate ran on (2026-10-22 production: 8192-token first batch in 3.42 s =
+// 2398 t/s at -ub 512). Unit test: tests/test-graph-reuse-pp.cpp.
+bool llama_graph_reuse_allowed(bool pipeline_parallel, uint32_t n_ubatches_in_batch, bool env_reuse_pp) {
+    return !pipeline_parallel || n_ubatches_in_batch <= 1 || env_reuse_pp;
+}
+
+int32_t llama_perf_context_n_reuse_skipped_pp(const llama_context * ctx) {
+    return ctx ? ctx->perf_n_reuse_skipped_pp() : 0;
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (dstats_on) {
         dstats.n_ubatch++;
@@ -1986,7 +2012,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    // [GRAPH_REUSE_PP] see llama_graph_reuse_allowed for the numbers. cur_n_ubatches is set by decode_impl (1 for
+    // encode). can_reuse is still evaluated when the rule says no, only to count n_reuse_skipped_pp; the graph is then
+    // reset and rebuilt below, so any state can_reuse touched is discarded. The KQ_MASK_INC drain below and the
+    // kq_build_check drain are separate (device-side writes outside the compute queue) and stay as they are.
+    const bool reuse_ok = llama_graph_reuse_allowed(cparams.pipeline_parallel, cur_n_ubatches, graph_reuse_pp);
+    const bool reusable = !graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams);
+    if (reusable && !reuse_ok) {
+        n_reuse_skipped_pp++;
+        if (dstats_on) {
+            dstats.n_reuse_skipped_pp++;
+        }
+    }
+
+    if (reusable && reuse_ok) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -2193,6 +2232,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
     cparams.causal_attn = false;
 
     ggml_status status;
+    cur_n_ubatches = 1; // [GRAPH_REUSE_PP] encode runs the whole batch as one ubatch
     const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_ENCODER, nullptr, status);
 
     cparams.causal_attn = causal_attn_org;
@@ -3097,13 +3137,13 @@ void llama_context::dstats_emit(int ret, int64_t t_start_us, uint32_t n_tokens, 
     char buf[1536];
     snprintf(buf, sizeof(buf),
             "{\"t\":%.6f,\"ctx\":%d,\"n_layer\":%u,\"n_rs_seq\":%u,\"ret\":%d,\"n_tokens\":%u,\"n_ubatch\":%d,\"n_outputs\":%u,"
-            "\"graph_reused\":%s,\"n_reused\":%d,\"n_nodes\":%d,\"n_splits\":%d,\"n_nodes_cpu\":%d,"
+            "\"graph_reused\":%s,\"n_reused\":%d,\"n_reuse_skipped_pp\":%d,\"n_nodes\":%d,\"n_splits\":%d,\"n_nodes_cpu\":%d,"
             "\"t_total_us\":%" PRId64 ",\"t_mem_apply_us\":%" PRId64 ",\"t_graph_reserve_us\":%" PRId64 ",\"t_graph_build_us\":%" PRId64 ","
             "\"t_sched_alloc_us\":%" PRId64 ",\"t_sched_split_us\":%s,\"t_sched_galloc_us\":%s,\"t_set_inputs_us\":%" PRId64 ",\"t_compute_us\":%" PRId64 ","
             "\"t_output_reserve_us\":%" PRId64 ",\"t_output_us\":%" PRId64 ",\"t_mem_commit_us\":%" PRId64 ",\"t_other_us\":%" PRId64 ","
             "\"t_sync_prev_us\":%" PRId64 ",\"rs_depth_max\":%d",
             t_unix, dstats_ctx_id, model.hparams.n_layer(), cparams.n_rs_seq, ret, n_tokens, d.n_ubatch, n_outputs_all,
-            (d.n_ubatch > 0 && d.n_reused == d.n_ubatch) ? "true" : "false", d.n_reused, dstats_n_nodes, dstats_n_splits, dstats_n_cpu,
+            (d.n_ubatch > 0 && d.n_reused == d.n_ubatch) ? "true" : "false", d.n_reused, d.n_reuse_skipped_pp, dstats_n_nodes, dstats_n_splits, dstats_n_cpu,
             t_total, d.t_mem_apply, d.t_graph_reserve, d.t_graph_build,
             d.t_sched_alloc, ssplit, sgalloc, d.t_set_inputs, d.t_compute,
             d.t_output_reserve, d.t_output, d.t_mem_commit, t_total - t_named,
@@ -3665,6 +3705,14 @@ int llama_context::decode_impl(const llama_batch_ext & batch_inp) {
     }
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
+
+    // [GRAPH_REUSE_PP] ubatch count of this call for llama_graph_reuse_allowed: the first ubatch covers the whole batch
+    // -> 1, else ceil(n_tokens_all / first ubatch size). Exact for 1 vs > 1 (all the rule needs); split_equal can make
+    // the real count larger than the estimate
+    {
+        const uint32_t n_first = mctx->get_ubatch().n_tokens;
+        cur_n_ubatches = (n_first == 0 || n_first >= n_tokens_all) ? 1 : (n_tokens_all + n_first - 1) / n_first;
+    }
 
     do {
         const auto & ubatch = mctx->get_ubatch();
@@ -5470,6 +5518,7 @@ void llama_context::perf_reset() {
     t_eval_us   = n_eval = 0;
     t_p_eval_us = n_p_eval = 0;
     n_reused    = 0;
+    n_reuse_skipped_pp = 0;
 }
 
 llama_memory_breakdown llama_context::memory_breakdown() const {
@@ -6502,7 +6551,7 @@ void llama_perf_context_print(const llama_context * ctx) {
     LLAMA_LOG_INFO("%s:        eval time = %10.2f ms / %5d runs   (%8.2f ms per token, %8.2f tokens per second)\n",
             __func__, data.t_eval_ms, data.n_eval, data.t_eval_ms / data.n_eval, 1e3 / data.t_eval_ms * data.n_eval);
     LLAMA_LOG_INFO("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (t_end_ms - data.t_start_ms), (data.n_p_eval + data.n_eval));
-    LLAMA_LOG_INFO("%s:    graphs reused = %10d\n", __func__, data.n_reused);
+    LLAMA_LOG_INFO("%s:    graphs reused = %10d (pp skipped %d)\n", __func__, data.n_reused, llama_perf_context_n_reuse_skipped_pp(ctx));
 }
 
 void llama_perf_context_reset(llama_context * ctx) {

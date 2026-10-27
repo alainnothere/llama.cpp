@@ -375,7 +375,10 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
             return true;
         }
 
-        const int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        // [MTP_CHUNK] 2026-10-27: the copy is a subset of batch_in, so it only exceeds the draft n_batch when the draft
+        // context was built with a smaller n_batch than the target. chunk anyway instead of aborting in get_sub_batch;
+        // the only output row is the last kept one, which lands in the last chunk. no draft step reads it today
+        const int ret = common_batch_decode_chunked(ctx_dft, batch, (int32_t) llama_n_batch(ctx_dft));
 
         if (ret != 0) {
             SPC_ERR("failed to decode draft batch, ret = %d\n", ret);
@@ -827,7 +830,9 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         }
 
         if (batch.size() > 0) {
-            const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            // [MTP_CHUNK] 2026-10-27: at most one bridge row per seq replaces the dropped last row of that seq, so
+            // the batch is <= batch_in.size(); chunked anyway (no output rows) so a smaller draft n_batch cannot abort
+            const int32_t rc = common_batch_decode_chunked(ctx_dft, batch, (int32_t) llama_n_batch(ctx_dft));
             if (rc != 0) {
                 SPC_ERR("llama_process(ctx_dft) failed rc=%d (n_tokens=%d, ubatch_pos[0]=%d)\n",
                         rc, (int) batch.size(), (int) batch_in.tokens[0].pos[0]);
@@ -1918,6 +1923,28 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
             }
 
+            // [MTP_CHUNK] the catch-up batch is batch_in's kept rows PLUS one seed row per sequence that samples
+            // next, so it can be larger than n_batch, the capacity of the draft llama_batch_ext. crash 2026-10-27
+            // (production, -np 2, -b 8192 -ub 512, Qwen3.8-27B, draft-mtp,ngram-mod): slot 1 was generating (its
+            // verify rows ~15 entries), slot 0 started a 16571-token prompt and the server filled the shared
+            // batch to n_batch: 8177 + 15 = 8192 rows, + 1 seed row for slot 1 = 8193 > 8192, and
+            // batch.get() = get_sub_batch(0, 8193) hit GGML_ABORT in common_batch::get_sub_batch.
+            // fix: decode in chunks of llama_n_batch(ctx_dft). safe for the MTP head because each row carries its
+            // own (token, pos, h) input and the chunks go in batch order, so a sequence's rows still reach the
+            // draft KV in position order, the same thing llama_decode does when it splits into ubatches.
+            // the h rows are read from ctx_tgt by batch_in index (k - 1, ith(k)) above, before any decode, so
+            // chunking does not move them. what chunking does change: output rows are only readable for the
+            // last chunk, so a seed whose row landed in an earlier chunk is marked stale below and draft()
+            // decodes its first row again (one extra 1-row decode, only on steps that overflow).
+            // unverified on the GPUs (owner's cards); CPU unit test: tests/test-speculative-batch-chunks.cpp
+            const int32_t n_batch_dft = (int32_t) llama_n_batch(ctx_dft);
+            if (batch.size() > n_batch_dft) {
+                SPC_WRN("catch-up batch of %d rows exceeds n_batch %d of the draft context (%d target rows), decoding in chunks\n",
+                        (int) batch.size(), (int) n_batch_dft, (int) n_tokens);
+            }
+
+            int32_t off_last = 0;
+
             bool ok = true;
             for (int head = 0; head < n_mtp_layers; ++head) {
                 if (chain_heads) {
@@ -1931,10 +1958,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
-                const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                const int32_t rc = common_batch_decode_chunked(ctx_dft, batch, n_batch_dft, &off_last);
                 if (rc != 0) {
-                    SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
-                            head, (int) rc, (int) batch_in.tokens[0].pos[0]);
+                    SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d, rows=%d, n_batch=%d)\n",
+                            head, (int) rc, (int) batch_in.tokens[0].pos[0], (int) batch.size(), (int) n_batch_dft);
                     ok = false;
                     break;
                 }
@@ -1947,9 +1974,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 if (next_tok[seq_id] != LLAMA_TOKEN_NULL) {
-                    seeds[seq_id].gen = n_dec;
+                    auto & sd = seeds[seq_id];
                     if (!ok) {
-                        seeds[seq_id] = {};
+                        sd = {};
+                    } else if (sd.idx < off_last) {
+                        // [MTP_CHUNK] the seed's output row was overwritten by a later chunk. keep pos so
+                        // draft() removes the row from ctx_dft KV; gen can never equal n_dec, so use_seed fails
+                        sd.gen = UINT64_MAX;
+                    } else {
+                        // output index inside the last chunk
+                        sd.idx -= off_last;
+                        sd.gen  = n_dec;
                     }
                 }
             }
@@ -2081,6 +2116,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             if (i > 0 || !use_seed) {
+                // [MTP_CHUNK] every row of a draft step is an output that is sampled below, so this batch cannot be
+                // chunked. it holds one row per drafting seq (n_seq * prefix for chained heads), far below n_batch,
+                // but an overflow must drop the draft, not abort the server through get_sub_batch (2026-10-27)
+                if (batch.size() > (int32_t) llama_n_batch(ctx_dft)) {
+                    SPC_ERR("draft step %d batch of %d rows exceeds n_batch %d of the draft context, dropping the step\n",
+                            i, (int) batch.size(), (int) llama_n_batch(ctx_dft));
+                    break;
+                }
                 int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
                 if (ret != 0) {
                     SPC_ERR("llama_process[%d] returned %d\n", i, ret);

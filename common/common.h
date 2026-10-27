@@ -593,6 +593,7 @@ struct common_params {
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
 
     std::vector<common_control_vector_load_info> control_vectors; // control vector with user defined scale
+    std::string mtp_head; // GGUF with replacement NextN/MTP block tensors, applied after model load (--mtp-head)
 
     int32_t verbosity                  = 3;  // LOG_LEVEL_INFO
     int32_t control_vector_layer_start = -1; // layer range for control vector
@@ -1181,6 +1182,15 @@ struct common_batch {
 
     int32_t size() const { return (int32_t) tokens.size(); }
 };
+
+// decode all entries of batch with llama_process(DECODE) in chunks of at most n_batch entries
+// (n_batch <= 0 or larger than llama_n_batch(ctx): llama_n_batch(ctx), the capacity of the llama_batch_ext)
+// returns 0 on success or the first non-zero llama_process() result; chunks after a failure are not submitted
+// output rows are only readable for the LAST chunk: batch index i of that chunk is output index i - *off_last
+// (off_last may be null). an output row in an earlier chunk is overwritten by the next chunk's decode
+// n_chunks (may be null) receives the number of llama_process() calls submitted
+int32_t common_batch_decode_chunked(struct llama_context * ctx, common_batch & batch, int32_t n_batch,
+                                    int32_t * off_last = nullptr, int32_t * n_chunks = nullptr);
 
 // create a single-sequence batch from a list of tokens
 // positions continue from the memory, last token always have output_logits set to true

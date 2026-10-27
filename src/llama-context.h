@@ -211,6 +211,7 @@ struct llama_context {
 
     llama_perf_context_data perf_get_data() const;
     void perf_reset();
+    int32_t perf_n_reuse_skipped_pp() const { return n_reuse_skipped_pp; } // [GRAPH_REUSE_PP]
 
     llama_memory_breakdown memory_breakdown() const;
 
@@ -457,6 +458,12 @@ private:
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
 
+    // [GRAPH_REUSE_PP] env: LLAMA_GRAPH_REUSE_PP=1 restores reuse + full sched drain inside multi-ubatch batches when
+    // pipeline parallelism is on (see llama_graph_reuse_allowed and the site comment in process_ubatch)
+    bool     graph_reuse_pp      = false;
+    uint32_t cur_n_ubatches      = 1; // ubatches of the llama_decode call in progress (estimate, exact for 1 vs > 1)
+    int32_t  n_reuse_skipped_pp  = 0; // reusable graphs rebuilt because of the rule above, since perf_reset
+
     // perf
     mutable int64_t t_start_us  = 0;
     mutable int64_t t_load_us   = 0;
@@ -545,6 +552,7 @@ public:
         int64_t t_mem_commit     = 0; // error-path seq_rm only, this tree has no commit phase
         int32_t n_ubatch         = 0;
         int32_t n_reused         = 0;
+        int32_t n_reuse_skipped_pp = 0; // [GRAPH_REUSE_PP] can_reuse passed, rebuilt to keep the pipeline overlap
         // 2026-10-21: ggml_backend_sched_stats of every graph computed in this call, summed (see dstats_fold_sched)
         int32_t s_n_graphs       = 0;
         int32_t s_n_splits       = 0;
