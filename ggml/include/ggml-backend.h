@@ -183,6 +183,11 @@ extern "C" {
     GGML_API const char *                  ggml_backend_dev_name(ggml_backend_dev_t device);
     GGML_API const char *                  ggml_backend_dev_description(ggml_backend_dev_t device);
     GGML_API void                          ggml_backend_dev_memory(ggml_backend_dev_t device, size_t * free, size_t * total);
+    // [fork, 2026-10-27] optional reg proc (ggml_backend_reg_get_proc_address): a backend whose dev_memory reports a
+    // kernel view (ggml-vulkan on amdgpu: sysfs mem_info_vram_*) returns its driver-budget reading here (true), so a
+    // caller can print both; false = dev_memory already is that reading. Read-only, never used for placement.
+    #define GGML_BACKEND_FORK_DEV_MEMORY_BUDGET_PROC "ggml_backend_fork_dev_memory_budget"
+    typedef bool (*ggml_backend_fork_dev_memory_budget_t)(ggml_backend_dev_t device, size_t * free, size_t * total);
     GGML_API enum ggml_backend_dev_type    ggml_backend_dev_type(ggml_backend_dev_t device);
     GGML_API void                          ggml_backend_dev_get_props(ggml_backend_dev_t device, struct ggml_backend_dev_props * props);
     GGML_API ggml_backend_reg_t            ggml_backend_dev_backend_reg(ggml_backend_dev_t device);
@@ -586,6 +591,12 @@ extern "C" {
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
+    // [fork, 2026-10-27] backend scratch the reserve sized for this backend (ggml_backend_fork_scratch_i in
+    // ggml-backend-impl.h; 0 for backends without it). NOT part of ggml_backend_sched_get_buffer_size: the backend
+    // allocates it in its own buffers. ggml_backend_sched_reserve / _reserve_size size it themselves; a caller that
+    // only splits a reserve graph (llama_context no_alloc probes) calls ggml_backend_sched_size_scratch after the split.
+    GGML_API size_t                     ggml_backend_sched_get_scratch_size(ggml_backend_sched_t sched, ggml_backend_t backend);
+    GGML_API void                       ggml_backend_sched_size_scratch(ggml_backend_sched_t sched);
 
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);

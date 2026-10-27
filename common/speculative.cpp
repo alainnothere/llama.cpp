@@ -1513,6 +1513,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<uint8_t>     vs_in;     // [n_vocab] membership of vs_ids
     size_t                   vs_n_base = 0; // file + forced part of vs_ids
     static constexpr size_t  vs_ctx_max = 32768; // 230-290k conversations hold 6.8-9.2k distinct ids (1517)
+    // ^ also the prompt allowance of the fit's reserve for this head (common_fit_vocab_subset_bytes, fit.cpp): change both
 
     bool vs_add(llama_token t) {
         if (t < 0 || t >= (llama_token) vs_in.size() || vs_in[t]) {

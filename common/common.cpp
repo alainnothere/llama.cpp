@@ -1260,10 +1260,37 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             /*.shares_model =*/ !has_draft, // an MTP context runs on the weights of the main model
         };
 
+        // [fork, 2026-10-27] --spec-draft-vocab-subset: the subset head (llama_set_logits_subset) is allocated after
+        // the fit, on the device of model.output, so it goes into that device's margin, like the server's mmproj
+        // reserve. model.output sits on the device of the last layer, which is the last device of the list (the fit
+        // fills from the last device backwards; a user -ts makes the fit abort anyway). Production 2026-10-27:
+        // 32769-line file -> 33280-row live list = 181 MB of Q8_0 rows, bound 346 MiB (common_fit_vocab_subset_bytes).
+        // A local copy, so a second common_init_result does not add it twice.
+        std::vector<size_t> fit_targets = params.fit_params_target;
+        if ((has_draft || spec_mtp) && !params.speculative.draft.vocab_subset_path.empty()) {
+            const std::string & path_head = has_draft ? params_dft.model.path : params.model.path;
+            const size_t vs_bytes = common_fit_vocab_subset_bytes(path_head.c_str(), params.speculative.draft.vocab_subset_path.c_str());
+            const std::vector<ggml_backend_dev_t> fit_devs = common_fit_devices(params.devices);
+            const std::vector<ggml_backend_dev_t> head_devs = has_draft && !params.speculative.draft.devices.empty()
+                ? common_fit_devices(params.speculative.draft.devices) : fit_devs;
+            bool added = false;
+            for (size_t i = 0; vs_bytes > 0 && !head_devs.empty() && i < fit_devs.size() && i < fit_targets.size(); i++) {
+                if (fit_devs[i] == head_devs.back()) {
+                    fit_targets[i] += vs_bytes;
+                    added = true;
+                    COM_TRC("vocab subset head: reserving %.2f MiB on %s\n", vs_bytes / (1024.0 * 1024.0), ggml_backend_dev_name(fit_devs[i]));
+                    break;
+                }
+            }
+            if (vs_bytes > 0 && !added) {
+                COM_WRN("vocab subset head (%.2f MiB) is not on a device the fit places, not reserved\n", vs_bytes / (1024.0 * 1024.0));
+            }
+        }
+
         common_fit_params(params.model.path.c_str(), &mparams, &cparams,
             params.tensor_split,
             params.tensor_buft_overrides.data(),
-            params.fit_params_target.data(),
+            fit_targets.data(),
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra : nullptr,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);

@@ -97,6 +97,11 @@ void ggml_vk_mem_watch_graph(vk_device& device);
 // [fork, 2026-10-22] kernel-side view (sysfs mem_info_gtt_used / mem_info_vram_used of the device's PCI node);
 // false when there is no such node (not Linux, not amdgpu, no VK_EXT_pci_bus_info, UMA device)
 bool ggml_vk_gtt_watch_read(vk_device& device, uint64_t & gtt_used, uint64_t & vram_used);
+// [fork, 2026-10-27] sysfs VRAM view behind ggml_backend_vk_get_device_memory (amdgpu only, see ggml-vulkan-buffers.cpp);
+// ggml_vk_get_device_memory_budget is the VK_EXT_memory_budget path it falls back to (and what RADV-labelled lines print)
+std::string ggml_vk_sysfs_mem_dir(vk::PhysicalDevice & pd);
+bool ggml_vk_sysfs_mem_read(const std::string & dir, uint64_t & free, uint64_t & total);
+void ggml_vk_get_device_memory_budget(int device, size_t * free, size_t * total);
 // [fork, 2026-10-22] one WARN line per lazy scratch / ring growth, rate limited by *counter (first 8, then every 64th)
 void ggml_vk_scratch_grow_log(vk_device& device, const char * which, size_t old_size, size_t new_size, uint32_t * counter);
 void ggml_vk_destroy_buffer(vk_buffer& buf);

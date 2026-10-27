@@ -124,13 +124,33 @@ llama_memory_recurrent::llama_memory_recurrent(
     }
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
+    //
+    // [fork, 2026-10-27] no_alloc (the --fit probes, common/fit.cpp common_get_device_memory_data_impl): a zero-size
+    // dummy buffer like llama_kv_cache and llama_model, sized by memory_breakdown() below. Upstream (and this fork
+    // until this date) allocated the RS planes FOR REAL in every probe, while the fit read device "free" with the
+    // probe context still alive: the RS memory was counted once as placed (KV/RS) and once more as missing from free.
+    // Measured 2026-10-27, Qwen3.8-27B Q6, production spec flags (n_rs_seq sized by the n-gram cap 48), -fit on: free at fit was
+    // 2975 / 2975 / 2004 MiB below VRAM on the XT / XTX / XTX while the cards were idle (the summary-time budget read
+    // total - 57 MiB). The split was 23 / 24 / 19 layers = 18 / 18 / 12 GDN layers, i.e. ~165 MiB of RS per GDN layer
+    // on each card - the gap is exactly the probe's own RS buffers. The fit landed n_ctx 323328 with that ~3 GB
+    // double count on the limiting XT (est. free 681 MiB vs ~3.6 GB the kernel showed). The fit now also samples
+    // free before the probe loads anything (fit.cpp), so any other real allocation in a probe is not double counted.
     for (auto & [buft, ctx] : ctx_map) {
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+        ggml_backend_buffer_t buf;
+        if (hparams.no_alloc) {
+            buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                t->buffer = buf; // so that the backend scheduler won't try to allocate the RS planes
+            }
+        } else {
+            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+        }
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for rs cache");
         }
-        ggml_backend_buffer_clear(buf, 0);
-        LLAMA_LOG_INFO("%s: %10s RS buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+        ggml_backend_buffer_clear(buf, 0); // no-op on the zero-size dummy
+        LLAMA_LOG_INFO("%s: %10s RS buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf),
+                (hparams.no_alloc ? ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft) : ggml_backend_buffer_get_size(buf))/1024.0/1024.0);
 
         // CPU PLACEMENT warning #2 of 3 (2026-10-20), recurrent-state half (the KV half
         // is in llama_kv_cache's constructor).
@@ -613,8 +633,15 @@ uint32_t llama_memory_recurrent::get_rs_budget(llama_seq_id seq_id) const {
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
-    for (const auto & [_, buf] : ctxs_bufs) {
-        ret[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
+    for (const auto & [ctx, buf] : ctxs_bufs) {
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
+        if (hparams.no_alloc) {
+            // [fork, 2026-10-27] the probe's dummy buffer (constructor): report what the real allocation would take
+            GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) == nullptr);
+            ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
+        } else {
+            ret[buft] += ggml_backend_buffer_get_size(buf.get());
+        }
     }
     return ret;
 }

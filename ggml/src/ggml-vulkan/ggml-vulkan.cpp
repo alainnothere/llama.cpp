@@ -7252,6 +7252,11 @@ static vk_pipeline ggml_vk_get_64b_indexing_pipeline(ggml_backend_vk_context * c
     return pipeline;
 }
 
+// [fork, 2026-10-27] the reserve-time scratch sizing runs the op functions on unallocated tensors (buffer == NULL)
+static ggml_backend_vk_buffer_context * ggml_vk_buf_ctx_or_null(const ggml_tensor * t) {
+    return t->buffer ? (ggml_backend_vk_buffer_context *)t->buffer->context : nullptr;
+}
+
 static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool disable_split_k) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_q_f16((" << src0 << ", name=" << src0->name << ", type=" << ggml_type_name(src0->type) << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << ggml_type_name(src1->type) << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
@@ -7277,9 +7282,9 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const uint64_t r2 = ne12 / ne02;
     const uint64_t r3 = ne13 / ne03;
 
-    ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
-    ggml_backend_vk_buffer_context * src0_buf_ctx = (ggml_backend_vk_buffer_context *)src0->buffer->context;
-    ggml_backend_vk_buffer_context * src1_buf_ctx = (ggml_backend_vk_buffer_context *)src1->buffer->context;
+    ggml_backend_vk_buffer_context * dst_buf_ctx = ggml_vk_buf_ctx_or_null(dst);
+    ggml_backend_vk_buffer_context * src0_buf_ctx = ggml_vk_buf_ctx_or_null(src0);
+    ggml_backend_vk_buffer_context * src1_buf_ctx = ggml_vk_buf_ctx_or_null(src1);
 
     vk_buffer d_Qx = nullptr;
     size_t qx_buf_offset = 0;
@@ -7412,6 +7417,9 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         if (split_k > 1 && ctx->prealloc_size_split_k < split_k_size) {
             ctx->prealloc_size_split_k = split_k_size;
             ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+        if (ctx->scratch_dry_run) {
+            return;   // reserve-time sizing only (ggml_vk_graph_size_scratch)
         }
 
         // Request descriptor sets
@@ -7759,6 +7767,9 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
         if ((qy_needs_dequant || quantize_y) && ctx->prealloc_size_y < y_sz) {
             ctx->prealloc_size_y = y_sz;
             ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+        if (ctx->scratch_dry_run) {
+            return;   // reserve-time sizing only (ggml_vk_graph_size_scratch)
         }
 
         // Request descriptor sets
@@ -8416,6 +8427,9 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
             ggml_vk_mmvq_slope_path(ctx, "m-split %s", inner.c_str());
         }
     } else if (ggml_vk_can_use_fwht(ctx, src1, dst)) {
+        if (ctx->scratch_dry_run) {
+            return;   // no prealloc scratch on this path
+        }
         ggml_vk_fwht(ctx, subctx, src1, dst);
         ggml_vk_mmvq_slope_path(ctx, "fwht");
     } else if (src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && dst->ne[1] == 1 &&
@@ -8430,6 +8444,9 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
         src1->ne[3] == 1 &&
         src0->ne[1] <= ctx->device->properties.limits.maxComputeWorkGroupCount[1] &&
         src1->ne[2] <= ctx->device->properties.limits.maxComputeWorkGroupCount[2]) {
+        if (ctx->scratch_dry_run) {
+            return;   // no prealloc scratch on this path
+        }
         ggml_vk_mul_mat_vec_p021_f16_f32(ctx, subctx, cgraph, node_idx);
         ggml_vk_mmvq_slope_path(ctx, "p021");
     } else if (src0->type == GGML_TYPE_F16 && !ggml_is_contiguous(src0) && !ggml_is_transposed(src1) && dst->ne[1] == 1 &&
@@ -8437,6 +8454,9 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
                src0->ne[3] <= ctx->device->properties.limits.maxComputeWorkGroupCount[0] &&
                src0->ne[1] <= ctx->device->properties.limits.maxComputeWorkGroupCount[1] &&
                src1->ne[2] <= ctx->device->properties.limits.maxComputeWorkGroupCount[2]) {
+        if (ctx->scratch_dry_run) {
+            return;   // no prealloc scratch on this path
+        }
         ggml_vk_mul_mat_vec_nc_f16_f32(ctx, subctx, cgraph, node_idx);
         ggml_vk_mmvq_slope_path(ctx, "nc");
     // With one output row, B^T*A has the same flat output as A^T*B.
@@ -8518,10 +8538,10 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                                 hoisted_row_id_words * sizeof(uint32_t) <=
                                     ctx->device->properties.limits.maxStorageBufferRange;
 
-    ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
-    ggml_backend_vk_buffer_context * src0_buf_ctx = (ggml_backend_vk_buffer_context *)src0->buffer->context;
-    ggml_backend_vk_buffer_context * src1_buf_ctx = (ggml_backend_vk_buffer_context *)src1->buffer->context;
-    ggml_backend_vk_buffer_context * ids_buf_ctx = (ggml_backend_vk_buffer_context *)ids->buffer->context;
+    ggml_backend_vk_buffer_context * dst_buf_ctx = ggml_vk_buf_ctx_or_null(dst);
+    ggml_backend_vk_buffer_context * src0_buf_ctx = ggml_vk_buf_ctx_or_null(src0);
+    ggml_backend_vk_buffer_context * src1_buf_ctx = ggml_vk_buf_ctx_or_null(src1);
+    ggml_backend_vk_buffer_context * ids_buf_ctx = ggml_vk_buf_ctx_or_null(ids);
 
     vk_buffer d_Qx = nullptr;
     size_t qx_buf_offset = 0;
@@ -8683,6 +8703,9 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         if (ctx->prealloc_size_split_k < expert_data_size) {
             ctx->prealloc_size_split_k = expert_data_size;
             ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+        if (ctx->scratch_dry_run) {
+            return;   // reserve-time sizing only (ggml_vk_graph_size_scratch)
         }
 
         // Request descriptor sets
@@ -8951,6 +8974,9 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
         if ((qy_needs_dequant || quantize_y) && ctx->prealloc_size_y < y_sz) {
             ctx->prealloc_size_y = y_sz;
             ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+        if (ctx->scratch_dry_run) {
+            return;   // reserve-time sizing only (ggml_vk_graph_size_scratch)
         }
 
         // Request descriptor sets
@@ -9386,12 +9412,23 @@ static vk_subbuffer ggml_vk_fa_mask_scratch(ggml_backend_vk_context * ctx, vk_co
         for (const auto & e : ctx->mask_scratch_entries) {
             if (e.mask == mask && e.kind == kind && e.p0 == p0 && e.p1 == p1 && e.p2 == p2 && e.p3 == p3 && e.p4 == p4 && e.size >= size) {
                 cached = true;
+                if (ctx->scratch_dry_run) {
+                    return {};
+                }
                 return ggml_vk_subbuffer(ctx, ctx->prealloc_mask_scratch, e.offset);
             }
         }
     }
     const size_t align = std::max<size_t>(256, ctx->device->properties.limits.minStorageBufferOffsetAlignment);
     const size_t sz = CEIL_DIV(size, align) * align;
+    if (ctx->scratch_dry_run) {
+        // reserve-time sizing: the bytes one graph packs into the mask scratch (entries are reset around the walk)
+        ggml_backend_vk_context::mask_scratch_entry e { mask, kind, p0, p1, p2, p3, p4, ctx->mask_scratch_used, sz };
+        ctx->mask_scratch_entries.push_back(e);
+        ctx->mask_scratch_used += sz;
+        ctx->prealloc_size_mask_scratch = std::max(ctx->prealloc_size_mask_scratch, ctx->mask_scratch_used);
+        return {};
+    }
     if (ctx->prealloc_mask_scratch == nullptr || ctx->mask_scratch_used + sz > ctx->prealloc_mask_scratch->size) {
         // grow (doubling to limit reallocations); preallocate submits+waits, recreates the buffer
         // and clears the entries, so everything produced so far in this graph is recomputed.
@@ -9985,7 +10022,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                     ggml_vk_preallocate_buffers(ctx, subctx);
                 }
 
-                if (ctx->prealloc_x_need_sync) {
+                if (ctx->prealloc_x_need_sync && !ctx->scratch_dry_run) {
                     ggml_vk_sync_buffers(ctx, subctx);
                 }
             }
@@ -10037,6 +10074,69 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         : ctx->device->pipeline_fa_sparse_compact;
     if (use_sparse) {
         ggml_pipeline_request_descriptor_sets(ctx, sparse_compact_pipeline, 1);
+    }
+
+    // K/V scratch sizes and the prealloc_x layout [K f16 scratch][V f16 scratch][dense mask scratch], shared by the
+    // reserve-time sizing right below and by the dispatch further down (placement rules in "Where the K/V scratch lives").
+    const uint64_t kv_align = ctx->device->properties.limits.minStorageBufferOffsetAlignment;
+    const uint64_t k_sz = use_dequant_kv ? (uint64_t)ggml_nelements(k) * kv_scratch_ts : 0;
+    const uint64_t v_sz = use_dequant_kv ? (uint64_t)ggml_nelements(v) * kv_scratch_ts : 0;
+    // dense copy of a strided mask behind the K/V part of prealloc_x; returns its offset
+    auto fa_grow_x_for_mask = [&](uint64_t dq_kv_sz) -> uint64_t {
+        const uint64_t off = mask_dense ? 0 : ROUNDUP_POW2(dq_kv_sz, kv_align);
+        const uint64_t sz  = mask_dense ? 0 : (uint64_t)KV * nem1 * nem2 * nem3 * sizeof(ggml_fp16_t);
+        if (!mask_dense && ctx->prealloc_size_x < off + sz) {
+            ctx->prealloc_size_x = off + sz;
+            ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+        return off;
+    };
+    // K/V scratch in prealloc_x (not behind the dst). Grow once, not per ubatch (see "Where the K/V scratch lives").
+    // Strided raw copy without dst padding (padded dst over the 1 GiB suballocation block, i.e. above ~262k cells
+    // for Qwen3.8-27B: 350208 x 4096 B = 1368 MiB per XTX at -c 350000): straight to the whole-cache bound.
+    // Quantized dequant path: double, capped at the whole-cache f16 bound, so a short context does not take the
+    // full-context scratch up front; to_bound (the reserve-time sizing) takes the bound directly, because the fit
+    // must reserve what the longest prefill will grow to, whatever n_kv the reserve graph was built at.
+    auto fa_grow_x_for_kv = [&](bool to_bound) {
+        if (ctx->prealloc_size_x >= k_sz + v_sz && !to_bound) {
+            return;
+        }
+        const ggml_tensor * kr = k->view_src ? k->view_src : k;
+        const ggml_tensor * vr = v->view_src ? v->view_src : v;
+        const uint64_t bound = kv_raw_strided ? ggml_vk_fa_kv_scratch_bound(ctx->device, k, v, nullptr)
+                                              : (uint64_t)(ggml_nelements(kr) + ggml_nelements(vr)) * sizeof(ggml_fp16_t);
+        uint64_t want = k_sz + v_sz;
+        if (kv_raw_strided || to_bound) {
+            want = std::max(want, bound);
+        } else {
+            want = std::max(want, std::min(bound, (uint64_t)ctx->prealloc_size_x * 2));
+        }
+        if (ctx->prealloc_size_x < want) {
+            ctx->prealloc_size_x = want;
+            ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+    };
+
+    // [fork, 2026-10-27] reserve-time sizing (ggml_vk_graph_size_scratch): split_k / Intel xe sizes were raised above,
+    // here the mask-derived scratch and the prealloc_x K/V fallback, then nothing is recorded. The strided raw copy
+    // goes behind the dst exactly when the dst pad is non-zero: ggml_backend_vk_buffer_type_get_alloc_size gives every
+    // non-view FA dst that pad (the dispatch re-checks it on the real buffer), so then it is already in the compute
+    // buffer and adds nothing here. The bound is the root cache tensor (view_src, kv_size cells), so it does not
+    // matter that the reserve graph's K/V views may be shorter than the cache.
+    if (ctx->scratch_dry_run) {
+        bool cached = false;
+        if (use_mask_opt) {
+            ggml_vk_fa_mask_scratch(ctx, subctx, mask, 0, Br, Bc, nem0, nem1, nem2 * nem3, mask_opt_size, cached);
+        }
+        if (use_sparse) {
+            ggml_vk_fa_mask_scratch(ctx, subctx, mask, 1, (uint32_t)n_kv_max, KV, nem1, nem2, nem3, sparse_idx_size, cached);
+        }
+        const bool kv_behind_dst = kv_raw_strided && ggml_vk_fa_kv_scratch_dst_pad(ctx->device, dst) > 0;
+        fa_grow_x_for_mask((use_dequant_kv && !kv_behind_dst) ? k_sz + v_sz : 0);
+        if (use_dequant_kv && !kv_behind_dst) {
+            fa_grow_x_for_kv(true);
+        }
+        return;
     }
 
     const uint32_t n_head_kv   = neq2;
@@ -10115,9 +10215,6 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // each a full drain of the pipelined pp: first paste 586 t/s vs 1005 t/s on the second paste (ledger
     // 2026-10-24 18:06). No pipeline compile and no gallocr re-plan is involved (the cpy pipelines exist at startup,
     // the FA dst size did not depend on n_kv). The micro-measure is in the 2026-10-24 kv-scratch-presize report.
-    const uint64_t kv_align = ctx->device->properties.limits.minStorageBufferOffsetAlignment;
-    const uint64_t k_sz = use_dequant_kv ? (uint64_t)ggml_nelements(k) * kv_scratch_ts : 0;
-    const uint64_t v_sz = use_dequant_kv ? (uint64_t)ggml_nelements(v) * kv_scratch_ts : 0;
     vk_subbuffer k_dst{}, v_dst{};
     bool kv_in_dst = false;
     if (kv_raw_strided) {
@@ -10137,33 +10234,12 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         }
     }
     const uint64_t dq_kv_sz = (use_dequant_kv && !kv_in_dst) ? k_sz + v_sz : 0;
-    const uint64_t mask_scratch_off = mask_dense ? 0 : ROUNDUP_POW2(dq_kv_sz, kv_align);
+    const uint64_t mask_scratch_off = fa_grow_x_for_mask(dq_kv_sz);
     const uint64_t mask_scratch_sz  = mask_dense ? 0 : (uint64_t)KV * nem1 * nem2 * nem3 * sizeof(ggml_fp16_t);
-    if (!mask_dense && ctx->prealloc_size_x < mask_scratch_off + mask_scratch_sz) {
-        ctx->prealloc_size_x = mask_scratch_off + mask_scratch_sz;
-        ggml_vk_preallocate_buffers(ctx, subctx);
-    }
 
     if (use_dequant_kv) {
         if (!kv_in_dst) {
-            if (ctx->prealloc_size_x < k_sz + v_sz) {
-                // Grow once, not per ubatch (see above). Strided raw copy without dst padding (padded dst over the
-                // 1 GiB suballocation block, e.g. the 270k cap): straight to the whole-cache bound, the presize the
-                // reserve path could not do. Quantized dequant path (ungated, also grew per ubatch): double, capped at
-                // the whole-cache f16 bound, so a short context does not take the full-context scratch up front.
-                uint64_t want = k_sz + v_sz;
-                const ggml_tensor * kr = k->view_src ? k->view_src : k;
-                const ggml_tensor * vr = v->view_src ? v->view_src : v;
-                const uint64_t bound = kv_raw_strided ? ggml_vk_fa_kv_scratch_bound(ctx->device, k, v, nullptr)
-                                                      : (uint64_t)(ggml_nelements(kr) + ggml_nelements(vr)) * sizeof(ggml_fp16_t);
-                if (kv_raw_strided) {
-                    want = std::max(want, bound);
-                } else {
-                    want = std::max(want, std::min(bound, (uint64_t)ctx->prealloc_size_x * 2));
-                }
-                ctx->prealloc_size_x = want;
-                ggml_vk_preallocate_buffers(ctx, subctx);
-            }
+            fa_grow_x_for_kv(false);
             k_dst = vk_subbuffer{ ctx->prealloc_x, 0,    k_sz };
             v_dst = vk_subbuffer{ ctx->prealloc_x, k_sz, v_sz };
         }
@@ -12973,14 +13049,11 @@ void ggml_vk_soft_max(ggml_backend_vk_context * ctx, vk_context& subctx, const g
     };
 
     if (ncols <= 16384) {
+        if (ctx->scratch_dry_run) {
+            return;   // reserve-time sizing: no scratch on the single-pass path
+        }
         ggml_vk_op_f32<vk_op_soft_max_push_constants>(ctx, subctx, src0, src1, src2, nullptr, dst, GGML_OP_SOFT_MAX, std::move(pc));
     } else {
-
-        vk_subbuffer buf_a = ggml_vk_tensor_subbuffer(ctx, src0);
-        vk_subbuffer buf_b = src1 ? ggml_vk_tensor_subbuffer(ctx, src1) : buf_a;
-        vk_subbuffer buf_c = src2 ? ggml_vk_tensor_subbuffer(ctx, src2) : buf_a;
-        vk_subbuffer buf_d = ggml_vk_tensor_subbuffer(ctx, dst);
-
         uint32_t elems_per_wg = 128 * 4;
         uint32_t num_wgs = CEIL_DIV(ncols, elems_per_wg);
         size_t tmp_size = num_wgs * nrows_x * sizeof(float);
@@ -12993,6 +13066,14 @@ void ggml_vk_soft_max(ggml_backend_vk_context * ctx, vk_context& subctx, const g
             ctx->prealloc_size_y = tmp_size;
             ggml_vk_preallocate_buffers(ctx, subctx);
         }
+        if (ctx->scratch_dry_run) {
+            return;   // reserve-time sizing only (ggml_vk_graph_size_scratch)
+        }
+
+        vk_subbuffer buf_a = ggml_vk_tensor_subbuffer(ctx, src0);
+        vk_subbuffer buf_b = src1 ? ggml_vk_tensor_subbuffer(ctx, src1) : buf_a;
+        vk_subbuffer buf_c = src2 ? ggml_vk_tensor_subbuffer(ctx, src2) : buf_a;
+        vk_subbuffer buf_d = ggml_vk_tensor_subbuffer(ctx, dst);
         if (ctx->prealloc_x_need_sync || ctx->prealloc_y_need_sync) {
             ggml_vk_sync_buffers(ctx, subctx);
         }
@@ -13173,18 +13254,21 @@ void ggml_vk_argsort(ggml_backend_vk_context * ctx, vk_context& subctx, const gg
     vk_pipeline pipeline = use_small ? ctx->device->pipeline_argsort_f32[pipeline_idx]
                                      : ctx->device->pipeline_argsort_large_f32[pipeline_idx];
 
+    // Reserve space for ivec2 per element, with rows padded to a power of two
+    const size_t x_sz = use_small ? 0 : size_t{ncolsp2} * nrows * 2 * sizeof(int);
+    if (!use_small && ctx->prealloc_size_x < x_sz) {
+        ctx->prealloc_size_x = x_sz;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+    if (ctx->scratch_dry_run) {
+        return;   // reserve-time sizing only (ggml_vk_graph_size_scratch)
+    }
+
     vk_subbuffer src0_buf = ggml_vk_tensor_subbuffer(ctx, src0);
     vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
     vk_subbuffer subbuf1 = dst_buf;
 
-    // Reserve space for ivec2 per element, with rows padded to a power of two
     if (!use_small) {
-        const size_t x_sz = size_t{ncolsp2} * nrows * 2 * sizeof(int);
-
-        if (ctx->prealloc_size_x < x_sz) {
-            ctx->prealloc_size_x = x_sz;
-            ggml_vk_preallocate_buffers(ctx, subctx);
-        }
         if (ctx->prealloc_x_need_sync) {
             ggml_vk_sync_buffers(ctx, subctx);
         }
@@ -13248,6 +13332,9 @@ void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_
     if (k_min_pipeline >= num_topk_pipelines || ctx->device->pipeline_topk_f32[k_min_pipeline] == nullptr) {
         vk_pipeline pipeline = ctx->device->pipeline_topk_radix_f32;
         GGML_ASSERT(pipeline != nullptr);
+        if (ctx->scratch_dry_run) {
+            return;   // reserve-time sizing: the radix path has no scratch
+        }
 
         if (ctx->prealloc_x_need_sync) {
             ggml_vk_sync_buffers(ctx, subctx);
@@ -13270,7 +13357,7 @@ void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_
 
     vk_op_topk_push_constants pc { ncols, ncols, ncols, k, nrows, 0, 0 };
 
-    if (ctx->prealloc_x_need_sync) {
+    if (ctx->prealloc_x_need_sync && !ctx->scratch_dry_run) {
         ggml_vk_sync_buffers(ctx, subctx);
     }
 
@@ -13338,6 +13425,9 @@ void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_
             if (ctx->prealloc_size_x < x_sz) {
                 ctx->prealloc_size_x = x_sz;
                 ggml_vk_preallocate_buffers(ctx, subctx);
+            }
+            if (ctx->scratch_dry_run) {
+                return;   // reserve-time sizing: only the first pass sizes the scratch
             }
         }
 
@@ -13441,6 +13531,9 @@ void ggml_vk_cumsum(ggml_backend_vk_context * ctx, vk_context& subctx, const ggm
     // Use the single pass shader when the rows are small or there are enough rows to fill the GPU.
     // For fewer, larger rows, use the multipass shader to spread each row across SMs.
     if (dst->ne[0] <= 4096 || ggml_nrows(dst) >= ctx->device->shader_core_count) {
+        if (ctx->scratch_dry_run) {
+            return;   // reserve-time sizing: no scratch on the single-pass path
+        }
         ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_CUMSUM, pc);
         return;
     }
@@ -13466,6 +13559,9 @@ void ggml_vk_cumsum(ggml_backend_vk_context * ctx, vk_context& subctx, const ggm
     if (ctx->prealloc_size_split_k < temp_size) {
         ctx->prealloc_size_split_k = temp_size;
         ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+    if (ctx->scratch_dry_run) {
+        return;   // reserve-time sizing only (ggml_vk_graph_size_scratch)
     }
 
     vk_subbuffer src_buf = ggml_vk_tensor_subbuffer(ctx, src0);
@@ -13980,6 +14076,10 @@ void ggml_vk_leaky_relu(ggml_backend_vk_context * ctx, vk_context& subctx, const
 }
 
 void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subctx) {
+    // reserve-time sizing (ggml_vk_graph_size_scratch): the caller already raised prealloc_size_*, nothing to create
+    if (ctx->scratch_dry_run) {
+        return;
+    }
 #if defined(GGML_VULKAN_RUN_TESTS)
     const std::vector<size_t> vals {
         512, 512, 128,
@@ -19415,7 +19515,11 @@ void ggml_backend_vk_get_device_description(int device, char * description, size
     ggml_vk_get_device_description(dev_idx, description, description_size);
 }
 
-void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total) {
+// [fork, 2026-10-27] the VK_EXT_memory_budget view (heapBudget - heapUsage over the device-local heaps). This was
+// ggml_backend_vk_get_device_memory until 2026-10-27; it is now its fallback (no amdgpu sysfs node, iGPU,
+// GGML_VK_SYSFS_MEMORY=0), the "driver budget" of the fit summary, and the RADV numbers of the GTT WATCH baseline and
+// SCRATCH GROW lines.
+void ggml_vk_get_device_memory_budget(int device, size_t * free, size_t * total) {
     GGML_ASSERT(device < (int) vk_instance.device_indices.size());
     GGML_ASSERT(device < (int) vk_instance.device_supports_membudget.size());
 
@@ -19446,6 +19550,88 @@ void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total
             }
         }
     }
+}
+
+// [fork, 2026-10-27] ggml_backend_dev_memory for Vulkan devices: on a discrete amdgpu with a sysfs node (Linux),
+// free = mem_info_vram_total - mem_info_vram_used and total = mem_info_vram_total; everything else (no node: non-AMD,
+// lavapipe, containers without /sys, no VK_EXT_pci_bus_info; integrated GPUs, whose real home is GTT; an unreadable or
+// insane read) takes the budget path above. GGML_VK_SYSFS_MEMORY=0 forces the budget path everywhere.
+//
+// Why: 2026-10-27 live log (Qwen3.8-27B Q6, -fit on, cards idle before the load) RADV's budget read below VRAM on
+// every card although nothing of ours was allocated: 7900 XT 17489 of 20464 MiB (-2975), one XTX 21585 of 24560
+// (-2975), the other XTX 22556 of 24560 (-2004). The fit subtracted its 1024 MiB margin on top of that, the XT became
+// the limiter at "est. free 681 MiB" (n_ctx shrunk 524288 -> 323328) while the kernel showed 3597 MiB really free
+// there (mem_info_vram_used 16867 of 20464) and the XTXs stopped at ~2-3 GB est. free: about 8 GB of phantom
+// reserve over the three cards.
+//
+// CORRECTION, same day (fit mem trace, common/fit.cpp): the gap was NOT RADV vs kernel. Both views count device-wide
+// and the run after this change printed the identical placement and "free at fit" numbers. The fit read free inside
+// its probe, with the probe's recurrent-state planes allocated for real (llama_memory_recurrent ignored no_alloc):
+// 18 / 18 / 12 GDN layers x ~165 MiB on the three cards = the -2975 / -2975 / -2004. Fixed in
+// llama-memory-recurrent.cpp (dummy buffer under no_alloc) and fit.cpp (free sampled before the probe loads). The
+// sysfs view stays because it is device-wide by construction; RADV's budget is too on this kernel, so the two should
+// read within a few MiB of each other on idle cards.
+//
+// Cross-module preconditions:
+//   - mem_info_vram_used is DEVICE-WIDE (all processes incl. the desktop on card0, a second llama-server), which is
+//     what "free" should mean; heapUsage is per process. Our own already-made allocations count in both.
+//   - CAUTION, not a measurement of this change: on 2026-10-22 at n_ctx 289024 the kernel evicted a 1.13 GB BO off
+//     the XT into GTT with sysfs at 17249 of 20464 MiB used (~3.2 GB kernel-free, see the GTT WATCH comment in
+//     ggml-vulkan-buffers.cpp, "why TTM evicts with ~3 GB nominally free is still unexplained"). Part of RADV's gap
+//     may be real headroom the kernel wants; with this view the fit's --fit-target margin is the ONLY reserve, so
+//     the GTT WATCH lines are the gate for the default.
+//   - The GPU PLACEMENT check (ggml_vk_mem_watch_*) keeps comparing against RADV's budget; it does not call this.
+//   - The fit summary prints both (GGML_BACKEND_FORK_DEV_MEMORY_BUDGET_PROC below).
+// Cost: two small sysfs reads per call after the first (the dir per device is cached).
+static bool ggml_vk_sysfs_memory_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_SYSFS_MEMORY");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+// true when ggml_backend_vk_get_device_memory(device) reports the sysfs view (fills free/total with it)
+static bool ggml_vk_get_device_memory_sysfs(int device, size_t * free, size_t * total) {
+    if (!ggml_vk_sysfs_memory_enabled()) {
+        return false;
+    }
+    static std::mutex mutex;
+    static std::vector<int8_t>      state; // 0 unknown, 1 node found, -1 none (or iGPU)
+    static std::vector<std::string> dirs;
+    std::string dir;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if ((int) state.size() <= device) {
+            state.resize(device + 1, 0);
+            dirs.resize(device + 1);
+        }
+        if (state[device] == 0) {
+            vk::PhysicalDevice pd = vk_instance.instance.enumeratePhysicalDevices()[vk_instance.device_indices[device]];
+            const bool igpu = pd.getProperties().deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
+            dirs[device]  = igpu ? std::string() : ggml_vk_sysfs_mem_dir(pd);
+            state[device] = dirs[device].empty() ? -1 : 1;
+        }
+        if (state[device] < 0) {
+            return false;
+        }
+        dir = dirs[device];
+    }
+    uint64_t f = 0, t = 0;
+    if (!ggml_vk_sysfs_mem_read(dir, f, t)) {
+        return false;
+    }
+    *free  = (size_t) f;
+    *total = (size_t) t;
+    return true;
+}
+
+void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total) {
+    GGML_ASSERT(device < (int) vk_instance.device_indices.size());
+    if (ggml_vk_get_device_memory_sysfs(device, free, total)) {
+        return;
+    }
+    ggml_vk_get_device_memory_budget(device, free, total);
 }
 
 static vk::PhysicalDeviceType ggml_backend_vk_get_device_type(int device_idx) {
@@ -20430,8 +20616,100 @@ static const struct ggml_backend_fork_fold_i * ggml_backend_vk_fork_fold(ggml_ba
     return nullptr;
 }
 
+// [fork, 2026-10-27] Reserve-time sizing of the lazy scratch (ggml_backend_fork_scratch_i, ggml-backend-impl.h).
+// Walks one split graph of a reserve pass through the op functions that own a prealloc_* buffer with
+// scratch_dry_run set: each raises prealloc_size_* with its own formula and returns before touching tensor buffers
+// (unallocated at reserve) or recording commands. The raised sizes stay, so the first graph_compute allocates them once
+// (ggml_vk_preallocate_buffers at graph start) and the memory fit has already counted them. Why: before this the fit
+// measured only the gallocr compute buffer, and at the first long prefill each XTX created prealloc_x 0 -> 1368 MiB
+// (-c 350000, strided-prefill K/V copy of one layer, 350208 cells x 4096 B; above ~262k cells the copy no longer fits
+// the dst padding inside the 1 GiB suballocation block, ggml_vk_fa_kv_scratch_dst_pad) plus ~250 MB of dequant / y /
+// split_k growth per card on the first prompt (ledger 2026-10-22 11:30); the kernel then parked buffers in GTT.
+// Covered: MUL_MAT (+ M-split), MUL_MAT_ID, FLASH_ATTN_EXT (split_k, Intel xe, mask_opt / sparse scratch, K/V copy
+// or quantized dequant to the whole-cache bound), multi-pass SOFT_MAX, ARGSORT, TOP_K, CUMSUM. Fusion is not
+// replayed (num_additional_fused_ops = 0): a fused node is sized as its unfused head, which never needs less.
+// Not covered: the GET_ROWS + TOP_K QSA fusion (DSA/QSA models only), CROSS_ENTROPY_LOSS (training).
+// prealloc_add_rms_partials is a fixed 1 KiB (counted below). D2D rings and staging are host memory, not VRAM.
+// Precondition for the graph-start allocation: planned sizes only change here, i.e. inside a scheduler reserve, which
+// synchronizes every backend first, so a buffer replaced at the next graph start is not in use by the GPU.
+static void ggml_vk_graph_size_scratch(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph) {
+    const int      saved_fused = ctx->num_additional_fused_ops;
+    const uint32_t saved_dsr   = ctx->pipeline_descriptor_set_requirements;
+    std::vector<ggml_backend_vk_context::mask_scratch_entry> saved_entries;
+    saved_entries.swap(ctx->mask_scratch_entries);
+    const size_t saved_used = ctx->mask_scratch_used;
+    ctx->mask_scratch_used = 0;
+    ctx->num_additional_fused_ops = 0;
+    ctx->scratch_dry_run = true;
+
+    vk_context none;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor * node = cgraph->nodes[i];
+        if (ggml_is_empty(node) || ggml_op_is_empty(node->op) || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        switch (node->op) {
+            case GGML_OP_MUL_MAT:        ggml_vk_mul_mat(ctx, none, cgraph, i); break;
+            case GGML_OP_MUL_MAT_ID:     ggml_vk_mul_mat_id(ctx, none, cgraph, i); break;
+            case GGML_OP_FLASH_ATTN_EXT:
+                ggml_vk_flash_attn(ctx, none, node->src[0], node->src[1], node->src[2], node->src[3], node->src[4], node);
+                break;
+            case GGML_OP_SOFT_MAX:       ggml_vk_soft_max(ctx, none, node->src[0], node->src[1], node->src[2], node); break;
+            case GGML_OP_ARGSORT:        ggml_vk_argsort(ctx, none, node->src[0], node); break;
+            case GGML_OP_TOP_K:          ggml_vk_topk(ctx, none, node->src[0], node); break;
+            case GGML_OP_CUMSUM:         ggml_vk_cumsum(ctx, none, node->src[0], node); break;
+            default: break;
+        }
+    }
+
+    ctx->scratch_dry_run = false;
+    ctx->num_additional_fused_ops = saved_fused;
+    ctx->pipeline_descriptor_set_requirements = saved_dsr;
+    ctx->mask_scratch_entries.swap(saved_entries);
+    ctx->mask_scratch_used = saved_used;
+}
+
+static size_t ggml_backend_vk_fork_scratch_reserve(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    if (cgraph != nullptr) {
+        ggml_vk_graph_size_scratch(ctx, cgraph);
+    }
+    auto held = [](size_t planned, const vk_buffer & b) -> size_t {
+        return std::max(planned, b ? (size_t)b->size : (size_t)0);
+    };
+    return held(ctx->prealloc_size_x,                 ctx->prealloc_x) +
+           held(ctx->prealloc_size_y,                 ctx->prealloc_y) +
+           held(ctx->prealloc_size_split_k,           ctx->prealloc_split_k) +
+           held(ctx->prealloc_size_add_rms_partials,  ctx->prealloc_add_rms_partials) +
+           held(ctx->prealloc_size_mask_scratch,      ctx->prealloc_mask_scratch);
+}
+
+static const struct ggml_backend_fork_scratch_i ggml_backend_vk_fork_scratch_i = {
+    /* .reserve = */ ggml_backend_vk_fork_scratch_reserve,
+};
+
+static const struct ggml_backend_fork_scratch_i * ggml_backend_vk_fork_scratch(ggml_backend_t backend) {
+    return backend && ggml_backend_is_vk(backend) ? &ggml_backend_vk_fork_scratch_i : nullptr;
+}
+
+// [fork, 2026-10-27] the driver-budget reading of a device whose ggml_backend_dev_memory is the sysfs view (fit summary
+// "free at fit N MiB (driver budget M MiB)"); false when dev_memory already is the budget, or dev is not ours
+static bool ggml_backend_vk_fork_dev_memory_budget(ggml_backend_dev_t dev, size_t * free, size_t * total) {
+    if (dev == nullptr || dev->reg != ggml_backend_vk_reg()) {
+        return false;
+    }
+    const int device = ((ggml_backend_vk_device_context *) dev->context)->device;
+    size_t f = 0, t = 0;
+    if (!ggml_vk_get_device_memory_sysfs(device, &f, &t)) {
+        return false;
+    }
+    ggml_vk_get_device_memory_budget(device, free, total);
+    return true;
+}
+
 // [fork, 2026-10-22] the LLAMA_DECODE_STATS hooks (ggml_backend_fork_stats_i, ggml-backend-impl.h); 2026-10-23 the hop
-// fold hooks (ggml_backend_fork_fold_i)
+// fold hooks (ggml_backend_fork_fold_i); 2026-10-27 the reserve-time scratch sizing (ggml_backend_fork_scratch_i); 2026-10-27 the
+// driver-budget memory reading (GGML_BACKEND_FORK_DEV_MEMORY_BUDGET_PROC, ggml-backend.h)
 static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, GGML_BACKEND_FORK_STATS_PROC) == 0) {
@@ -20439,6 +20717,12 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     }
     if (strcmp(name, GGML_BACKEND_FORK_FOLD_PROC) == 0) {
         return (void *)ggml_backend_vk_fork_fold;
+    }
+    if (strcmp(name, GGML_BACKEND_FORK_SCRATCH_PROC) == 0) {
+        return (void *)ggml_backend_vk_fork_scratch;
+    }
+    if (strcmp(name, GGML_BACKEND_FORK_DEV_MEMORY_BUDGET_PROC) == 0) {
+        return (void *)ggml_backend_vk_fork_dev_memory_budget;
     }
     return NULL;
 }

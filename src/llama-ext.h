@@ -68,6 +68,11 @@ struct llama_memory_breakdown_data {
     size_t model   = 0; // memory allocated for the model
     size_t context = 0; // memory allocated for the context
     size_t compute = 0; // memory allocated for temporary compute buffers
+    // [fork, 2026-10-27] the part of compute that is backend scratch outside the scheduler's buffers (ggml-vulkan
+    // prealloc_x/y/split_k/mask, sized at reserve by ggml_backend_sched_get_scratch_size). ALREADY INCLUDED in
+    // compute, so total() and every existing sum stay right; kept apart only so the fit summary can print it.
+    // Measured gap it closes: prealloc_x 1368 MiB per XTX at -c 350000 (one layer's K+V copy above ~262k cells).
+    size_t scratch = 0;
 
     size_t total() const {
         return model + context + compute;

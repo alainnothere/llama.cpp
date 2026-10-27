@@ -2910,21 +2910,8 @@ private:
                 // indexed by the global registry index here, which with --device Vulkan2,Vulkan3,Vulkan1 (or an
                 // iGPU registered before the dGPUs) added the mmproj reserve to another card's margin. The default
                 // branch ignores RPC servers and duplicate device ids (llama.cpp default selection), as before.
-                std::vector<ggml_backend_dev_t> fit_devs = params_base.devices;
-                if (fit_devs.empty()) {
-                    std::vector<ggml_backend_dev_t> igpus;
-                    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
-                        ggml_backend_dev_t d = ggml_backend_dev_get(i);
-                        if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-                            fit_devs.push_back(d);
-                        } else if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-                            igpus.push_back(d);
-                        }
-                    }
-                    if (fit_devs.empty()) {
-                        fit_devs = igpus;
-                    }
-                }
+                // 2026-10-27: the list now comes from common_fit_devices (fit.h), shared with the vocab-subset reserve
+                const std::vector<ggml_backend_dev_t> fit_devs = common_fit_devices(params_base.devices);
                 for (auto & [dev, size] : mmproj_mem) {
                     for (size_t i = 0; i < fit_devs.size(); i++) {
                         if (fit_devs[i] == dev) {

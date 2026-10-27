@@ -4442,6 +4442,10 @@ ggml_cgraph * llama_context::graph_reserve(
             ggml_backend_sched_reserve_size(sched.get(), gf, sizes);
         } else {
             ggml_backend_sched_split_graph(sched.get(), gf);
+            // [fork, 2026-10-27] the no_alloc probe reserves tg and the second pp graph split-only; size their backend
+            // scratch too, as ggml_backend_sched_reserve does for the real context (the tg FA split_k scratch can
+            // exceed the pp one), so probe and real context report the same scratch
+            ggml_backend_sched_size_scratch(sched.get());
         }
     } else if (!ggml_backend_sched_reserve(sched.get(), gf)) {
         GGML_ASSERT(!sizes);
@@ -5494,6 +5498,18 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ggml_backend_t             backend = backend_ptr.get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
             ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend);
+        }
+    }
+    // [fork, 2026-10-27] backend scratch sized at reserve (llama_memory_breakdown_data::scratch), folded into compute.
+    // Same in both modes: the probe's no_alloc reserve sizes it exactly like the real one (graph_reserve below).
+    // Counted on the backend's buffer type; for ggml-vulkan that is the device buffer the scratch is created in.
+    for (const auto & backend_ptr : backends) {
+        ggml_backend_t backend = backend_ptr.get();
+        const size_t   sz      = ggml_backend_sched_get_scratch_size(sched.get(), backend);
+        if (sz > 0) {
+            ggml_backend_buffer_type_t buft = ggml_backend_sched_get_buffer_type(sched.get(), backend);
+            ret[buft].compute += sz;
+            ret[buft].scratch += sz;
         }
     }
     return ret;

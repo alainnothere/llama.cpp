@@ -984,8 +984,19 @@ llama_dsv4_comp_state::llama_dsv4_comp_state(
         layers.push_back({ il, kv, score, std::move(kv_stream), std::move(score_stream) });
     }
 
+    // [fork, 2026-10-27] no_alloc (--fit probes): zero-size dummy buffer, sized in memory_breakdown(); same probe
+    // double count as llama_memory_recurrent (see the comment at its allocation loop)
+    no_alloc = hparams.no_alloc;
     for (auto & [buft, ctx] : ctx_map) {
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+        ggml_backend_buffer_t buf;
+        if (no_alloc) {
+            buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                t->buffer = buf;
+            }
+        } else {
+            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+        }
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for DSV4 compressor state");
         }
@@ -1073,9 +1084,10 @@ uint32_t llama_dsv4_comp_state::get_n_rows() const {
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_dsv4_comp_state::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
-    for (const auto & [_, buf] : ctxs_bufs) {
+    for (const auto & [ctx, buf] : ctxs_bufs) {
         ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
-        ret[buft] += ggml_backend_buffer_get_size(buf.get());
+        ret[buft] += no_alloc ? ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft)
+                              : ggml_backend_buffer_get_size(buf.get());
     }
     return ret;
 }

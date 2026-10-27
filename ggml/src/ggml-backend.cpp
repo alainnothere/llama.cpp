@@ -1016,6 +1016,9 @@ struct ggml_backend_sched {
     // [fork, 2026-10-23] per backend: hop fold hooks (ggml_backend_fork_fold_i, ggml-backend-impl.h), looked up at
     // sched_new; NULL unless the backend has the fold on (Vulkan: GGML_VK_D2D_HOP_FOLD >= 1)
     const struct ggml_backend_fork_fold_i * fork_fold[GGML_SCHED_MAX_BACKENDS];
+    // [fork, 2026-10-27] per backend: reserve-time scratch sizing (ggml_backend_fork_scratch_i, ggml-backend-impl.h),
+    // looked up at sched_new, NULL for backends without lazy scratch
+    const struct ggml_backend_fork_scratch_i * fork_scratch[GGML_SCHED_MAX_BACKENDS];
     // [fork, 2026-10-22 night] per backend: what ggml_backend_sched_synchronize waited on since the last take
     // (ggml_backend_sched_sync_take, ggml-backend.h). Only touched while stats is non-NULL
     struct ggml_backend_sched_sync_stats sync_acc[GGML_SCHED_MAX_BACKENDS];
@@ -2417,6 +2420,19 @@ ggml_backend_sched_t ggml_backend_sched_new(
         }
     }
 
+    // [fork, 2026-10-27] reserve-time scratch sizing (comment at ggml_backend_fork_scratch_i)
+    for (int b = 0; b < n_backends; b++) {
+        sched->fork_scratch[b] = NULL;
+        ggml_backend_dev_t dev = ggml_backend_get_device(backends[b]);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : NULL;
+        if (reg && reg->iface.get_proc_address) {
+            auto fn = (ggml_backend_fork_scratch_iface_t) reg->iface.get_proc_address(reg, GGML_BACKEND_FORK_SCRATCH_PROC);
+            if (fn) {
+                sched->fork_scratch[b] = fn(backends[b]);
+            }
+        }
+    }
+
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
 
@@ -2482,6 +2498,8 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
     ggml_backend_sched_split_graph(sched, measure_graph);
 
     ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
+
+    ggml_backend_sched_size_scratch(sched);
 }
 
 bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {
@@ -2495,6 +2513,8 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
         return false;
     }
+
+    ggml_backend_sched_size_scratch(sched);
 
     ggml_backend_sched_reset(sched);
 
@@ -2753,6 +2773,27 @@ ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched
     GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
 
     return sched->bufts[backend_index];
+}
+
+// [fork, 2026-10-27] walk the splits of the graph split last and let each backend size its lazy scratch for them
+// (ggml_backend_fork_scratch_i). Called after split_graph of a reserve graph; never on the per-decode path.
+void ggml_backend_sched_size_scratch(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    for (int i = 0; i < sched->n_splits; i++) {
+        struct ggml_backend_sched_split * split = &sched->splits[i];
+        const struct ggml_backend_fork_scratch_i * fs = sched->fork_scratch[split->backend_id];
+        if (fs != NULL && split->graph.n_nodes > 0) {
+            fs->reserve(sched->backends[split->backend_id], &split->graph);
+        }
+    }
+}
+
+size_t ggml_backend_sched_get_scratch_size(ggml_backend_sched_t sched, ggml_backend_t backend) {
+    GGML_ASSERT(sched);
+    int backend_index = ggml_backend_sched_backend_id(sched, backend);
+    GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
+    const struct ggml_backend_fork_scratch_i * fs = sched->fork_scratch[backend_index];
+    return fs != NULL ? fs->reserve(backend, NULL) : 0;
 }
 
 size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend) {

@@ -66,6 +66,7 @@ private:
     const uint32_t n_stream;
     const uint32_t n_rs_seq;
 
+    bool no_alloc = false; // [fork, 2026-10-27] --fit probe: ctxs_bufs hold zero-size dummies
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
 
     std::vector<layer> layers;

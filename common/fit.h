@@ -37,6 +37,15 @@ common_params_fit_status common_fit_params(
       const common_fit_extra_model * extra,                  // model to fit alongside the main one, nullptr if there is none
                      ggml_log_level   log_level);            // minimum log level to print during fitting, lower levels go to debug log
 
+// [fork, 2026-10-27] the device list the fit's margins (fit_params_target) are indexed by: --device order without the
+// trailing nullptr, or llama's default selection (discrete GPUs in registry order, iGPUs only when there is no
+// discrete GPU). Shared by the server's mmproj reserve and the vocab-subset reserve so both index the same card.
+std::vector<ggml_backend_dev_t> common_fit_devices(const std::vector<ggml_backend_dev_t> & devices);
+
+// [fork, 2026-10-27] upper bound of the bytes the --spec-draft-vocab-subset head (llama_set_logits_subset) allocates
+// at runtime on the device of model.output, for a model file and a subset id file; 0 when either cannot be read
+size_t common_fit_vocab_subset_bytes(const char * path_model, const char * path_subset);
+
 // print estimated memory to stdout
 void common_fit_print(
                          const char * path_model,

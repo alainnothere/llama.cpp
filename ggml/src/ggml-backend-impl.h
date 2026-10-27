@@ -333,6 +333,22 @@ extern "C" {
     #define GGML_BACKEND_FORK_FOLD_PROC "ggml_backend_fork_fold"
     typedef const struct ggml_backend_fork_fold_i * (*ggml_backend_fork_fold_iface_t)(ggml_backend_t backend);
 
+    // [fork, 2026-10-27] lazy backend scratch made visible to the reserve (and so to --fit). ggml-vulkan creates its
+    // prealloc_x/y/split_k/mask scratch on the first graph that needs it, AFTER the fit measured the compute buffer:
+    // 1368 MiB of prealloc_x per XTX at -c 350000 (the strided-prefill KV copy above the ~262k-cell 1 GiB block
+    // threshold, live log 'prealloc_x 0.00 -> 1368.00 MiB'), plus ~250 MB of first-prompt dequant/split_k growth per
+    // card (ledger 2026-10-22 11:30). Looked up at sched_new. Contract (ggml_backend_sched_size_scratch):
+    //   - reserve(b, g) with g = one split graph of a reserve pass sizes the scratch g's nodes need with the same
+    //     formulas the compute path uses, raises the backend's planned sizes (never lowers them, never allocates),
+    //     and returns the bytes the backend will hold as scratch = sum over buffers of max(planned, allocated).
+    //   - reserve(b, NULL) only returns that total.
+    // The planned sizes persist, so the first graph_compute allocates them once instead of growing mid-graph.
+    struct ggml_backend_fork_scratch_i {
+        size_t (*reserve)(ggml_backend_t backend, struct ggml_cgraph * graph);
+    };
+    #define GGML_BACKEND_FORK_SCRATCH_PROC "ggml_backend_fork_scratch"
+    typedef const struct ggml_backend_fork_scratch_i * (*ggml_backend_fork_scratch_iface_t)(ggml_backend_t backend);
+
 #ifdef  __cplusplus
 }
 #endif

@@ -427,6 +427,30 @@ static std::string ggml_vk_physical_device_bdf(vk::PhysicalDevice & pd) {
     return buf;
 }
 
+// [fork, 2026-10-27] kernel VRAM view for ggml_backend_vk_get_device_memory (= ggml_backend_dev_memory, the fit's
+// "free"). Same PCI -> sysfs mapping as the GTT watch above (VK_EXT_pci_bus_info bdf -> /sys/bus/pci/devices/<bdf>,
+// which is what /sys/class/drm/cardN/device links to); dir is empty when the device has no amdgpu node.
+std::string ggml_vk_sysfs_mem_dir(vk::PhysicalDevice & pd) {
+    std::string dir, card;
+    if (!ggml_vk_gtt_sysfs_dir(ggml_vk_physical_device_bdf(pd), dir, card)) {
+        return "";
+    }
+    return dir;
+}
+
+// free = mem_info_vram_total - mem_info_vram_used (device-wide: every process incl. the display); false when a file
+// is unreadable or the pair is not sane (total 0, used > total), the caller then falls back to the budget path
+bool ggml_vk_sysfs_mem_read(const std::string & dir, uint64_t & free, uint64_t & total) {
+    uint64_t used = 0, tot = 0;
+    if (dir.empty() || !ggml_vk_sysfs_read_u64(dir + "/mem_info_vram_used", used) ||
+        !ggml_vk_sysfs_read_u64(dir + "/mem_info_vram_total", tot) || tot == 0 || used > tot) {
+        return false;
+    }
+    free  = tot - used;
+    total = tot;
+    return true;
+}
+
 // call with w.mutex held
 static void ggml_vk_gtt_watch_init_locked(vk_device & device, vk_gtt_watch & w) {
     if (w.init) {
@@ -470,9 +494,10 @@ static void ggml_vk_gtt_watch_sample(vk_device & device, uint64_t n_graph) {
         w.sampled  = true;
         w.gtt_base = w.gtt_prev = w.gtt_first = gtt;
         w.vram_prev = w.vram_first = vram;
-        // RADV's view next to the kernel's (the same numbers the fit read via ggml_backend_vk_get_device_memory)
+        // RADV's view next to the kernel's (the budget path of ggml_backend_vk_get_device_memory; since 2026-10-27 the
+        // fit reads the sysfs view on amdgpu, this line keeps printing RADV's so the two stay side by side)
         size_t free = 0, total = 0;
-        ggml_backend_vk_get_device_memory((int) device->idx, &free, &total);
+        ggml_vk_get_device_memory_budget((int) device->idx, &free, &total);
         uint64_t budget = 0, usage = 0, vram_total = 0;
         bool has_budget;
         {
@@ -539,7 +564,8 @@ static void ggml_vk_gtt_watch_sample(vk_device & device, uint64_t n_graph) {
 // Why: the 289k first-prompt eviction above was triggered by ~250 MB of first-prompt allocations that nothing in the
 // log named (VK_LOG_MEMORY is a debug-build macro). These buffers are sized lazily by the first graph that needs them,
 // after the fit and after the model/KV/compute buffers, so they are exactly what lands on a card the fit left with
-// little headroom. free is ggml_backend_vk_get_device_memory (RADV budget - usage, the fit's view) right after the
+// little headroom. free is ggml_vk_get_device_memory_budget (RADV budget - usage; the fit's view until 2026-10-27, now
+// sysfs on amdgpu, which the kernel VRAM field of the same line shows) right after the
 // growth; kernel VRAM/GTT is sysfs (device-wide). D2D rings are host memory imported into both devices: they cost
 // no VRAM, they may show as GTT. Rate limit per buffer: the first 8 growths, then every 64th.
 void ggml_vk_scratch_grow_log(vk_device & device, const char * which, size_t old_size, size_t new_size, uint32_t * counter) {
@@ -563,7 +589,7 @@ void ggml_vk_scratch_grow_log(vk_device & device, const char * which, size_t old
     }
     constexpr double MiB = 1024.0 * 1024.0;
     size_t free = 0, total = 0;
-    ggml_backend_vk_get_device_memory((int) device->idx, &free, &total);
+    ggml_vk_get_device_memory_budget((int) device->idx, &free, &total);
     char kernel[128] = "";
     uint64_t gtt = 0, vram = 0;
     if (ggml_vk_gtt_watch_read(device, gtt, vram)) {

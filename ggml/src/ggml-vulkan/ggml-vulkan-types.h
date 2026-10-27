@@ -1429,6 +1429,10 @@ struct ggml_backend_vk_context {
     };
     std::vector<mask_scratch_entry> mask_scratch_entries;
     size_t mask_scratch_used {};
+    // [fork, 2026-10-27] reserve-time scratch sizing (ggml_vk_graph_size_scratch): while set, the op functions that
+    // own a prealloc_* buffer only raise prealloc_size_* and return before touching tensor buffers or recording
+    // commands, and ggml_vk_preallocate_buffers does nothing. Only the reserve hook sets it.
+    bool scratch_dry_run {};
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};

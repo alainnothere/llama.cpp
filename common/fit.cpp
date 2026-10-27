@@ -4,12 +4,16 @@
 #include "log.h"
 
 #include "../src/llama-ext.h"
+#include "gguf.h"
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <stdexcept>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
+#include <fstream>
 #include <map>
 #include <set>
 #include <string>
@@ -45,6 +49,77 @@ static std::string common_fit_probe_key(const llama_model_params & mp, const lla
     return k;
 }
 
+// [fork, 2026-10-27] Fit memory trace + pre-load free sampling.
+//
+// Why: two fit-on runs on 2026-10-27 (Qwen3.8-27B Q6, before and after ggml_backend_dev_memory moved to the amdgpu
+// sysfs view) printed the IDENTICAL "free at fit 17489 MiB (driver budget 20407 MiB)" on the XT and 21585 / 22556 on
+// the XTXs, n_ctx 323328. The budget column is read at summary time (no probe alive) = total - 57 MiB; free was read
+// inside the probe, after llama_model_load_from_file(no_alloc) + llama_init_from_model, so whatever the probe
+// allocated on the device for real came out of "free" while the breakdown also counted it as placed. The probe's
+// real allocation was the recurrent-state planes (llama_memory_recurrent ignored no_alloc, upstream too): 18 / 18 / 12
+// GDN layers x ~165 MiB = the 2975 / 2975 / 2004 MiB gap. Upstream sampled free after init only because the model's
+// device list is known there (b1f3a6e5db, 2025-12-15), not by design: with no_alloc nothing was supposed to be
+// allocated. Free is now sampled once per probe BEFORE the model load, for every candidate device (the --device list,
+// else all non-CPU devices), and looked up by device after init; RS now uses a dummy buffer under no_alloc as well.
+// The trace prints both views at four points of a probe so the next allocation that leaks into a probe is named by
+// the point where free drops. Default: the first probe ("full") at WARN; LLAMA_FIT_MEM_TRACE=1: every probe at WARN.
+static bool common_fit_mem_trace_all() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_FIT_MEM_TRACE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return on;
+}
+
+// the driver-budget reading (ggml-vulkan: RADV heapBudget - heapUsage) of a device whose ggml_backend_dev_memory is
+// the sysfs view; false when the backend has no such proc or dev_memory already IS the budget (lavapipe, iGPU, ...)
+static bool common_fit_dev_budget(ggml_backend_dev_t dev, size_t & free, size_t & total) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    auto fn = reg ? (ggml_backend_fork_dev_memory_budget_t)
+        ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_FORK_DEV_MEMORY_BUDGET_PROC) : nullptr;
+    free = total = 0;
+    return fn != nullptr && fn(dev, &free, &total);
+}
+
+// devices a probe can place memory on, known before the model is loaded: the --device list, else every non-CPU device
+static std::vector<ggml_backend_dev_t> common_fit_candidate_devs(const llama_model_params * mp) {
+    std::vector<ggml_backend_dev_t> ret;
+    if (mp->devices != nullptr) {
+        for (ggml_backend_dev_t * d = mp->devices; *d != nullptr; d++) {
+            ret.push_back(*d);
+        }
+        return ret;
+    }
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            ret.push_back(d);
+        }
+    }
+    return ret;
+}
+
+static void common_fit_mem_trace(const char * label, const char * point, const std::vector<ggml_backend_dev_t> & devs) {
+    constexpr size_t MiB = 1024*1024;
+    for (ggml_backend_dev_t dev : devs) {
+        size_t f = 0, t = 0;
+        ggml_backend_dev_memory(dev, &f, &t);
+        size_t bf = 0, bt = 0;
+        char budget[48];
+        if (common_fit_dev_budget(dev, bf, bt)) {
+            snprintf(budget, sizeof(budget), "%zu MiB", bf/MiB);
+        } else {
+            snprintf(budget, sizeof(budget), "n/a");
+        }
+        LOG_WRN("fit mem trace[%s] %s: %s free %zu MiB (budget %s) total %zu MiB\n",
+                label, point, ggml_backend_dev_name(dev), f/MiB, budget, t/MiB);
+    }
+}
+
+// [fork, 2026-10-27] probes made by the current fit (each = no_alloc model load + context init), reset at the start of
+// common_params_fit_impl; the fit summary prints it and the refill rounds budget against it. The fit is single-threaded.
+static int common_fit_n_probes = 0;
+
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const char * path_model,
         const llama_model_params * mparams,
@@ -53,7 +128,9 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         uint32_t & hp_ngl,
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
-        ggml_log_level log_level) {
+        ggml_log_level log_level,
+        const char * label = "probe",
+        bool trace = false) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
@@ -62,6 +139,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         ggml_log_level min_level; // prints below this log level go to debug log
     };
     user_data_t ud;
+    common_fit_n_probes++;
     llama_log_get(&ud.original_logger.callback, &ud.original_logger.user_data);
     ud.min_level = log_level;
 
@@ -75,10 +153,39 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     mparams_copy.no_alloc  = true;
     mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
 
+    // [fork, 2026-10-27] free/total sampled BEFORE the probe loads anything (see common_fit_mem_trace_all above): a
+    // probe's own real allocations must not be subtracted from free while the breakdown also counts them as placed
+    trace = trace || common_fit_mem_trace_all();
+    const std::vector<ggml_backend_dev_t> cand_devs = common_fit_candidate_devs(mparams);
+    std::map<ggml_backend_dev_t, std::pair<size_t, size_t>> free_pre;
+    for (ggml_backend_dev_t dev : cand_devs) {
+        size_t f = 0, t = 0;
+        ggml_backend_dev_memory(dev, &f, &t);
+        free_pre[dev] = { f, t };
+    }
+    size_t cpu_free_pre = 0, cpu_total_pre = 0;
+    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (cpu_dev == nullptr) {
+        llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+        throw std::runtime_error("no CPU backend found");
+    }
+    ggml_backend_dev_memory(cpu_dev, &cpu_free_pre, &cpu_total_pre);
+    if (trace) {
+        common_fit_mem_trace(label, "before model load", cand_devs);
+    }
+
     llama_model * model = llama_model_load_from_file(path_model, mparams_copy);
     if (model == nullptr) {
         llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
         throw std::runtime_error("failed to load model");
+    }
+
+    std::vector<ggml_backend_dev_t> model_devs;
+    for (int i = 0; i < llama_model_n_devices(model); i++) {
+        model_devs.push_back(llama_model_get_device(model, i));
+    }
+    if (trace) {
+        common_fit_mem_trace(label, "after model load", model_devs);
     }
 
     llama_context * ctx = llama_init_from_model(model, *cparams);
@@ -86,6 +193,9 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         llama_model_free(model);
         llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
         throw std::runtime_error("failed to create llama_context from model");
+    }
+    if (trace) {
+        common_fit_mem_trace(label, "after context init", model_devs);
     }
 
     const size_t nd = llama_model_n_devices(model);
@@ -98,6 +208,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
             ret.back().mb.model   += mb.model;
             ret.back().mb.context += mb.context;
             ret.back().mb.compute += mb.compute;
+            ret.back().mb.scratch += mb.scratch;
             continue;
         }
 
@@ -110,28 +221,28 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
                 ret[i].mb.model   += mb.model;
                 ret[i].mb.context += mb.context;
                 ret[i].mb.compute += mb.compute;
+                ret[i].mb.scratch += mb.scratch;
                 break;
             }
         }
     }
 
-    {
-        ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-        if (cpu_dev == nullptr) {
-            throw std::runtime_error("no CPU backend found");
-        }
-        size_t free;
-        size_t total;
-        ggml_backend_dev_memory(cpu_dev, &free, &total);
-        ret.back().free  = free;
-        ret.back().total = total;
-    }
+    ret.back().free  = cpu_free_pre;
+    ret.back().total = cpu_total_pre;
     for (size_t i = 0; i < nd; i++) {
         ggml_backend_dev_t dev = llama_model_get_device(model, i);
 
         size_t free;
         size_t total;
-        ggml_backend_dev_memory(dev, &free, &total);
+        const auto it = free_pre.find(dev);
+        if (it != free_pre.end()) {
+            free  = it->second.first;
+            total = it->second.second;
+        } else {
+            // not a candidate before the load (a device the model picked outside the --device list / non-CPU set,
+            // e.g. a CPU-typed accelerator): read it now, the old behaviour
+            ggml_backend_dev_memory(dev, &free, &total);
+        }
 
         // Some non-GPU accelerator backends, such as BLAS, report 0/0 and rely on
         // the host-memory fallback. For GPU-like backends, keep 0/0 so --fit does
@@ -167,6 +278,9 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     llama_free(ctx);
     llama_model_free(model);
     llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+    if (trace) {
+        common_fit_mem_trace(label, "after free", model_devs);
+    }
 
     return ret;
 }
@@ -203,6 +317,7 @@ static void common_params_fit_impl(
     }
     constexpr int64_t MiB = 1024*1024;
     typedef std::vector<llama_device_memory_data> dmds_t;
+    common_fit_n_probes = 0;
     const llama_model_params default_mparams = llama_model_default_params();
 
     std::vector<ggml_backend_dev_t> devs;
@@ -217,6 +332,21 @@ static void common_params_fit_impl(
 
     dmds_t   dmds_extra;       // memory of the extra model, laid out on the devices of the main model
     uint32_t n_ctx_extra = 0;  // context that memory was measured at
+    // [fork, 2026-10-27] parts of the extra model on devices outside the main model's list (see add_extra_memory)
+    struct extra_outside_t {
+        ggml_backend_dev_t dev;
+        int64_t            free;
+        int64_t            placed;
+    };
+    std::vector<extra_outside_t> extra_outside;
+    // margins are per main device and are only known after step 1; the outside-device check uses the largest one
+    auto nd_margin_max = [&]() -> int64_t {
+        int64_t mx = 0;
+        for (size_t id = 0; id < std::max<size_t>(devs.size(), 1); id++) {
+            mx = std::max(mx, int64_t(margins_s[id]));
+        }
+        return mx;
+    };
 
     // sets llama_fit_set_assume_full_offload for a scope and restores the previous value (also on exceptions);
     // see the step 3 comment for what the switch does
@@ -257,7 +387,8 @@ static void common_params_fit_impl(
                 // with 4 input copies its real (partially offloaded, pipeline-free) context never allocates.
                 assume_full_offload_guard extra_guard(false);
                 measured = common_get_device_memory_data_impl(
-                    extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
+                    extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level,
+                    "extra");
             } catch (const std::runtime_error & e) {
                 // the extra model is optional, fit the main model alone rather than giving up
                 LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
@@ -268,13 +399,34 @@ static void common_params_fit_impl(
 
             dmds_extra = dmds_t(devs.size() + 1);
             dmds_extra.back().mb = measured.back().mb;
+            extra_outside.clear();
             for (size_t je = 0; je < devs_extra.size(); je++) {
+                bool matched = false;
                 for (size_t id = 0; id < devs.size(); id++) {
                     if (devs_extra[je] == devs[id]) {
                         dmds_extra[id].mb.model   += measured[je].mb.model;
                         dmds_extra[id].mb.context += measured[je].mb.context;
                         dmds_extra[id].mb.compute += measured[je].mb.compute;
+                        dmds_extra[id].mb.scratch += measured[je].mb.scratch;
+                        matched = true;
                         break;
+                    }
+                }
+                // [fork, 2026-10-27] a draft placed with -devd on a device the main model does not use was dropped
+                // here without a word (inventory 2026-10-27 gap 6). The fit cannot move it (it only places the main
+                // model's layers), so it is checked on its own device against that device's free memory and the
+                // largest main-device margin, and reported in the summary; a deficit is a WARN naming the device.
+                if (!matched && je < measured.size()) {
+                    const llama_device_memory_data & m = measured[je];
+                    const int64_t placed = int64_t(extra->shares_model ? m.mb.total() - m.mb.model : m.mb.total());
+                    extra_outside.push_back({ devs_extra[je], m.free, placed });
+                    const int64_t margin = nd_margin_max();
+                    if (placed > m.free - margin) {
+                        LOG_WRN("%s: the draft/MTP model puts %" PRId64 " MiB on %s, which the main model does not use; "
+                                "it has %" PRId64 " MiB free, %" PRId64 " MiB short of the %" PRId64 " MiB margin (the fit "
+                                "cannot move it: lower -ngld, -cd or pick another -devd)\n",
+                                __func__, placed/MiB, ggml_backend_dev_name(devs_extra[je]), m.free/MiB,
+                                (placed - (m.free - margin))/MiB, margin/MiB);
                     }
                 }
             }
@@ -291,6 +443,7 @@ static void common_params_fit_impl(
             dmds[id].mb.model   += dmds_extra[id].mb.model;
             dmds[id].mb.context += dmds_extra[id].mb.context;
             dmds[id].mb.compute += dmds_extra[id].mb.compute;
+            dmds[id].mb.scratch += dmds_extra[id].mb.scratch;
         }
     };
 
@@ -302,8 +455,24 @@ static void common_params_fit_impl(
 
     // step 1: get data for default parameters and check whether any changes are necessary in the first place
 
+    // [fork, 2026-10-27] what is on each card before the fit touches it, kernel view (sysfs mem_info_vram_used, via
+    // ggml_backend_dev_memory = total - used on that path): a leftover process (a second llama-server, a stuck HIP
+    // context) shows up here as "used" on an otherwise idle card. Idle 2026-10-27 the budget read total - 57 MiB.
+    for (ggml_backend_dev_t dev : common_fit_candidate_devs(mparams)) {
+        size_t f = 0, t = 0, bf = 0, bt = 0;
+        ggml_backend_dev_memory(dev, &f, &t);
+        if (common_fit_dev_budget(dev, bf, bt)) {
+            LOG_WRN("fit start: %s kernel used %" PRId64 " of %" PRId64 " MiB\n",
+                    ggml_backend_dev_name(dev), int64_t(t - f)/MiB, int64_t(t)/MiB);
+        } else {
+            LOG_WRN("fit start: %s kernel used n/a (no sysfs view; free %" PRId64 " of %" PRId64 " MiB)\n",
+                    ggml_backend_dev_name(dev), int64_t(f)/MiB, int64_t(t)/MiB);
+        }
+    }
+
     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
-    dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+    dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level,
+            "full", /*trace =*/ true);
 
     // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
     const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_streams, UINT32_MAX);
@@ -315,13 +484,16 @@ static void common_params_fit_impl(
         if (n_streams > 1) {
             LOG_TRC("%s: context size unset and KV cache not unified -> using %" PRIu32 " for %" PRIu32 " sequences:\n",
                 __func__, n_ctx_max, n_streams);
-            dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+            dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level,
+                    "full");
         }
     }
     add_extra_memory(dmds_full);
     remember(*mparams, dmds_full);
     const uint32_t n_ctx_initial = cparams->n_ctx; // [fork] for the summary: the context before any shrink
     uint32_t n_ctx_grow_from = 0;                  // [fork] for the summary: start of the grow-back, 0 = none
+    int      n_fit_rounds    = 0;                  // [fork] for the summary: layer-fill rounds (0 = no fill ran)
+    std::vector<uint32_t> split_round0;            // [fork] for the summary: layers per device after round 0's grow
 
     const size_t nd = devs.size(); // number of devices
 
@@ -361,7 +533,8 @@ static void common_params_fit_impl(
     // could not put the fit's view next to the kernel's. This prints the chosen configuration's estimate at WARN
     // (library and common INFO are hidden at -lv 3), to be read against the GTT WATCH / SCRATCH GROW lines of
     // ggml-vulkan-buffers.cpp. Cross-module precondition: "free" is ggml_backend_dev_memory at fit time =
-    // RADV heapBudget - heapUsage (VK_EXT_memory_budget), blind to kernel placement; context = KV + recurrent state
+    // RADV heapBudget - heapUsage (VK_EXT_memory_budget), blind to kernel placement (since 2026-10-27 on amdgpu:
+    // sysfs mem_info_vram_total - mem_info_vram_used, device-wide, with the budget printed beside it); context = KV + recurrent state
     // (the breakdown does not split them); compute = the reserve at fit time, NOT the lazy per-graph scratch
     // (prealloc_*, D2D rings, staging) the backend allocates later. The estimate is the probe of the chosen
     // configuration when one was made, else one more no_alloc probe.
@@ -372,13 +545,33 @@ static void common_params_fit_impl(
             d = it->second;
         } else {
             try {
-                d = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+                d = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level,
+                        "final");
                 add_extra_memory(d);
             } catch (const std::exception & e) {
                 LOG_WRN("%s: fit summary: final probe failed: %s\n", __func__, e.what());
                 return;
             }
         }
+        // [fork, 2026-10-27] on amdgpu "free" is the kernel's (sysfs mem_info_vram_total - _used, ggml-vulkan
+        // ggml_backend_vk_get_device_memory); the driver budget (RADV heapBudget - heapUsage, the fit's "free" before
+        // that date) is printed next to it so the delta stays visible. 2026-10-27 live log, cards idle: budget read
+        // 2975 / 2975 / 2004 MiB below VRAM (XT 17489 of 20464, XTX 21585 and 22556 of 24560), the XT limited the fit at
+        // est. free 681 MiB while the kernel showed 3597 MiB free. Empty for backends without the proc.
+        // CORRECTION (same day, fit mem trace): that gap was the probe's own RS planes, not the driver - "free at fit"
+        // was read inside the probe and both views count device-wide. Free is now sampled before the probe's load
+        // (common_get_device_memory_data_impl), and this budget is read at summary time, so on idle cards with no
+        // other process the two should now agree within a few MiB.
+        auto budget_note = [](ggml_backend_dev_t dev) -> std::string {
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            auto fn = reg ? (ggml_backend_fork_dev_memory_budget_t)
+                ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_FORK_DEV_MEMORY_BUDGET_PROC) : nullptr;
+            size_t f = 0, t = 0;
+            if (fn == nullptr || !fn(dev, &f, &t)) {
+                return "";
+            }
+            return " (driver budget " + std::to_string(f/MiB) + " MiB)";
+        };
         for (size_t id = 0; id < nd && id < d.size(); id++) {
             const llama_device_memory_data & dm = d[id];
             const int64_t placed = dm.mb.total();
@@ -387,12 +580,21 @@ static void common_params_fit_impl(
             if (nd > 1 && mparams->tensor_split) {
                 snprintf(layers, sizeof(layers), ", %.0f layers", mparams->tensor_split[id]);
             }
-            LOG_WRN("%s: fit summary: %s: total %6" PRId64 " MiB, free at fit %6" PRId64 " MiB, placed %6" PRId64 " MiB "
-                    "(model %" PRId64 " + KV/RS %" PRId64 " + compute %" PRId64 ")%s, margin %" PRId64 " MiB, est. free %6" PRId64
-                    " MiB (%+" PRId64 " vs margin)\n",
-                    __func__, dev_names[id].c_str(), dm.total/MiB, dm.free/MiB, placed/MiB,
-                    int64_t(dm.mb.model)/MiB, int64_t(dm.mb.context)/MiB, int64_t(dm.mb.compute)/MiB, layers,
+            // [fork, 2026-10-27] "scratch" = the backend scratch inside compute (llama_memory_breakdown_data::scratch),
+            // e.g. 1368 MiB of prealloc_x per XTX at -c 350000; it was invisible to the fit before that date
+            LOG_WRN("%s: fit summary: %s: total %6" PRId64 " MiB, free at fit %6" PRId64 " MiB%s, placed %6" PRId64 " MiB "
+                    "(model %" PRId64 " + KV/RS %" PRId64 " + compute %" PRId64 ", of which backend scratch %" PRId64 ")%s, "
+                    "margin %" PRId64 " MiB, est. free %6" PRId64 " MiB (%+" PRId64 " vs margin)\n",
+                    __func__, dev_names[id].c_str(), dm.total/MiB, dm.free/MiB, budget_note(devs[id]).c_str(), placed/MiB,
+                    int64_t(dm.mb.model)/MiB, int64_t(dm.mb.context)/MiB, int64_t(dm.mb.compute)/MiB,
+                    int64_t(dm.mb.scratch)/MiB, layers,
                     margins[id]/MiB, est_free/MiB, (est_free - margins[id])/MiB);
+        }
+        for (const extra_outside_t & eo : extra_outside) {
+            LOG_WRN("%s: fit summary: %s: draft/MTP only (not a main-model device): free at fit %6" PRId64 " MiB%s, "
+                    "placed %6" PRId64 " MiB, est. free %6" PRId64 " MiB (%+" PRId64 " vs margin %" PRId64 " MiB)\n",
+                    __func__, ggml_backend_dev_name(eo.dev), eo.free/MiB, budget_note(eo.dev).c_str(), eo.placed/MiB, (eo.free - eo.placed)/MiB,
+                    (eo.free - eo.placed - nd_margin_max())/MiB, nd_margin_max()/MiB);
         }
         if (!d.empty()) {
             const llama_device_memory_data & h = d.back();
@@ -413,7 +615,19 @@ static void common_params_fit_impl(
                     : ", grow-back found no room above " + std::to_string(n_ctx_grow_from);
             }
         }
-        LOG_WRN("%s: fit summary: n_ctx %" PRIu32 " (%s)\n", __func__, cparams->n_ctx, how.c_str());
+        LOG_WRN("%s: fit summary: n_ctx %" PRIu32 " (%s), rounds %d, probes %d\n", __func__, cparams->n_ctx, how.c_str(),
+                n_fit_rounds, common_fit_n_probes);
+        // [fork, 2026-10-27] layers a refill round moved (see "Refill rounds" in step 3), against round 0's split
+        if (nd > 1 && mparams->tensor_split && split_round0.size() == nd) {
+            for (size_t id = 0; id < nd; id++) {
+                const uint32_t l1 = split_round0[id];
+                const uint32_t l2 = uint32_t(mparams->tensor_split[id]);
+                if (l1 != l2) {
+                    LOG_WRN("%s: fit refill: %s %" PRIu32 " -> %" PRIu32 " layers\n", __func__,
+                            ggml_backend_dev_name(devs[id]), l1, l2);
+                }
+            }
+        }
     };
 
     int64_t sum_free            = 0;
@@ -524,7 +738,8 @@ static void common_params_fit_impl(
 
                     int64_t sum_projected_used_min_ctx = 0;
                     cparams->n_ctx = n_ctx_min_total;
-                    dmds_t dmds_min_ctx = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+                    dmds_t dmds_min_ctx = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level,
+                            "minctx");
                     add_extra_memory(dmds_min_ctx);
                     remember(*mparams, dmds_min_ctx);
                     if (nd == 0) {
@@ -704,6 +919,8 @@ static void common_params_fit_impl(
     };
 
     // utility function that returns the memory use per device for given numbers of layers per device
+    // [fork, 2026-10-27] trace label of the layer probes: "fill" while placing layers, "grow" during the n_ctx grow-back
+    const char * probe_label = "fill";
     auto get_memory_for_layers = [&](
             const char * func_name,
             const std::vector<ngl_t> & ngl_per_device,
@@ -712,7 +929,7 @@ static void common_params_fit_impl(
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, mparams_copy);
 
         dmds_t dmd_nl = common_get_device_memory_data_impl(
-            path_model, &mparams_copy, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+            path_model, &mparams_copy, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level, probe_label);
         add_extra_memory(dmd_nl);
         remember(mparams_copy, dmd_nl);
 
@@ -742,7 +959,7 @@ static void common_params_fit_impl(
 
         LOG_TRC("%s: getting device memory data with all MoE tensors moved to system memory:\n", __func__);
         dmds_t dmds_cpu_moe = common_get_device_memory_data_impl(
-            path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+            path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level, "cpumoe");
         add_extra_memory(dmds_cpu_moe);
 
         for (size_t id = 0; id < nd; id++) {
@@ -812,6 +1029,16 @@ static void common_params_fit_impl(
     const bool pp_possible = nd > 1 && mparams->split_mode == LLAMA_SPLIT_MODE_LAYER && cparams->offload_kqv;
     assume_full_offload_guard pp_guard(pp_possible);
 
+    // [fork, 2026-10-27] design hook for --fit-performance-bias (contextFiles/design-fit-performance-bias.md, NOT built):
+    // the most layers device id may be offered by the fill ("high" bound) and by the refill walk. Today it is the
+    // memory-only fit's n_unassigned. The bias will return min(n_unassigned, round(share_id * n_layer)) for every
+    // device but device 0, which always takes the remainder (the fill's device 0 is never capped, the refill walk
+    // does not call it for id 0); memory still clamps below the cap.
+    auto layer_cap = [&](size_t id, uint32_t n_unassigned) -> uint32_t {
+        GGML_UNUSED(id);
+        return n_unassigned;
+    };
+
     auto fill_dense_back_to_front = [&](const char * func) {
         ngl_per_device = std::vector<ngl_t>(nd);
         mem = get_memory_for_layers(func, ngl_per_device, overflow_bufts);
@@ -836,7 +1063,8 @@ static void common_params_fit_impl(
             }
 
             std::vector<ngl_t> ngl_per_device_high = ngl_per_device;
-            ngl_per_device_high[id].n_layer = n_unassigned;
+            const uint32_t n_cap = id == 0 ? n_unassigned : layer_cap(id, n_unassigned);
+            ngl_per_device_high[id].n_layer = n_cap;
             if (hp_nex > 0) {
                 ngl_per_device_high[id].n_part = size_t(id) < nd - 1 ? ngl_per_device_high[id].n_layer : ngl_per_device_high[id].n_layer - 1;
             }
@@ -871,7 +1099,7 @@ static void common_params_fit_impl(
                         delta = ngl_per_device_high[id].n_layer - ngl_per_device[id].n_layer;
                     }
                 } else {
-                    assert(ngl_per_device_high[id].n_layer == n_unassigned);
+                    assert(ngl_per_device_high[id].n_layer == n_cap);
                     ngl_per_device = ngl_per_device_high;
                     mem            = mem_high;
                     LOG_TRC("%s: set ngl_per_device[%d].n_layer=%" PRIu32 "\n", func, id, ngl_per_device[id].n_layer);
@@ -885,6 +1113,7 @@ static void common_params_fit_impl(
         }
     };
     fill_dense_back_to_front(__func__);
+    n_fit_rounds = 1;
     if (pp_possible && hp_nex == 0) {
         auto n_assigned = [&]() {
             uint32_t n = 0;
@@ -974,9 +1203,13 @@ static void common_params_fit_impl(
             // allocations and the kernel's own placement; 2873 MiB free (270k) ran clean, 783 did not; the threshold in
             // between is not known, so the slack is a floor, not the answer (ledger 2026-10-22 14:15).
             const int64_t GROW_SLACK = 256 * MiB;
+            // every probe of the CURRENT split made by the grow-back (n_ctx, per-device use): the refill rounds below
+            // take the per-cell rate from the two farthest points
+            std::vector<std::pair<uint32_t, std::vector<int64_t>>> grow_pts;
             auto fits_at = [&](uint32_t n_ctx_test, std::vector<int64_t> & mem_test) -> bool {
                 cparams->n_ctx = n_ctx_test;
                 mem_test = get_memory_for_layers(__func__, ngl_per_device, overflow_bufts);
+                grow_pts.push_back({ n_ctx_test, mem_test });
                 for (size_t id = 0; id < nd; id++) {
                     if (mem_test[id] > targets[id] - GROW_SLACK) {
                         return false;
@@ -985,84 +1218,85 @@ static void common_params_fit_impl(
                 return true;
             };
 
-            const uint32_t n_ctx_start = cparams->n_ctx;
-            n_ctx_grow_from = n_ctx_start;
-            uint32_t             lo      = n_ctx_start;
-            std::vector<int64_t> mem_lo  = mem;
-            uint32_t             lo_prev = 0; // previous fitting point for the secant, 0 = none yet
-            std::vector<int64_t> mem_lo_prev;
-            uint32_t             hi      = 0; // smallest known failing context, 0 = none yet
-            int                  n_probe = 0;
+            // grows n_ctx from n_ctx_start (which fits with the current split, per-device use mem_start) to the
+            // largest context that fits with ngl_per_device fixed; leaves the result in cparams->n_ctx and mem.
+            // Returns false when the result fails the fresh free re-check even at n_ctx_start.
+            auto grow_back = [&](uint32_t n_ctx_start, const std::vector<int64_t> & mem_start, int & n_probe) -> bool {
+                grow_pts.clear();
+                grow_pts.push_back({ n_ctx_start, mem_start });
+                uint32_t             lo      = n_ctx_start;
+                std::vector<int64_t> mem_lo  = mem_start;
+                uint32_t             lo_prev = 0; // previous fitting point for the secant, 0 = none yet
+                std::vector<int64_t> mem_lo_prev;
+                uint32_t             hi      = 0; // smallest known failing context, 0 = none yet
+                n_probe = 0;
 
-            // phase 1: walk up until a probe fails or the cap fits
-            for (; n_probe < 16 && hi == 0 && lo < n_ctx_cap; n_probe++) {
-                uint32_t n_ctx_test;
-                if (lo_prev == 0) {
-                    n_ctx_test = lo + std::max(align, lo / 64 / align * align);
-                } else {
-                    int64_t cells = INT64_MAX;
-                    for (size_t id = 0; id < nd; id++) {
-                        const int64_t rate = (mem_lo[id] - mem_lo_prev[id]) / int64_t(lo - lo_prev);
-                        if (rate > 0) {
-                            cells = std::min(cells, (targets[id] - mem_lo[id]) / rate);
+                // phase 1: walk up until a probe fails or the cap fits
+                for (; n_probe < 16 && hi == 0 && lo < n_ctx_cap; n_probe++) {
+                    uint32_t n_ctx_test;
+                    if (lo_prev == 0) {
+                        n_ctx_test = lo + std::max(align, lo / 64 / align * align);
+                    } else {
+                        int64_t cells = INT64_MAX;
+                        for (size_t id = 0; id < nd; id++) {
+                            const int64_t rate = (mem_lo[id] - mem_lo_prev[id]) / int64_t(lo - lo_prev);
+                            if (rate > 0) {
+                                cells = std::min(cells, (targets[id] - mem_lo[id]) / rate);
+                            }
                         }
+                        const int64_t pred = cells == INT64_MAX ? int64_t(n_ctx_cap) : int64_t(lo) + cells;
+                        n_ctx_test = uint32_t(std::min<int64_t>(pred, n_ctx_cap)) / align * align;
+                        n_ctx_test = std::max(n_ctx_test, lo + align);
                     }
-                    const int64_t pred = cells == INT64_MAX ? int64_t(n_ctx_cap) : int64_t(lo) + cells;
-                    n_ctx_test = uint32_t(std::min<int64_t>(pred, n_ctx_cap)) / align * align;
-                    n_ctx_test = std::max(n_ctx_test, lo + align);
-                }
-                n_ctx_test = std::min(n_ctx_test, n_ctx_cap);
+                    n_ctx_test = std::min(n_ctx_test, n_ctx_cap);
 
-                std::vector<int64_t> mem_test;
-                if (fits_at(n_ctx_test, mem_test)) {
-                    lo_prev     = lo;
-                    mem_lo_prev = mem_lo;
-                    lo          = n_ctx_test;
-                    mem_lo      = mem_test;
-                } else {
-                    hi = n_ctx_test;
+                    std::vector<int64_t> mem_test;
+                    if (fits_at(n_ctx_test, mem_test)) {
+                        lo_prev     = lo;
+                        mem_lo_prev = mem_lo;
+                        lo          = n_ctx_test;
+                        mem_lo      = mem_test;
+                    } else {
+                        hi = n_ctx_test;
+                    }
                 }
-            }
-            // phase 2: bisect (lo fits, hi fails)
-            while (hi != 0 && hi - lo > align) {
-                const uint32_t mid = (lo + (hi - lo) / 2) / align * align;
-                if (mid <= lo || mid >= hi) {
-                    break;
+                // phase 2: bisect (lo fits, hi fails)
+                while (hi != 0 && hi - lo > align) {
+                    const uint32_t mid = (lo + (hi - lo) / 2) / align * align;
+                    if (mid <= lo || mid >= hi) {
+                        break;
+                    }
+                    std::vector<int64_t> mem_test;
+                    n_probe++;
+                    if (fits_at(mid, mem_test)) {
+                        lo     = mid;
+                        mem_lo = mem_test;
+                    } else {
+                        hi = mid;
+                    }
                 }
-                std::vector<int64_t> mem_test;
-                n_probe++;
-                if (fits_at(mid, mem_test)) {
-                    lo     = mid;
-                    mem_lo = mem_test;
-                } else {
-                    hi = mid;
-                }
-            }
 
-            cparams->n_ctx = lo;
-            mem            = mem_lo;
+                cparams->n_ctx = lo;
+                mem            = mem_lo;
 
-            // re-check against a FRESH free reading (see GROW_SLACK above: the reading drifted 243 MiB during one fit);
-            // step down one align at a time, at most 8 times, until every device keeps its margin against it
-            {
+                // re-check against a FRESH free reading (see GROW_SLACK above: the reading drifted 243 MiB during one fit);
+                // step down one align at a time, at most 8 times, until every device keeps its margin against it
                 std::vector<int64_t> free_now(nd, 0);
                 for (size_t id = 0; id < nd; id++) {
                     size_t f = 0, t = 0;
                     ggml_backend_dev_memory(devs[id], &f, &t);
                     free_now[id] = int64_t(f);
                 }
-                int n_down = 0;
-                for (; n_down < 8 && lo > n_ctx_start; n_down++) {
-                    bool ok = true;
+                auto fresh_ok = [&]() {
                     for (size_t id = 0; id < nd; id++) {
                         if (free_now[id] - mem[id] < margins[id]) {
-                            ok = false;
-                            break;
+                            return false;
                         }
                     }
-                    if (ok) {
-                        break;
-                    }
+                    return true;
+                };
+                int n_down = 0;
+                for (; n_down < 8 && lo > n_ctx_start && !fresh_ok(); n_down++) {
                     lo = std::max(n_ctx_start, (lo - align) / align * align);
                     cparams->n_ctx = lo;
                     mem = get_memory_for_layers(__func__, ngl_per_device, overflow_bufts);
@@ -1071,13 +1305,223 @@ static void common_params_fit_impl(
                 if (n_down > 0) {
                     LOG_TRC("%s: grow-back stepped down %d x %" PRIu32 " cells after a fresh free reading\n", __func__, n_down, align);
                 }
+                LOG_TRC("%s: context grown from %" PRIu32 " to %" PRIu32 " with the layer split fixed (%d probes, cap %" PRIu32 "):\n",
+                    __func__, n_ctx_start, lo, n_probe, n_ctx_cap);
+                for (size_t id = 0; id < nd; id++) {
+                    LOG_TRC("%s:   - %s: %2" PRIu32 " layers, %6" PRId64 " MiB used, %6" PRId64 " MiB free vs. target of %6" PRId64 "\n",
+                        __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, mem[id]/MiB,
+                        (dmds_full[id].free - mem[id])/MiB, margins[id]/MiB);
+                }
+                return fresh_ok();
+            };
+
+            n_ctx_grow_from = cparams->n_ctx;
+            probe_label = "grow";
+            {
+                int n_probe = 0;
+                const int n_probes_pre = common_fit_n_probes;
+                grow_back(cparams->n_ctx, mem, n_probe); // round 0: taken as before, whatever the fresh check says
+                LOG_TRC("%s: fit round 0: n_ctx %" PRIu32 ", %d probes this round (%d before it)\n",
+                    __func__, cparams->n_ctx, common_fit_n_probes - n_probes_pre, n_probes_pre);
             }
-            LOG_TRC("%s: context grown from %" PRIu32 " to %" PRIu32 " with the layer split fixed (%d probes, cap %" PRIu32 "):\n",
-                __func__, n_ctx_start, lo, n_probe, n_ctx_cap);
-            for (size_t id = 0; id < nd; id++) {
-                LOG_TRC("%s:   - %s: %2" PRIu32 " layers, %6" PRId64 " MiB used, %6" PRId64 " MiB free vs. target of %6" PRId64 "\n",
-                    __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, mem[id]/MiB,
-                    (dmds_full[id].free - mem[id])/MiB, margins[id]/MiB);
+            split_round0.clear();
+            for (const ngl_t & n : ngl_per_device) {
+                split_round0.push_back(n.n_layer);
+            }
+
+            // [fork, 2026-10-27] Refill rounds: re-place the layers at a larger context, grow again, keep the best.
+            //
+            // Why: the split above is decided ONCE, by the back-to-front fill at the context the shrink loop stopped
+            // at; the grow-back then raises n_ctx with that split frozen until the first card binds. 2026-10-27,
+            // Qwen3.8-27B Q6, --fit-target 2048,2048,2048, --device Vulkan2,Vulkan3,Vulkan1, MTP draft context on
+            // Vulkan1 (1495 MiB KV + 437 compute + 1495 scratch, margin 2315 with the vocab head): shrunk from 524288,
+            // grown back from 353536 to 382720, then XT Vulkan2 20 layers +1725 MiB vs its margin, Vulkan3 26 layers
+            // +275, Vulkan1 20 layers +260; 25 s from fit start to summary. The XTXs bind and the XT keeps 1.7 GB: one
+            // layer XTX -> XT is ~300 model + ~290 KV (attention layer) or ~160 RS (GDN layer) MiB per XTX, which the
+            // grow-back turns into context (owner estimate ~20k cells).
+            //
+            // Premise checked before building: a refill AT the grown n_ctx is a fixed point. The grow-back stops where
+            // the binding cards are within one layer of their target, and the greedy back-to-front fill gives each
+            // card the most layers that fit, which at that n_ctx is exactly what it already has (Vulkan1: 20 fit with
+            // +260, a 21st costs ~460-750). So the refill is aimed ABOVE the grown context: the summed slack over the
+            // cards divided by the summed bytes per cell (split-independent: KV, RS and mask copies per cell do not
+            // depend on which card holds a layer) is the most context any split could add; the fill runs there, then
+            // at 1/2 and 1/4 of that gain while it fails (whole-layer waste). At the aimed context the back cards get
+            // fewer layers and the front card (device 0, the XT here) takes the remainder; if that remainder does not
+            // fit, the attempt fails (owner veto: layers beat context, a round never puts a layer on the CPU). A split
+            // that fits is grown back from the aim; the best (largest n_ctx that also passes the fresh free check)
+            // over all rounds is kept.
+            //
+            // The refill places layers by walking from the previous split (back device first, -1 while it does not
+            // fit, +1 while it does, capped by layer_cap; device 0 takes the remainder or the attempt fails). With
+            // memory monotone in layers this lands on the same greedy maximum as the false-position fill, in ~2 probes
+            // per device instead of ~4-5 (each probe = no_alloc model load + context init, + the extra model when
+            // n_ctx moved). The last device keeps the output layer as in the fill: dense layers only (MoE never gets
+            // here), counted from the back, so whatever the last device holds starts with the output layer.
+            //
+            // Stop rule: 4 rounds in total (round 0 included); or the gain estimate is under 4 x 256 cells; or no
+            // aim fits; or the refill returns the current split (stable) or one already tried (cycle); or the refill
+            // rounds have spent as many probes as everything before them (probe budget = 2x the pre-refill count).
+            // Unverified on the dGPUs when written (server live): lavapipe only runs one device, where the loop exits
+            // on "single device".
+            if (nd > 1) {
+                struct fit_round_t {
+                    std::vector<ngl_t>   split;
+                    uint32_t             n_ctx;
+                    std::vector<int64_t> mem;
+                };
+                fit_round_t best = { ngl_per_device, cparams->n_ctx, mem };
+                auto layers_of = [&](const std::vector<ngl_t> & s) {
+                    std::vector<uint32_t> v;
+                    for (const ngl_t & n : s) {
+                        v.push_back(n.n_layer);
+                    }
+                    return v;
+                };
+                std::set<std::vector<uint32_t>> seen = { layers_of(ngl_per_device) };
+                // the refill rounds may spend as much again as everything before them (2x in total), at least 16 so a
+                // fit whose earlier phase was cheap (lavapipe 9B, 8 probes before the refill) can finish one round
+                const int n_probes_budget = std::max(common_fit_n_probes, 16);
+                const int n_probes_refill0 = common_fit_n_probes;
+                const char * stop = "4 rounds";
+
+                // the walk described above; true + split/mem on success
+                auto refill_at = [&](uint32_t n_ctx_aim, std::vector<ngl_t> & s_out, std::vector<int64_t> & mem_out) -> bool {
+                    cparams->n_ctx = n_ctx_aim;
+                    const std::vector<ngl_t> hint = ngl_per_device;
+                    std::vector<ngl_t> s(nd);
+                    std::vector<int64_t> m;
+                    auto fits_dev = [&](size_t id, const std::vector<int64_t> & mm) {
+                        return mm[id] <= targets[id] - GROW_SLACK;
+                    };
+                    for (int id = int(nd) - 1; id >= 0; id--) {
+                        uint32_t n_unassigned = hp_ngl + 1;
+                        for (size_t jd = id + 1; jd < nd; jd++) {
+                            n_unassigned -= s[jd].n_layer;
+                        }
+                        const uint32_t cap = id == 0 ? n_unassigned : layer_cap(id, n_unassigned);
+                        s[id].n_layer = id == 0 ? n_unassigned : std::min(hint[id].n_layer, cap);
+                        m = get_memory_for_layers(__func__, s, overflow_bufts);
+                        if (fits_dev(id, m)) {
+                            while (id > 0 && s[id].n_layer < cap) {
+                                std::vector<ngl_t> t = s;
+                                t[id].n_layer++;
+                                std::vector<int64_t> mt = get_memory_for_layers(__func__, t, overflow_bufts);
+                                if (!fits_dev(id, mt)) {
+                                    break;
+                                }
+                                s = t;
+                                m = mt;
+                            }
+                        } else {
+                            if (id == 0) {
+                                LOG_TRC("%s: refill at %" PRIu32 ": %s cannot take the remaining %" PRIu32 " layers\n",
+                                    __func__, n_ctx_aim, dev_names[0].c_str(), n_unassigned);
+                                return false;
+                            }
+                            while (s[id].n_layer > 0 && !fits_dev(id, m)) {
+                                s[id].n_layer--;
+                                m = get_memory_for_layers(__func__, s, overflow_bufts);
+                            }
+                            if (!fits_dev(id, m)) {
+                                return false; // fixed per-device cost (MTP context, compute) alone exceeds the target
+                            }
+                        }
+                    }
+                    s_out   = s;
+                    mem_out = m;
+                    return true;
+                };
+
+                probe_label = "refill";
+                for (int round = 1; ; round++) {
+                    if (round >= 4) {
+                        break;
+                    }
+                    if (common_fit_n_probes - n_probes_refill0 >= n_probes_budget) {
+                        stop = "probe budget";
+                        break;
+                    }
+                    // per-cell rate of the current split from its grow-back probes, slack at its grown context
+                    const auto pmin = std::min_element(grow_pts.begin(), grow_pts.end(),
+                        [](const auto & a, const auto & b) { return a.first < b.first; });
+                    const auto pmax = std::max_element(grow_pts.begin(), grow_pts.end(),
+                        [](const auto & a, const auto & b) { return a.first < b.first; });
+                    if (pmax->first <= pmin->first) {
+                        stop = "no rate (grow-back made no probe)";
+                        break;
+                    }
+                    int64_t sum_rate = 0, sum_slack = 0;
+                    for (size_t id = 0; id < nd; id++) {
+                        sum_rate  += (pmax->second[id] - pmin->second[id]) / int64_t(pmax->first - pmin->first);
+                        sum_slack += std::max<int64_t>(0, targets[id] - GROW_SLACK - mem[id]);
+                    }
+                    const uint32_t lo = cparams->n_ctx;
+                    const int64_t gain = sum_rate > 0 ? sum_slack / sum_rate : 0;
+                    LOG_TRC("%s: fit round %d: slack %" PRId64 " MiB over the devices at %" PRId64 " B/cell -> at most %" PRId64 " more cells\n",
+                        __func__, round, sum_slack/MiB, sum_rate, gain);
+                    if (gain < int64_t(4 * align) || lo >= n_ctx_cap) {
+                        stop = "gain under 4 x align";
+                        break;
+                    }
+                    // a refill at a larger context only moves layers TOWARD device 0 (the back devices get fewer, device 0
+                    // the remainder), so it needs device 0 to have room for at least one layer's weights (the average over
+                    // the full-offload probe; the layer's KV/RS come on top, so this is a lower bound and only skips
+                    // attempts that cannot succeed). Lavapipe 2026-10-27, 0.8B, front device binding: 3 failed aims, 12
+                    // probes, before this check.
+                    const int64_t layer_min = sum_projected_model / int64_t(hp_ngl + 1);
+                    if (targets[0] - GROW_SLACK - mem[0] < layer_min) {
+                        stop = "device 0 has no room for a layer";
+                        break;
+                    }
+                    const int n_probes_pre = common_fit_n_probes;
+                    std::vector<ngl_t>   s;
+                    std::vector<int64_t> m;
+                    uint32_t aim = 0;
+                    bool ok = false;
+                    for (int k = 0; k < 3 && !ok; k++) {
+                        const uint32_t a = uint32_t(std::min<int64_t>(int64_t(lo) + (gain >> k), n_ctx_cap)) / align * align;
+                        if (a <= lo) {
+                            break;
+                        }
+                        aim = a;
+                        ok  = refill_at(aim, s, m);
+                    }
+                    if (!ok) {
+                        cparams->n_ctx = lo;
+                        stop = "no refill fits above the grown context";
+                        break;
+                    }
+                    if (layers_of(s) == layers_of(ngl_per_device)) {
+                        cparams->n_ctx = lo;
+                        stop = "split stable";
+                        break;
+                    }
+                    if (!seen.insert(layers_of(s)).second) {
+                        cparams->n_ctx = lo;
+                        stop = "split cycle";
+                        break;
+                    }
+                    ngl_per_device = s;
+                    int n_probe = 0;
+                    const bool fresh = grow_back(aim, m, n_probe);
+                    n_fit_rounds++;
+                    std::string sl;
+                    for (const ngl_t & n : ngl_per_device) {
+                        sl += (sl.empty() ? "" : ",") + std::to_string(n.n_layer);
+                    }
+                    LOG_TRC("%s: fit round %d: refill at %" PRIu32 " -> split %s, n_ctx %" PRIu32 "%s, %d probes this round\n",
+                        __func__, round, aim, sl.c_str(), cparams->n_ctx, fresh ? "" : " (fails the fresh free check, not taken)",
+                        common_fit_n_probes - n_probes_pre);
+                    if (fresh && cparams->n_ctx > best.n_ctx) {
+                        best = { ngl_per_device, cparams->n_ctx, mem };
+                    }
+                }
+                LOG_TRC("%s: fit refill stopped (%s) after %d rounds, %d probes in the refills\n",
+                    __func__, stop, n_fit_rounds, common_fit_n_probes - n_probes_refill0);
+                ngl_per_device = best.split;
+                cparams->n_ctx = best.n_ctx;
+                mem            = best.mem;
             }
         }
     }
@@ -1442,6 +1886,73 @@ void common_memory_breakdown_print(const struct llama_context * ctx) {
     }));
 }
 
+std::vector<ggml_backend_dev_t> common_fit_devices(const std::vector<ggml_backend_dev_t> & devices) {
+    std::vector<ggml_backend_dev_t> ret;
+    if (!devices.empty()) {
+        // parse_device_list ends the list with nullptr; "--device none" is just { nullptr }
+        for (ggml_backend_dev_t d : devices) {
+            if (d != nullptr) {
+                ret.push_back(d);
+            }
+        }
+        return ret;
+    }
+    std::vector<ggml_backend_dev_t> igpus;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            ret.push_back(d);
+        } else if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            igpus.push_back(d);
+        }
+    }
+    return ret.empty() ? igpus : ret;
+}
+
+// Bound of the vocab-subset head buffer (llama_context::set_logits_subset): n_pad = GGML_PAD(n_ids, 256) rows of
+// model.output (or token_embd when tied) + 8 B per row of ids/mask. n_ids is the id file + the forced
+// control/EOG/digit/newline ids + at most vs_ctx_max = 32768 prompt ids before the list restarts (common/speculative.cpp,
+// keep the two in sync). Measured 2026-10-27 on Qwen3.8-27B with mtp-vocab-top32k.txt: file 32769 lines, base
+// 32899 ids (130 forced), live list 33187 ids / n_pad 33280 = 181 MB of Q8_0 rows (5440 B). Forced ids are allowed
+// 1024 here. The bound (32769 + 1024 + 32768 -> 66560 rows, 362 MB) also covers the reallocation transient: on an
+// n_pad change the new buffer is created before the old one is freed, i.e. 2 x 33280 rows for a moment.
+size_t common_fit_vocab_subset_bytes(const char * path_model, const char * path_subset) {
+    size_t n_file = 0;
+    {
+        std::ifstream f(path_subset);
+        if (!f) {
+            return 0;
+        }
+        std::string line;
+        while (std::getline(f, line)) {
+            const size_t p = line.find_first_not_of(" \t");
+            if (p != std::string::npos && line[p] != '#') {
+                n_file++;
+            }
+        }
+    }
+    ggml_context * meta = nullptr;
+    gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ &meta };
+    gguf_context * gctx = gguf_init_from_file(path_model, gp);
+    if (gctx == nullptr) {
+        return 0;
+    }
+    size_t bytes = 0;
+    const ggml_tensor * w = ggml_get_tensor(meta, "output.weight");
+    if (w == nullptr) {
+        w = ggml_get_tensor(meta, "token_embd.weight");
+    }
+    if (w != nullptr) {
+        const size_t n_vocab = (size_t) w->ne[1];
+        const size_t n_ids   = std::min(n_vocab, n_file + 1024 + 32768);
+        const size_t n_pad   = GGML_PAD(n_ids, 256);
+        bytes = n_pad * (ggml_row_size(w->type, w->ne[0]) + sizeof(int32_t) + sizeof(float));
+    }
+    gguf_free(gctx);
+    ggml_free(meta);
+    return bytes;
+}
+
 void common_fit_print(
         const char * path_model,
         llama_model_params * mparams,
@@ -1451,7 +1962,8 @@ void common_fit_print(
     uint32_t hp_nct = 0; // hparams.n_ctx_train
     uint32_t hp_nex = 0; // hparams.n_expert
 
-    auto dmd = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
+    auto dmd = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR,
+            "print");
     GGML_ASSERT(dmd.size() == devs.size() + 1);
 
     for (size_t id = 0; id < devs.size(); id++) {
