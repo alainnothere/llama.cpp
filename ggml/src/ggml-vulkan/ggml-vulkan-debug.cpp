@@ -21,7 +21,14 @@ uint32_t vk_fa_sparse_min_ratio_f16 = 2;
 int vk_fa_quant_staging = -1;
 int vk_fa_cm1_wave32 = -1;
 int vk_fa_pv_reg = -1;   // GGML_VK_FA_PV_REG default -1 = auto (mode 3 on RDNA3 dense aligned f16, mode 1 if LDS short): production read 2026-10-20 15:54, 45k KV, FA per 1k KV at 4/12 tokens 6.4/14.9 -> 5.2/10.8
-int vk_fa_pv_reg_quant = 0;         // GGML_VK_FA_PV_REG_QUANT default 0 = off (2026-10-24, C1): ships off until the pipelined ppl gate passes on the cards; q8 on = 0.56-0.60x q8 off, 0.67x f16 at 1-2 tokens, 1.68x f16 at 6 (XTX, 229k)
+// GGML_VK_FA_PV_REG_QUANT default 1 since 2026-10-30 (was 0 from 2026-10-24, C1): the ppl gate passed 2026-10-25 01:16
+// (agent-reports/2026-10-25-0212-fa-merge-gate-and-196k-q8-pair.md) and the knob only acts when K and V are q8_0 (f16
+// K/V take the same path as before). It stayed 0 because f16 KV was the production default; since 2026-10-29 the q8 cache
+// is forced for 300k and the knob is mandatory with it, but it lived in ONE launch script (q6_u_v2): the q8_u / fit3
+// scripts ran q8 KV without it for days. 2026-10-30 14:35, 70k ctx, 8-row verify step 114 ms vs 47 ms at the same ctx on
+// 10-29 with the knob; 10-24 numbers: q8 on = 0.56-0.60x q8 off, 0.67x f16 at 1-2 tokens, 1.68x f16 at 6 (XTX, 229k).
+// GGML_VK_FA_PV_REG_QUANT=0 restores the dequant path.
+int vk_fa_pv_reg_quant = 1;
 int vk_fa_tile_loop = 0;            // GGML_VK_FA_TILE_LOOP default 0 = off (2026-10-24, C5 for q8_0 KV, needs PV_REG_QUANT=1): q8 229k 4 tokens 1249 -> 1004 us (0.92x f16), 6-8 tokens 1838 -> 1612 (1.34x f16), 9 2378 -> 1934, 16 3594 -> 2827; ships off with the quant knob until the ppl gate
 int vk_fa_gqa_dense = 1;            // GGML_VK_FA_GQA_DENSE, default ON since the 2026-10-22 23:50 gate (ppl identical modulo split_k rounding, session -3.6%/step at 120k, 7-10 rows -4 ms); =0 disables
 int vk_mmvq_chunk = 48;

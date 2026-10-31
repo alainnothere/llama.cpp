@@ -104,6 +104,20 @@ bool ggml_vk_sysfs_mem_read(const std::string & dir, uint64_t & free, uint64_t &
 void ggml_vk_get_device_memory_budget(int device, size_t * free, size_t * total);
 // [fork, 2026-10-22] one WARN line per lazy scratch / ring growth, rate limited by *counter (first 8, then every 64th)
 void ggml_vk_scratch_grow_log(vk_device& device, const char * which, size_t old_size, size_t new_size, uint32_t * counter);
+// [fork, 2026-10-30] lazy allocation accounting + LAZY ALLOC line (enum vk_lazy_cat, ggml-vulkan-types.h).
+// account: delta bytes (negative on free) into the device's per-category and vram/gtt totals.
+// log: one WARN line "LAZY ALLOC: ..." (floor GGML_VK_SCRATCH_GROW_MIB, first 8 then every 64th per *counter, or per
+// device category when counter is NULL). kind: "vram", "host-visible", or "imported" (dst side of a ring: not counted
+// on this device). detail may be NULL. Logging never changes the accounting; call account first.
+void ggml_vk_lazy_account(vk_device_struct * device, vk_lazy_cat cat, int64_t delta, bool vram);
+void ggml_vk_lazy_alloc_log(vk_device& device, vk_lazy_cat cat, size_t old_size, size_t new_size, const char * kind,
+                            const char * detail = nullptr, uint32_t * counter = nullptr);
+// sysfs GTT/VRAM used for a device that may not be initialized yet (GGML_BACKEND_FORK_DEV_GTT_USED_PROC): dir from
+// ggml_vk_sysfs_mem_dir (which already checked mem_info_gtt_used exists)
+bool ggml_vk_sysfs_gtt_read(const std::string & dir, uint64_t & gtt_used, uint64_t & vram_used);
+// [fork, 2026-10-30] synchronous staging transfers are split into pieces of at most this many bytes (0 = unsplit);
+// GGML_VK_STAGING_CHUNK_MIB, default 0 = off until gated, intended 32 (ggml-vulkan-buffers.cpp)
+size_t ggml_vk_staging_chunk_bytes();
 void ggml_vk_destroy_buffer(vk_buffer& buf);
 void * ggml_vk_host_malloc(vk_device& device, size_t size);
 void ggml_vk_host_free(vk_device& device, void* ptr);

@@ -75,7 +75,11 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
-    do {
+    // [fork, 2026-10-30] pass 1 splits as before; when it would move the recurrent cell of a seq that already finished in
+    // an earlier ubatch (its snapshot planes get overwritten and the post-verify rollback is refused, the -np 3 abort, see
+    // llama_memory_recurrent::moves_done_seq), pass 2 re-splits with one seq per ubatch, which never moves another seq
+    bool one_seq = false;
+    while (true) {
         balloc.split_reset();
 
         // follow the recurrent pattern for creating the ubatch splits
@@ -96,7 +100,7 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
                 //   so that the rollback snapshots remain valid
                 const uint32_t n_rs_seq = get_mem_recr()->n_rs_seq;
 
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0, one_seq);
             }
 
             if (ubatch.n_tokens == 0) {
@@ -109,6 +113,11 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
         if (balloc.get_n_used() < balloc.get_n_tokens()) {
             // failed to find a suitable split
             break;
+        }
+
+        if (!one_seq && !embd_all && get_mem_recr()->moves_done_seq(ubatches)) {
+            one_seq = true;
+            continue;
         }
 
         // prepare the recurrent batches first
@@ -133,7 +142,7 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
 
         return std::make_unique<llama_memory_hybrid_idx_context>(
                 this, std::move(heads_attn), std::move(heads_idx), std::move(ubatches));
-    } while(false);
+    }
 
     return std::make_unique<llama_memory_hybrid_idx_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
 }

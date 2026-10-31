@@ -3,6 +3,7 @@
 #include "common.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -746,13 +747,28 @@ struct server_prompt_cache {
     // string and vocab (e.g. two sizes of the same family) yet produce mutually
     // unreadable state blobs; this is what tells them apart.
     uint32_t    state_hash           = 0;
+    // [fork, 2026-10-30] --cache-convert: the state hashes of the other convertible K/V type pairs (f16 / q8_0) of
+    // the same geometry. a file or checkpoint carrying one of them is readable through the converting state reader.
+    // empty = only state_hash (conversion off, or this server's types are not convertible)
+    std::vector<uint32_t> state_hash_accept;
+
+    bool state_hash_ok(uint32_t fs) const {
+        return fs == state_hash || std::find(state_hash_accept.begin(), state_hash_accept.end(), fs) != state_hash_accept.end();
+    }
 
     size_t size();
     size_t n_tokens();
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, const std::string & conversation_id, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    // n_room: free cells of the unified KV pool for this slot (the other slots' cells subtracted), -1 = no limit
+    // (per-slot KV streams). a RAM entry or disk state with more tokens than n_room is not restored, see [TAG_EVICT_ON_NEED]
+    bool load(server_prompt & prompt, const server_tokens & tokens_new, const std::string & conversation_id, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, int32_t n_room = -1);
+
+    // [TAG_EVICT_ON_NEED] number of tokens load() would restore into the slot for this request, without touching any
+    // context or reading a .kv file: the RAM entry load() would pick, else the disk state of conversation_id (the
+    // in-RAM mirror, or the .hdr alone). -1 = load() would restore nothing and the slot keeps its own state
+    int32_t restore_n_tokens(const server_prompt & prompt, const server_tokens & tokens_new, const std::string & conversation_id, bool has_dft);
 
     // [LLAMA_SERVER_UBATCH_STATS] 2026-10-22 night, set by the last load(): 0 = nothing restored (the slot's own state
     // stays), 1 = RAM entry, 2 = disk tier; bytes restored; the LCP scan over the RAM entries (us)
@@ -874,6 +890,12 @@ public:
 
         // a write failed or the files are inconsistent: the next flush must rewrite from scratch
         bool broken = false;
+
+        // [fork, 2026-10-30] the state hash in the .hdr this mirror was seeded from (read_disk_state), or this server's
+        // own once it scheduled a rewrite. a foreign one (another K/V type, read through --cache-convert) makes the
+        // next flush a rewrite: appending this server's type to it would mix types in one file under a header that
+        // names only one of them
+        uint32_t file_state_hash = 0;
     };
 
     // [TAG_CP_INDEX] one cp_{conv}_{pos_min}.bin file as merge_checkpoint_spills() needs it: the header
@@ -944,12 +966,18 @@ private:
 
 public:
     // seed a disk_conv_state's committed fields from an existing .hdr (server restart case)
-    bool read_disk_state(const std::string & conversation_id, disk_conv_state & st);
+    // with_tokens = false: header and file sizes only, st.scheduled_tokens stays empty (do not seed disk_convs with it)
+    bool read_disk_state(const std::string & conversation_id, disk_conv_state & st, bool with_tokens = true);
 
     // direct disk load by conversation_id: reads .hdr and .tok, then streams the .kv/.drft
     // segments into the context one at a time (bounded RAM - peak is one segment)
+    // n_room: see load(). a state that does not fit is refused before the first segment is read
     bool load_from_disk(server_prompt & prompt, const std::string & conversation_id,
-                        llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+                        llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, int32_t n_room = -1);
+
+private:
+    // Phase 1 of load(): the RAM entry that beats the slot's own prefix, or states.end()
+    std::list<server_prompt_cache_state>::iterator find_state(const server_prompt & prompt, const server_tokens & tokens_new);
 };
 
 // used exclusively by router mode

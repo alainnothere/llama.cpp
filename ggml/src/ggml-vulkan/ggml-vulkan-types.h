@@ -708,9 +708,27 @@ struct vk_gtt_watch {
     bool        sampled  = false;  // first (baseline) sample taken, at the device's first graph
     uint64_t    gtt_base = 0;      // warn level: last warned value, lowered when GTT shrinks
     uint64_t    gtt_prev = 0, vram_prev = 0;
+    uint64_t    vram_base = 0;     // [fork, 2026-10-30] VRAM when gtt_base was set (EVICTION verdict of the growth line)
+    int64_t     lazy_gtt_base = 0; // [fork, 2026-10-30] device lazy_gtt_bytes when gtt_base was set (attribution)
     uint64_t    gtt_first = 0, vram_first = 0;
     uint32_t    n_warn   = 0;
     bool        armed_recovery = false; // a growth warning fired; log once when GTT falls back
+};
+
+// [fork, 2026-10-30] lazy device allocation categories (design-fit-lazy-reserve-and-warmup-gate.md section A).
+// Everything ggml-vulkan allocates AFTER the scheduler reserve, per category, so a log can be summed per device and
+// compared with the fit's lazy column (GGML_BACKEND_FORK_DEV_LAZY_RESERVE_PROC). Why: 2026-10-30 09:50 Vulkan1 went
+// GTT 20 -> 1046 MiB / VRAM 23114 -> 22291 on the first request with NO SCRATCH GROW line in between: staging, the
+// initial rings and the pinned host buffers were never logged. PREALLOC is counted for the SCRATCH GROW lines only:
+// prealloc_* are priced by the fit as scratch (8e979c03db), so they are NOT part of lazy_vram/gtt_bytes.
+enum vk_lazy_cat {
+    VK_LAZY_STAGING_DEV = 0,   // device sync_staging (ggml_vk_ensure_sync_staging_buffer(vk_device&)), host-visible
+    VK_LAZY_STAGING_CTX,       // context sync_staging (async set/get fallback for non-pinned host memory)
+    VK_LAZY_D2D_RING_INIT,     // the VK_D2D_RING_MIN ring made at link setup
+    VK_LAZY_D2D_RING,          // ring growth (retired rings stay alive until link destroy)
+    VK_LAZY_HOST_PINNED,       // ggml_vk_host_malloc (Vulkan_Host buffers, always device 0)
+    VK_LAZY_PREALLOC,          // prealloc_* (SCRATCH GROW), priced as fit scratch, excluded from the lazy totals
+    VK_LAZY_COUNT,
 };
 
 struct vk_device_struct {
@@ -1092,6 +1110,13 @@ struct vk_device_struct {
     std::atomic<uint64_t> buffer_destroy_count {};
     vk_mem_watch mem_watch;
     vk_gtt_watch gtt_watch;   // [fork, 2026-10-22] kernel GTT watch (sysfs)
+    // [fork, 2026-10-30] live lazy bytes on this device (enum vk_lazy_cat above; ggml_vk_lazy_account in
+    // ggml-vulkan-buffers.cpp). vram = DEVICE_LOCAL memory (incl. the ReBAR type), gtt = host-visible non-device-local
+    // memory this device allocated or exported (sysfs GTT of this card). lazy_vram/gtt_bytes exclude VK_LAZY_PREALLOC.
+    std::atomic<int64_t>  lazy_vram_bytes {0};
+    std::atomic<int64_t>  lazy_gtt_bytes {0};
+    std::atomic<int64_t>  lazy_cat_bytes[VK_LAZY_COUNT] {};
+    std::atomic<uint32_t> lazy_log_n[VK_LAZY_COUNT] {};   // LAZY ALLOC rate limit per category (first 8, then every 64th)
     bool disable_host_visible_vidmem;
     bool allow_sysmem_fallback;
     bool disable_graph_optimize;

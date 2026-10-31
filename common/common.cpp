@@ -1267,6 +1267,10 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         // 32769-line file -> 33280-row live list = 181 MB of Q8_0 rows, bound 346 MiB (common_fit_vocab_subset_bytes).
         // A local copy, so a second common_init_result does not add it twice.
         std::vector<size_t> fit_targets = params.fit_params_target;
+        // [fork, 2026-10-30] fit step 3 D: the per-device part of fit_targets that must stay ON TOP of the
+        // --fit-floor-frac floor (the vocab-subset head bound below), passed to the fit apart so max(target, floor)
+        // does not absorb it
+        std::vector<size_t> fit_extras(fit_targets.size(), 0);
         if ((has_draft || spec_mtp) && !params.speculative.draft.vocab_subset_path.empty()) {
             const std::string & path_head = has_draft ? params_dft.model.path : params.model.path;
             const size_t vs_bytes = common_fit_vocab_subset_bytes(path_head.c_str(), params.speculative.draft.vocab_subset_path.c_str());
@@ -1277,6 +1281,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             for (size_t i = 0; vs_bytes > 0 && !head_devs.empty() && i < fit_devs.size() && i < fit_targets.size(); i++) {
                 if (fit_devs[i] == head_devs.back()) {
                     fit_targets[i] += vs_bytes;
+                    fit_extras[i]  += vs_bytes;
                     added = true;
                     COM_TRC("vocab subset head: reserving %.2f MiB on %s\n", vs_bytes / (1024.0 * 1024.0), ggml_backend_dev_name(fit_devs[i]));
                     break;
@@ -1293,7 +1298,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             fit_targets.data(),
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra : nullptr,
-            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR,
+            params.fit_floor_frac, fit_extras.data());
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
@@ -1752,6 +1758,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.no_perf           = params.no_perf;
     cparams.perf_instrumentation = params.perf_instrumentation;
+    cparams.kv_cache_convert     = params.cache_convert;
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;

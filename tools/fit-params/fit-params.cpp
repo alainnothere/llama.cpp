@@ -34,7 +34,8 @@ int llama_fit_params(int argc, char ** argv) {
         const common_params_fit_status status = common_fit_params(params.model.path.c_str(), &mparams, &cparams,
                 params.tensor_split, params.tensor_buft_overrides.data(), params.fit_params_target.data(), params.fit_params_min_ctx,
                 nullptr,
-                params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+                params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR,
+                params.fit_floor_frac); // [fork, 2026-10-30] same floor as the server's fit (step 3 D)
         if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
             LOG_ERR("%s: failed to fit CLI arguments to free memory, exiting...\n", __func__);
             exit(1);

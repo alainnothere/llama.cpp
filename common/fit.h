@@ -35,7 +35,9 @@ common_params_fit_status common_fit_params(
                              size_t * margins,               // margins of memory to leave per device in bytes
                            uint32_t   n_ctx_min,             // minimum context size to set when trying to reduce memory use
       const common_fit_extra_model * extra,                  // model to fit alongside the main one, nullptr if there is none
-                     ggml_log_level   log_level);            // minimum log level to print during fitting, lower levels go to debug log
+                     ggml_log_level   log_level,             // minimum log level to print during fitting, lower levels go to debug log
+                              float   floor_frac    = 0.0f,  // [fork, 2026-10-30] VRAM floor: margin = max(target, floor_frac x total), <= 0 = off
+                       const size_t * margins_extra = nullptr); // [fork] per-device part of margins added ON TOP of the floor (already included in margins)
 
 // [fork, 2026-10-27] the device list the fit's margins (fit_params_target) are indexed by: --device order without the
 // trailing nullptr, or llama's default selection (discrete GPUs in registry order, iGPUs only when there is no

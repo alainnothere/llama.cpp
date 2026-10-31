@@ -958,15 +958,29 @@ static bool ggml_gallocr_reserve_n_impl(
             }
         }
         if (realloc) {
-#ifndef NDEBUG
+            // [fork, 2026-10-30] a runtime re-plan that GROWS a compute buffer after the fit is a lazy device
+            // allocation like the backend ones (design-fit-lazy-reserve-and-warmup-gate.md A, inventory row P): the
+            // fit measured the reserve, not this. It was a DEBUG line compiled out of release builds, so the
+            // 2026-10-30 Vulkan1 GTT jump (20 -> 1046 MiB with no SCRATCH GROW line) could not rule it out. Growth
+            // is WARN in every build (buft name = the device, old/new MiB); the first allocation and shrinks/
+            // reshuffles (a chunk grew but the total did not) stay DEBUG. Known trigger: the vocab-subset n_pad
+            // change re-plans the draft graphs (speculative.cpp). Rate limit: first 16 growths per process, then
+            // every 64th (the 2026-10-22 mask re-plans ran 22 per batch before GGML_OP_KQ_MASK_BUILD; any such
+            // regression must not flood the log). no_alloc probes (the fit) never warn: nothing is allocated.
             {
                 size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
-                if (cur_size > 0) {
+                if (cur_size > 0 && new_size > cur_size && !no_alloc) {
+                    static int n_grow_warn = 0;   // reserve runs under the scheduler's caller thread; a lost update only shifts the rate limit
+                    const int n = n_grow_warn++;
+                    if (n < 16 || n % 64 == 0) {
+                        GGML_LOG_WARN("%s: GALLOC GROW: reallocating %s compute buffer %.02f -> %.02f MiB (re-plan grew it after its first allocation) (#%d)\n",
+                            __func__, ggml_backend_buft_name(galloc->bufts[i]), cur_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0, n + 1);
+                    }
+                } else if (cur_size > 0) {
                     GGML_LOG_DEBUG("%s: reallocating %s buffer from size %.02f MiB to %.02f MiB\n",
                         __func__, ggml_backend_buft_name(galloc->bufts[i]), cur_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
                 }
             }
-#endif
             ggml_vbuffer_free(galloc->buffers[i]);
             if (no_alloc) {
                 galloc->buffers[i] = NULL;

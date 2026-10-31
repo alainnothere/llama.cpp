@@ -833,6 +833,257 @@ static bool test_state_rotation(struct llama_model * model, const struct common_
     return true;
 }
 
+// Test 11: K/V type conversion on load (llama_context_params.kv_cache_convert, fork 2026-10-30)
+// - a state saved from an f16 cache must load into a q8_0 cache only with kv_cache_convert, and the logits of the
+//   continuation must stay within 4x the f16 vs native q8_0 distance (+ a 1e-7 floor) of the native q8_0 run (the
+//   q8_0 error itself is the yardstick, see K_CONV for the measured ratios)
+// - the reverse (q8_0 saved, f16 cache) is d*q rounded to f16: a q8_0 -> f16 -> q8_0 round trip through two converted
+//   loads must give back the saved q8_0 bytes (up to the rare f16 tie that moves a scale by one ulp), and its logits
+//   must obey the same bound
+// - pos-range + APPEND blobs (llama_state_seq_get_data_range, the server's disk segments) must convert to exactly the
+//   bytes of the whole-blob conversion
+// - kv_cache_convert off keeps the refusal, and pairs other than f16/q8_0 are refused even with it on
+// note: models without an attention KV cache (pure recurrent) and models whose head size is not a multiple of the
+//       q8_0 block pass vacuously
+static double test_state_convert_max_nmse = 0.0; // worst max(d_conv, d_rev) / d_ref over the models, printed at the end
+static double test_state_convert_max_abs  = 0.0; // worst max(d_conv, d_rev) over the models
+static double test_state_convert_max_ref  = 0.0; // worst d_ref over the models
+
+static bool test_state_convert(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens) {
+    LOGV(LOG_LEVEL_INFO, "\n=== Test 11: K/V type conversion on load ===\n");
+
+    if (tokens.size() < 8) {
+        return true;
+    }
+
+    const auto make_context = [&](ggml_type type_k, ggml_type type_v, bool convert) {
+        auto params_ctx = common_context_params_to_llama(params);
+        params_ctx.n_ctx     = 256;
+        params_ctx.n_batch   = 256;
+        params_ctx.n_ubatch  = 256;
+        params_ctx.n_seq_max = 1;
+        params_ctx.type_k    = type_k;
+        params_ctx.type_v    = type_v;
+        params_ctx.flash_attn_type  = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        params_ctx.kv_cache_convert = convert;
+        return llama_context_ptr(llama_init_from_model(model, params_ctx));
+    };
+
+    const int n_prefix = (int) tokens.size() - 1;
+
+    // the continuation fed to every context after the restore: the last prompt token, then a few fixed ones
+    llama_tokens cont = { tokens[n_prefix], tokens[0], tokens[1], tokens[2] };
+
+    const auto decode_prefix = [&](llama_context * ctx) {
+        llama_tokens pre(tokens.begin(), tokens.begin() + n_prefix);
+        return llama_decode(ctx, llama_batch_get_one(pre.data(), (int32_t) pre.size())) == 0;
+    };
+
+    const auto save = [](llama_context * ctx, std::vector<uint8_t> & out, llama_pos p0 = -1, llama_pos p1 = -1) {
+        if (p0 >= 0 || p1 >= 0) {
+            out.resize(llama_state_seq_get_size_range(ctx, 0, p0, p1, 0));
+            return !out.empty() && llama_state_seq_get_data_range(ctx, out.data(), out.size(), 0, p0, p1, 0) == out.size();
+        }
+        out.resize(llama_state_seq_get_size(ctx, 0));
+        return !out.empty() && llama_state_seq_get_data(ctx, out.data(), out.size(), 0) == out.size();
+    };
+
+    // logits after each continuation token
+    const auto run = [&](llama_context * ctx, std::vector<std::vector<float>> & out) {
+        out.clear();
+        for (llama_token t : cont) {
+            if (llama_decode(ctx, llama_batch_get_one(&t, 1)) != 0) {
+                return false;
+            }
+            std::vector<float> l;
+            if (!get_current_logits(ctx, l)) {
+                return false;
+            }
+            out.push_back(std::move(l));
+        }
+        return true;
+    };
+
+    const auto max_nmse = [](const std::vector<std::vector<float>> & a, const std::vector<std::vector<float>> & b) {
+        double m = 0.0;
+        for (size_t i = 0; i < a.size(); ++i) {
+            m = std::max(m, nmse(a[i], b[i]));
+        }
+        return m;
+    };
+
+    auto ctx_f16 = make_context(GGML_TYPE_F16,  GGML_TYPE_F16,  false);
+    auto ctx_q8  = make_context(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, false);
+    if (!ctx_f16 || !ctx_q8) {
+        LOG_WRN("%s: no f16 + q8_0 flash-attention context for this model - skipping\n", __func__);
+        return true;
+    }
+
+    if (!decode_prefix(ctx_f16.get()) || !decode_prefix(ctx_q8.get())) {
+        LOG_ERR("%s: failed to decode the prefix\n", __func__);
+        return false;
+    }
+
+    std::vector<uint8_t> blob_f16;
+    std::vector<uint8_t> blob_q8;
+    if (!save(ctx_f16.get(), blob_f16) || !save(ctx_q8.get(), blob_q8)) {
+        LOG_ERR("%s: failed to save the states\n", __func__);
+        return false;
+    }
+
+    if (blob_f16.size() == blob_q8.size()) {
+        LOG_TRC("%s: the state does not depend on the K/V type (no attention KV) - nothing to convert\n", __func__);
+        return true;
+    }
+
+    // conversion off: the refusal is unchanged
+    {
+        auto off_q8  = make_context(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, false);
+        auto off_f16 = make_context(GGML_TYPE_F16,  GGML_TYPE_F16,  false);
+        if (llama_state_seq_set_data(off_q8.get(),  blob_f16.data(), blob_f16.size(), 0) != 0 ||
+            llama_state_seq_set_data(off_f16.get(), blob_q8.data(),  blob_q8.size(),  0) != 0) {
+            LOG_ERR("%s: a mismatched K/V type loaded with kv_cache_convert off\n", __func__);
+            return false;
+        }
+    }
+
+    // unsupported pair: refused even with conversion on
+    {
+        auto q4 = make_context(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, true);
+        if (q4 && llama_state_seq_set_data(q4.get(), blob_f16.data(), blob_f16.size(), 0) != 0) {
+            LOG_ERR("%s: an f16 state loaded into a q4_0 cache\n", __func__);
+            return false;
+        }
+    }
+
+    // the DSV4 memory (llama-kv-cache-dsv4.cpp) has its own state reader without the conversion: it must refuse, cleanly
+    {
+        char arch[64] = {};
+        llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
+        if (std::string(arch) == "deepseek4") {
+            auto c = make_context(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, true);
+            if (llama_state_seq_set_data(c.get(), blob_f16.data(), blob_f16.size(), 0) != 0) {
+                LOG_ERR("%s: the DSV4 memory accepted a converted state it cannot convert\n", __func__);
+                return false;
+            }
+            LOG_TRC("%s: DSV4 memory: conversion not implemented, refused as expected\n", __func__);
+            return true;
+        }
+    }
+
+    // f16 -> q8_0
+    auto conv_q8 = make_context(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, true);
+    if (!conv_q8 || llama_state_seq_set_data(conv_q8.get(), blob_f16.data(), blob_f16.size(), 0) != blob_f16.size()) {
+        LOG_ERR("%s: f16 -> q8_0 load failed\n", __func__);
+        return false;
+    }
+    if (llama_state_get_convert_stats(conv_q8.get()).n_loads != 1) {
+        LOG_ERR("%s: f16 -> q8_0 load did not report a conversion\n", __func__);
+        return false;
+    }
+    std::vector<uint8_t> blob_conv_q8;
+    if (!save(conv_q8.get(), blob_conv_q8) || blob_conv_q8.size() != blob_q8.size()) {
+        LOG_ERR("%s: the converted q8_0 state has the wrong size (%zu vs native %zu)\n", __func__, blob_conv_q8.size(), blob_q8.size());
+        return false;
+    }
+
+    // pos-range + APPEND: the server's disk segments. state_write_range exists only for the plain KV cache and the
+    // hybrid memory, and nothing outside libllama names the memory type (n_swa == 0 && !recurrent still lands on the
+    // DSA/MSA memories, which abort: deepseek32), so the segment check runs on archs known to use the plain cache
+    char arch[64] = {};
+    llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
+    const std::string arch_s = arch;
+    if (arch_s == "llama" || arch_s == "qwen2" || arch_s == "qwen3") {
+        const llama_pos mid = n_prefix / 2;
+        std::vector<uint8_t> seg0;
+        std::vector<uint8_t> seg1;
+        if (!save(ctx_f16.get(), seg0, 0, mid) || !save(ctx_f16.get(), seg1, mid, -1)) {
+            LOG_ERR("%s: failed to save the range segments\n", __func__);
+            return false;
+        }
+        auto conv_seg = make_context(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, true);
+        if (llama_state_seq_set_data_ext(conv_seg.get(), seg0.data(), seg0.size(), 0, 0) != seg0.size() ||
+            llama_state_seq_set_data_ext(conv_seg.get(), seg1.data(), seg1.size(), 0, LLAMA_STATE_SEQ_FLAGS_APPEND) != seg1.size()) {
+            LOG_ERR("%s: range segments failed to load with conversion\n", __func__);
+            return false;
+        }
+        std::vector<uint8_t> blob_seg;
+        if (!save(conv_seg.get(), blob_seg) || blob_seg != blob_conv_q8) {
+            LOG_ERR("%s: range + APPEND conversion differs from the whole-blob conversion\n", __func__);
+            return false;
+        }
+    }
+
+    // q8_0 -> f16, then back: the saved q8_0 bytes come back
+    auto conv_f16 = make_context(GGML_TYPE_F16, GGML_TYPE_F16, true);
+    if (!conv_f16 || llama_state_seq_set_data(conv_f16.get(), blob_q8.data(), blob_q8.size(), 0) != blob_q8.size()) {
+        LOG_ERR("%s: q8_0 -> f16 load failed\n", __func__);
+        return false;
+    }
+    {
+        std::vector<uint8_t> rt_f16;
+        std::vector<uint8_t> rt_q8;
+        auto rt = make_context(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, true);
+        if (!save(conv_f16.get(), rt_f16) || rt_f16.size() != blob_f16.size() ||
+            llama_state_seq_set_data(rt.get(), rt_f16.data(), rt_f16.size(), 0) != rt_f16.size() ||
+            !save(rt.get(), rt_q8) || rt_q8.size() != blob_q8.size()) {
+            LOG_ERR("%s: q8_0 -> f16 -> q8_0 round trip failed\n", __func__);
+            return false;
+        }
+        size_t n_diff = 0;
+        for (size_t i = 0; i < rt_q8.size(); ++i) {
+            n_diff += rt_q8[i] != blob_q8[i];
+        }
+        LOG_TRC("%s: q8_0 -> f16 -> q8_0 round trip: %zu of %zu bytes differ\n", __func__, n_diff, rt_q8.size());
+        // 1e-3: an f16 tie can move one block scale (2 bytes) and a few of its quants. measured 2026-10-30 over the
+        // 121 dummy models with a K/V cache: 0 .. 2.1e-4 of the bytes (deepseek2-moe 26 of 122420, gpt2 13 of 108980)
+        if ((double) n_diff > 1e-3 * (double) rt_q8.size()) {
+            LOG_ERR("%s: q8_0 -> f16 -> q8_0 round trip changed %zu of %zu bytes\n", __func__, n_diff, rt_q8.size());
+            return false;
+        }
+    }
+
+    std::vector<std::vector<float>> l_f16, l_q8, l_conv_q8, l_conv_f16;
+    if (!run(ctx_f16.get(), l_f16) || !run(ctx_q8.get(), l_q8) || !run(conv_q8.get(), l_conv_q8) || !run(conv_f16.get(), l_conv_f16)) {
+        LOG_ERR("%s: failed to decode the continuation\n", __func__);
+        return false;
+    }
+
+    const double d_ref     = max_nmse(l_f16, l_q8);      // the cost of q8_0 itself
+    const double d_conv    = max_nmse(l_q8,  l_conv_q8); // f16 -> q8_0 converted vs native q8_0
+    const double d_conv_rf = max_nmse(l_f16, l_conv_q8); // ... and vs f16
+    const double d_rev     = max_nmse(l_q8,  l_conv_f16); // q8_0 -> f16 converted vs native q8_0
+
+    LOG_INF("%s: nmse f16 vs q8_0 %.3e | f16->q8_0 converted vs q8_0 %.3e (vs f16 %.3e) | q8_0->f16 converted vs q8_0 %.3e\n",
+            __func__, d_ref, d_conv, d_conv_rf, d_rev);
+
+    // tolerance = K_CONV x the q8_0 error itself (d_ref, nmse f16 vs native q8_0) + NMSE_FLOOR.
+    // measured 2026-10-30 on CPU over the 121 dummy models with a K/V cache, 31 regenerations of the random weights:
+    //   d_conv / d_ref is ~1 (0.6 .. 1.8 worst per regeneration) except on models where q8_0 barely moves the
+    //   logits (d_ref ~1e-9), where it spiked to 2.7 (gpt2/starcoder), 3.7, 18.7 (mpt) and 59. the mpt case was taken
+    //   apart element by element (scratch dump of the blobs): the converted K/V carries the same q8_0 error as the
+    //   native one (rel rms vs the f16 values 5.49e-3 converted vs 5.50e-3 native for K, 5.25e-3 vs 5.26e-3 for V),
+    //   only the logits differ, 4.84e-8 vs 1.25e-9. at nmse 1e-8 which q8_0 draw a run gets is luck, not a bias,
+    //   hence the absolute floor. worst absolute values seen: converted 5.9e-5, f16 vs q8_0 1.7e-4. with this bound
+    //   the last 12 regenerations passed 130/130 (the 4x-only bound failed mpt once in 8).
+    //   the bug this test exists for is far outside both: the rotation applied where the graph does not rotate (MLA)
+    //   gave 2.5e-3 (deepseek2, d_ref 4.7e-8) and 6.3e-2 (bailingmoe3, d_ref 2.2e-6)
+    constexpr double K_CONV     = 4.0;
+    constexpr double NMSE_FLOOR = 1e-7;
+    const double bound = K_CONV * d_ref + NMSE_FLOOR;
+    test_state_convert_max_nmse = std::max(test_state_convert_max_nmse, std::max(d_conv, d_rev) / std::max(d_ref, 1e-9));
+    test_state_convert_max_abs  = std::max(test_state_convert_max_abs, std::max(d_conv, d_rev));
+    test_state_convert_max_ref  = std::max(test_state_convert_max_ref, d_ref);
+    if (d_conv > bound || d_rev > bound) {
+        LOG_ERR("%s: converted logits are further from native q8_0 than %.0fx the f16 vs q8_0 distance + %.0e (f16->q8 %.3e, q8->f16 %.3e, bound %.3e)\n",
+                __func__, K_CONV, NMSE_FLOOR, d_conv, d_rev, bound);
+        return false;
+    }
+
+    LOGV(LOG_LEVEL_INFO, "\nPASS\n");
+    return true;
+}
+
 struct test_suite {
     std::vector<test_status> results;
 
@@ -843,10 +1094,10 @@ struct test_suite {
 
 // column headers for the --models table, one per test, in the order they are run
 static const std::vector<const char *> test_names = {
-    "baseline", "seq_rm", "state_load", "cp_h", "cp_d", "cp_h_s", "cp_d_s", "rt", "rf", "rot",
+    "baseline", "seq_rm", "state_load", "cp_h", "cp_d", "cp_h_s", "cp_d_s", "rt", "rf", "rot", "conv",
 };
 
-// Run the full save/load test suite (tests 1-10) for a single model.
+// Run the full save/load test suite (tests 1-11) for a single model.
 // Returns the per-test results.
 static test_suite run_save_load_tests_for_model(const std::string & model_path, const struct common_params & base_params) {
     test_suite suite;
@@ -927,6 +1178,9 @@ static test_suite run_save_load_tests_for_model(const std::string & model_path, 
 
     // Test 10: state rotation
     suite.results.push_back(test_state_rotation(model, params) ? test_status::PASS : test_status::FAIL);
+
+    // Test 11: K/V type conversion on load
+    suite.results.push_back(test_state_convert(model, params, tokens) ? test_status::PASS : test_status::FAIL);
 
     return suite;
 }
@@ -1055,6 +1309,8 @@ int main(int argc, char ** argv) {
         common_log_flush(common_log_main());
 
         LOG_INF("%s: summary: %zu passed, %zu failed (of %zu)\n", __func__, n_pass, n_fail, models.size());
+        LOG_INF("%s: conv: worst converted vs native-q8 / f16 vs native-q8 logit nmse ratio %.3f, worst converted nmse %.3e, worst f16 vs q8_0 nmse %.3e\n",
+                __func__, test_state_convert_max_nmse, test_state_convert_max_abs, test_state_convert_max_ref);
 
         return n_fail == 0 ? 0 : 1;
     }

@@ -50,6 +50,7 @@ struct llama_cparams {
     bool auto_fhc;
     bool no_perf;
     bool perf_instrumentation; // periodic decode()/synchronize() timing breakdown (debug)
+    bool kv_cache_convert;     // state load converts K/V f16 <-> q8_0 (llama_context_params.kv_cache_convert)
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;
     bool kv_unified;

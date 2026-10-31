@@ -13,6 +13,7 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 
 static bool ggml_is_power_of_2(int n) {
@@ -2297,6 +2298,8 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
 ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
+    k_rot_used = true; // [fork] see the header: the K/V conversion on load follows what the graph applies
+
     if (n_rot_k) {
         res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_rot_k, n_rot_k);
         ggml_set_input(res);
@@ -2308,6 +2311,8 @@ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
 
 ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
+
+    v_rot_used = true;
 
     if (n_rot_v) {
         res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_rot_v, n_rot_v);
@@ -3745,6 +3750,132 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
     return true;
 }
 
+//
+// [fork, 2026-10-30] K/V type conversion on state load (cparams.kv_cache_convert, see llama_io_read_i::kv_convert)
+//
+// the owner runs the 27B with -ctk/-ctv f16 or q8_0 depending on the context he needs; before this, every saved
+// conversation was dead after a switch (state_read_data refused the type at the per-layer check below, the server's
+// disk cache made it a miss through its state hash) and a 98k replay cost ~10 min of prefill.
+//
+// what is converted: only f16 <-> q8_0, the two types the owner switches between. f16 -> q8_0 re-quantizes rows of
+// n_embd_{k,v}_gqa in blocks of 32 + one f16 scale, the same reference arithmetic (d = amax/127, round(x/d)) the cache
+// applies to every new token; q8_0 -> f16 is d*q in f32 rounded to f16, exact up to that one f16 rounding. every other
+// pair (q4_0, q5_*, iq4_nl, bf16, f32...) stays a refusal with a WARN naming both types: each needs its own error
+// budget and nothing asked for it.
+//
+// quantize-once-clean vs native q8: a native q8_0 cache quantizes the f32 K/V the graph produced; a converted one
+// quantizes K/V that was already rounded to f16 once, so it carries one extra f16 rounding (~2^-11 relative) under the
+// q8_0 step (~2^-8 of the block max). the test (test-save-load-state, "conv") measures that the converted logits
+// stay at least as close to the native q8_0 run as the native q8_0 run is to f16.
+//
+// attention rotation: a quantized cache whose head size is a multiple of 64 stores K (n_rot_k, up to the head size)
+// and V (n_rot_v = 64) multiplied by an orthonormal Sylvester-Hadamard H (llama_mul_mat_hadamard on k_cur/v_cur,
+// q rotated the same way, the attention output rotated back). an f16 cache has n_rot = 0. H is symmetric and H*H = I,
+// so the reader moves a row from the saved rotation to the cache's one as x_cache = H_dst (H_src x_saved), applied to
+// consecutive groups of n_rot elements of the row, which is exactly the [n_rot, n/n_rot] reshape the graph uses.
+// without this a f16 -> q8_0 load on the production model (head 256: n_rot_k 256, n_rot_v 64) would read garbage.
+//
+// layouts: whole blobs, pos-range (llama_state_seq_get_data_range) and APPEND segments all carry the same per-stream
+// header + per-layer (type, row size, rows) records, so each segment converts on its own and a file may even mix
+// types segment by segment. the transposed V layout (no flash attention) cannot hold a quantized V and is refused.
+//
+
+static bool kv_convert_type_ok(ggml_type t) {
+    return t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0;
+}
+
+// in-place orthonormal Walsh-Hadamard transform of n (power of 2) floats: H_n x with the natural (Sylvester) order,
+// H_2n = [[H_n, H_n], [H_n, -H_n]] / sqrt(2), the same matrix ggml_gen_hadamard builds (O(n log n) instead of n^2)
+static void kv_fwht(float * x, int n) {
+    for (int h = 1; h < n; h *= 2) {
+        for (int i = 0; i < n; i += 2*h) {
+            for (int j = i; j < i + h; ++j) {
+                const float a = x[j];
+                const float b = x[j + h];
+                x[j]     = a + b;
+                x[j + h] = a - b;
+            }
+        }
+    }
+    const float s = 1.0f / sqrtf((float) n);
+    for (int i = 0; i < n; ++i) {
+        x[i] *= s;
+    }
+}
+
+// convert n_rows rows of n_per_row elements from (tsrc, rotation rot_src) to (tdst, rotation rot_dst), host only.
+// threaded over rows: the 27B restore at 98k converts ~6 GB of K/V (house rule: host loops over cells get threaded
+// once they are on the request path); per thread one f32 row of scratch
+static void kv_convert_rows(
+        const uint8_t * src, ggml_type tsrc, uint32_t rot_src,
+              uint8_t * dst, ggml_type tdst, uint32_t rot_dst,
+        int64_t n_rows, int64_t n_per_row) {
+    const size_t row_src = ggml_row_size(tsrc, n_per_row);
+    const size_t row_dst = ggml_row_size(tdst, n_per_row);
+
+    const auto * tr_src = ggml_get_type_traits(tsrc);
+
+    ggml_quantize_init(tdst); // no-op for q8_0, kept so the threads never race on a lazy init
+
+    auto work = [&](int64_t r0, int64_t r1) {
+        std::vector<float> tmp(n_per_row);
+        for (int64_t r = r0; r < r1; ++r) {
+            const uint8_t * s = src + r*row_src;
+            uint8_t       * d = dst + r*row_dst;
+
+            if (tsrc == GGML_TYPE_F16) {
+                ggml_fp16_to_fp32_row((const ggml_fp16_t *) s, tmp.data(), n_per_row);
+            } else {
+                tr_src->to_float(s, tmp.data(), n_per_row);
+            }
+
+            if (rot_src != rot_dst) {
+                if (rot_src) {
+                    for (int64_t i = 0; i < n_per_row; i += rot_src) {
+                        kv_fwht(tmp.data() + i, (int) rot_src);
+                    }
+                }
+                if (rot_dst) {
+                    for (int64_t i = 0; i < n_per_row; i += rot_dst) {
+                        kv_fwht(tmp.data() + i, (int) rot_dst);
+                    }
+                }
+            }
+
+            if (tdst == GGML_TYPE_F16) {
+                ggml_fp32_to_fp16_row(tmp.data(), (ggml_fp16_t *) d, n_per_row);
+            } else {
+                ggml_quantize_chunk(tdst, tmp.data(), d, 0, 1, n_per_row, nullptr);
+            }
+        }
+    };
+
+    // ~1 MiB of rows per thread before another thread pays for itself
+    const int64_t rows_per_thread = std::max<int64_t>(1, (int64_t) ((1u << 20) / std::max<size_t>(1, row_src)));
+    const int64_t n_hw = std::max<int64_t>(1, (int64_t) std::thread::hardware_concurrency());
+    const int64_t n_th = std::min<int64_t>(n_hw, (n_rows + rows_per_thread - 1) / rows_per_thread);
+
+    if (n_th <= 1) {
+        work(0, n_rows);
+        return;
+    }
+
+    std::vector<std::thread> threads;
+    threads.reserve(n_th - 1);
+    const int64_t per = (n_rows + n_th - 1) / n_th;
+    for (int64_t t = 1; t < n_th; ++t) {
+        const int64_t r0 = std::min(n_rows, t*per);
+        const int64_t r1 = std::min(n_rows, r0 + per);
+        if (r0 < r1) {
+            threads.emplace_back(work, r0, r1);
+        }
+    }
+    work(0, std::min(n_rows, per));
+    for (auto & th : threads) {
+        th.join();
+    }
+}
+
 bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo) {
     auto & cells = v_cells[strm];
 
@@ -3791,84 +3922,153 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         return false;
     }
 
-    if (n_rot_k_ref != n_rot_k) {
+    // [fork, 2026-10-30] with kv_convert a rotation change is part of the type conversion (f16 has none, a quantized
+    // cache with head % 64 == 0 has one): the per-layer reader below moves every row to this cache's rotation
+    if (n_rot_k_ref != n_rot_k && !io.kv_convert) {
         LLAMA_LOG_ERROR("%s: incompatible key rotation (%u instead of %u)\n", __func__, n_rot_k_ref, n_rot_k);
         return false;
     }
 
-    if (n_rot_v_ref != n_rot_v) {
+    if (n_rot_v_ref != n_rot_v && !io.kv_convert) {
         LLAMA_LOG_ERROR("%s: incompatible value rotation (%u instead of %u)\n", __func__, n_rot_v_ref, n_rot_v);
         return false;
     }
 
+    // one K or V record of one layer: (type, row size) then the rows of every run. before 2026-10-30 a type mismatch
+    // was `mismatched key/value type` + return false right here, now it converts when the io allows it (see the
+    // K/V conversion block above kv_convert_rows). the same-type path is byte for byte what it was
+    const char * func = __func__; // the log lines keep naming state_read_data, not the lambda
+    auto read_layer_rows = [&](const kv_layer & layer, bool is_v, ggml_tensor * t, uint32_t n_embd, uint32_t rot_ref, uint32_t rot_cur) -> bool {
+        const char *   what = is_v ? "value" : "key";
+        const uint32_t il   = layer.il;
+
+        int32_t type_ref_i;
+        io.read(&type_ref_i, sizeof(type_ref_i));
+        const int32_t type_i = (int32_t) t->type;
+
+        // the rotation the stored rows really carry: the header's n_rot only where the graph applies it (k/v_rot_used)
+        const bool     rot_used    = is_v ? v_rot_used : k_rot_used;
+        const uint32_t rot_src_eff = rot_used ? rot_ref : 0;
+        const uint32_t rot_dst_eff = rot_used ? rot_cur : 0;
+
+        // same type and same effective rotation: the bytes are already what this cache holds, copy them as they are
+        const bool same = type_i == type_ref_i && rot_src_eff == rot_dst_eff;
+
+        if (!same && !io.kv_convert) {
+            LLAMA_LOG_ERROR("%s: mismatched %s type (%d != %d, layer %d)\n", func, what, type_i, type_ref_i, il);
+            return false;
+        }
+
+        uint64_t size_row_ref;
+        io.read(&size_row_ref, sizeof(size_row_ref));
+        const size_t size_row = ggml_row_size(t->type, n_embd);
+
+        if (same) {
+            if (size_row != size_row_ref) {
+                LLAMA_LOG_ERROR("%s: mismatched %s row size (%zu != %zu, layer %d)\n", func, what, size_row, (size_t) size_row_ref, il);
+                return false;
+            }
+
+            // [CP] each destination run goes to the range(s) holding it: the restore writes the owning device directly
+            // (the 2026-10-21 mirror needed cp_resync after this: 410 MiB / 233 ms per layer per restore)
+            for (const auto & r : runs) {
+                cp_rows(layer, is_v, strm, r.from, r.to, [&](ggml_tensor * tt, uint32_t r0, uint32_t n) {
+                    io.read_tensor(tt, (size_t) r0 * size_row, (size_t) n * size_row);
+                });
+            }
+            return true;
+        }
+
+        if (type_ref_i < 0 || type_ref_i >= GGML_TYPE_COUNT) {
+            LLAMA_LOG_ERROR("%s: invalid saved %s type %d (layer %d)\n", func, what, type_ref_i, il);
+            return false;
+        }
+        const ggml_type tsrc = (ggml_type) type_ref_i;
+
+        if (!kv_convert_type_ok(tsrc) || !kv_convert_type_ok(t->type)) {
+            LLAMA_LOG_WARN("%s: cannot convert the saved %s type %s to the cache type %s (layer %d): K/V conversion handles f16 <-> q8_0 only\n",
+                    func, what, ggml_type_name(tsrc), ggml_type_name(t->type), il);
+            return false;
+        }
+
+        if (n_embd % ggml_blck_size(tsrc) != 0 || n_embd % ggml_blck_size(t->type) != 0 ||
+            (rot_src_eff && n_embd % rot_src_eff != 0) || (rot_dst_eff && n_embd % rot_dst_eff != 0)) {
+            LLAMA_LOG_ERROR("%s: cannot convert %s %s -> %s (layer %d): row of %u elements vs block %" PRId64 "/%" PRId64 ", rotation %u/%u\n",
+                    func, what, ggml_type_name(tsrc), ggml_type_name(t->type), il, n_embd,
+                    ggml_blck_size(tsrc), ggml_blck_size(t->type), rot_src_eff, rot_dst_eff);
+            return false;
+        }
+
+        // the size check is against the SAVED type: f16 rows are 2*n bytes, q8_0 rows 34*n/32
+        const size_t size_row_src = ggml_row_size(tsrc, n_embd);
+        if (size_row_src != size_row_ref) {
+            LLAMA_LOG_ERROR("%s: mismatched saved %s row size (%zu != %zu for %s, layer %d)\n",
+                    func, what, size_row_src, (size_t) size_row_ref, ggml_type_name(tsrc), il);
+            return false;
+        }
+
+        // bounded host RAM: <= ~64 MiB of saved + converted rows per chunk, whatever the run length (a 98k-cell run of
+        // the 27B is ~2.5 MiB per row block of 1k cells per layer); the cache tensor is written directly, not deferred
+        // like io.read_tensor, so the converted bytes need no lifetime past this chunk
+        const uint32_t rows_chunk = (uint32_t) std::max<size_t>(1, (64u << 20) / (size_row_src + size_row));
+
+        std::vector<uint8_t> buf_src;
+        std::vector<uint8_t> buf_dst;
+
+        uint64_t n_rows = 0;
+        for (const auto & r : runs) {
+            for (uint32_t c0 = r.from; c0 < r.to; c0 += rows_chunk) {
+                const uint32_t c1 = std::min(r.to, c0 + rows_chunk);
+                const uint32_t n  = c1 - c0;
+
+                buf_src.resize((size_t) n * size_row_src);
+                buf_dst.resize((size_t) n * size_row);
+
+                io.read(buf_src.data(), buf_src.size());
+
+                kv_convert_rows(buf_src.data(), tsrc, rot_src_eff, buf_dst.data(), t->type, rot_dst_eff, n, n_embd);
+
+                size_t off = 0;
+                cp_rows(layer, is_v, strm, c0, c1, [&](ggml_tensor * tt, uint32_t r0, uint32_t nn) {
+                    ggml_backend_tensor_set(tt, buf_dst.data() + off, (size_t) r0 * size_row, (size_t) nn * size_row);
+                    off += (size_t) nn * size_row;
+                });
+                GGML_ASSERT(off == buf_dst.size());
+
+                n_rows += n;
+            }
+        }
+
+        auto & c = io.kv_conv;
+        if (c.n_tensors > 0 && (c.type_src != (int32_t) tsrc || c.type_dst != type_i)) {
+            c.mixed = true;
+        }
+        c.n_tensors   += 1;
+        c.n_rows      += n_rows;
+        c.n_bytes_src += n_rows * size_row_src;
+        c.n_bytes_dst += n_rows * size_row;
+        c.type_src     = (int32_t) tsrc;
+        c.type_dst     = type_i;
+
+        return true;
+    };
+
     // For each layer, read the keys for each cell, one row is one cell, read as one contiguous block
     for (const auto & layer : layers) {
-        const uint32_t il = layer.il;
-
-        const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
-
-        auto * k = layer.k_stream[strm];
-
-        // Read type of key
-        int32_t k_type_i_ref;
-        io.read(&k_type_i_ref, sizeof(k_type_i_ref));
-        const int32_t k_type_i = (int32_t) k->type;
-        if (k_type_i != k_type_i_ref) {
-            LLAMA_LOG_ERROR("%s: mismatched key type (%d != %d, layer %d)\n", __func__, k_type_i, k_type_i_ref, il);
+        if (!read_layer_rows(layer, false, layer.k_stream[strm], hparams.n_embd_k_gqa(layer.il), n_rot_k_ref, n_rot_k)) {
             return false;
-        }
-
-        // Read row size of key
-        uint64_t k_size_row_ref;
-        io.read(&k_size_row_ref, sizeof(k_size_row_ref));
-        const size_t k_size_row = ggml_row_size(k->type, n_embd_k_gqa);
-        if (k_size_row != k_size_row_ref) {
-            LLAMA_LOG_ERROR("%s: mismatched key row size (%zu != %zu, layer %d)\n", __func__, k_size_row, (size_t) k_size_row_ref, il);
-            return false;
-        }
-
-        // [CP] each destination run goes to the range(s) holding it: the restore writes the owning device directly
-        // (the 2026-10-21 mirror needed cp_resync after this: 410 MiB / 233 ms per layer per restore)
-        for (const auto & r : runs) {
-            cp_rows(layer, false, strm, r.from, r.to, [&](ggml_tensor * t, uint32_t r0, uint32_t n) {
-                io.read_tensor(t, (size_t) r0 * k_size_row, (size_t) n * k_size_row);
-            });
         }
     }
 
     if (!this->v_trans) {
         for (const auto & layer : layers) {
-            const uint32_t il = layer.il;
-
-            const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
-
             auto * v = layer.v_stream[strm];
             if (!v) {
                 continue;
             }
 
-            // Read type of value
-            int32_t v_type_i_ref;
-            io.read(&v_type_i_ref, sizeof(v_type_i_ref));
-            const int32_t v_type_i = (int32_t) v->type;
-            if (v_type_i != v_type_i_ref) {
-                LLAMA_LOG_ERROR("%s: mismatched value type (%d != %d, layer %d)\n", __func__, v_type_i, v_type_i_ref, il);
+            if (!read_layer_rows(layer, true, v, hparams.n_embd_v_gqa(layer.il), n_rot_v_ref, n_rot_v)) {
                 return false;
-            }
-
-            // Read row size of value
-            uint64_t v_size_row_ref;
-            io.read(&v_size_row_ref, sizeof(v_size_row_ref));
-            const size_t v_size_row = ggml_row_size(v->type, n_embd_v_gqa);
-            if (v_size_row != v_size_row_ref) {
-                LLAMA_LOG_ERROR("%s: mismatched value row size (%zu != %zu, layer %d)\n", __func__, v_size_row, (size_t) v_size_row_ref, il);
-                return false;
-            }
-
-            for (const auto & r : runs) {
-                cp_rows(layer, true, strm, r.from, r.to, [&](ggml_tensor * t, uint32_t r0, uint32_t n) {
-                    io.read_tensor(t, (size_t) r0 * v_size_row, (size_t) n * v_size_row);
-                });
             }
         }
 
@@ -3896,6 +4096,12 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             io.read(&v_type_i_ref, sizeof(v_type_i_ref));
             const int32_t v_type_i = (int32_t) v->type;
             if (v_type_i != v_type_i_ref) {
+                if (io.kv_convert) {
+                    // [fork, 2026-10-30] the transposed layout stores V element-wise across cells, so a q8_0 block of 32
+                    // cannot exist in it (quantized V requires flash attention); f16 <-> q8_0 conversion is row-wise only
+                    LLAMA_LOG_WARN("%s: cannot convert the saved value type %d to %s (layer %d): this cache stores V transposed (flash attention off), conversion needs -fa on\n",
+                            __func__, v_type_i_ref, ggml_type_name(v->type), il);
+                }
                 LLAMA_LOG_ERROR("%s: mismatched value type (%d != %d, layer %d)\n", __func__, v_type_i, v_type_i_ref, il);
                 return false;
             }

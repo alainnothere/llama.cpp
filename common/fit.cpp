@@ -209,6 +209,10 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
             ret.back().mb.context += mb.context;
             ret.back().mb.compute += mb.compute;
             ret.back().mb.scratch += mb.scratch;
+            ret.back().mb.lazy_vram     += mb.lazy_vram;
+            ret.back().mb.lazy_gtt      += mb.lazy_gtt;
+            ret.back().mb.lazy_vram_2nd += mb.lazy_vram_2nd;
+            ret.back().mb.lazy_gtt_2nd  += mb.lazy_gtt_2nd;
             continue;
         }
 
@@ -222,6 +226,14 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
                 ret[i].mb.context += mb.context;
                 ret[i].mb.compute += mb.compute;
                 ret[i].mb.scratch += mb.scratch;
+                // [fork, 2026-10-30] fit step 3 B: the lazy reserve llama_context::memory_breakdown priced for this probe's
+                // own cparams and split (links from the layer chain, staging from n_ctx_seq x row bytes), so every probe -
+                // fill, grow-back, refill, summary, the extra context - sees it at its own shape. It is inside
+                // llama_memory_breakdown_data::total(), which is what every placement sum below charges against free.
+                ret[i].mb.lazy_vram     += mb.lazy_vram;
+                ret[i].mb.lazy_gtt      += mb.lazy_gtt;
+                ret[i].mb.lazy_vram_2nd += mb.lazy_vram_2nd;
+                ret[i].mb.lazy_gtt_2nd  += mb.lazy_gtt_2nd;
                 break;
             }
         }
@@ -311,7 +323,8 @@ common_device_memory_data_vec common_get_device_memory_data(
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
-        size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
+        size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra, enum ggml_log_level log_level,
+        float floor_frac, const size_t * margins_extra) {
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
     }
@@ -340,8 +353,16 @@ static void common_params_fit_impl(
     };
     std::vector<extra_outside_t> extra_outside;
     // margins are per main device and are only known after step 1; the outside-device check uses the largest one
+    // [fork, 2026-10-30] once built (floor applied, step 3 D) the effective margins, before that the raw targets
+    std::vector<int64_t> margins;
     auto nd_margin_max = [&]() -> int64_t {
         int64_t mx = 0;
+        if (!margins.empty()) {
+            for (int64_t m : margins) {
+                mx = std::max(mx, m);
+            }
+            return mx;
+        }
         for (size_t id = 0; id < std::max<size_t>(devs.size(), 1); id++) {
             mx = std::max(mx, int64_t(margins_s[id]));
         }
@@ -408,6 +429,13 @@ static void common_params_fit_impl(
                         dmds_extra[id].mb.context += measured[je].mb.context;
                         dmds_extra[id].mb.compute += measured[je].mb.compute;
                         dmds_extra[id].mb.scratch += measured[je].mb.scratch;
+                        // [fork, 2026-10-30] fit step 3 B, n_contexts: on a main-model device the extra context is the
+                        // SECOND context, so it carries only its increment proc(n_contexts 2) - proc(n_contexts 1)
+                        // (context staging, its rings, its arenas); the per-device sync staging is already in the
+                        // target's lazy_* (llama_context::memory_breakdown). On a device of its own (the
+                        // extra_outside branch below) it is the only context and m.mb.total() carries its full lazy_*.
+                        dmds_extra[id].mb.lazy_vram += measured[je].mb.lazy_vram_2nd;
+                        dmds_extra[id].mb.lazy_gtt  += measured[je].mb.lazy_gtt_2nd;
                         matched = true;
                         break;
                     }
@@ -444,6 +472,8 @@ static void common_params_fit_impl(
             dmds[id].mb.context += dmds_extra[id].mb.context;
             dmds[id].mb.compute += dmds_extra[id].mb.compute;
             dmds[id].mb.scratch += dmds_extra[id].mb.scratch;
+            dmds[id].mb.lazy_vram += dmds_extra[id].mb.lazy_vram;
+            dmds[id].mb.lazy_gtt  += dmds_extra[id].mb.lazy_gtt;
         }
     };
 
@@ -497,13 +527,34 @@ static void common_params_fit_impl(
 
     const size_t nd = devs.size(); // number of devices
 
-    std::vector<int64_t> margins; // this function uses int64_t rather than size_t for memory sizes to more conveniently handle deficits
+    margins.clear(); // declared above nd_margin_max; int64_t rather than size_t to more conveniently handle deficits
     margins.reserve(nd);
+    // [fork, 2026-10-30] fit step 3 D (design-fit-lazy-reserve-and-warmup-gate.md): VRAM floor, --fit-floor-frac F
+    // (default 0.08). margin_i = max(--fit-target_i, F x VRAM total_i) + extras_i, where extras_i are reserves the caller
+    // already folded into margins_s (vocab-subset head bound, common.cpp) and passed again in margins_extra so they stay
+    // ON TOP of the floor instead of being absorbed by it. 24 GB XTX (24560 MiB) -> 1964 MiB, 20 GB XT -> 1637 MiB.
+    // Why a fraction and not a flat 1024: the measured free VRAM after context init vs whether the first requests
+    // spilled to GTT: 2873 MiB free ran clean (GROW_SLACK history), 1446 MiB (2026-10-30 09:50, Vulkan1, first request
+    // GTT 20 -> 1046 MiB, tg 34 -> 26 t/s) and 783 MiB spilled. The threshold is somewhere in 1446..2873; 8% of a 24 GB
+    // card sits above every spill seen and below the clean run. The lazy reserve (step 3 B, mb.lazy_*) prices what is
+    // known; the floor is the wiggle room for what is not (TTM evicting early, OPEN since the 289k KQ-mask incident:
+    // buffers.cpp:330-347, ~3 GB nominally free when the 1.13 GB mask BO went to GTT). The floor is a per-card fraction
+    // because the unpriced costs grow with what sits on the card, not with a constant.
+    // Not changed: GROW_SLACK (256 MiB) still applies on top in the grow-back. The --fit-verify gate (server, step 3 E)
+    // raising fit_params_target only moves a margin once the raised target passes the floor - its increment has to be
+    // judged against the printed margin, not the raw target. The mmproj reserve (server-context.cpp, added straight into
+    // fit_params_target) is NOT in margins_extra, so the floor absorbs it (UNKNOWN whether the owner wants it on top too).
+    // floor_frac <= 0 = off (the old behaviour: margin = target).
+    std::vector<bool> margin_is_floor(std::max<size_t>(nd, 1), false);
     if (nd == 0) {
         margins.push_back(margins_s[0]);
     } else {
         for (size_t id = 0; id < nd; id++) {
-            margins.push_back(margins_s[id]);
+            const int64_t extra_id  = margins_extra ? int64_t(margins_extra[id]) : 0;
+            const int64_t target_id = std::max<int64_t>(int64_t(margins_s[id]) - extra_id, 0);
+            const int64_t floor_id  = floor_frac > 0.0f ? int64_t(double(floor_frac) * double(dmds_full[id].total)) : 0;
+            margin_is_floor[id] = floor_id > target_id;
+            margins.push_back(std::max(target_id, floor_id) + extra_id);
         }
     }
 
@@ -535,9 +586,13 @@ static void common_params_fit_impl(
     // ggml-vulkan-buffers.cpp. Cross-module precondition: "free" is ggml_backend_dev_memory at fit time =
     // RADV heapBudget - heapUsage (VK_EXT_memory_budget), blind to kernel placement (since 2026-10-27 on amdgpu:
     // sysfs mem_info_vram_total - mem_info_vram_used, device-wide, with the budget printed beside it); context = KV + recurrent state
-    // (the breakdown does not split them); compute = the reserve at fit time, NOT the lazy per-graph scratch
-    // (prealloc_*, D2D rings, staging) the backend allocates later. The estimate is the probe of the chosen
-    // configuration when one was made, else one more no_alloc probe.
+    // (the breakdown does not split them); compute = the reserve at fit time INCLUDING the backend scratch
+    // (prealloc_x/y/split_k/mask, sized at reserve since 2026-10-27, printed as "scratch"); "lazy <vram>+<gtt>" = what the
+    // backend reports it will allocate after the reserve (D2D rings, device/context sync staging, descriptor/pipeline
+    // arenas; GGML_BACKEND_FORK_DEV_LAZY_RESERVE_PROC, 2026-10-30), outside compute but inside placed. Still NOT seen:
+    // gallocr runtime re-plans (logged at WARN by step 3 A, not priced) and the vocab-subset head (priced as a margin add,
+    // common.cpp). The margin is max(--fit-target, --fit-floor-frac x total) + extras and says which one won. The
+    // estimate is the probe of the chosen configuration when one was made, else one more no_alloc probe.
     auto finish = [&]() {
         dmds_t d;
         const auto it = probes.find(common_fit_probe_key(*mparams, *cparams, devs.size()));
@@ -582,13 +637,16 @@ static void common_params_fit_impl(
             }
             // [fork, 2026-10-27] "scratch" = the backend scratch inside compute (llama_memory_breakdown_data::scratch),
             // e.g. 1368 MiB of prealloc_x per XTX at -c 350000; it was invisible to the fit before that date
+            // [fork, 2026-10-30] "lazy V+G" = mb.lazy_vram + mb.lazy_gtt (target + the extra context's 2nd-context
+            // increment), a separate term of placed; "(floor|target)" = which side of max() set the margin (step 3 D)
             LOG_WRN("%s: fit summary: %s: total %6" PRId64 " MiB, free at fit %6" PRId64 " MiB%s, placed %6" PRId64 " MiB "
-                    "(model %" PRId64 " + KV/RS %" PRId64 " + compute %" PRId64 ", of which backend scratch %" PRId64 ")%s, "
-                    "margin %" PRId64 " MiB, est. free %6" PRId64 " MiB (%+" PRId64 " vs margin)\n",
+                    "(model %" PRId64 " + KV/RS %" PRId64 " + compute %" PRId64 ", of which backend scratch %" PRId64
+                    ", + lazy %" PRId64 "+%" PRId64 ")%s, "
+                    "margin %" PRId64 " MiB (%s), est. free %6" PRId64 " MiB (%+" PRId64 " vs margin)\n",
                     __func__, dev_names[id].c_str(), dm.total/MiB, dm.free/MiB, budget_note(devs[id]).c_str(), placed/MiB,
                     int64_t(dm.mb.model)/MiB, int64_t(dm.mb.context)/MiB, int64_t(dm.mb.compute)/MiB,
-                    int64_t(dm.mb.scratch)/MiB, layers,
-                    margins[id]/MiB, est_free/MiB, (est_free - margins[id])/MiB);
+                    int64_t(dm.mb.scratch)/MiB, int64_t(dm.mb.lazy_vram)/MiB, int64_t(dm.mb.lazy_gtt)/MiB, layers,
+                    margins[id]/MiB, margin_is_floor[id] ? "floor" : "target", est_free/MiB, (est_free - margins[id])/MiB);
         }
         for (const extra_outside_t & eo : extra_outside) {
             LOG_WRN("%s: fit summary: %s: draft/MTP only (not a main-model device): free at fit %6" PRId64 " MiB%s, "
@@ -1686,11 +1744,14 @@ enum common_params_fit_status common_fit_params(
         size_t * margins,
         uint32_t n_ctx_min,
         const common_fit_extra_model * extra,
-        ggml_log_level log_level) {
+        ggml_log_level log_level,
+        float floor_frac,
+        const size_t * margins_extra) {
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     try {
-        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, log_level);
+        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, log_level,
+            floor_frac, margins_extra);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());

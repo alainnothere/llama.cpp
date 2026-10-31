@@ -1988,13 +1988,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, const std::string & conversation_id, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
-    // [LLAMA_SERVER_UBATCH_STATS] 2026-10-22 night: which tier served the restore, read by the per-request line
-    last_load_src   = 0;
-    last_load_bytes = 0;
-    last_load_lcp_us = 0;
-    static const bool lcp_timed = getenv("LLAMA_SERVER_UBATCH_STATS") != nullptr; // no clock reads when off
-    const int64_t t_lcp0 = lcp_timed ? ggml_time_us() : 0;
+std::list<server_prompt_cache_state>::iterator server_prompt_cache::find_state(const server_prompt & prompt, const server_tokens & tokens_new) {
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -2004,7 +1998,6 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     auto it_best = states.end();
 
-    // Phase 1: find best match in states
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
 
@@ -2029,10 +2022,70 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
     }
 
-    last_load_lcp_us = lcp_timed ? ggml_time_us() - t_lcp0 : 0;
-
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+    }
+
+    return it_best;
+}
+
+int32_t server_prompt_cache::restore_n_tokens(const server_prompt & prompt, const server_tokens & tokens_new, const std::string & conversation_id, bool has_dft) {
+    // same order as load(): Phase 1 RAM entry, then Phase 3 disk
+    const auto it = find_state(prompt, tokens_new);
+    if (it != states.end()) {
+        return it->prompt.n_tokens();
+    }
+
+    if (disk_path.empty() || conversation_id.empty()) {
+        return -1;
+    }
+
+    // what the files will hold once the writer drained this conversation - load_from_disk() waits for exactly that.
+    // the release flush ([TAG_RELEASE_FLUSH]) may still be in the queue, so the mirror beats the .hdr on disk
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        const auto d = disk_convs.find(conversation_id);
+        if (d != disk_convs.end() && !d->second.broken && d->second.scheduled_n_tok > 0) {
+            const uint32_t n_tok = d->second.scheduled_n_tok;
+            return limit_tokens > 0 && n_tok > limit_tokens ? -1 : (int32_t) n_tok;
+        }
+    }
+
+    // the .hdr and the file sizes only: the .tok/.kv files are not read
+    disk_conv_state st;
+    if (!read_disk_state(conversation_id, st, /*with_tokens =*/ false)) {
+        return -1;
+    }
+    // the same refusals as load_from_disk()
+    if ((limit_tokens > 0 && st.n_tok > limit_tokens) || (has_dft && st.drft_size == 0)) {
+        return -1;
+    }
+
+    return (int32_t) st.n_tok;
+}
+
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, const std::string & conversation_id, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, int32_t n_room) {
+    // [LLAMA_SERVER_UBATCH_STATS] 2026-10-22 night: which tier served the restore, read by the per-request line
+    last_load_src   = 0;
+    last_load_bytes = 0;
+    last_load_lcp_us = 0;
+    static const bool lcp_timed = getenv("LLAMA_SERVER_UBATCH_STATS") != nullptr; // no clock reads when off
+    const int64_t t_lcp0 = lcp_timed ? ggml_time_us() : 0;
+
+    // Phase 1: find best match in states
+    auto it_best = find_state(prompt, tokens_new);
+
+    last_load_lcp_us = lcp_timed ? ggml_time_us() - t_lcp0 : 0;
+
+    // [TAG_EVICT_ON_NEED] the caller evicted idle slots for this entry already; when it could not (the other slots are
+    // busy), set_data would fail in state_read_meta after a partial write and wipe the slot. keep the slot's own state
+    if (it_best != states.end() && n_room >= 0 && it_best->prompt.n_tokens() > n_room) {
+        SRV_WRN("load: RAM entry with %d tokens does not fit in %d free cells of the unified KV pool - not restored\n",
+                it_best->prompt.n_tokens(), n_room);
+        return true;
+    }
+
+    if (it_best != states.end()) {
         last_load_src   = 1;
         last_load_bytes = (int64_t) (it_best->data.main.size() + it_best->data.drft.size());
 
@@ -2095,7 +2148,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     // Phase 3: disk fallback - direct lookup by conversation_id
     if (!disk_path.empty() && !conversation_id.empty()) {
-        if (load_from_disk(prompt, conversation_id, ctx_tgt, ctx_dft, id_slot)) {
+        if (load_from_disk(prompt, conversation_id, ctx_tgt, ctx_dft, id_slot, n_room)) {
             last_load_src = 2;
             SRV_INF("load: restored '%s' from disk\n", conversation_id.c_str());
             merge_checkpoint_spills(prompt);
@@ -2321,7 +2374,15 @@ bool server_prompt_cache::flush_from_context(const server_prompt & prompt, llama
         const size_t n_cmp = std::min<size_t>(std::min<size_t>(st.scheduled_n_tok, st.scheduled_tokens.size()), n_tok);
         const uint32_t lcp = (uint32_t) (std::mismatch(st.scheduled_tokens.begin(), st.scheduled_tokens.begin() + n_cmp, toks.begin()).first - st.scheduled_tokens.begin());
 
-        const bool usable = !st.broken && st.scheduled_n_tok > 0;
+        // [fork, 2026-10-30] a file in another K/V type (restored through --cache-convert) is never appended to: the
+        // next flush rewrites it in this server's type. one-time cost per conversation (2026-10 numbers: ~200 ms per
+        // 8192-token segment on the 27B, ~2.5 s for a 98k conversation) against ~10 min of prefill it saved
+        const bool same_type = st.file_state_hash == state_hash;
+        if (!st.broken && st.scheduled_n_tok > 0 && !same_type) {
+            SRV_WRN("disk cache: '%s' was saved with another K/V type (state=0x%08x, this server 0x%08x) - rewriting it in this server's type\n",
+                    conv_id.c_str(), st.file_state_hash, state_hash);
+        }
+        const bool usable = !st.broken && st.scheduled_n_tok > 0 && same_type;
 
         if (usable && lcp == st.scheduled_n_tok && n_tok == lcp) {
             SRV_INF("disk cache: '%s' already flushed (%u tokens) - nothing to write\n", conv_id.c_str(), n_tok);
@@ -2459,6 +2520,7 @@ bool server_prompt_cache::flush_from_context(const server_prompt & prompt, llama
             st.scheduled_tokens = job.tokens;
             if (job.rewrite) {
                 st.scheduled_seg_ends.clear();
+                st.file_state_hash = state_hash; // the rewrite writes this server's header (process_disk_job)
             }
             while (job.truncate_to >= 0 && !st.scheduled_seg_ends.empty() && st.scheduled_seg_ends.back() > (uint32_t) job.truncate_to) {
                 st.scheduled_seg_ends.pop_back();
@@ -2664,7 +2726,7 @@ void server_prompt_cache::process_disk_job(const disk_job & job) {
             t_ms, st.n_tok, n_segs);
 }
 
-bool server_prompt_cache::read_disk_state(const std::string & conversation_id, disk_conv_state & st) {
+bool server_prompt_cache::read_disk_state(const std::string & conversation_id, disk_conv_state & st, bool with_tokens) {
     const std::string base = (std::filesystem::path(disk_path) / conversation_id).string();
 
     std::vector<uint8_t> hdr;
@@ -2722,7 +2784,9 @@ bool server_prompt_cache::read_disk_state(const std::string & conversation_id, d
     // same arch and vocab does not mean readable state: KV cache types and model
     // geometry must match too, or state_read aborts mid-restore on the first
     // typed tensor (observed: two qwen35-family models sharing one cache dir)
-    if (fs != state_hash) {
+    // [fork, 2026-10-30] state_hash_ok: with --cache-convert the other f16/q8_0 type pairs of this geometry are
+    // readable too (server-context.cpp, make_state_hash); st.file_state_hash records which one this file has
+    if (!state_hash_ok(fs)) {
         SRV_INF("disk cache: '%s.hdr' kv-state identity mismatch (0x%08x != 0x%08x) - ignoring\n",
                 conversation_id.c_str(), fs, state_hash);
         return false;
@@ -2763,8 +2827,8 @@ bool server_prompt_cache::read_disk_state(const std::string & conversation_id, d
         }
     }
 
-    std::vector<llama_token> toks(n_tok);
-    {
+    std::vector<llama_token> toks(with_tokens ? n_tok : 0);
+    if (with_tokens) {
         std::ifstream f(split_path(base, SPLIT_EXT_TOK), std::ios::binary);
         if (!f) {
             return false;
@@ -2779,6 +2843,7 @@ bool server_prompt_cache::read_disk_state(const std::string & conversation_id, d
     st.kv_size          = kv_size;
     st.drft_size        = drft_size;
     st.rec_size         = rec_size;
+    st.file_state_hash  = fs;
     st.scheduled_n_tok  = n_tok;
     st.scheduled_tokens = std::move(toks);
     st.broken           = false;
@@ -3234,7 +3299,9 @@ bool server_prompt_cache::read_checkpoint_file_entry(const std::string & path, c
         return true; // short header
     }
 
-    if (fa != arch_hash || fv != vocab_hash || fs != state_hash) {
+    // [fork, 2026-10-30] a checkpoint of another convertible K/V type pair is readable with --cache-convert: the
+    // recurrent part is f32 and type-independent, the KV part (SWA models) goes through the converting reader
+    if (fa != arch_hash || fv != vocab_hash || !state_hash_ok(fs)) {
         e.status = cp_file_entry::CP_BAD_HASH;
         return true;
     }
@@ -3309,7 +3376,7 @@ void server_prompt_cache::cp_index_seed(const std::string & conversation_id) {
 
 
 bool server_prompt_cache::load_from_disk(server_prompt & prompt, const std::string & conversation_id,
-                                          llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+                                          llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, int32_t n_room) {
     if (disk_path.empty() || conversation_id.empty()) {
         return false;
     }
@@ -3347,6 +3414,19 @@ bool server_prompt_cache::load_from_disk(server_prompt & prompt, const std::stri
         return false;
     }
 
+    // [TAG_EVICT_ON_NEED] refuse a state that cannot fit before reading a byte of it. the segments are applied one by
+    // one with APPEND and only the one that runs out of cells fails, in state_read_meta. 2026-10-28 production (27B
+    // hybrid, -np 2 --kv-unified, 420096-cell pool): slot 1 held 172070 cells, this conversation needed 248289, 263
+    // short. all 118 segments (15.4 GB, 14 s) streamed in, the last one ("failed to find 1767 available cells")
+    // failed, the wipe below threw it all away, and the request re-prefilled 248k tokens (~5 min). a partial restore
+    // is no use on a hybrid model anyway: the attention cells need the .rec state valid at n_tok, which goes in last.
+    // the caller (get_available_slot) evicts idle slots first, so this triggers only when every other slot is busy
+    if (n_room >= 0 && st.n_tok > (uint32_t) n_room) {
+        SRV_WRN("load_from_disk: '%s' needs %u cells, only %d free in the unified KV pool - not restored\n",
+                conversation_id.c_str(), st.n_tok, n_room);
+        return false;
+    }
+
     const std::string base = (std::filesystem::path(disk_path) / conversation_id).string();
 
     std::ifstream kf(split_path(base, SPLIT_EXT_KV), std::ios::binary);
@@ -3363,6 +3443,10 @@ bool server_prompt_cache::load_from_disk(server_prompt & prompt, const std::stri
 
     const int64_t t_start = ggml_time_us();
 
+    // [fork, 2026-10-30] --cache-convert: the counters are cumulative per context, the difference is this restore
+    const llama_state_convert_stats conv0_tgt = llama_state_get_convert_stats(ctx_tgt);
+    const llama_state_convert_stats conv0_dft = ctx_dft ? llama_state_get_convert_stats(ctx_dft) : llama_state_convert_stats { 0, 0, 0, -1, -1 };
+
     SRV_INF("load_from_disk: '%s' n_tok=%u kv=%.1f MiB drft=%.1f MiB segments=%zu\n",
             conversation_id.c_str(), st.n_tok,
             st.kv_size / (1024.0 * 1024.0), st.drft_size / (1024.0 * 1024.0), st.segments.size());
@@ -3375,11 +3459,14 @@ bool server_prompt_cache::load_from_disk(server_prompt & prompt, const std::stri
     // rec_size > 0 (hybrid): every segment is attention-only, which only the APPEND path
     // parses - so wipe the sequence explicitly and apply all segments with APPEND, then
     // restore the recurrent state from .rec with PARTIAL_ONLY.
+    // the prompt is cleared with the memory: load() returns true after a failed disk load and the caller keeps the
+    // slot, so stale tokens left here would claim cells that are gone (the next turn would reuse a prefix of them)
     auto wipe_slot = [&]() {
         llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, -1, -1);
         if (ctx_dft) {
             llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, -1, -1);
         }
+        prompt.clear();
     };
 
     const bool hybrid_file = st.rec_size > 0;
@@ -3488,6 +3575,27 @@ bool server_prompt_cache::load_from_disk(server_prompt & prompt, const std::stri
     SRV_WRN("load_from_disk: restored '%s' tokens=%zu in %.0f ms (%.1f MiB/s)\n",
             conversation_id.c_str(), prompt.tokens.size(), t_ms,
             t_ms > 0.0 ? ((st.kv_size + st.drft_size) / (1024.0 * 1024.0)) / (t_ms / 1e3) : 0.0);
+
+    // [fork, 2026-10-30] one line per converted restore (the library adds one per segment it converted); the next
+    // flush of this conversation rewrites it in this server's type, see flush_from_context
+    {
+        const llama_state_convert_stats c1_tgt = llama_state_get_convert_stats(ctx_tgt);
+        const llama_state_convert_stats c1_dft = ctx_dft ? llama_state_get_convert_stats(ctx_dft) : conv0_dft;
+
+        const uint64_t src_tgt = c1_tgt.n_bytes_src - conv0_tgt.n_bytes_src;
+        const uint64_t src_dft = c1_dft.n_bytes_src - conv0_dft.n_bytes_src;
+        const uint64_t dst_all = (c1_tgt.n_bytes_dst - conv0_tgt.n_bytes_dst) + (c1_dft.n_bytes_dst - conv0_dft.n_bytes_dst);
+
+        if (src_tgt + src_dft > 0) {
+            const llama_state_convert_stats & c = src_tgt > 0 ? c1_tgt : c1_dft;
+            SRV_WRN("disk cache: restored '%s' with K/V conversion %s->%s (%.1f MiB) - main %.1f MiB, drft %.1f MiB as saved, %.1f MiB in the cache\n",
+                    conversation_id.c_str(),
+                    c.type_src >= 0 ? ggml_type_name((ggml_type) c.type_src) : "?",
+                    c.type_dst >= 0 ? ggml_type_name((ggml_type) c.type_dst) : "?",
+                    (src_tgt + src_dft) / (1024.0 * 1024.0),
+                    src_tgt / (1024.0 * 1024.0), src_dft / (1024.0 * 1024.0), dst_all / (1024.0 * 1024.0));
+        }
+    }
 
     return true;
 }

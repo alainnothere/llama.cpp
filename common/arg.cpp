@@ -1404,6 +1404,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         params.sampling.temp = 0.2; // lower temp by default for better quality
     } else if (ex == LLAMA_EXAMPLE_SERVER) {
         params.n_parallel = -1;     // auto by default
+        // [fork, 2026-10-30] -b 8192 is the server default: the pipelined prompt path needs n_batch > n_ubatch to overlap
+        // the cards (ledger 2026-10-22: PPL 2.8989 both arms, all 12 per-chunk values identical, prompt eval 856.7 ->
+        // 1077.0 t/s at -b 8192 -ub 512; -b 8192 -ub 2048 LOST 25-35% at 60k+). Every production script passed it by
+        // hand for a week and one (q4_u.sh) forgot. Only the batch size: -ub stays 512. llama clamps n_batch to n_ctx.
+        params.n_batch = 8192;
     } else if (ex == LLAMA_EXAMPLE_TOKENIZE) {
         params.parse_special = true; // parse special tokens by default, like the old tokenize tool
     } else if (ex == LLAMA_EXAMPLE_TTS) {
@@ -2509,6 +2514,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_type_v = kv_cache_type_from_str(value);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
+    // [fork, 2026-10-30] the owner switches -ctk/-ctv between f16 and q8_0 and lost every saved conversation each time
+    // (the state reader refused the type, the disk cache hash made it a miss): a 98k replay is ~10 min of prefill.
+    // off by default until the conversion passes the gate on the owner's run (rule: default flips ship OFF)
+    add_opt(common_arg(
+        {"--cache-convert"}, "[on|off]",
+        string_format(
+            "convert saved K/V state between f16 and q8_0 when it is loaded into a cache of the other type\n"
+            "(slot restore, disk prompt cache, checkpoints; main and draft context; other types are refused)\n"
+            "(default: %s)", params.cache_convert ? "on" : "off"),
+        [](common_params & params, const std::string & value) {
+            if (is_truthy(value)) {
+                params.cache_convert = true;
+            } else if (is_falsey(value)) {
+                params.cache_convert = false;
+            } else {
+                throw std::invalid_argument(
+                    string_format("error: unknown value for --cache-convert: '%s'\n", value.c_str()));
+            }
+        }
+    ).set_env("LLAMA_ARG_CACHE_CONVERT"));
     add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",
@@ -2977,6 +3002,51 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_FIT_TARGET"));
+    // [fork, 2026-10-30] fit step 3 D (design-fit-lazy-reserve-and-warmup-gate.md): fraction-of-VRAM floor under
+    // --fit-target. Measured free VRAM after context init vs GTT spill on the first requests: 2873 MiB clean, 1446 MiB
+    // (2026-10-30, Vulkan1, ~1 GB to GTT, tg 34 -> 26 t/s) and 783 MiB spilled; 0.08 x 24560 MiB = 1964 MiB sits between.
+    add_opt(common_arg(
+        { "--fit-floor-frac" }, "F",
+        string_format("VRAM floor for --fit as a fraction of each device's total memory: the margin per device is "
+            "max(--fit-target, F x total), 0 = off (default: %.2f)", (double) params.fit_floor_frac),
+        [](common_params & params, const std::string & value) {
+            const float f = std::stof(value);
+            if (!(f >= 0.0f && f < 1.0f)) {
+                throw std::invalid_argument("--fit-floor-frac must be in [0, 1)");
+            }
+            params.fit_floor_frac = f;
+        }
+    ).set_env("LLAMA_ARG_FIT_FLOOR_FRAC"));
+    // [fork, 2026-10-30] --fit-verify / --fit-verify-mib: the server's warm-up gate (tools/server/server-context.cpp,
+    // fit_verify_*). Kept as its own block, away from --fit-target, so the --fit-floor-frac block can merge next to it
+    add_opt(common_arg(
+        { "--fit-verify" }, "[on|off|auto]",
+        "server: after loading, run one n_ubatch prompt graph and one speculative step, diff the kernel's GTT/VRAM "
+        "counters per device, and on a VRAM eviction raise that device's --fit-target and reload (at most 2 retries); "
+        "replaces the BOS+EOS warmup when active. 'auto' = on when --fit is on and -c is not set (default: off)",
+        [](common_params & params, const std::string & value) {
+            if (is_autoy(value)) {
+                params.fit_verify = 2;
+            } else if (is_truthy(value)) {
+                params.fit_verify = 1;
+            } else if (is_falsey(value)) {
+                params.fit_verify = 0;
+            } else {
+                throw std::runtime_error(
+                    string_format("error: unknown value for --fit-verify: '%s'\n", value.c_str()));
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_FIT_VERIFY"));
+    add_opt(common_arg(
+        { "--fit-verify-mib" }, "N",
+        string_format("--fit-verify: GTT growth per device (MiB) across the warm-up that counts as a finding (default: %d)", params.fit_verify_mib),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--fit-verify-mib must be >= 0");
+            }
+            params.fit_verify_mib = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_FIT_VERIFY_MIB"));
     add_opt(common_arg(
         { "-fitc", "--fit-ctx" }, "N",
         string_format("minimum ctx size that can be set by --fit option, default: %" PRIu32, params.fit_params_min_ctx),
@@ -3983,6 +4053,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_LOG_FILE"));
     add_opt(common_arg(
+        {"--fit-log-file"}, "FNAME",
+        "[fork] also append the memory-fit lines (fit summary, LAZY ALLOC, SCRATCH/GALLOC GROW, GTT WATCH, PLACEMENT, fit verify) to this file",
+        [](common_params &, const std::string & value) {
+            common_log_set_fit_file(common_log_main(), value.c_str());
+        }
+    ).set_env("LLAMA_ARG_FIT_LOG_FILE"));
+    add_opt(common_arg(
         {"--log-jsonl"},
         {"--no-log-jsonl"},
         "Log as JSONL (one JSON object per line) to stdout, this also disables colored logging (default: disabled)",
@@ -4331,6 +4408,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.auto_n = true;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_AUTO"));
+    add_opt(common_arg(
+        {"--no-spec-draft-auto"},
+        "fixed draft length (--spec-draft-n-max), no per-slot tuning; [fork 2026-10-30] the auto tuner is the default now",
+        [](common_params & params) {
+            params.speculative.draft.auto_n = false;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_NO_SPEC_DRAFT_AUTO"));
     add_opt(common_arg(
         {"--spec-synth-len"}, "L",
         "target mean synthetic acceptance length, including the target token (benchmarking only)",

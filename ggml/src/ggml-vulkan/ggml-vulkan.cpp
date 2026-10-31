@@ -6124,9 +6124,9 @@ void ggml_vk_instance_init() {
         const int v = atoi(e);
         vk_fa_pv_reg = v < 0 ? -1 : ((v == 2 || v == 3) ? v : (v != 0 ? 1 : 0));
     }
-    // GGML_VK_FA_PV_REG_QUANT (2026-10-24, candidate C1 of q8-kv-faster-than-f16.md.response): 0 off (default), 1 = q8_0
-    // K and/or V may take PV_REG mode 3 with per-subgroup dequant staging, and quant K/V in PV_REG get the wave32
-    // auto like f16. Ships off until the pipelined ppl gate passes on the cards (see ggml_vk_flash_attn).
+    // GGML_VK_FA_PV_REG_QUANT (2026-10-24, candidate C1 of q8-kv-faster-than-f16.md.response): 1 (default since
+    // 2026-10-30, ppl gate passed 2026-10-25; see ggml-vulkan-debug.cpp) = q8_0 K and/or V may take PV_REG mode 3 with
+    // per-subgroup dequant staging, and quant K/V in PV_REG get the wave32 auto like f16; 0 = the dequant FA path.
     // Measured 2026-10-24, 7900 XTX (GPU3), test-backend-ops perf, hs 256, 4 kv heads x 6, decode mask, K/V permuted
     // like the cache, us at nb 1/2/4/6/8/12/16 (dense tiles 1/1/2/3/3/5/6):
     //   kv 229376  f16 1095.9/1088.7/1112.9/1193.3/1204.0/2144.3/2290.0
@@ -9707,7 +9707,8 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     const bool kv_f16 = k_type_eff == GGML_TYPE_F16 && v_type_eff == GGML_TYPE_F16;
     // cm2 dense is fast, so it needs a larger reduction to win.
     // With quantized K/V, sparse only breaks even around 16x (measured on RDNA3/RDNA4).
-    // The f16 ratio is GGML_VK_FA_SPARSE_MIN_RATIO (default 1; 2 was the old gate).
+    // The f16 ratio is GGML_VK_FA_SPARSE_MIN_RATIO (default 2 = the old gate; 1 was tried and LOST, session 49.0 vs 49.4 t/s,
+    // ledger 2026-10-2x "KNOB-OFF"; comment corrected 2026-10-30, it said default 1 while the initializer is 2).
     const int64_t min_ratio = tuning_params.path == FA_COOPMAT2 ? 4 : (kv_f16 ? (int64_t)vk_fa_sparse_min_ratio_f16 : 16);
     const bool use_sparse = !disable_sparse && n_kv_max > 0 && mask && gqa_T == 1 &&
                             max_bias == 0.0f && logit_softcap == 0.0f &&
@@ -14197,6 +14198,8 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
             ggml_vk_destroy_buffer(ctx->prealloc_x);
         }
         ctx->prealloc_x = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_x, "prealloc_x");
+        ggml_vk_lazy_account(ctx->device.get(), VK_LAZY_PREALLOC, (int64_t) ctx->prealloc_x->size - (int64_t) old_size,
+                             bool(ctx->prealloc_x->memory_property_flags & vk::MemoryPropertyFlagBits::eDeviceLocal));
         ggml_vk_scratch_grow_log(ctx->device, "prealloc_x", old_size, ctx->prealloc_size_x, &ctx->scratch_grow_n[0]);
     }
     if (ctx->prealloc_y == nullptr || (ctx->prealloc_size_y > 0 && ctx->prealloc_y->size < ctx->prealloc_size_y)) {
@@ -14207,6 +14210,8 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
             ggml_vk_destroy_buffer(ctx->prealloc_y);
         }
         ctx->prealloc_y = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_y, "prealloc_y");
+        ggml_vk_lazy_account(ctx->device.get(), VK_LAZY_PREALLOC, (int64_t) ctx->prealloc_y->size - (int64_t) old_size,
+                             bool(ctx->prealloc_y->memory_property_flags & vk::MemoryPropertyFlagBits::eDeviceLocal));
         ggml_vk_scratch_grow_log(ctx->device, "prealloc_y", old_size, ctx->prealloc_size_y, &ctx->scratch_grow_n[1]);
         ctx->prealloc_y_last_pipeline_used = nullptr;
         ctx->prealloc_y_last_tensor_used = nullptr;
@@ -14220,6 +14225,8 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
             ggml_vk_destroy_buffer(ctx->prealloc_mask_scratch);
         }
         ctx->prealloc_mask_scratch = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_mask_scratch, "prealloc_mask_scratch");
+        ggml_vk_lazy_account(ctx->device.get(), VK_LAZY_PREALLOC, (int64_t) ctx->prealloc_mask_scratch->size - (int64_t) old_size,
+                             bool(ctx->prealloc_mask_scratch->memory_property_flags & vk::MemoryPropertyFlagBits::eDeviceLocal));
         ggml_vk_scratch_grow_log(ctx->device, "prealloc_mask_scratch", old_size, ctx->prealloc_size_mask_scratch, &ctx->scratch_grow_n[2]);
         // the old contents are gone, so every cached entry is invalid
         ctx->mask_scratch_entries.clear();
@@ -14233,6 +14240,8 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
             ggml_vk_destroy_buffer(ctx->prealloc_split_k);
         }
         ctx->prealloc_split_k = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_split_k, "prealloc_split_k");
+        ggml_vk_lazy_account(ctx->device.get(), VK_LAZY_PREALLOC, (int64_t) ctx->prealloc_split_k->size - (int64_t) old_size,
+                             bool(ctx->prealloc_split_k->memory_property_flags & vk::MemoryPropertyFlagBits::eDeviceLocal));
         ggml_vk_scratch_grow_log(ctx->device, "prealloc_split_k", old_size, ctx->prealloc_size_split_k, &ctx->scratch_grow_n[3]);
     }
     if (ctx->prealloc_add_rms_partials == nullptr || (ctx->prealloc_size_add_rms_partials > 0 && ctx->prealloc_add_rms_partials->size < ctx->prealloc_size_add_rms_partials)) {
@@ -14243,6 +14252,8 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
             ggml_vk_destroy_buffer(ctx->prealloc_add_rms_partials);
         }
         ctx->prealloc_add_rms_partials = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_add_rms_partials, "prealloc_add_rms_partials");
+        ggml_vk_lazy_account(ctx->device.get(), VK_LAZY_PREALLOC, (int64_t) ctx->prealloc_add_rms_partials->size - (int64_t) old_size,
+                             bool(ctx->prealloc_add_rms_partials->memory_property_flags & vk::MemoryPropertyFlagBits::eDeviceLocal));
         ggml_vk_scratch_grow_log(ctx->device, "prealloc_add_rms_partials", old_size, ctx->prealloc_size_add_rms_partials, &ctx->scratch_grow_n[4]);
     }
 }
@@ -15468,6 +15479,14 @@ void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
         ctx->dts_init_done = false;
     }
 
+    // [fork, 2026-10-30] live lazy totals (ggml_vk_lazy_account): this context's prealloc_* and staging go away
+    for (vk_buffer * b : { &ctx->prealloc_x, &ctx->prealloc_y, &ctx->prealloc_split_k, &ctx->prealloc_add_rms_partials,
+                           &ctx->prealloc_mask_scratch, &ctx->sync_staging }) {
+        if (*b) {
+            ggml_vk_lazy_account(ctx->device.get(), b == &ctx->sync_staging ? VK_LAZY_STAGING_CTX : VK_LAZY_PREALLOC,
+                                 -(int64_t) (*b)->size, bool((*b)->memory_property_flags & vk::MemoryPropertyFlagBits::eDeviceLocal));
+        }
+    }
     ggml_vk_destroy_buffer(ctx->prealloc_x);
     ggml_vk_destroy_buffer(ctx->prealloc_y);
     ggml_vk_destroy_buffer(ctx->prealloc_split_k);
@@ -16270,6 +16289,10 @@ struct vk_d2d_link {
         size_t    len = 0;         // 0: no ring (len, not ptr, is the "exists" test since the export ring has no ptr)
         vk_buffer buf_src;
         vk_buffer buf_dst;
+        // [fork, 2026-10-30] lazy accounting on the SRC device (ggml_vk_lazy_account): which category it was counted
+        // under and in which pool, so link destroy subtracts exactly what ring_alloc added
+        vk_lazy_cat lazy_cat  = VK_LAZY_D2D_RING;
+        bool        lazy_vram = false;
     };
     ring_t              ring;
     std::vector<ring_t> retired;   // outgrown rings, imports alive until link destroy
@@ -16579,6 +16602,44 @@ static vk_buffer ggml_vk_d2d_wrap_buffer(vk_device & dev, vk::Buffer b, vk::Devi
     return buf;
 }
 
+// [fork, 2026-10-30] the exported ring's src memory type choice, factored out of ggml_vk_d2d_export_alloc so the
+// fit's lazy reserve (ggml_backend_vk_fork_dev_lazy_reserve) classifies the ring with the SAME decision the exporter
+// makes: rank 0/1 = GTT (host-visible), rank 2 = BAR VRAM (charged as vram). type_bits = the buffer's
+// memoryTypeBits (the reserve passes ~0u: no buffer exists at fit time; RADV accepts every type for a transfer
+// buffer, so the pick matches as long as that holds). Returns UINT32_MAX when no type qualifies (*rank_out = 3).
+//
+// rank 0: HOST_VISIBLE|HOST_COHERENT, not DEVICE_LOCAL, not HOST_CACHED (RADV GTT write-combined: system pages,
+//         GPU access unsnooped); rank 1: the same, cached (GTT cached); rank 2: any HOST_VISIBLE (the src card's
+//         BAR-visible VRAM: no userptr either, but hop 2 reads across PCIe from the src card). Skipped: AMD
+//         device-coherent/uncached types (need VK_AMD_device_coherent_memory, not enabled), protected, lazy.
+static uint32_t ggml_vk_d2d_ring_pick_type(const vk::PhysicalDeviceMemoryProperties & mps, uint32_t type_bits, vk::DeviceSize size, int * rank_out) {
+    const vk::MemoryPropertyFlags skip = vk::MemoryPropertyFlagBits::eDeviceCoherentAMD | vk::MemoryPropertyFlagBits::eDeviceUncachedAMD |
+                                         vk::MemoryPropertyFlagBits::eProtected | vk::MemoryPropertyFlagBits::eLazilyAllocated;
+    const vk::MemoryPropertyFlags hvhc = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent;
+    uint32_t type = UINT32_MAX;
+    int      best = 3;
+    for (uint32_t i = 0; i < mps.memoryTypeCount; i++) {
+        const vk::MemoryType & mt = mps.memoryTypes[i];
+        if (!(type_bits & (1u << i)) || (mt.propertyFlags & skip) || mps.memoryHeaps[mt.heapIndex].size < size) {
+            continue;
+        }
+        int rank = 3;
+        if ((mt.propertyFlags & hvhc) == hvhc && !(mt.propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal)) {
+            rank = (mt.propertyFlags & vk::MemoryPropertyFlagBits::eHostCached) ? 1 : 0;
+        } else if (mt.propertyFlags & vk::MemoryPropertyFlagBits::eHostVisible) {
+            rank = 2;
+        }
+        if (rank < best) {
+            best = rank;
+            type = i;
+        }
+    }
+    if (rank_out) {
+        *rank_out = best;
+    }
+    return type;
+}
+
 // [fork, 2026-10-22 evening] exported ring (comment at ggml_vk_d2d_ring_pref): cap bytes of src memory, exported as an
 // opaque fd and imported on dst. Returns NULL on success, else the fallback reason (static or thread-local storage).
 static const char * ggml_vk_d2d_export_alloc(vk_device & src, vk_device & dst, size_t cap, vk_buffer & out_src, vk_buffer & out_dst) {
@@ -16620,31 +16681,9 @@ static const char * ggml_vk_d2d_export_alloc(vk_device & src, vk_device & dst, s
         const vk::PhysicalDeviceMemoryProperties mps = src->physical_device.getMemoryProperties();
         const vk::PhysicalDeviceMemoryProperties mpd = dst->physical_device.getMemoryProperties();
 
-        // rank 0: HOST_VISIBLE|HOST_COHERENT, not DEVICE_LOCAL, not HOST_CACHED (RADV GTT write-combined: system pages,
-        //         GPU access unsnooped); rank 1: the same, cached (GTT cached); rank 2: any HOST_VISIBLE (the src card's
-        //         BAR-visible VRAM: no userptr either, but hop 2 reads across PCIe from the src card). Skipped: AMD
-        //         device-coherent/uncached types (need VK_AMD_device_coherent_memory, not enabled), protected, lazy.
-        const vk::MemoryPropertyFlags skip = vk::MemoryPropertyFlagBits::eDeviceCoherentAMD | vk::MemoryPropertyFlagBits::eDeviceUncachedAMD |
-                                             vk::MemoryPropertyFlagBits::eProtected | vk::MemoryPropertyFlagBits::eLazilyAllocated;
-        const vk::MemoryPropertyFlags hvhc = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent;
-        uint32_t type = UINT32_MAX;
-        int      best = 3;
-        for (uint32_t i = 0; i < mps.memoryTypeCount; i++) {
-            const vk::MemoryType & mt = mps.memoryTypes[i];
-            if (!(rs.memoryTypeBits & (1u << i)) || (mt.propertyFlags & skip) || mps.memoryHeaps[mt.heapIndex].size < rs.size) {
-                continue;
-            }
-            int rank = 3;
-            if ((mt.propertyFlags & hvhc) == hvhc && !(mt.propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal)) {
-                rank = (mt.propertyFlags & vk::MemoryPropertyFlagBits::eHostCached) ? 1 : 0;
-            } else if (mt.propertyFlags & vk::MemoryPropertyFlagBits::eHostVisible) {
-                rank = 2;
-            }
-            if (rank < best) {
-                best = rank;
-                type = i;
-            }
-        }
+        int rank = 3;
+        const uint32_t type = ggml_vk_d2d_ring_pick_type(mps, rs.memoryTypeBits, rs.size, &rank);
+        GGML_UNUSED(rank);
         if (type == UINT32_MAX) {
             why = "src has no HOST_VISIBLE memory type for the ring";
         } else if (type >= mpd.memoryTypeCount || !(rd.memoryTypeBits & (1u << type)) ||
@@ -16737,6 +16776,15 @@ static bool ggml_vk_d2d_ring_alloc(vk_d2d_link * l, size_t cap, const char ** wh
             return false;
         }
     }
+    // [fork, 2026-10-30] lazy accounting (design A): the ring is src memory, so it counts on the src device: exported =
+    // the src card's GTT BO (rank 0/1) or its BAR VRAM (rank 2, DEVICE_LOCAL flag on buf_src), userptr = pinned host
+    // pages imported into both cards (counted once, on the src, as host-visible). The dst side is an imported dma-buf
+    // (or the same userptr pages): whether the dst card's sysfs GTT moves for it is UNKNOWN (inventory row J), so it is
+    // not counted on the dst; the dst LAZY ALLOC line says "imported". The first ring of a link is d2d-ring-init.
+    r.lazy_cat  = (l->ring.len == 0 && l->retired.empty()) ? VK_LAZY_D2D_RING_INIT : VK_LAZY_D2D_RING;
+    r.lazy_vram = l->ring_kind == GGML_BACKEND_D2D_RING_EXPORT && r.buf_src &&
+                  (r.buf_src->memory_property_flags & vk::MemoryPropertyFlagBits::eDeviceLocal);
+    ggml_vk_lazy_account(l->src_dev.get(), r.lazy_cat, (int64_t) r.len, r.lazy_vram);
     if (l->ring.len) {
         l->retired.push_back(std::move(l->ring));
     }
@@ -16821,6 +16869,8 @@ static void ggml_vk_d2d_link_destroy(vk_d2d_link * l) {
     for (auto & r : l->retired) {
         ggml_vk_destroy_buffer(r.buf_dst);
         ggml_vk_destroy_buffer(r.buf_src);
+        // userptr pages stay mapped until exit (rule above), but the imports are gone; the totals follow the imports
+        ggml_vk_lazy_account(l->src_dev.get(), r.lazy_cat, -(int64_t) r.len, r.lazy_vram);
     }
     delete l;
 }
@@ -16886,6 +16936,15 @@ static vk_d2d_link * ggml_vk_d2d_get_link(ggml_backend_vk_context * dst_ctx, con
     l->why_code = GGML_BACKEND_D2D_BOUNCE_NONE;
     // first-run check (a): one of these per link at startup / first hop. DEBUG level (-lv 4 or LLAMA_LOG_VERBOSITY);
     // the WARN above is the visible signal that a link did NOT get the exported ring
+    // [fork, 2026-10-30] the initial VK_D2D_RING_MIN ring was DEBUG-only (inventory row J): 16 MiB per ordered pair per
+    // context that no WARN line named. One LAZY ALLOC d2d-ring-init per link on the src device (where it is counted)
+    {
+        const bool exp = l->ring_kind == GGML_BACKEND_D2D_RING_EXPORT;
+        char detail[160];
+        snprintf(detail, sizeof(detail), "d2d %s->%s %s, dst side imported (not counted on %s)", l->src_dev->name.c_str(),
+                 l->dst_dev->name.c_str(), exp ? "exported" : "pinned host memory", l->dst_dev->name.c_str());
+        ggml_vk_lazy_alloc_log(l->src_dev, VK_LAZY_D2D_RING_INIT, 0, l->cap, l->ring.lazy_vram ? "vram" : "host-visible", detail);
+    }
     if (l->ring_kind == GGML_BACKEND_D2D_RING_EXPORT) {
         GGML_LOG_DEBUG("ggml_vulkan: async D2D %s -> %s: ring export, %zu MiB of %s src memory (type flags 0x%x) imported on dst, timeline sync\n",
                        l->src_dev->name.c_str(), l->dst_dev->name.c_str(), l->cap >> 20,
@@ -16969,18 +17028,26 @@ static bool ggml_vk_d2d_ensure_cap(vk_d2d_link * l, size_t size_al, struct ggml_
     // card's own GTT BO (its sysfs GTT grows by the ring) and an imported dma-buf on the dst (or BAR VRAM on the src
     // if the card had no GTT type, see the setup DEBUG line). Either can explain a GTT WATCH delta that is not an
     // eviction; retired rings stay alive until link destroy (live total = sum of rings)
+    // [fork, 2026-10-30] retagged from SCRATCH GROW to LAZY ALLOC d2d-ring (design A): the ring is not prealloc_*
+    // scratch, the fit prices it through GGML_BACKEND_FORK_DEV_LAZY_RESERVE_PROC, and the category word lets a log
+    // be summed per device. The src line carries the counted kind; the dst line says "imported" (not counted there).
+    // Retired rings stay alive until link destroy, so the src running total includes them.
     {
         const bool exp = l->ring_kind == GGML_BACKEND_D2D_RING_EXPORT;
-        char which[128];
-        snprintf(which, sizeof(which), "d2d ring %s->%s (src side, %s, %zu retired)", l->src_dev->name.c_str(), l->dst_dev->name.c_str(),
+        char detail[160];
+        snprintf(detail, sizeof(detail), "d2d %s->%s src side, %s, %zu retired", l->src_dev->name.c_str(), l->dst_dev->name.c_str(),
                  exp ? "exported" : "pinned host memory", l->retired.size());
-        ggml_vk_scratch_grow_log(l->src_dev, which, old_cap, l->cap, &l->n_grow_log);
-        if (l->cap > old_cap) {
-            l->n_grow_log--;   // one growth event, two lines: count it once
+        const uint32_t n_log0 = l->n_grow_log;
+        ggml_vk_lazy_alloc_log(l->src_dev, VK_LAZY_D2D_RING, old_cap, l->cap, l->ring.lazy_vram ? "vram" : "host-visible", detail, &l->n_grow_log);
+        if (l->n_grow_log != n_log0) {
+            // one growth event, two lines: count it once. Was `if (cap > old_cap) n_grow_log--`, which wrapped the
+            // counter to UINT32_MAX (silencing every later ring line) when the floor (GGML_VK_SCRATCH_GROW_MIB) skipped
+            // the src line without counting it; only reachable with a floor above 16 MiB, fixed while here
+            l->n_grow_log--;
         }
-        snprintf(which, sizeof(which), "d2d ring %s->%s (dst side, %s, %zu retired)", l->src_dev->name.c_str(), l->dst_dev->name.c_str(),
+        snprintf(detail, sizeof(detail), "d2d %s->%s dst side, %s, %zu retired", l->src_dev->name.c_str(), l->dst_dev->name.c_str(),
                  exp ? "imported export" : "pinned host memory", l->retired.size());
-        ggml_vk_scratch_grow_log(l->dst_dev, which, old_cap, l->cap, &l->n_grow_log);
+        ggml_vk_lazy_alloc_log(l->dst_dev, VK_LAZY_D2D_RING, old_cap, l->cap, "imported", detail, &l->n_grow_log);
     }
     return true;
 }
@@ -20707,6 +20774,154 @@ static bool ggml_backend_vk_fork_dev_memory_budget(ggml_backend_dev_t dev, size_
     return true;
 }
 
+// [fork, 2026-10-30] GGML_BACKEND_FORK_DEV_LAZY_RESERVE_PROC (ggml-backend.h; design-fit-lazy-reserve-and-warmup-gate.md
+// section B): what this device will allocate AFTER the scheduler reserve, for a context of the given shape, so the fit
+// can charge it per probe. Why: 2026-10-30 09:50 (Qwen3.8-27B Q4_u, q8 KV, -np 3, three cards, --fit-target 1024 each)
+// Vulkan1 was placed at 22961 of 24511 MiB, had 1446 MiB free after context init, and the first request (98k disk
+// restore + 76-token pp + decode) moved GTT 20 -> 1046 MiB with VRAM 23114 -> 22291 and no SCRATCH GROW line: the
+// lazy allocations were neither logged nor priced. The LAZY ALLOC lines (ggml_vk_lazy_alloc_log) are the measurement
+// this formula must be checked against; it has NOT been checked against a production log yet (gate step 2/4).
+//
+// Formula (all sums, bytes):
+//   rings (Linux, GGML_VK_D2D_ASYNC on, n_links_out > 0, hop <= VK_D2D_HOP_MAX):
+//       hop      = align(n_ubatch x n_embd x 4, VK_D2D_ALIGN)
+//       per link = VK_D2D_RING_MIN + ggml_vk_d2d_ring_target(hop)   (the 16 MiB setup ring is RETIRED, not freed, when
+//                  the first big hop grows the ring: live = both; no second term when the target is the minimum)
+//       x n_links_out, on THIS device as src memory. Pool: the exported ring's type by ggml_vk_d2d_ring_pick_type
+//       (same function the exporter calls; rank 2 = BAR VRAM -> vram, else host-visible); the userptr ring
+//       (GGML_VK_D2D_RING=userptr or no exportable type) -> host-visible. Not priced: wait-driven growth past the
+//       target (>= 4x, up to VK_D2D_RING_MAX = 512 MiB; logged as LAZY ALLOC d2d-ring when it happens). Example: ub 512
+//       x 5120 -> 10 MiB hop -> 64 MiB target -> 80 MiB per link; ub 2048 -> 40 MiB -> 256 -> 272 MiB per link.
+//       n_links_in: the dst side is an imported dma-buf (or the same userptr pages); whether the dst card's GTT counter
+//       moves for it is UNKNOWN (inventory row J), counted 0 here. n_links_out must be the total over every context the
+//       caller prices (links are per context x ordered pair).
+//       Hop above VK_D2D_HOP_MAX (128 MiB, ub 8192 x n_embd 4096): the pair takes the host bounce, no ring, 0.
+//   staging-dev = min(max(max_state_read_bytes, max_state_write_bytes), GGML_VK_STAGING_CHUNK_MIB bound), in the pool of the type
+//       ggml_vk_ensure_sync_staging_buffer gets (HOST_VISIBLE|COHERENT|CACHED, else HOST_VISIBLE|COHERENT; GTT on
+//       the XTX/XT). One per DEVICE, shared by all contexts: price it once per device, not per context.
+//   staging-ctx = max(read, write) x n_contexts ONLY when the device has no ReBAR type (no DEVICE_LOCAL|HOST_VISIBLE
+//       type on a heap >= 90% of the largest device-local heap) or GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM is set; else 0.
+//       CAVEAT (found while implementing, not in the design): the context staging is NOT driven by state reads/writes
+//       (those are synchronous and use staging-dev); it is the async set/get fallback when the host side is not pinned
+//       on THIS device, regardless of ReBAR: logits read into the Vulkan_Host output buffer from any device other
+//       than device 0 ("VULKAN FALLBACK ... device mismatch"), n_outputs x n_vocab x 4 per read (MiB-scale for a
+//       server; n_ubatch x n_vocab x 4 when all logits are requested). The contract has no field for that size, so
+//       it is unpriced; the LAZY ALLOC staging-ctx lines measure it.
+//   arenas = 64 MiB VRAM x n_contexts: an ALLOWANCE, not a measurement. Descriptor pools (KB-scale, grow by 50%),
+//       query pools and RADV's shader arena (MB-scale, lazy pipeline compile) have UNKNOWN sizes and placement
+//       (inventory rows L, M, N); the 64 MiB is the wiggle room the design names for them.
+//   NOT counted (already in the fork scratch reserve, 8e979c03db): prealloc_x/y/split_k/mask_scratch/add_rms_partials.
+//   NOT counted: Vulkan_Host pinned buffers on device 0 (allocated at context init, before the fit's free reading of
+//       the next start; logged as LAZY ALLOC host-pinned), the vocab-subset head (the fit adds it to the margin,
+//       common_fit_vocab_subset_bytes).
+static void ggml_backend_vk_fork_dev_lazy_reserve(ggml_backend_dev_t dev, const struct ggml_backend_fork_lazy_params * p,
+                                                  size_t * vram_bytes, size_t * host_visible_bytes) {
+    if (vram_bytes) { *vram_bytes = 0; }
+    if (host_visible_bytes) { *host_visible_bytes = 0; }
+    if (dev == nullptr || dev->reg != ggml_backend_vk_reg() || p == nullptr) {
+        return;
+    }
+    const int device = ((ggml_backend_vk_device_context *) dev->context)->device;
+    vk::PhysicalDevice pd = vk_instance.instance.enumeratePhysicalDevices()[vk_instance.device_indices[device]];
+    const vk::PhysicalDeviceMemoryProperties mps = pd.getMemoryProperties();
+    uint64_t vram = 0, hv = 0;
+
+#ifdef __linux__
+    if (ggml_vk_d2d_async_enabled() && p->n_links_out > 0 && p->n_ubatch > 0 && p->n_embd > 0) {
+        const size_t hop = ggml_vk_align_size((size_t) p->n_ubatch * p->n_embd * sizeof(float), VK_D2D_ALIGN);
+        if (hop <= VK_D2D_HOP_MAX) {
+            const size_t target   = ggml_vk_d2d_ring_target(hop);
+            const size_t per_link = VK_D2D_RING_MIN + (target > VK_D2D_RING_MIN ? target : 0);
+            bool ring_vram = false;
+            if (ggml_vk_d2d_ring_pref() == GGML_BACKEND_D2D_RING_EXPORT) {
+                int rank = 3;
+                if (ggml_vk_d2d_ring_pick_type(mps, ~0u, target, &rank) != UINT32_MAX) {
+                    ring_vram = rank == 2;
+                }   // no type: the link falls back to the userptr ring = host memory
+            }
+            (ring_vram ? vram : hv) += (uint64_t) per_link * p->n_links_out;
+        }
+    }
+#endif
+
+    // staging pools: same preference order as ggml_vk_ensure_sync_staging_buffer (first type with the flags)
+    // clamped to the staging chunk bound (ggml_vk_staging_chunk_bytes, default 0 = off until gated, 32 MiB once on): no single
+    // synchronous transfer stages more than that, so the caller may pass the raw whole-range figure
+    uint64_t staging = std::max(p->max_state_read_bytes, p->max_state_write_bytes);
+    if (ggml_vk_staging_chunk_bytes() > 0) {
+        staging = std::min<uint64_t>(staging, ggml_vk_staging_chunk_bytes());
+    }
+    if (staging > 0) {
+        const vk::MemoryPropertyFlags want[2] = {
+            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
+            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
+        };
+        bool staging_vram = false, found = false;
+        for (int w = 0; w < 2 && !found; w++) {
+            for (uint32_t i = 0; i < mps.memoryTypeCount; i++) {
+                if ((mps.memoryTypes[i].propertyFlags & want[w]) == want[w]) {
+                    staging_vram = bool(mps.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal);
+                    found = true;
+                    break;
+                }
+            }
+        }
+        uint64_t largest_dl = 0;
+        for (uint32_t h = 0; h < mps.memoryHeapCount; h++) {
+            if (mps.memoryHeaps[h].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+                largest_dl = std::max<uint64_t>(largest_dl, mps.memoryHeaps[h].size);
+            }
+        }
+        const vk::MemoryPropertyFlags rebar_flags = vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible |
+                                                    vk::MemoryPropertyFlagBits::eHostCoherent;
+        bool rebar = false;
+        for (uint32_t i = 0; i < mps.memoryTypeCount; i++) {
+            if ((mps.memoryTypes[i].propertyFlags & rebar_flags) == rebar_flags &&
+                mps.memoryHeaps[mps.memoryTypes[i].heapIndex].size * 10 >= largest_dl * 9) {
+                rebar = true;
+            }
+        }
+        if (getenv("GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM") != nullptr) {
+            rebar = false;   // same switch the device reads at creation (disable_host_visible_vidmem)
+        }
+        const uint64_t ctx_staging = rebar ? 0 : staging * std::max<uint32_t>(p->n_contexts, 1);
+        (staging_vram ? vram : hv) += staging + ctx_staging;
+    }
+
+    vram += (uint64_t) 64 * 1024 * 1024 * std::max<uint32_t>(p->n_contexts, 1);   // arena ALLOWANCE (see above)
+
+    if (vram_bytes) { *vram_bytes = (size_t) vram; }
+    if (host_visible_bytes) { *host_visible_bytes = (size_t) hv; }
+}
+
+// [fork, 2026-10-30] GGML_BACKEND_FORK_DEV_GTT_USED_PROC: the kernel's device-wide sysfs counters (mem_info_gtt_used,
+// mem_info_vram_used) for the server's warm-up gate (--fit-verify, design E): GTT up with VRAM down across a probe
+// decode = eviction. Wraps ggml_vk_gtt_watch_read when the vk_device exists (same cached sysfs dir as GTT WATCH);
+// before that it maps the physical device to its PCI node without creating a VkDevice. false: integrated GPU (GTT is
+// its home), no sysfs node (not Linux / not amdgpu / no VK_EXT_pci_bus_info), or a read failed.
+static bool ggml_backend_vk_fork_dev_gtt_used(ggml_backend_dev_t dev, uint64_t * gtt_used, uint64_t * vram_used) {
+    if (dev == nullptr || dev->reg != ggml_backend_vk_reg()) {
+        return false;
+    }
+    const int device = ((ggml_backend_vk_device_context *) dev->context)->device;
+    uint64_t g = 0, v = 0;
+    bool ok = false;
+    if (device < GGML_VK_MAX_DEVICES && vk_instance.devices[device]) {
+        ok = ggml_vk_gtt_watch_read(vk_instance.devices[device], g, v);
+    } else {
+        vk::PhysicalDevice pd = vk_instance.instance.enumeratePhysicalDevices()[vk_instance.device_indices[device]];
+        if (pd.getProperties().deviceType != vk::PhysicalDeviceType::eIntegratedGpu) {
+            ok = ggml_vk_sysfs_gtt_read(ggml_vk_sysfs_mem_dir(pd), g, v);
+        }
+    }
+    if (!ok) {
+        return false;
+    }
+    if (gtt_used) { *gtt_used = g; }
+    if (vram_used) { *vram_used = v; }
+    return true;
+}
+
 // [fork, 2026-10-22] the LLAMA_DECODE_STATS hooks (ggml_backend_fork_stats_i, ggml-backend-impl.h); 2026-10-23 the hop
 // fold hooks (ggml_backend_fork_fold_i); 2026-10-27 the reserve-time scratch sizing (ggml_backend_fork_scratch_i); 2026-10-27 the
 // driver-budget memory reading (GGML_BACKEND_FORK_DEV_MEMORY_BUDGET_PROC, ggml-backend.h)
@@ -20723,6 +20938,13 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     }
     if (strcmp(name, GGML_BACKEND_FORK_DEV_MEMORY_BUDGET_PROC) == 0) {
         return (void *)ggml_backend_vk_fork_dev_memory_budget;
+    }
+    // [fork, 2026-10-30] fit step 3: lazy reserve (fit) + kernel GTT/VRAM counters (server warm-up gate)
+    if (strcmp(name, GGML_BACKEND_FORK_DEV_LAZY_RESERVE_PROC) == 0) {
+        return (void *)ggml_backend_vk_fork_dev_lazy_reserve;
+    }
+    if (strcmp(name, GGML_BACKEND_FORK_DEV_GTT_USED_PROC) == 0) {
+        return (void *)ggml_backend_vk_fork_dev_gtt_used;
     }
     return NULL;
 }

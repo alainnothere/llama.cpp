@@ -336,15 +336,21 @@ struct common_params_speculative_draft {
     // long drafts stop paying off once the verify batch is dominated by KV reads
     int32_t ctx_step = 0;
 
-    // tune the draft length online, per slot, using `n_max` as the ceiling
-    bool auto_n = false;
+    // tune the draft length online, per slot, using `n_max` as the ceiling.
+    // [fork] default ON since 2026-10-30 (--no-spec-draft-auto turns it off): ledger 2026-10-09 +23% t/s at 93k ctx
+    // (fixed cap 11 -> auto 5-9), compounds with the GQA fold; every production script passed it by hand for 3 weeks.
+    bool auto_n = true;
 
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
-    bool probabilistic = false; // sample the draft and verify by rejection, instead of argmax and match
+    // sample the draft and verify by rejection, instead of argmax and match.
+    // [fork] default ON since 2026-10-30 (--spec-draft-sampling greedy restores argmax): owner measured 47 vs 30 t/s on real
+    // sessions 2026-10-08 (my short-prompt bench said tie 45.5 vs 45.3; the bench was wrong, the session is the measure);
+    // every production script has passed probabilistic since 10-07.
+    bool probabilistic = true;
 
     // draft-mtp only: file of vocab ids (one per line, '#' comments) the MTP head projects onto, unioned with the
     // control/digit/newline tokens and every id seen in the prompts; empty = full vocab (default)
@@ -542,6 +548,18 @@ struct common_params {
 
     // margin per device in bytes for fitting parameters to free memory:
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);
+    // [fork, 2026-10-30] fit step 3 D: VRAM floor as a fraction of each device's total, margin = max(target, frac x total)
+    // (+ the vocab-subset reserve on top). 0.08: 2873 MiB free after init ran clean, 1446 and 783 MiB spilled to GTT;
+    // 8% of a 24 GB card = 1964 MiB sits between. <= 0 = off. See common/fit.cpp where margins[] is built.
+    float fit_floor_frac = 0.08f;
+
+    // [fork, 2026-10-30] server warm-up gate (design-fit-lazy-reserve-and-warmup-gate.md, section E): after load, run one
+    // n_ubatch pp graph + one speculative step, diff the kernel's GTT/VRAM counters per fit device and on an eviction
+    // raise that device's fit_params_target and reload. 0 = off (default until the owner's gate run), 1 = on,
+    // 2 = auto (on when --fit is on and n_ctx is auto). Why: 2026-10-30 09:50 the fit left Vulkan1 1446 MiB free and the
+    // first request moved ~1 GB to GTT (tg 34 -> 26 t/s); nothing checked the fit's answer before the first request.
+    int32_t fit_verify     = 0;
+    int32_t fit_verify_mib = 256; // GTT growth (MiB) per device across the warm-up that counts as a finding
 
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
     enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_AUTO; // how to load the model
@@ -632,6 +650,7 @@ struct common_params {
     bool cont_batching     = true;  // insert new sequences for decoding on-the-fly
     bool no_perf           = false; // disable performance metrics
     bool perf_instrumentation = false; // --performance-instrumentation: 5s decode()/synchronize() breakdown in libllama + server update_slots() timings
+    bool cache_convert        = false; // --cache-convert: a saved K/V state in f16 loads into a q8_0 cache and back (main and draft context)
     bool show_timings      = true;  // show timing information on CLI
     bool ctx_shift         = false; // context shift on infinite text generation
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)

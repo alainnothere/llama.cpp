@@ -416,6 +416,8 @@ extern "C" {
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
         bool perf_instrumentation; // print a 5s breakdown of decode()/synchronize() timings (debug; costs a few clock reads per decode)
+        bool kv_cache_convert;     // [fork] state load: convert K/V between f16 and q8_0 when the saved type differs from the cache type
+                                   //        (default false: a type mismatch refuses the load, as upstream does)
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -999,6 +1001,18 @@ extern "C" {
                           size_t   size,
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
+
+    // [fork] K/V type conversion on state load (llama_context_params.kv_cache_convert)
+    // cumulative over the life of the context: callers take the difference around a restore
+    struct llama_state_convert_stats {
+        uint64_t n_loads;      // state loads that converted at least one K/V tensor
+        uint64_t n_bytes_src;  // K/V bytes read from the blobs in the saved type
+        uint64_t n_bytes_dst;  // K/V bytes written to the cache in its own type
+        int32_t  type_src;     // enum ggml_type of the last converted tensor as saved, -1 = none yet
+        int32_t  type_dst;     // enum ggml_type of the last converted tensor in the cache, -1 = none yet
+    };
+
+    LLAMA_API struct llama_state_convert_stats llama_state_get_convert_stats(const struct llama_context * ctx);
 
     // Same as llama_state_seq_get_size_ext, but covering only the cells with pos in [p0, p1)
     // p0 < 0 : from the start; p1 < 0 : to the end

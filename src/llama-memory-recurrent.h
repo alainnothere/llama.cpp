@@ -56,6 +56,14 @@ public:
 
     bool prepare(const std::vector<llama_ubatch> & ubatches);
 
+    // [fork, 2026-10-30] dry run of find_slot() over ubatches (restores everything): true when a ubatch moves the cell of
+    // a seq that is not in it but whose LAST ubatch of this batch came earlier. That seq's snapshot groups and pre-ubatch
+    // plane are left behind and overwritten, so the rollback right after the decode (spec verify trim) is refused.
+    // The init_batch() of every memory holding a llama_memory_recurrent then re-splits one seq per ubatch.
+    bool moves_done_seq(const std::vector<llama_ubatch> & ubatches);
+    uint64_t n_moves_done_seq     = 0; // events seen, for the rate-limited warning
+    uint64_t n_moves_done_seq_log = 1; // next event count that logs
+
     // find a contiguous slot of memory cells and emplace the ubatch there
     bool find_slot(const llama_ubatch & ubatch);
 

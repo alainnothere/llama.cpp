@@ -1030,6 +1030,117 @@ static test_status test_seq_cp_resets_rollback(const common_params & params, lla
     return test_status::PASS;
 }
 
+// [fork, 2026-10-30] production abort "server-context.cpp:8002: failed to remove sequence 0 from pos 1274" (Qwen3.8-27B
+// Q6, -np 3 --kv-unified, --spec-rs-depth 24, three conversations decoding at once; log in contextFiles/
+// crash-logs-2026-10-30-seq_rm-np3). The verify batch was 535 rows in 3 ubatches (decode_stats: slot 1 prompt chunk 512 +
+// 23 verify rows of slots 0 and 2). split_equal's n_keep_tail rule emitted slot 0's verify rows in an EARLY ubatch and
+// a LATER ubatch held two other seqs. find_slot() lays a ubatch out on the contiguous cells [min, min + n_seqs), and with
+// size == n_seq_max == 3 and the third seq's cell in the middle, that cell is swapped out (the "gather and re-order" loop):
+// its current state follows via src, but its snapshot groups and pre-ubatch plane stay behind and are overwritten, so
+// find_slot resets rs_depth / rs_pre_pos of the moved seq. The post-verify seq_rm(pos_next) of slot 0 then had no group
+// to select and returned false. Two seqs cannot hit this (a 2-seq ubatch holds both, a 1-seq ubatch never swaps).
+//
+// Layout built here: seq 1 -> cell 0, seq 0 -> cell 1, seq 2 -> cell 2 (first decodes take the next empty cell). Then one
+// batch [seq 0 x3, seq 1 x10, seq 2 x2] with n_rs_seq 2 (n_keep_tail 3) splits as [0 x3] [1 x2, 2 x2] [1 x8] without the
+// fix, and the second ubatch moves seq 0 out of cell 1. The rollback of seq 0 to the first verify row + 1 must succeed
+// and the replay must match a context that never went past it.
+static test_status test_foreign_move_keeps_rollback(const common_params & params, llama_model * model, uint8_t fill) {
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
+    constexpr llama_pos n_prompt = 8;
+    constexpr llama_pos n_v0 = 3;  // seq 0 "verify rows": done in the first ubatch
+    constexpr llama_pos n_v1 = 10; // seq 1 "prompt chunk": spans the later ubatches
+    constexpr llama_pos n_v2 = 2;  // seq 2 "verify rows": shares the second ubatch with seq 1
+
+    llama_context_ptr ctx_roll = make_ctx_prebatch(params, model, fill, 3);
+    llama_context_ptr ctx_ref  = make_ctx_prebatch(params, model, fill, 3);
+    if (!ctx_roll || !ctx_ref) {
+        LOG_ERR("%s: failed to init contexts\n", __func__);
+        return test_status::FAIL;
+    }
+
+    llama_memory_t mem = llama_get_memory(ctx_roll.get());
+    // the cell gather is llama_memory_recurrent's (hybrid/recurrent, the ones with a pre-ubatch plane). DSV4 keeps its
+    // compressed state per stream and refuses this rollback for a reason of its own (split_simple under kv_unified,
+    // pre-existing, not investigated 2026-10-30), so it is skipped like in the prebatch / seq_cp tests
+    if (llama_n_rs_seq(ctx_roll.get()) != 2 || !llama_memory_rs_has_prebatch(mem)) {
+        LOG_INF("%s: skipping, n_rs_seq %u / no pre-ubatch plane (the split below assumes 2 and the recurrent cells)\n",
+                __func__, llama_n_rs_seq(ctx_roll.get()));
+        return test_status::SKIP;
+    }
+
+    std::vector<llama_token> tok[3];
+    for (int s = 0; s < 3; ++s) {
+        tok[s].resize(n_prompt + n_v1);
+        for (size_t i = 0; i < tok[s].size(); ++i) {
+            tok[s][i] = (llama_token) (((uint32_t) (3 + 2*s)*(uint32_t) i + 11 + 7*(uint32_t) s) % (uint32_t) n_vocab);
+        }
+    }
+
+    // seq 1 first, then seq 0, then seq 2: seq 0 lands in the middle cell
+    bool ok = decode_span(ctx_roll.get(), tok[1], 0, n_prompt, 1) &&
+              decode_span(ctx_roll.get(), tok[0], 0, n_prompt, 0) &&
+              decode_span(ctx_roll.get(), tok[2], 0, n_prompt, 2);
+    ok = ok && decode_span(ctx_ref.get(), tok[0], 0, n_prompt, 0);
+    if (!ok) {
+        LOG_ERR("%s: prompt decode failed\n", __func__);
+        return test_status::FAIL;
+    }
+
+    {
+        common_batch batch(ctx_roll.get());
+        for (llama_pos p = n_prompt; p < n_prompt + n_v0; ++p) {
+            batch.add(tok[0][p], p, 0, true);
+        }
+        for (llama_pos p = n_prompt; p < n_prompt + n_v1; ++p) {
+            batch.add(tok[1][p], p, 1, false);
+        }
+        for (llama_pos p = n_prompt; p < n_prompt + n_v2; ++p) {
+            batch.add(tok[2][p], p, 2, true);
+        }
+        if (llama_process(ctx_roll.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+            LOG_ERR("%s: mixed batch decode failed\n", __func__);
+            return test_status::FAIL;
+        }
+    }
+
+    // the server's post-verify trim with 0 drafts accepted: keep the first verify row (the seed), drop the rest
+    const llama_pos p_keep = n_prompt + 1;
+    if (!llama_memory_rs_can_rollback_to(mem, 0, p_keep) || !llama_memory_seq_rm(mem, 0, p_keep, -1)) {
+        LOG_ERR("%s: rollback of seq 0 to %d after a later ubatch of the same batch moved its cell was refused "
+                "(the 2026-10-30 -np 3 abort)\n", __func__, p_keep);
+        return test_status::FAIL;
+    }
+
+    // reference: seq 0 alone, seed row only
+    if (!decode_span(ctx_ref.get(), tok[0], n_prompt, p_keep, 0)) {
+        LOG_ERR("%s: reference decode failed\n", __func__);
+        return test_status::FAIL;
+    }
+
+    constexpr double nmse_eps = 1e-4;
+    float  diff_max = 0.0f;
+    double nmse_max = 0.0;
+    for (llama_pos pos = p_keep; pos < n_prompt + n_v0; ++pos) {
+        if (!replay_one_both(ctx_roll.get(), ctx_ref.get(), tok[0][pos], pos, n_vocab, diff_max, nmse_max)) {
+            return test_status::FAIL;
+        }
+    }
+    if (nmse_max > nmse_eps) {
+        LOG_ERR("%s: replay after the rollback mismatch (max diff %g, nmse %g)\n", __func__, (double) diff_max, nmse_max);
+        return test_status::FAIL;
+    }
+
+    // the other two seqs kept their tails
+    if (llama_memory_seq_pos_max(mem, 1) != n_prompt + n_v1 - 1 || llama_memory_seq_pos_max(mem, 2) != n_prompt + n_v2 - 1) {
+        LOG_ERR("%s: seq 1/2 pos_max %d/%d after the batch\n", __func__, llama_memory_seq_pos_max(mem, 1), llama_memory_seq_pos_max(mem, 2));
+        return test_status::FAIL;
+    }
+
+    LOG_INF("%s: rollback after a foreign cell move matched (max diff %g, nmse %g)\n", __func__, (double) diff_max, nmse_max);
+    return test_status::PASS;
+}
+
 // nullptr unsets
 static void set_env(const char * name, const char * value) {
 #ifdef _WIN32
@@ -1141,6 +1252,7 @@ struct test_results {
     test_status prebatch = test_status::SKIP;
     test_status seq_cp   = test_status::SKIP;
     test_status kq_mask  = test_status::SKIP;
+    test_status fmove    = test_status::SKIP;
 };
 
 // Run every test for an initialized model over both cache fills.
@@ -1156,6 +1268,7 @@ static test_results run_tests(const common_params & params, llama_model * model)
         const test_status pb = test_prebatch_rollback(params, model, fill);
         const test_status sc = test_seq_cp_resets_rollback(params, model, fill);
         const test_status km = test_kq_mask_multi_seq(params, model, fill);
+        const test_status fm = test_foreign_move_keeps_rollback(params, model, fill);
         res.rollback = merge_status(res.rollback, rb);
         res.replay   = merge_status(res.replay,   rp);
         res.shared   = merge_status(res.shared,   ss);
@@ -1164,9 +1277,10 @@ static test_results run_tests(const common_params & params, llama_model * model)
         res.prebatch = merge_status(res.prebatch, pb);
         res.seq_cp   = merge_status(res.seq_cp,   sc);
         res.kq_mask  = merge_status(res.kq_mask,  km);
+        res.fmove    = merge_status(res.fmove,    fm);
         if (rb == test_status::FAIL || rp == test_status::FAIL || ss == test_status::FAIL ||
             cp == test_status::FAIL || rs == test_status::FAIL || pb == test_status::FAIL || sc == test_status::FAIL ||
-            km == test_status::FAIL) {
+            km == test_status::FAIL || fm == test_status::FAIL) {
             break;
         }
     }
@@ -1185,7 +1299,7 @@ static test_results run_tests_for_model(const std::string & model_path, const st
     if (model == nullptr) {
         LOG_ERR("%s: failed to init model '%s'\n", __func__, model_path.c_str());
         // a model that cannot be loaded is a failure, not a skip
-        return { test_status::FAIL, test_status::FAIL, test_status::FAIL, test_status::FAIL, test_status::FAIL, test_status::FAIL, test_status::FAIL, test_status::FAIL };
+        return { test_status::FAIL, test_status::FAIL, test_status::FAIL, test_status::FAIL, test_status::FAIL, test_status::FAIL, test_status::FAIL, test_status::FAIL, test_status::FAIL };
     }
 
     if (!llama_model_is_recurrent(model) && !llama_model_is_hybrid(model)) {
@@ -1271,10 +1385,10 @@ int main(int argc, char ** argv) {
         // silence everything but the table itself (LOG has verbosity LOG_LEVEL_OUTPUT = 0)
         common_log_set_verbosity_thold(0);
 
-        LOG("%-*s  %-8s  %-11s  %-10s  %-8s  %-13s  %-8s  %-6s  %s\n", (int) name_width, "Model", "rollback", "split replay", "shared seq", "composed", "after restore", "prebatch", "seq_cp", "kq mask");
+        LOG("%-*s  %-8s  %-11s  %-10s  %-8s  %-13s  %-8s  %-6s  %-7s  %s\n", (int) name_width, "Model", "rollback", "split replay", "shared seq", "composed", "after restore", "prebatch", "seq_cp", "kq mask", "foreign move");
         common_log_flush(common_log_main());
 
-        constexpr int n_tests = 8;
+        constexpr int n_tests = 9;
         size_t n_pass[n_tests] = {};
         size_t n_skip[n_tests] = {};
         size_t n_fail[n_tests] = {};
@@ -1287,12 +1401,13 @@ int main(int argc, char ** argv) {
 
             // all status strings have the same raw length, so the columns line up;
             // pad the first status to the width of the "rollback" header + separator
-            LOG("  %s      %s         %s        %s      %s           %s      %s    %s", test_status_str(res.rollback), test_status_str(res.replay), test_status_str(res.shared),
-                    test_status_str(res.composed), test_status_str(res.restore), test_status_str(res.prebatch), test_status_str(res.seq_cp), test_status_str(res.kq_mask));
+            LOG("  %s      %s         %s        %s      %s           %s      %s    %s     %s", test_status_str(res.rollback), test_status_str(res.replay), test_status_str(res.shared),
+                    test_status_str(res.composed), test_status_str(res.restore), test_status_str(res.prebatch), test_status_str(res.seq_cp), test_status_str(res.kq_mask),
+                    test_status_str(res.fmove));
             LOG("\n");
             common_log_flush(common_log_main());
 
-            const test_status all[n_tests] = { res.rollback, res.replay, res.shared, res.composed, res.restore, res.prebatch, res.seq_cp, res.kq_mask };
+            const test_status all[n_tests] = { res.rollback, res.replay, res.shared, res.composed, res.restore, res.prebatch, res.seq_cp, res.kq_mask, res.fmove };
             for (int t = 0; t < n_tests; ++t) {
                 switch (all[t]) {
                     case test_status::PASS: n_pass[t]++; break;
@@ -1321,6 +1436,8 @@ int main(int argc, char ** argv) {
                 __func__, n_pass[6], n_skip[6], n_fail[6], models.size());
         LOG_INF("%s: kq mask:      %zu passed, %zu skipped, %zu failed (of %zu)\n",
                 __func__, n_pass[7], n_skip[7], n_fail[7], models.size());
+        LOG_INF("%s: foreign move: %zu passed, %zu skipped, %zu failed (of %zu)\n",
+                __func__, n_pass[8], n_skip[8], n_fail[8], models.size());
 
         size_t n_fail_all = 0;
         for (int t = 0; t < n_tests; ++t) {
@@ -1334,5 +1451,5 @@ int main(int argc, char ** argv) {
 
     return (res.rollback == test_status::FAIL || res.replay   == test_status::FAIL || res.shared == test_status::FAIL ||
             res.composed == test_status::FAIL || res.restore  == test_status::FAIL || res.prebatch == test_status::FAIL ||
-            res.seq_cp   == test_status::FAIL || res.kq_mask  == test_status::FAIL) ? 1 : 0;
+            res.seq_cp   == test_status::FAIL || res.kq_mask  == test_status::FAIL || res.fmove == test_status::FAIL) ? 1 : 0;
 }

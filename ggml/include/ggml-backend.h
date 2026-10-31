@@ -188,6 +188,32 @@ extern "C" {
     // caller can print both; false = dev_memory already is that reading. Read-only, never used for placement.
     #define GGML_BACKEND_FORK_DEV_MEMORY_BUDGET_PROC "ggml_backend_fork_dev_memory_budget"
     typedef bool (*ggml_backend_fork_dev_memory_budget_t)(ggml_backend_dev_t device, size_t * free, size_t * total);
+    // [fork, 2026-10-30] fit step 3 (design-fit-lazy-reserve-and-warmup-gate.md). Two optional reg procs so the fit can
+    // price what a backend allocates AFTER the scheduler reserve and so the server can read the kernel's GTT counter.
+    // 2026-10-30: Vulkan1 placed 22961 of 24511 MiB by the fit, 1446 MiB free after context init, first request moved
+    // 1 GB to GTT with no SCRATCH GROW line (rings, staging and gallocr re-plans were unlogged and unpriced).
+    //
+    // lazy_reserve: how much the device will allocate lazily for a context of this shape, beyond the sched reserve
+    // (prealloc_* are already in the fork scratch reserve, do NOT count them here). vram_bytes = device-local,
+    // host_visible_bytes = GTT on this device (host-visible staging, ring src memory). The caller charges BOTH against the
+    // device's free VRAM (pessimistic by design). Missing proc = 0/0.
+    struct ggml_backend_fork_lazy_params {
+        uint32_t n_ubatch;               // rows of the largest pp graph
+        uint32_t n_embd;                 // f32 elements per hop row; hop bytes = n_ubatch * n_embd * 4
+        uint32_t n_links_in;             // ordered device pairs with this device as dst (D2D rings live on the dst ctx)
+        uint32_t n_links_out;            // pairs with this device as src (ring src memory lands here)
+        uint64_t max_state_read_bytes;   // largest single ggml_backend_tensor_get range on this device (staging bound)
+        uint64_t max_state_write_bytes;  // largest single tensor_set from non-pinned host memory (0 when the mapped path is used)
+        uint32_t n_contexts;             // llama contexts sharing the device (target + draft)
+    };
+    #define GGML_BACKEND_FORK_DEV_LAZY_RESERVE_PROC "ggml_backend_fork_dev_lazy_reserve"
+    typedef void (*ggml_backend_fork_dev_lazy_reserve_t)(ggml_backend_dev_t device, const struct ggml_backend_fork_lazy_params * params,
+                                                         size_t * vram_bytes, size_t * host_visible_bytes);
+    // gtt_used: the kernel's device-wide counters (amdgpu sysfs mem_info_gtt_used / mem_info_vram_used for the device's
+    // PCI id). true = read; false = unavailable (UMA, no sysfs, other vendor). Read-only; the server's warm-up gate
+    // (--fit-verify) diffs it across a probe decode: GTT up with VRAM down = eviction.
+    #define GGML_BACKEND_FORK_DEV_GTT_USED_PROC "ggml_backend_fork_dev_gtt_used"
+    typedef bool (*ggml_backend_fork_dev_gtt_used_t)(ggml_backend_dev_t device, uint64_t * gtt_used, uint64_t * vram_used);
     GGML_API enum ggml_backend_dev_type    ggml_backend_dev_type(ggml_backend_dev_t device);
     GGML_API void                          ggml_backend_dev_get_props(ggml_backend_dev_t device, struct ggml_backend_dev_props * props);
     GGML_API ggml_backend_reg_t            ggml_backend_dev_backend_reg(ggml_backend_dev_t device);

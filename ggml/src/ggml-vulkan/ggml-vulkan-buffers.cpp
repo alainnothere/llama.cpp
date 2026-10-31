@@ -451,6 +451,13 @@ bool ggml_vk_sysfs_mem_read(const std::string & dir, uint64_t & free, uint64_t &
     return true;
 }
 
+// [fork, 2026-10-30] GGML_BACKEND_FORK_DEV_GTT_USED_PROC for a device whose vk_device does not exist yet (the server
+// asks before/without touching it). Same two files as ggml_vk_gtt_watch_read.
+bool ggml_vk_sysfs_gtt_read(const std::string & dir, uint64_t & gtt_used, uint64_t & vram_used) {
+    return !dir.empty() && ggml_vk_sysfs_read_u64(dir + "/mem_info_gtt_used", gtt_used) &&
+           ggml_vk_sysfs_read_u64(dir + "/mem_info_vram_used", vram_used);
+}
+
 // call with w.mutex held
 static void ggml_vk_gtt_watch_init_locked(vk_device & device, vk_gtt_watch & w) {
     if (w.init) {
@@ -493,7 +500,8 @@ static void ggml_vk_gtt_watch_sample(vk_device & device, uint64_t n_graph) {
     if (!w.sampled) {
         w.sampled  = true;
         w.gtt_base = w.gtt_prev = w.gtt_first = gtt;
-        w.vram_prev = w.vram_first = vram;
+        w.vram_prev = w.vram_first = w.vram_base = vram;
+        w.lazy_gtt_base = device->lazy_gtt_bytes.load(std::memory_order_relaxed);
         // RADV's view next to the kernel's (the budget path of ggml_backend_vk_get_device_memory; since 2026-10-27 the
         // fit reads the sysfs view on amdgpu, this line keeps printing RADV's so the two stay side by side)
         size_t free = 0, total = 0;
@@ -528,15 +536,36 @@ static void ggml_vk_gtt_watch_sample(vk_device & device, uint64_t n_graph) {
         return;
     }
 
+    // [fork, 2026-10-30] verdict word (design-fit-lazy-reserve-and-warmup-gate.md A): GTT growth alone cannot tell host-
+    // visible growth (staging, ring src memory, pinned buffers: allocated in GTT on purpose, they cost no VRAM) from a
+    // real eviction (a VRAM BO moved to GTT: VRAM used falls by the same amount). 2026-10-30 09:50 Vulkan1: GTT
+    // 20 -> 1046 MiB, VRAM 23114 -> 22291 (-823 of +1026 = 80%) = EVICTION by this rule; the 289k incident (VRAM
+    // 17249 -> 17000, GTT 522 -> 1925: -249 of +1403 = 18%) reads HOST-VISIBLE GROWTH although the KQ-mask BO WAS
+    // evicted, because the same window also allocated ~1 GB of new VRAM that hid the drop. So the rule is a floor, not
+    // proof: EVICTION is reliable, HOST-VISIBLE GROWTH means "check the lazy delta on the same line": when the lazy
+    // host-visible total of this device grew by about the GTT delta, it was ours; when it did not, suspect eviction.
+    // Window = since the warn level was set (gtt_base / vram_base / lazy_gtt_base move together), so slow creep that
+    // finally crosses the threshold is judged over the same window it accumulated in. Threshold 50%: the owner's rule
+    // in the design (E uses the same one); not tuned on data beyond the two incidents above.
     if (thr > 0 && gtt > w.gtt_base + thr) {
+        const double  d_gtt   = (double) gtt - (double) w.gtt_base;
+        const double  d_vram  = (double) w.vram_base - (double) vram;   // > 0: VRAM used fell
+        const int64_t lazy_g  = device->lazy_gtt_bytes.load(std::memory_order_relaxed);
+        const double  d_lazy  = (double) (lazy_g - w.lazy_gtt_base);
+        const bool    evicted = d_vram >= 0.5 * d_gtt;
         if (w.n_warn < 32) {
-            GGML_LOG_WARN("GTT WATCH: ggml_vulkan: %s (%s) %s %s: GTT grew %.0f -> %.0f MiB (+%.0f since the previous sample, "
-                    "+%.0f since baseline), VRAM %.0f -> %.0f MiB, graph %llu; the kernel placed or evicted buffers to host memory "
-                    "(GTT) and the kernels that read them run 5-10x slower (RADV's budget does not see this); "
-                    "check --fit-target / -c / extra per-device buffers%s\n",
+            GGML_LOG_WARN("GTT WATCH: ggml_vulkan: %s (%s) %s %s: %s: GTT grew %.0f -> %.0f MiB (+%.0f since the previous sample, "
+                    "+%.0f since baseline), VRAM %.0f -> %.0f MiB, graph %llu; window since the warn level: GTT %+.0f MiB, VRAM used "
+                    "%+.0f MiB, lazy host-visible of this process on this device %+.0f MiB; %s%s\n",
                     device->name.c_str(), device->properties.deviceName.data(), w.bdf.c_str(), w.card.c_str(),
+                    evicted ? "EVICTION" : "HOST-VISIBLE GROWTH",
                     w.gtt_prev/MiB, gtt/MiB, ((double) gtt - (double) w.gtt_prev)/MiB, ((double) gtt - (double) w.gtt_first)/MiB,
-                    w.vram_prev/MiB, vram/MiB, (unsigned long long) n_graph,
+                    w.vram_prev/MiB, vram/MiB, (unsigned long long) n_graph, d_gtt/MiB, -d_vram/MiB, d_lazy/MiB,
+                    evicted ? "VRAM fell by >= 50% of the GTT growth: the kernel evicted buffers to host memory (GTT) and the "
+                              "kernels that read them run 5-10x slower (RADV's budget does not see this); check --fit-target / -c / "
+                              "extra per-device buffers"
+                            : "VRAM did not fall with it: host-visible allocations (staging, D2D ring src, pinned buffers; see the "
+                              "LAZY ALLOC lines), unless the lazy delta is far below the GTT delta",
                     w.n_warn == 31 ? " (last GTT growth warning for this device)" : "");
         }
         w.n_warn++;
@@ -544,9 +573,13 @@ static void ggml_vk_gtt_watch_sample(vk_device & device, uint64_t n_graph) {
             w.armed_recovery = true;
             w.gtt_first = std::min(w.gtt_first, w.gtt_prev);   // recovery level = GTT before the first growth
         }
-        w.gtt_base = gtt;
+        w.gtt_base      = gtt;
+        w.vram_base     = vram;
+        w.lazy_gtt_base = lazy_g;
     } else if (gtt < w.gtt_base) {
-        w.gtt_base = gtt;
+        w.gtt_base      = gtt;
+        w.vram_base     = vram;
+        w.lazy_gtt_base = device->lazy_gtt_bytes.load(std::memory_order_relaxed);
     }
     if (w.armed_recovery && gtt <= w.gtt_first + thr / 4) {
         w.armed_recovery = false;
@@ -595,9 +628,83 @@ void ggml_vk_scratch_grow_log(vk_device & device, const char * which, size_t old
     if (ggml_vk_gtt_watch_read(device, gtt, vram)) {
         snprintf(kernel, sizeof(kernel), ", kernel VRAM %.0f MiB / GTT %.0f MiB used", vram/MiB, gtt/MiB);
     }
-    GGML_LOG_WARN("SCRATCH GROW: ggml_vulkan: %s (%s): %s %.2f -> %.2f MiB (growth #%u), free VRAM %.0f of %.0f MiB%s\n",
+    // [fork, 2026-10-30] running totals (design A): the lazy total of this device (everything the fit does NOT price as
+    // scratch: staging, rings, pinned) next to the prealloc_* total (priced as scratch since 8e979c03db), so one grep
+    // of SCRATCH GROW + LAZY ALLOC lines adds up per device without a second pass
+    GGML_LOG_WARN("SCRATCH GROW: ggml_vulkan: %s (%s): %s %.2f -> %.2f MiB (growth #%u), free VRAM %.0f of %.0f MiB%s, "
+            "running lazy total %.0f MiB VRAM / %.0f MiB host-visible on this device, prealloc total %.0f MiB, graph %llu\n",
             device->name.c_str(), device->properties.deviceName.data(), which, old_size/MiB, new_size/MiB, n + 1,
-            free/MiB, total/MiB, kernel);
+            free/MiB, total/MiB, kernel,
+            device->lazy_vram_bytes.load(std::memory_order_relaxed)/MiB, device->lazy_gtt_bytes.load(std::memory_order_relaxed)/MiB,
+            device->lazy_cat_bytes[VK_LAZY_PREALLOC].load(std::memory_order_relaxed)/MiB,
+            (unsigned long long) device->mem_watch.n_graphs.load(std::memory_order_relaxed));
+}
+
+// [fork, 2026-10-30] lazy allocation accounting (enum vk_lazy_cat, ggml-vulkan-types.h; design-fit-lazy-reserve-and-
+// warmup-gate.md A). Every call site passes the exact byte delta of the buffer it made or freed (old buffer destroyed
+// = negative part of the same delta), so the totals are LIVE bytes, not a high-water mark; context teardown and
+// ggml_vk_host_free subtract. vram is decided per buffer from its memory_property_flags (DEVICE_LOCAL, including the
+// ReBAR DEVICE_LOCAL|HOST_VISIBLE type the prealloc_* buffers land in on the XTXs). Atomics: the D2D path accounts
+// from the dst context's thread for the src device, which another context's thread may be accounting concurrently.
+void ggml_vk_lazy_account(vk_device_struct * device, vk_lazy_cat cat, int64_t delta, bool vram) {
+    if (device == nullptr || delta == 0) {
+        return;
+    }
+    device->lazy_cat_bytes[cat].fetch_add(delta, std::memory_order_relaxed);
+    if (cat == VK_LAZY_PREALLOC) {
+        return;   // priced as scratch by the fit, shown separately
+    }
+    (vram ? device->lazy_vram_bytes : device->lazy_gtt_bytes).fetch_add(delta, std::memory_order_relaxed);
+}
+
+static const char * ggml_vk_lazy_cat_name(vk_lazy_cat cat) {
+    switch (cat) {
+        case VK_LAZY_STAGING_DEV:   return "staging-dev";
+        case VK_LAZY_STAGING_CTX:   return "staging-ctx";
+        case VK_LAZY_D2D_RING_INIT: return "d2d-ring-init";
+        case VK_LAZY_D2D_RING:      return "d2d-ring";
+        case VK_LAZY_HOST_PINNED:   return "host-pinned";
+        case VK_LAZY_PREALLOC:      return "prealloc";
+        default:                    return "?";
+    }
+}
+
+// DEVICE_LOCAL (incl. ReBAR) = VRAM; anything else host-visible = GTT on that card
+static bool ggml_vk_buf_is_vram(const vk_buffer & b) {
+    return b && (b->memory_property_flags & vk::MemoryPropertyFlagBits::eDeviceLocal);
+}
+
+// [fork, 2026-10-30] one WARN per lazy allocation, the SCRATCH GROW shape with a category word so a log sums per
+// device: `LAZY ALLOC: ggml_vulkan: <dev> <bdf>: <category> <old> -> <new> MiB (<kind>), running lazy total <v> MiB
+// VRAM / <g> MiB host-visible on this device, graph <n>[, <detail>] (#<k>)`. Same floor (GGML_VK_SCRATCH_GROW_MIB,
+// default 4) and rate limit (first 8, then every 64th) as SCRATCH GROW: the 2026-10-22 12:20 run printed ~60 sub-MiB
+// growth lines per card before the floor existed. Below the floor the accounting still happens (caller did it).
+void ggml_vk_lazy_alloc_log(vk_device & device, vk_lazy_cat cat, size_t old_size, size_t new_size, const char * kind,
+                            const char * detail, uint32_t * counter) {
+    if (new_size <= old_size) {
+        return;
+    }
+    static const size_t floor_bytes = [] {
+        const char * e = getenv("GGML_VK_SCRATCH_GROW_MIB");
+        return (size_t) (e ? atof(e) : 4.0) * 1024 * 1024;
+    }();
+    if (new_size < floor_bytes) {
+        return;
+    }
+    const uint32_t n = counter ? (*counter)++ : device->lazy_log_n[cat].fetch_add(1, std::memory_order_relaxed);
+    if (n >= 8 && n % 64 != 0) {
+        return;
+    }
+    constexpr double MiB = 1024.0 * 1024.0;
+    uint64_t gtt = 0, vram = 0;
+    ggml_vk_gtt_watch_read(device, gtt, vram);   // initializes gtt_watch.bdf (empty on UMA / no sysfs)
+    const std::string & bdf = device->gtt_watch.bdf;
+    GGML_LOG_WARN("LAZY ALLOC: ggml_vulkan: %s %s: %s %.2f -> %.2f MiB (%s), running lazy total %.0f MiB VRAM / %.0f MiB "
+            "host-visible on this device, graph %llu%s%s (#%u)\n",
+            device->name.c_str(), bdf.empty() ? "-" : bdf.c_str(), ggml_vk_lazy_cat_name(cat), old_size/MiB, new_size/MiB, kind,
+            device->lazy_vram_bytes.load(std::memory_order_relaxed)/MiB, device->lazy_gtt_bytes.load(std::memory_order_relaxed)/MiB,
+            (unsigned long long) device->mem_watch.n_graphs.load(std::memory_order_relaxed),
+            detail ? ", " : "", detail ? detail : "", n + 1);
 }
 
 void ggml_vk_mem_watch_graph(vk_device & device) {
@@ -691,6 +798,13 @@ void * ggml_vk_host_malloc(vk_device& device, size_t size) {
         return nullptr;
     }
 
+    // [fork, 2026-10-30] inventory row O: Vulkan_Host buffers (output buffer, CPU-side compute/inputs) are pinned host
+    // memory on device 0 (the host buffer type is always device 0), counted as GTT on that card by the kernel; the
+    // GTT WATCH baseline on the XT showed 400-5000 MiB depending on config with nothing naming it
+    const bool vram = ggml_vk_buf_is_vram(buf);
+    ggml_vk_lazy_account(device.get(), VK_LAZY_HOST_PINNED, (int64_t) size, vram);
+    ggml_vk_lazy_alloc_log(device, VK_LAZY_HOST_PINNED, 0, size, vram ? "vram" : "host-visible");
+
     std::lock_guard<std::shared_mutex> guard(device->pinned_memory_mutex);
     device->pinned_memory.push_back(std::make_tuple(buf->ptr, size, buf));
 
@@ -720,6 +834,7 @@ void ggml_vk_host_free(vk_device& device, void* ptr) {
         return;
     }
 
+    ggml_vk_lazy_account(device.get(), VK_LAZY_HOST_PINNED, -(int64_t) std::get<1>(device->pinned_memory[index]), ggml_vk_buf_is_vram(buf));
     ggml_vk_destroy_buffer(buf);
 
     device->pinned_memory.erase(device->pinned_memory.begin() + index);
@@ -740,23 +855,45 @@ void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffer& buf,
     }
 }
 
+// [fork, 2026-10-30] both staging buffers are lazy, monotonic and were unlogged (inventory rows H and I): the device
+// one grows to the largest single synchronous transfer (ggml_vk_buffer_read_2d on a dGPU ALWAYS stages, the host-
+// visible shortcut is UMA-only; the whole-sequence RAM prompt-cache save read n_tokens x row bytes of one layer through
+// it: 270k x 1088 B q8 K row ~ 280 MiB, arithmetic, never measured; since 2026-10-30 bounded by the transfer split,
+// ggml_vk_staging_chunk_bytes, 32 MiB default), the context one to the largest async set/get whose host side is not pinned on THIS device (logits
+// read into the Vulkan_Host output buffer, which is pinned on device 0 only: the "VULKAN FALLBACK ... device
+// mismatch" line). Both are host-visible cached = GTT on this card; a LAZY ALLOC line names each growth.
 void ggml_vk_ensure_sync_staging_buffer(vk_device& device, size_t size) {
     if (device->sync_staging == nullptr || device->sync_staging->size < size) {
         VK_LOG_MEMORY("ggml_vk_ensure_sync_staging_buffer(" << size << ")");
+        const size_t old_size = device->sync_staging ? device->sync_staging->size : 0;
+        if (device->sync_staging) {
+            ggml_vk_lazy_account(device.get(), VK_LAZY_STAGING_DEV, -(int64_t) old_size, ggml_vk_buf_is_vram(device->sync_staging));
+        }
         ggml_vk_destroy_buffer(device->sync_staging);
         device->sync_staging = ggml_vk_create_buffer_check(device, size,
             vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
             vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+        const bool vram = ggml_vk_buf_is_vram(device->sync_staging);
+        ggml_vk_lazy_account(device.get(), VK_LAZY_STAGING_DEV, (int64_t) device->sync_staging->size, vram);
+        ggml_vk_lazy_alloc_log(device, VK_LAZY_STAGING_DEV, old_size, device->sync_staging->size, vram ? "vram" : "host-visible");
     }
 }
 
 void ggml_vk_ensure_sync_staging_buffer(ggml_backend_vk_context * ctx, size_t size) {
     if (ctx->sync_staging == nullptr || ctx->sync_staging->size < size) {
         VK_LOG_MEMORY("ggml_vk_ensure_sync_staging_buffer(" << size << ")");
+        const size_t old_size = ctx->sync_staging ? ctx->sync_staging->size : 0;
+        if (ctx->sync_staging) {
+            ggml_vk_lazy_account(ctx->device.get(), VK_LAZY_STAGING_CTX, -(int64_t) old_size, ggml_vk_buf_is_vram(ctx->sync_staging));
+        }
         ggml_vk_destroy_buffer(ctx->sync_staging);
         ctx->sync_staging = ggml_vk_create_buffer_check(ctx->device, size,
             vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
             vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+        const bool vram = ggml_vk_buf_is_vram(ctx->sync_staging);
+        ggml_vk_lazy_account(ctx->device.get(), VK_LAZY_STAGING_CTX, (int64_t) ctx->sync_staging->size, vram);
+        ggml_vk_lazy_alloc_log(ctx->device, VK_LAZY_STAGING_CTX, old_size, ctx->sync_staging->size, vram ? "vram" : "host-visible",
+                               ctx->name.c_str());
     }
 }
 
@@ -932,6 +1069,36 @@ bool ggml_vk_buffer_write_async(vk_context subctx, vk_buffer& dst, size_t offset
     return ggml_vk_buffer_write_2d_async(subctx, dst, offset, src, size, size, size, 1, sync_staging);
 }
 
+// [fork, 2026-10-30] staging chunk bound (design-fit-lazy-reserve-and-warmup-gate.md section C, done here instead of
+// in the server). Why: the device sync_staging is sized to the largest single synchronous transfer and kept forever
+// (inventory row H): ggml_vk_buffer_read_2d on a dGPU always stages, so the RAM prompt-cache save
+// (server-context.cpp prompt_save, llama_state_seq_get_data_ext over the whole sequence: one tensor_get per layer per
+// contiguous cell range = n_tokens x row bytes, 270k x 1088 B q8 K ~ 280 MiB, arithmetic) and the hybrid checkpoint /
+// .rec readbacks (157 MB RS plane per get on the 27B, measured 2026-10-22) each left that much GTT on the card, unlogged,
+// and the fit could not price it except as the whole-sequence bound.
+// Why HERE and not by chunking the server reads to DISK_SEGMENT_TOKENS (the design's plan): (1) the non-delta flush
+// (server-task.cpp flush_from_context, delta_capable == false) runs only for SWA or recurrent models, and
+// llama_state_seq_get_*_range aborts on exactly those memory types, so it cannot be chunked by position; (2) the RAM
+// prompt-cache entry is ONE full blob (cur->data.main) loaded by llama_state_seq_set_data_ext without APPEND; range
+// blobs would change that format and need the loader to apply N APPEND blobs plus the hybrid PARTIAL_ONLY state, in
+// code that carries the uncommitted need-based-eviction work. Splitting the transfer below the state writer keeps
+// every blob byte-identical by construction (same bytes, same order, only more submits) and bounds every reader,
+// including the checkpoint planes. Cost: one extra submit + fence wait per chunk (157 MB plane = 5 chunks at 32 MiB,
+// order 0.1-0.3 ms each, not measured; the copy bytes are unchanged).
+// GGML_VK_STAGING_CHUNK_MIB (default 0 = off = one staging copy per transfer, the old behavior; 32 is the intended
+// production value). The lazy reserve proc clamps staging-dev to this bound when it is on.
+// 2026-10-30 (owner rule, gate-before-default-flip): a transfer-path change ships OFF until the PIPELINED ppl gate and the
+// fit step-3 gate (design-fit-lazy-reserve-and-warmup-gate.md) pass on a production run; the 2026-10-22 host-copy race
+// was exposed by exactly this kind of "more submits, same bytes" change. Flip to 32 only after that run.
+size_t ggml_vk_staging_chunk_bytes() {
+    static const size_t b = [] {
+        const char * e = getenv("GGML_VK_STAGING_CHUNK_MIB");
+        const double mib = e ? atof(e) : 0.0;
+        return mib > 0 ? (size_t) (mib * 1024.0 * 1024.0) : (size_t) 0;
+    }();
+    return b;
+}
+
 void ggml_vk_buffer_write_2d(vk_buffer& dst, size_t offset, const void * src, size_t spitch, size_t dpitch, size_t width, size_t height) {
     VK_LOG_DEBUG("ggml_vk_buffer_write_2d(" << width << ", " << height << ")");
     vk_slope_timer slope_t(VK_SLOPE_CPY_HOST);   // GGML_VK_MMVQ_SLOPE_STATS t_cpy_host_us (its wait is in t_wait_us)
@@ -947,6 +1114,28 @@ void ggml_vk_buffer_write_2d(vk_buffer& dst, size_t offset, const void * src, si
             }
         }
     } else {
+        // [fork, 2026-10-30] staging chunk bound (ggml_vk_staging_chunk_bytes): each piece goes through this same
+        // function with <= cap bytes, so it takes the unsplit path below; bytes and order are unchanged
+        const size_t cap = ggml_vk_staging_chunk_bytes();
+        if (cap > 0 && width * height > cap) {
+            if (width == spitch && width == dpitch) {
+                const size_t total = width * height;
+                for (size_t off = 0; off < total; off += cap) {
+                    const size_t n = std::min(cap, total - off);
+                    ggml_vk_buffer_write_2d(dst, offset + off, (const uint8_t *) src + off, n, n, n, 1);
+                }
+                return;
+            }
+            if (width <= cap) {
+                const size_t rows = cap / width;
+                for (size_t r = 0; r < height; r += rows) {
+                    const size_t h = std::min(rows, height - r);
+                    ggml_vk_buffer_write_2d(dst, offset + r * dpitch, (const uint8_t *) src + r * spitch, spitch, dpitch, width, h);
+                }
+                return;
+            }
+            // one strided row wider than the bound: unsplit (no caller does this today)
+        }
         std::lock_guard<std::recursive_mutex> guard(dst->device->mutex);
 
         vk_context subctx = ggml_vk_create_temporary_context(dst->device->transfer_queue->cmd_pool);
@@ -1099,6 +1288,28 @@ void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, size_t sp
             }
         }
     } else {
+        // [fork, 2026-10-30] staging chunk bound (ggml_vk_staging_chunk_bytes, comment there): the save-side state
+        // reads (whole-sequence RAM prompt-cache save, non-delta flush, checkpoint planes) come through here
+        const size_t cap = ggml_vk_staging_chunk_bytes();
+        if (cap > 0 && width * height > cap) {
+            if (width == spitch && width == dpitch) {
+                const size_t total = width * height;
+                for (size_t off = 0; off < total; off += cap) {
+                    const size_t n = std::min(cap, total - off);
+                    ggml_vk_buffer_read_2d(src, offset + off, (uint8_t *) dst + off, n, n, n, 1);
+                }
+                return;
+            }
+            if (width <= cap) {
+                const size_t rows = cap / width;
+                for (size_t r = 0; r < height; r += rows) {
+                    const size_t h = std::min(rows, height - r);
+                    ggml_vk_buffer_read_2d(src, offset + r * spitch, (uint8_t *) dst + r * dpitch, spitch, dpitch, width, h);
+                }
+                return;
+            }
+            // one strided row wider than the bound: unsplit (no caller does this today)
+        }
         std::lock_guard<std::recursive_mutex> guard(src->device->mutex);
 
         vk_context subctx = ggml_vk_create_temporary_context(src->device->transfer_queue->cmd_pool);
@@ -1154,6 +1365,15 @@ void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& src, size
         ggml_vk_queue_command_pools_cleanup(src->device);
     } else {
         VK_LOG_DEBUG("ggml_vk_buffer_copy(MULTI_DEVICE, " << size << ")");
+        // [fork, 2026-10-30] staging chunk bound (ggml_vk_staging_chunk_bytes): the cross-device bounce staged the
+        // whole tensor in the src device's sync_staging; pieces of <= cap take the unsplit path below
+        const size_t cap = ggml_vk_staging_chunk_bytes();
+        if (cap > 0 && size > cap) {
+            for (size_t off = 0; off < size; off += cap) {
+                ggml_vk_buffer_copy(dst, dst_offset + off, src, src_offset + off, std::min(cap, size - off));
+            }
+            return;
+        }
         // Copy device to device
         ggml_vk_ensure_sync_staging_buffer(src->device, size);
 

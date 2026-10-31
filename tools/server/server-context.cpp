@@ -1396,10 +1396,11 @@ struct server_slot {
         return true;
     }
 
-    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, const std::string & conversation_id) {
+    // n_room: free cells of the unified KV pool for this slot, -1 = no limit ([TAG_EVICT_ON_NEED])
+    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, const std::string & conversation_id, int32_t n_room = -1) {
         server_ustats_timer ut(server_ustats().t_prompt_cache); // [LLAMA_SERVER_UBATCH_STATS]
         state_changed(); // [TAG_REC_REUSE] a RAM or disk restore rewrites the sequence (or may have, on failure)
-        bool res = prompt_cache.load(prompt, tokens, conversation_id, ctx_tgt, ctx_dft, id);
+        bool res = prompt_cache.load(prompt, tokens, conversation_id, ctx_tgt, ctx_dft, id, n_room);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -2681,6 +2682,26 @@ private:
 
     int64_t t_last_load_progress_ms = 0;
 
+    // [fork, 2026-10-30] what load_model_core() added to params_base.fit_params_target for the mmproj reserve, per fit
+    // device index. load_model_core() propagates params_base back to the caller (params = params_base), and the sleep
+    // path and the fit-verify reload both call it again with params_base, so without this the mmproj bytes were added
+    // once more on every wake (pre-existing on the sleep path) and on every --fit-verify retry. Subtracted at the top
+    // of load_model_core(), re-added below.
+    std::vector<size_t> fit_target_mmproj_added;
+
+    // [fork, 2026-10-30] --fit-verify (design-fit-lazy-reserve-and-warmup-gate.md, section E). Set by load_model_core()
+    // before common_init_from_params: one entry per fit device (common_fit_devices order = fit_params_target index)
+    // with its GGML_BACKEND_FORK_DEV_GTT_USED_PROC reader. fit_verify_armed = every device resolved and answered, the
+    // common BOS+EOS warmup is switched off and load_model() runs the gate instead.
+    struct fit_verify_dev {
+        ggml_backend_dev_t                dev   = nullptr; // nullptr = the fake device of LLAMA_SERVER_FIT_VERIFY_FAKE_EVICT_MIB
+        size_t                            idx   = SIZE_MAX; // index into fit_params_target, SIZE_MAX = none
+        ggml_backend_fork_dev_gtt_used_t  read  = nullptr;
+        std::string                       name;
+    };
+    std::vector<fit_verify_dev> fit_verify_devs;
+    bool fit_verify_armed = false;
+
     void destroy() {
         ledger.save();
 
@@ -2828,7 +2849,38 @@ private:
 
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
+    //
+    // [fork, 2026-10-30] split into load_model_core() (everything that was here) + the --fit-verify gate + init(). The
+    // gate needs a loaded server (spec, slots, batch) but must finish before init() wires the queues and before
+    // server.cpp sets is_ready, and an EVICTION verdict reloads through destroy() + load_model_core(), the sleep path's
+    // pair (handle_sleeping_state), so the retry re-inits exactly what a wake does: model + ctx_tgt (llama_init),
+    // ctx_dft/spec_init, spec (with the vocab-subset head), slots (ctx pointers, slot.mem, n_ctx), batch +
+    // batch_prebuild*, prompt_cache (new n_ctx), mtmd.
     bool load_model(common_params & params) {
+        const bool is_resume = sleeping;
+
+        if (!load_model_core(params)) {
+            return false;
+        }
+
+        if (fit_verify_armed && !fit_verify_gate()) {
+            return false;
+        }
+        params = params_base; // the gate may have raised fit_params_target, keep them for the caller and a later wake
+
+        if (!is_resume) {
+            return init();
+        }
+
+        if (callback_state) {
+            callback_state(SERVER_STATE_READY, {});
+        }
+
+        return true;
+    }
+
+    // the body of load_model() before 2026-10-30: fit, model, contexts, spec, slots, batch, prompt cache
+    bool load_model_core(common_params & params) {
         load_progress_data load_progress_text  (this, "text_model");
         load_progress_data load_progress_mmproj(this, "mmproj_model");
         load_progress_data load_progress_spec  (this, "spec_model");
@@ -2836,6 +2888,12 @@ private:
         const bool is_resume = sleeping;
 
         params_base = params;
+        // [fork, 2026-10-30] undo the mmproj reserve this instance added on a previous load (see fit_target_mmproj_added)
+        for (size_t i = 0; i < fit_target_mmproj_added.size() && i < params_base.fit_params_target.size(); i++) {
+            params_base.fit_params_target[i] -= std::min(params_base.fit_params_target[i], fit_target_mmproj_added[i]);
+        }
+        fit_target_mmproj_added.clear();
+
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
@@ -2919,6 +2977,10 @@ private:
                             if (i < params_base.fit_params_target.size()) {
                                 SRV_DBG("[mtmd] adding %.2f MiB to fit_params_target for device %s\n", size / (1024.0 * 1024.0), ggml_backend_dev_name(dev));
                                 params_base.fit_params_target[i] += size;
+                                if (fit_target_mmproj_added.size() <= i) {
+                                    fit_target_mmproj_added.resize(i + 1, 0);
+                                }
+                                fit_target_mmproj_added[i] += size;
                             }
                             break;
                         }
@@ -2937,7 +2999,17 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
+        // [fork, 2026-10-30] --fit-verify: resolve the GTT readers before the load, so a start that cannot verify keeps
+        // the common BOS+EOS warmup and a start that can replaces it with the gate's warm-up (load_model()). The common
+        // warmup is 2 tokens on ctx_tgt only, before the MTP context exists: no ubatch-sized hop, no verify rows, no
+        // draft chain, so it never touches the lazy allocations that moved 1 GB to GTT on 2026-10-30
+        fit_verify_arm(params_base);
+        const bool warmup_saved = params_base.warmup;
+        if (fit_verify_armed) {
+            params_base.warmup = false;
+        }
         llama_init = common_init_from_params(params_base);
+        params_base.warmup = warmup_saved;
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
@@ -3279,14 +3351,24 @@ private:
             // KV state identity: cache types + coarse model geometry. Same arch string
             // and vocab (two sizes of one family) still produce mutually unreadable
             // state blobs when any of these differ.
-            uint32_t state_hash = 0;
-            if (!params_base.cache_disk_path.empty() && model_tgt != nullptr) {
+            //
+            // [fork, 2026-10-30] --cache-convert: the K/V types stay IN the hash (the files keep saying what they
+            // hold, and with conversion off a type switch is still the clean miss it always was), but a server that
+            // can convert also accepts the hashes of the same geometry under the other convertible type pairs
+            // ({f16, q8_0} for K x the same for V). chosen over dropping the types from the hash because that would
+            // turn every off-mode mismatch from a miss into a mid-restore refusal (state_read fails after streaming
+            // the segments, the slot is wiped and re-prefilled), and would make files written by older builds
+            // unreadable to this one (the hash value would change). a file found through a foreign hash is
+            // restored with conversion and then REWRITTEN in this server's type at its next flush (flush_from_context sees
+            // the foreign file hash and refuses to append), so no file ever mixes types and the header stays true.
+            // the draft context's types (-ctkd/-ctvd) were never in the hash; the reader converts them the same way
+            auto make_state_hash = [&](ggml_type tk, ggml_type tv) -> uint32_t {
                 constexpr uint32_t FNV_OFFSET = 2166136261u;
                 constexpr uint32_t FNV_PRIME  = 16777619u;
 
                 const uint32_t vals[] = {
-                    (uint32_t) params_base.cache_type_k,
-                    (uint32_t) params_base.cache_type_v,
+                    (uint32_t) tk,
+                    (uint32_t) tv,
                     (uint32_t) llama_model_n_layer  (model_tgt),
                     (uint32_t) llama_model_n_embd   (model_tgt),
                     (uint32_t) llama_model_n_head   (model_tgt),
@@ -3299,7 +3381,27 @@ private:
                         h *= FNV_PRIME;
                     }
                 }
-                state_hash = h;
+                return h;
+            };
+
+            uint32_t state_hash = 0;
+            std::vector<uint32_t> state_hash_accept;
+            if (!params_base.cache_disk_path.empty() && model_tgt != nullptr) {
+                state_hash = make_state_hash(params_base.cache_type_k, params_base.cache_type_v);
+
+                const auto convertible = [](ggml_type t) { return t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0; };
+                if (params_base.cache_convert && convertible(params_base.cache_type_k) && convertible(params_base.cache_type_v)) {
+                    for (ggml_type tk : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+                        for (ggml_type tv : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+                            if (tk == params_base.cache_type_k && tv == params_base.cache_type_v) {
+                                continue;
+                            }
+                            state_hash_accept.push_back(make_state_hash(tk, tv));
+                            SRV_WRN("disk cache: --cache-convert on, also accepting files saved with K %s / V %s (state=0x%08x)\n",
+                                    ggml_type_name(tk), ggml_type_name(tv), state_hash_accept.back());
+                        }
+                    }
+                }
             }
 
             prompt_cache = std::make_unique<server_prompt_cache>(
@@ -3307,6 +3409,7 @@ private:
                 params_base.cache_disk_path, params_base.cache_disk_queue_depth,
                 params_base.checkpoint_spill_max,
                 arch_hash, vocab_hash, state_hash);
+            prompt_cache->state_hash_accept = std::move(state_hash_accept);
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -3336,15 +3439,411 @@ private:
         // propagate new defaults back to caller
         params = params_base;
 
-        if (!is_resume) {
-            return init();
-        }
-
-        if (callback_state) {
-            callback_state(SERVER_STATE_READY, {});
-        }
-
         return true;
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // [fork, 2026-10-30] --fit-verify: the warm-up gate (design-fit-lazy-reserve-and-warmup-gate.md, section E)
+    //
+    // Why. 2026-10-30 09:50, Qwen3.8-27B Q4_u, q8 KV, -np 3, three cards, --fit-target 1024: the fit placed 22961 of
+    // 24511 MiB on Vulkan1 (compute 6908, scratch 5093), 1446 MiB free after context init. The first request (98k disk
+    // restore + 76-token pp + decode) moved GTT 20 -> 1046 MiB and VRAM 23114 -> 22291 MiB on Vulkan1 with no SCRATCH
+    // GROW line, tg 34 -> 26 t/s; the owner heard the alarm. The lazy costs behind it (D2D rings per ordered device
+    // pair, sync staging up to the largest readback, gallocr re-plans, the vocab-subset head) only appear when a graph
+    // of the real shapes runs, and the common warmup (BOS+EOS, 2 rows, ctx_tgt only, before ctx_dft exists) runs none
+    // of them. Earlier: the 289k incident evicted the KQ-mask BO with ~3 GB nominally free; GROW_SLACK history "2873
+    // free ran clean, 783 did not". So the fit's answer is checked here, before is_ready, instead of by the first request.
+    //
+    // Pass: baseline GTT/VRAM per fit device (GGML_BACKEND_FORK_DEV_GTT_USED_PROC, ggml-backend.h; Vulkan reads amdgpu
+    // sysfs mem_info_gtt_used / mem_info_vram_used), one pp batch of n_ubatch rows on seq 0, one speculative step the
+    // way update_slots() runs it, clear both memories, read again.
+    // Verdict per device: delta_gtt > --fit-verify-mib (256) and VRAM fell by >= 50% of delta_gtt = EVICTION (the
+    // kernel moved our buffers out); delta_gtt > threshold with VRAM steady = HOST-VISIBLE GROWTH (staging/ring memory
+    // the fit did not price, logged, not a failure). On EVICTION: fit_params_target[dev] += delta_gtt + 256 MiB,
+    // destroy() + load_model_core() (~2 min on the 27B), at most FIT_VERIFY_MAX_RETRIES; then start anyway.
+    // Cost when it passes: one pp graph + one spec step, ~1-2 s (design estimate, UNMEASURED on the cards as of writing).
+    //
+    // The counters are device-wide (kernel view): another process allocating on the same card during the ~2 s window
+    // reads as our growth. The owner runs one server per card set, so this is accepted, and the reload is bounded.
+    // ---------------------------------------------------------------------------------------------------------------
+
+    static constexpr int FIT_VERIFY_MAX_RETRIES = 2;
+
+    struct fit_verify_reading {
+        uint64_t gtt  = 0;
+        uint64_t vram = 0;
+    };
+
+    // LLAMA_SERVER_FIT_VERIFY_FAKE_EVICT_MIB=N (test hook, CPU builds): when no device can be read, gate one fake
+    // device whose first warm-up reports GTT +N MiB / VRAM -N MiB (an EVICTION when N > --fit-verify-mib) and every
+    // later one reports nothing. Exercises the verdict, the reload through destroy() + load_model_core() and the pass
+    // on the next attempt without a GPU. Never raises a real target (the fake device has no fit index).
+    static int64_t fit_verify_fake_mib() {
+        static const int64_t v = [] {
+            const char * e = getenv("LLAMA_SERVER_FIT_VERIFY_FAKE_EVICT_MIB");
+            return e ? (int64_t) atoll(e) : (int64_t) -1;
+        }();
+        return v;
+    }
+    int fit_verify_fake_runs = 0; // gate runs so far, the fake evicts on the first only
+
+    static bool fit_verify_active(const common_params & p) {
+        // auto: only when the fit chooses n_ctx; with -c the owner pinned the context and a raised target would only
+        // move layers, so auto leaves that start alone (on still runs it)
+        return p.fit_verify == 1 || (p.fit_verify == 2 && p.fit_params && p.n_ctx == 0);
+    }
+
+    // resolve one reader per fit device; on any miss log one WARN and leave the gate disarmed (never fails the start)
+    void fit_verify_arm(const common_params & p) {
+        fit_verify_devs.clear();
+        fit_verify_armed = false;
+
+        if (!fit_verify_active(p)) {
+            return;
+        }
+
+        std::string why;
+        const std::vector<ggml_backend_dev_t> fit_devs = common_fit_devices(p.devices);
+        if (fit_devs.empty()) {
+            why = "no GPU device to fit (CPU only)";
+        }
+        for (size_t i = 0; i < fit_devs.size() && why.empty(); i++) {
+            ggml_backend_dev_t dev = fit_devs[i];
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            auto fn = reg ? (ggml_backend_fork_dev_gtt_used_t) ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_FORK_DEV_GTT_USED_PROC) : nullptr;
+            if (fn == nullptr) {
+                why = string_format("backend of %s has no %s proc", ggml_backend_dev_name(dev), GGML_BACKEND_FORK_DEV_GTT_USED_PROC);
+                break;
+            }
+            uint64_t gtt = 0, vram = 0;
+            if (!fn(dev, &gtt, &vram)) {
+                why = string_format("%s: no GTT/VRAM counters (UMA, no amdgpu sysfs or another vendor)", ggml_backend_dev_name(dev));
+                break;
+            }
+            fit_verify_devs.push_back({ dev, i, fn, ggml_backend_dev_name(dev) });
+        }
+
+        if (!why.empty() && fit_verify_fake_mib() >= 0) {
+            SRV_WRN("fit verify: LLAMA_SERVER_FIT_VERIFY_FAKE_EVICT_MIB=%lld, gating a fake device instead (%s)\n",
+                    (long long) fit_verify_fake_mib(), why.c_str());
+            fit_verify_devs.clear();
+            fit_verify_devs.push_back({ nullptr, SIZE_MAX, nullptr, "fake" });
+            why.clear();
+        }
+
+        if (!why.empty()) {
+            SRV_WRN("fit verify: cannot verify (%s), gate skipped; the common BOS+EOS warmup runs instead\n", why.c_str());
+            fit_verify_devs.clear();
+            return;
+        }
+
+        fit_verify_armed = true;
+    }
+
+    bool fit_verify_read(const fit_verify_dev & d, bool after, fit_verify_reading & r) const {
+        if (d.read == nullptr) { // fake device
+            const uint64_t mib = 1024ull * 1024ull;
+            const uint64_t n   = after && fit_verify_fake_runs == 0 ? (uint64_t) fit_verify_fake_mib() * mib : 0;
+            r.gtt  = 20 * mib + n;
+            r.vram = 16384 * mib - n;
+            return true;
+        }
+        return d.read(d.dev, &r.gtt, &r.vram);
+    }
+
+    // one warm-up: pp of n_ubatch rows + one speculative step + reset. returns false only when a decode failed (the
+    // caller then starts without a verdict); rows/draft lengths go to the pass line
+    bool fit_verify_warmup(int & n_pp_out, int & n_verify_out, int & n_drafted_out) {
+        n_pp_out = n_verify_out = n_drafted_out = 0;
+
+        const llama_token tok = llama_vocab_bos(vocab) != LLAMA_TOKEN_NULL ? llama_vocab_bos(vocab) : 0;
+        const bool use_spec   = spec && !params_base.embedding && decision.type == COMMON_DECISION_TYPE_NONE;
+
+        // verify rows: 1 + the largest cap of any registered drafter (n-gram caps included: they can verify up to
+        // --spec-ngram-draft-n-max rows, 64 in the 2026-10-20 production run), clamped like a slot is clamped
+        int n_verify = 1 + (use_spec ? common_speculative_n_max(spec.get()) : 0);
+        n_verify = std::min(n_verify, (int) llama_n_ubatch(ctx_tgt));
+        n_verify = std::min(n_verify, std::max(1, params_base.n_outputs_max_per_seq));
+
+        // pp: one ubatch-sized graph (the largest D2D hop, n_ubatch x n_embd x 4 B per boundary), room left for verify
+        const int n_pp = std::min((int) llama_n_ubatch(ctx_tgt), n_ctx_slot() - n_verify - 1);
+        if (n_pp < 1) {
+            SRV_WRN("fit verify: context too small for a warm-up (n_ctx_slot = %d), no verdict\n", n_ctx_slot());
+            return false;
+        }
+
+        llama_memory_clear(llama_get_memory(ctx_tgt), true);
+        if (ctx_dft) {
+            llama_memory_clear(llama_get_memory(ctx_dft), true);
+        }
+
+        // (2) prompt: the graph shape is what matters, the token is BOS repeated
+        common_batch b(ctx_tgt);
+        for (int i = 0; i < n_pp; i++) {
+            b.add(tok, i, 0, i == n_pp - 1);
+        }
+        if (llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, b.get()) != 0) {
+            SRV_WRN("fit verify: warm-up prompt decode (%d rows) failed, no verdict\n", n_pp);
+            return false;
+        }
+        // as update_slots() post_decode: mirror the prompt into the drafter (MTP catch-up prefill of n_pp rows)
+        if (use_spec && !common_speculative_process(spec.get(), b)) {
+            SRV_WRN("%s", "fit verify: warm-up speculative prefill failed, no verdict\n");
+            return false;
+        }
+        // the first-token sample reads the last row (syncs ctx_tgt); embedding/decision models have no logits to read
+        const bool has_logits = !params_base.embedding && decision.type == COMMON_DECISION_TYPE_NONE;
+        if (has_logits) {
+            llama_get_logits_ith(ctx_tgt, -1);
+        } else {
+            llama_synchronize(ctx_tgt);
+        }
+
+        // (3) one speculative step, the calls of update_slots(): begin at the first token, draft params as pre_decode
+        // sets them, draft, verify n_verify rows on ctx_tgt, process the verify batch with the seed (`next`)
+        llama_tokens prompt(n_pp, tok);
+        llama_tokens draft;
+        if (use_spec) {
+            common_speculative_begin(spec.get(), 0, prompt);
+
+            const int n_ngram = params_base.speculative.ngram_draft_n_max;
+            common_speculative_get_draft_params(spec.get(), 0) = {
+                /* .drafting = */ true,
+                /* .n_max    = */ std::max(1, std::min(n_verify - 1, params_base.speculative.draft.n_max)),
+                /* .pos0     = */ n_pp,
+                /* .id_last  = */ tok,
+                /* .prompt   = */ &prompt,
+                /* .result   = */ &draft,
+                /* .result_q = */ nullptr,
+                /* .temp     = */ 0.0f,
+                /* .seed     = */ LLAMA_DEFAULT_SEED,
+                /* .n_max_ngram = */ n_ngram > 0 ? std::min(n_ngram, n_verify - 1) : -1,
+            };
+            if (n_verify > 1) {
+                common_speculative_draft(spec.get());
+            }
+            common_speculative_get_draft_params(spec.get(), 0).drafting = false;
+            if (ctx_dft) {
+                // the slot rewinds ctx_dft to the verify start after drafting (draft() wrote its chain rows there)
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, n_pp, -1);
+            }
+        }
+        n_drafted_out = (int) draft.size();
+
+        // verify: id_last + the draft, padded with tok to n_verify rows, every row an output, so the verify graph has
+        // the size of the largest one a slot can issue even when the drafter stopped early on the synthetic prompt
+        common_batch v(ctx_tgt);
+        for (int i = 0; i < n_verify; i++) {
+            const llama_token t = i == 0 ? tok : (i - 1 < (int) draft.size() ? draft[i - 1] : tok);
+            v.add(t, n_pp + i, 0, true);
+        }
+        if (llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, v.get()) != 0) {
+            SRV_WRN("fit verify: warm-up verify decode (%d rows) failed, no verdict\n", n_verify);
+            return false;
+        }
+        for (int i = 0; has_logits && i < n_verify; i++) {
+            llama_get_logits_ith(ctx_tgt, i); // the verify sampler reads every row
+        }
+        llama_synchronize(ctx_tgt);
+        if (use_spec) {
+            // all rows kept, the seed (`next`) at the row after them: the largest MTP catch-up batch, n_verify + 1 rows
+            const std::vector<common_speculative_seed> next = { { 0, tok } };
+            if (!common_speculative_process(spec.get(), v, {}, next)) {
+                SRV_WRN("%s", "fit verify: warm-up speculative catch-up failed, no verdict\n");
+                return false;
+            }
+        }
+        // common_speculative_accept() is not called: host-side stats and a pending_h memcpy, no device memory
+
+        // (4) reset as slot release does (seed_drop) plus both memories cleared, so slot 0 starts empty
+        if (ctx_dft) {
+            llama_synchronize(ctx_dft);
+        }
+        common_speculative_seed_drop(spec.get(), 0);
+        llama_memory_clear(llama_get_memory(ctx_tgt), true);
+        if (ctx_dft) {
+            llama_memory_clear(llama_get_memory(ctx_dft), true);
+            llama_synchronize(ctx_dft);
+        }
+        llama_synchronize(ctx_tgt);
+        llama_perf_context_reset(ctx_tgt); // as the common warmup does
+
+        n_pp_out     = n_pp;
+        n_verify_out = n_verify;
+        return true;
+    }
+
+    // optional sidecar (design E): one JSON line per gate attempt in <cache-disk-path>/fit-verify.jsonl. Write side only:
+    // reading it back at the next start to pre-raise the targets before the fit is NOT implemented (UNDONE)
+    void fit_verify_sidecar(int attempt, const std::vector<fit_verify_reading> & r0, const std::vector<fit_verify_reading> & r1,
+                            const std::vector<std::string> & verdicts) const {
+        if (params_base.cache_disk_path.empty()) {
+            return;
+        }
+        const double mib = 1024.0 * 1024.0;
+        json devs = json::array();
+        for (size_t k = 0; k < fit_verify_devs.size(); k++) {
+            const auto & d = fit_verify_devs[k];
+            devs.push_back({
+                {"device",          d.name},
+                {"delta_gtt_mib",   ((double) r1[k].gtt  - (double) r0[k].gtt)  / mib},
+                {"delta_vram_mib",  ((double) r1[k].vram - (double) r0[k].vram) / mib},
+                {"verdict",         verdicts[k]},
+                {"target_mib",      d.idx < params_base.fit_params_target.size() ? (double) params_base.fit_params_target[d.idx] / mib : -1.0},
+            });
+        }
+        const json line = {
+            {"t",        (int64_t) std::time(nullptr)},
+            {"model",    params_base.model.path},
+            {"n_ctx",    n_ctx},
+            {"n_ubatch", (int) llama_n_ubatch(ctx_tgt)},
+            {"attempt",  attempt},
+            {"devices",  devs},
+        };
+        const std::string path = (std::filesystem::path(params_base.cache_disk_path) / "fit-verify.jsonl").string();
+        std::ofstream f(path, std::ios::app);
+        if (f) {
+            f << line.dump() << "\n";
+        } else {
+            SRV_WRN("fit verify: cannot append to '%s'\n", path.c_str());
+        }
+    }
+
+    // run the gate, reload on EVICTION; false only when a reload failed to load (the start fails like any load error)
+    bool fit_verify_gate() {
+        const int64_t mib       = 1024 * 1024;
+        const int64_t threshold = (int64_t) params_base.fit_verify_mib * mib;
+        const int     n_attempt = 1 + FIT_VERIFY_MAX_RETRIES;
+
+        for (int attempt = 1; ; attempt++) {
+            const int64_t t0 = ggml_time_us();
+
+            // (1) baseline
+            std::vector<fit_verify_reading> r0(fit_verify_devs.size()), r1(fit_verify_devs.size());
+            for (size_t k = 0; k < fit_verify_devs.size(); k++) {
+                if (!fit_verify_read(fit_verify_devs[k], false, r0[k])) {
+                    SRV_WRN("fit verify: %s: GTT/VRAM read failed, gate skipped\n", fit_verify_devs[k].name.c_str());
+                    return true;
+                }
+            }
+
+            int n_pp = 0, n_verify = 0, n_drafted = 0;
+            if (!fit_verify_warmup(n_pp, n_verify, n_drafted)) {
+                return true; // the reason is logged; start without a verdict, as before this gate existed
+            }
+
+            // (5) after
+            for (size_t k = 0; k < fit_verify_devs.size(); k++) {
+                if (!fit_verify_read(fit_verify_devs[k], true, r1[k])) {
+                    SRV_WRN("fit verify: %s: GTT/VRAM read failed, gate skipped\n", fit_verify_devs[k].name.c_str());
+                    return true;
+                }
+            }
+            fit_verify_fake_runs++;
+            const double t_s = (ggml_time_us() - t0) / 1e6;
+
+            // verdicts
+            std::vector<std::string> verdicts(fit_verify_devs.size(), "ok");
+            std::vector<int64_t>     d_gtt(fit_verify_devs.size()), d_vram(fit_verify_devs.size());
+            int n_evicted = 0;
+            for (size_t k = 0; k < fit_verify_devs.size(); k++) {
+                const auto & d = fit_verify_devs[k];
+                d_gtt [k] = (int64_t) r1[k].gtt  - (int64_t) r0[k].gtt;
+                d_vram[k] = (int64_t) r1[k].vram - (int64_t) r0[k].vram;
+                const int64_t fell = -d_vram[k];
+                if (d_gtt[k] > threshold && 2 * fell >= d_gtt[k]) {
+                    verdicts[k] = "EVICTION";
+                    n_evicted++;
+                    SRV_WRN("fit verify: EVICTION on %s (attempt %d of %d): GTT grew %lld MiB (%llu -> %llu), VRAM fell %lld MiB (%llu -> %llu)\n",
+                            d.name.c_str(), attempt, n_attempt, (long long) (d_gtt[k] / mib),
+                            (unsigned long long) (r0[k].gtt / mib), (unsigned long long) (r1[k].gtt / mib), (long long) (fell / mib),
+                            (unsigned long long) (r0[k].vram / mib), (unsigned long long) (r1[k].vram / mib));
+                } else if (d_gtt[k] > threshold) {
+                    verdicts[k] = "HOST-VISIBLE GROWTH";
+                    SRV_WRN("fit verify: HOST-VISIBLE GROWTH on %s (attempt %d of %d): GTT grew %lld MiB (%llu -> %llu), VRAM %+lld MiB (%llu -> %llu): "
+                            "not an eviction, %lld MiB of host-visible memory the fit did not price\n",
+                            d.name.c_str(), attempt, n_attempt, (long long) (d_gtt[k] / mib),
+                            (unsigned long long) (r0[k].gtt / mib), (unsigned long long) (r1[k].gtt / mib), (long long) (d_vram[k] / mib),
+                            (unsigned long long) (r0[k].vram / mib), (unsigned long long) (r1[k].vram / mib), (long long) (d_gtt[k] / mib));
+                } else {
+                    SRV_INF("fit verify: ok on %s (attempt %d of %d): GTT %+lld MiB (%llu -> %llu), VRAM %+lld MiB (%llu -> %llu)\n",
+                            d.name.c_str(), attempt, n_attempt, (long long) (d_gtt[k] / mib),
+                            (unsigned long long) (r0[k].gtt / mib), (unsigned long long) (r1[k].gtt / mib), (long long) (d_vram[k] / mib),
+                            (unsigned long long) (r0[k].vram / mib), (unsigned long long) (r1[k].vram / mib));
+                }
+            }
+
+            if (n_evicted == 0) {
+                fit_verify_sidecar(attempt, r0, r1, verdicts);
+                SRV_INF("fit verify: pass on attempt %d of %d (%.2f s: pp %d rows, verify %d rows, drafted %d)\n",
+                        attempt, n_attempt, t_s, n_pp, n_verify, n_drafted);
+                return true;
+            }
+
+            if (attempt >= n_attempt) {
+                fit_verify_sidecar(attempt, r0, r1, verdicts);
+                SRV_WRN("fit verify: EVICTION persists after %d retries, starting anyway (the first requests will run with "
+                        "evicted buffers: expect slower tg and GTT WATCH lines)\n", FIT_VERIFY_MAX_RETRIES);
+                return true;
+            }
+
+            // raise: the measured growth plus 256 MiB (the fit's GROW_SLACK step) on every evicted device. A device that
+            // only grew host-visible memory keeps its target: raising it would not stop staging/ring growth, the lazy
+            // reserve (design B) has to price that
+            std::string summary;
+            bool raised = false;
+            for (size_t k = 0; k < fit_verify_devs.size(); k++) {
+                const auto & d = fit_verify_devs[k];
+                std::string tgt = "no fit target";
+                if (d.idx < params_base.fit_params_target.size() && params_base.fit_params) {
+                    auto & t = params_base.fit_params_target[d.idx];
+                    const size_t t_old = t;
+                    bool from_floor = false;
+                    if (verdicts[k] == "EVICTION") {
+                        // step 3 D: the fit's margin is max(target, --fit-floor-frac x total) (common/fit.cpp, margins[]),
+                        // so a target under the floor (1024 vs 1964 MiB on a 24 GB card at 0.08) would absorb most of
+                        // the raise. Raise from the effective margin instead, so the reload really gets delta + 256 more
+                        size_t base = t;
+                        if (params_base.fit_floor_frac > 0.0f && d.dev != nullptr) {
+                            size_t dev_free = 0, dev_total = 0;
+                            ggml_backend_dev_memory(d.dev, &dev_free, &dev_total);
+                            const size_t floor_b = (size_t) ((double) params_base.fit_floor_frac * (double) dev_total);
+                            from_floor = floor_b > base;
+                            base = std::max(base, floor_b);
+                        }
+                        t = base + (size_t) d_gtt[k] + 256 * (size_t) mib;
+                        raised = true;
+                    }
+                    tgt = t != t_old
+                        ? string_format("target %zu -> %zu MiB%s", t_old / (size_t) mib, t / (size_t) mib, from_floor ? " (raised from the floor)" : "")
+                        : string_format("target %zu MiB", t / (size_t) mib);
+                }
+                summary += string_format("%s%s GTT %+lld MiB VRAM %+lld MiB %s", k ? "; " : "", d.name.c_str(),
+                        (long long) (d_gtt[k] / mib), (long long) (d_vram[k] / mib), tgt.c_str());
+            }
+            fit_verify_sidecar(attempt, r0, r1, verdicts);
+
+            if (!raised && fit_verify_fake_mib() < 0) {
+                SRV_WRN("fit verify: EVICTION but no target to raise (%s), starting anyway: %s\n",
+                        params_base.fit_params ? "evicted device is not in the fit list" : "--fit off", summary.c_str());
+                return true;
+            }
+
+            SRV_WRN("fit verify: attempt %d of %d found EVICTION on %d device(s), reloading (retry %d of %d): %s\n",
+                    attempt, n_attempt, n_evicted, attempt, FIT_VERIFY_MAX_RETRIES, summary.c_str());
+
+            // the sleep path's pair. The prompt cache goes first so its destructor (disk spill, empty at start) runs
+            // before load_model_core() opens a new one on the same --cache-disk-path
+            destroy();
+            prompt_cache.reset();
+            if (!load_model_core(params_base)) {
+                SRV_ERR("fit verify: reload %d of %d failed\n", attempt, FIT_VERIFY_MAX_RETRIES);
+                return false;
+            }
+            if (!fit_verify_armed) {
+                return true; // the reload could not resolve the readers any more, it logged why
+            }
+        }
     }
 
     // unlike load_model(), this is only called once during initialization
@@ -3622,9 +4121,18 @@ private:
                 if (prompt_cache->over_budget()) {
                     { server_ustats_timer ut(server_ustats().t_prompt_cache); prompt_cache->spill_all_to_disk(); }
                 }
+
+                // [TAG_EVICT_ON_NEED] room for what the load restores (RAM entry or disk n_tok, read from the mirror or
+                // the .hdr, never the .kv) and for the prompt this slot prefills after it, whichever is larger: an
+                // edit of an earlier turn restores more tokens than the new prompt has before it truncates to the LCP
+                int32_t n_room = -1;
+                if (params_base.kv_unified) {
+                    const int32_t n_restore = prompt_cache->restore_n_tokens(ret->prompt, task.tokens, task.conversation_id, ctx_dft != nullptr);
+                    n_room = kv_make_room(*ret, std::max<int32_t>((int32_t) task.tokens.size(), n_restore));
+                }
                 rq_lap(rq_pre.t_cache_save);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens, task.conversation_id)) {
+                if (!ret->prompt_load(*prompt_cache, task.tokens, task.conversation_id, n_room)) {
                     ret->prompt_clear();
                     rq_pre.restore_src = 3;
                 } else {
@@ -3638,7 +4146,15 @@ private:
                 rq_lap(rq_pre.t_cache_save);
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
-            } else if (prompt_cache) {
+            } else {
+                // [TAG_EVICT_ON_NEED] in-place reuse (or no prompt cache): only the prefill needs room, and it gets it
+                // before token 0 instead of at the decode-retry purge in try_clear_idle_slots()
+                if (params_base.kv_unified) {
+                    kv_make_room(*ret, (int32_t) task.tokens.size());
+                }
+            }
+
+            if (!update_cache && prompt_cache) {
                 // f_keep >= 0.5: the incoming request shares enough of the slot's current
                 // tokens that the slot is reused in-place without a save/load cycle.
                 // Without this save, the outgoing conversation's KV state is silently
@@ -3661,6 +4177,95 @@ private:
         return ret;
     }
 
+    // [TAG_EVICT_ON_NEED] cells of the unified KV pool that slot `self` can use: the pool minus what the other slots hold.
+    // the slot's own cells do not count, a restore or a prefill replaces them. per slot: max(prompt tokens, pos_max + 1)
+    // in each context - the draft context can hold one seed row past the prompt mid-request (draft-mtp, see
+    // [TAG_SPEC_AVOID_DRAFT_REEVAL]), release() drops it. cells shared by seq_cp (n_cmpl children) count once per
+    // slot, so the room can be under-estimated, never over. -1 = per-slot KV streams, nothing to share
+    int32_t kv_room_for(const server_slot & self) const {
+        if (!params_base.kv_unified) {
+            return -1;
+        }
+
+        auto room_of = [&](llama_context * ctx) -> int64_t {
+            if (ctx == nullptr) {
+                return INT32_MAX;
+            }
+            llama_memory_t mem = llama_get_memory(ctx);
+            int64_t n_held = 0;
+            for (const auto & s : slots) {
+                if (s.id == self.id) {
+                    continue;
+                }
+                n_held += std::max<int64_t>(s.prompt.n_tokens(), (int64_t) llama_memory_seq_pos_max(mem, s.id) + 1);
+            }
+            return std::max<int64_t>(0, (int64_t) llama_n_ctx(ctx) - n_held);
+        };
+
+        return (int32_t) std::min(room_of(ctx_tgt), room_of(ctx_dft));
+    }
+
+    // [TAG_EVICT_ON_NEED] evict idle slots, least recently used first, until `self` has room for n_need cells. returns
+    // the room after eviction (-1 without a unified pool). never evicts `self` or a processing slot.
+    //
+    // why: with --kv-unified all slots share one pool, and an idle slot keeps its cells after release so the next turn
+    // of its conversation reuses them in place. 2026-10-28 production (27B hybrid, -np 2 --kv-unified,
+    // --no-cache-idle-slots, 420096 cells): slot 1 parked conversation ce64fcc22854dada at 172070 cells, the next
+    // request (5dcac908adb9acbc, 248289 tokens on disk) took slot 0 with 248026 cells free, 263 short. the disk load
+    // streamed 15.4 GB in 14 s, failed on its last segment and the slot re-prefilled 248k tokens (~5 min), and that
+    // prefill would hit the same wall near its end before the decode-retry path (try_clear_idle_slots) purged slot 1.
+    //
+    // this replaces the unconditional "save and clear all idle slots before selection" block (--cache-idle-slots):
+    // it made room by clearing every idle slot on every turn, including the one whose conversation the new task
+    // continues, so with the disk tier every turn reloaded the whole conversation from disk (15 GB on that one).
+    // eviction is cheap here: release_and_flush() already wrote the slot to the disk tier ([TAG_RELEASE_FLUSH]), so
+    // the prompt_save() inside slot_save_and_clear() finds "already flushed" and only the clear is left. the evicted
+    // conversation comes back later as a segment-streamed disk restore (with its .rec on hybrid models)
+    int32_t kv_make_room(const server_slot & self, int32_t n_need) {
+        int32_t n_room = kv_room_for(self);
+        if (n_room < 0) {
+            return n_room;
+        }
+
+        // the slot cannot use more than its context: evicting for more frees cells nobody will use
+        n_need = std::min(n_need, n_ctx_slot());
+
+        while (n_room < n_need) {
+            llama_memory_t mem = llama_get_memory(ctx_tgt);
+
+            server_slot * victim = nullptr;
+            for (auto & s : slots) {
+                if (s.id == self.id || s.is_processing()) {
+                    continue;
+                }
+                if (s.prompt.n_tokens() == 0 && llama_memory_seq_pos_max(mem, s.id) < 0) {
+                    continue;
+                }
+                if (victim == nullptr || s.t_last_used < victim->t_last_used) {
+                    victim = &s;
+                }
+            }
+
+            if (victim == nullptr) {
+                SLT_WRN(self, "needs %d cells, %d free in the unified KV pool and no idle slot left to evict\n", n_need, n_room);
+                break;
+            }
+
+            SLT_WRN(*victim, "evicting idle slot (%d tokens) for slot %d: needs %d cells, %d free in the unified KV pool\n",
+                    victim->prompt.n_tokens(), self.id, n_need, n_room);
+
+            if (prompt_cache && victim->prompt.n_tokens() > 0) {
+                slot_save_and_clear(*victim);
+            } else {
+                victim->prompt_clear();
+            }
+
+            n_room = kv_room_for(self);
+        }
+
+        return n_room;
+    }
+
     // return true if at least one slot has been cleared
     // TODO: improve logic
     //       - smarter decision which slot to clear (LRU or longest prompt?)
@@ -3673,28 +4278,32 @@ private:
             return res;
         }
 
+        // least recently used first, as kv_make_room() ([TAG_EVICT_ON_NEED]) does before the prefill; this is now the
+        // fallback for growth that was not known at slot selection (generation, a busy slot's own prefill)
+        server_slot * victim = nullptr;
         for (auto & slot : slots) {
-            if (slot.is_processing()) {
+            if (slot.is_processing() || slot.prompt.n_tokens() == 0) {
                 continue;
             }
-
-            if (slot.prompt.n_tokens() > 0) {
-                SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
-
-                // Park the state into the prompt cache before freeing the KV slot.
-                // Without this, the conversation's entire context is thrown away and
-                // the next request for it pays a full re-prefill instead of resuming.
-                if (prompt_cache) {
-                    slot_save_and_clear(slot);
-                } else {
-                    slot.prompt_clear();
-                }
-
-                res = true;
-
-                // clear slots one by one
-                break;
+            if (victim == nullptr || slot.t_last_used < victim->t_last_used) {
+                victim = &slot;
             }
+        }
+
+        if (victim != nullptr) {
+            SRV_WRN("purging slot %d with %zu tokens\n", victim->id, victim->prompt.tokens.size());
+
+            // Park the state into the prompt cache before freeing the KV slot.
+            // Without this, the conversation's entire context is thrown away and
+            // the next request for it pays a full re-prefill instead of resuming.
+            if (prompt_cache) {
+                slot_save_and_clear(*victim);
+            } else {
+                victim->prompt_clear();
+            }
+
+            // clear slots one by one
+            res = true;
         }
 
         return res;
@@ -4596,35 +5205,16 @@ private:
                         ~rq_task_end() { if (u.on) { u.t_tasks += ggml_time_us() - t0 - (u.named() - n0); } }
                     } rq_task_end_guard { ust, rq_task_t0, rq_task_named0 };
 
-                    // Save and clear all idle slots before slot selection so the KV pool is
-                    // free when prompt_load() runs inside get_available_slot().  Doing this
-                    // after launch (the old location) meant the load could fail with "no
-                    // available cells" because a prior conversation still occupied the pool.
-                    //
-                    // Why the clear here is unconditional, unlike the launch-time flush below
-                    // that clears only with kv_unified: a restore must not hold the incoming
-                    // state and the old slot state alive at the same time, or the memory
-                    // spike can OOM the box (the original bug this block fixed).
-                    //
-                    // The tradeoff: upstream keeps idle slot KV in place and truncates it to
-                    // the common prefix on the next request, so partial prompt matches are
-                    // free.  Here every turn instead pays a save + restore round-trip through
-                    // the RAM cache, and load() rejects candidates that would keep less than
-                    // 25% of a cached entry ([TAG_CACHE_SELECT_SIM]), so a request sharing
-                    // only a short prefix with the slot's previous state re-prefills from
-                    // scratch.  mtmd states take this path too (RAM tier only, never disk),
-                    // so they survive within a session but not across restarts.  Known
-                    // fallout: test_slot_save.py and
-                    // test_kv_keep_only_active.py::test_clear_and_restore fail on this
-                    // branch (pre-dates the 2026-08-13 master merge, verified against
-                    // clean-master and pre-merge control builds).
-                    if (params_base.cache_idle_slots) {
-                        for (auto & s : slots) {
-                            if (!s.is_processing()) {
-                                slot_save_and_clear(s);
-                            }
-                        }
-                    }
+                    // [TAG_EVICT_ON_NEED] there used to be a "save and clear all idle slots" block here, under
+                    // --cache-idle-slots, so the pool was free when prompt_load() ran in get_available_slot() (after
+                    // launch was too late: the load failed with "no available cells"). it cleared every idle slot on
+                    // every turn, non-unified ones included (which frees nothing) and the slot whose conversation the
+                    // task continues: with the disk tier that slot then reloaded from disk every turn (15 GB on the
+                    // 248k conversation of 2026-10-28), and the RAM tier lost in-slot prefix reuse (test_slot_save.py,
+                    // test_kv_keep_only_active.py::test_clear_and_restore failed on this branch because of it).
+                    // with the flag off the pool overbooked instead (420096 cells, 172070 parked, 263 short, 15.4 GB
+                    // streamed for nothing). get_available_slot() now evicts idle slots only when the chosen slot needs
+                    // their cells, with or without the flag (kv_make_room)
                     const int64_t rq_sel_t0 = ust.on ? ggml_time_us() : 0;
                     if (ust.on) {
                         rq_pre.t_idle_save = rq_sel_t0 - rq_task_t0;
@@ -4684,6 +5274,11 @@ private:
                     }
 
                     if (params_base.cache_idle_slots) {
+                        // [TAG_EVICT_ON_NEED] with the disk tier the clear is skipped: prompt_save() keeps nothing in
+                        // host RAM, so a cleared slot comes back only as a full disk restore, and get_available_slot()
+                        // already clears an idle slot when its cells are needed. the save still runs: it flushes the
+                        // tail of a slot that was released without the release flush (error, cancel)
+                        const bool clear_idle = params_base.kv_unified && prompt_cache->disk_path.empty();
                         for (auto & slot : slots) {
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
@@ -4693,7 +5288,7 @@ private:
                                     { server_ustats_timer ut(server_ustats().t_prompt_cache); prompt_cache->update(); }
                                 }
 
-                                if (params_base.kv_unified) {
+                                if (clear_idle) {
                                     // [TAG_IDLE_SLOT_CLEAR]
                                     slot.prompt_clear();
                                 }
@@ -7433,9 +8028,16 @@ private:
 
                 slot.state_changed(); // [TAG_REC_REUSE] the trim below (and the verify decode before it)
                 if (slot.ctx_dft && pos_seed == pos_next) {
-                    if (!llama_memory_seq_rm(llama_get_memory(slot.ctx_tgt), slot.id, pos_next,     -1) ||
-                        !llama_memory_seq_rm(llama_get_memory(slot.ctx_dft), slot.id, pos_next + 1, -1)) {
-                        GGML_ABORT("failed to remove sequence %d from pos %d\n", slot.id, pos_next);
+                    // [fork, 2026-10-30] the abort used to say only "failed to remove sequence 0 from pos 1274", not which
+                    // memory refused. That one was the target: a later ubatch of the same decode moved the slot's recurrent
+                    // cell (-np 3, three seqs in one batch), fixed in the recurrent init_batch (moves_done_seq). Name the side
+                    const bool ok_tgt = llama_memory_seq_rm(llama_get_memory(slot.ctx_tgt), slot.id, pos_next, -1);
+                    const bool ok_dft = ok_tgt && llama_memory_seq_rm(llama_get_memory(slot.ctx_dft), slot.id, pos_next + 1, -1);
+                    if (!ok_tgt || !ok_dft) {
+                        GGML_ABORT("failed to remove sequence %d from pos %d (%s refused, tgt pos_max %d, dft pos_max %d)\n",
+                                slot.id, pos_next + (ok_tgt ? 1 : 0), ok_tgt ? "ctx_dft" : "ctx_tgt",
+                                llama_memory_seq_pos_max(llama_get_memory(slot.ctx_tgt), slot.id),
+                                llama_memory_seq_pos_max(llama_get_memory(slot.ctx_dft), slot.id));
                     }
                 } else {
                     slot.mem.seq_rm(slot.id, pos_next, -1);

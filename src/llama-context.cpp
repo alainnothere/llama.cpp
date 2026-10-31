@@ -27,6 +27,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <set>
 #include <string>
 #include <unordered_map>
 
@@ -363,6 +364,7 @@ llama_context::llama_context(
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
     cparams.perf_instrumentation    = params.perf_instrumentation;
+    cparams.kv_cache_convert        = params.kv_cache_convert;
     cparams.warmup                  = false;
 
     // +1: id n_layer() taps the output of the last layer ("input" of the head)
@@ -637,6 +639,8 @@ llama_context::llama_context(
     }
 
     // init the memory module
+    lazy_type_k = params.type_k; // [fork, 2026-10-30] for memory_breakdown()'s lazy staging bound
+    lazy_type_v = params.type_v;
     if (!hparams.vocab_only) {
         llama_memory_params params_mem = {
             /*.type_k    =*/ params.type_k,
@@ -1768,6 +1772,20 @@ int32_t llama_context::set_logits_subset(const llama_token * ids, int32_t n_ids)
         }
         // weights usage: the scheduler places the head matvec on this buffer's backend, like model.output
         ggml_backend_buffer_set_usage(buf_new.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+        // [fork, 2026-10-30] lazy device allocation after the fit (design-fit-lazy-reserve-and-warmup-gate.md A, inventory
+        // row Q): the new head buffer is allocated while the old one is still alive (freed by the assignment below), so
+        // the device peaks at old + new for the duration. The fit reserves it in the margin (common_fit_vocab_subset_
+        // bytes, fit.cpp) at the bound n_vocab-subset size, not at the transient 2x. Logged at WARN (lib INFO is hidden
+        // at the default -lv 3) because the ggml-vulkan LAZY ALLOC lines cannot see it (an ordinary buffer allocation).
+        {
+            const double MiB     = 1024.0 * 1024.0;
+            const size_t old_sz  = logits_subset_buf ? ggml_backend_buffer_get_size(logits_subset_buf.get()) : 0;
+            const size_t new_sz  = ggml_backend_buffer_get_size(buf_new.get());
+            LLAMA_LOG_WARN("%s: LAZY ALLOC vocab-head on %s: %.2f -> %.2f MiB (%d rows, n_pad %d -> %d; transient peak %.2f MiB while both exist)\n",
+                __func__, dev ? ggml_backend_dev_name(dev) : "?", old_sz/MiB, new_sz/MiB, n_ids,
+                logits_subset.active() ? logits_subset.n_pad : 0, n_pad, (old_sz + new_sz)/MiB);
+        }
 
         ls.n_pad = n_pad;
         ls.gen   = logits_subset.gen + 1;
@@ -5205,8 +5223,11 @@ size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
 
 size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
     llama_io_read_host io(src, size);
+    state_read_convert_begin(io);
     try {
-        return state_read_data(io);
+        const size_t n = state_read_data(io);
+        state_read_convert_end(io, "state_set_data");
+        return n;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
         io.discard();
@@ -5275,6 +5296,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
         io = std::make_unique<llama_io_read_device>(src, size, mem_storage[seq_id_read]);
     } else {
         io = std::make_unique<llama_io_read_host>(src, size);
+        state_read_convert_begin(*io);
     }
 
     try {
@@ -5287,7 +5309,9 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
         llama_seq_id seq_id_read;
         io->read(&seq_id_read, sizeof(seq_id_read));
 
-        return state_seq_read_data(*io, seq_id, flags);
+        const size_t n = state_seq_read_data(*io, seq_id, flags);
+        state_read_convert_end(*io, "state_seq_set_data");
+        return n;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
         io->discard();
@@ -5327,7 +5351,9 @@ bool llama_context::state_load_file(const char * filepath, llama_token * tokens_
         const size_t n_state_size_cur = file.size() - file.tell();
 
         llama_io_read_file io( &file);
+        state_read_convert_begin(io);
         const size_t n_read = state_read_data(io);
+        state_read_convert_end(io, "state_load_file");
 
         if (n_read != n_state_size_cur) {
             LLAMA_LOG_ERROR("%s: did not read all of the session file data! size %zu, got %zu\n", __func__, n_state_size_cur, n_read);
@@ -5397,7 +5423,11 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
     {
         const size_t state_size = file.size() - file.tell();
         llama_io_read_file io(&file);
+        state_read_convert_begin(io);
         const size_t nread = state_seq_read_data(io, seq_id, 0);
+        if (nread) {
+            state_read_convert_end(io, "state_seq_load_file");
+        }
         if (!nread) {
             LLAMA_LOG_ERROR("%s: failed to restore sequence state\n", __func__);
             return 0;
@@ -5487,6 +5517,40 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
     return io.n_bytes();
 }
 
+// [fork, 2026-10-30] K/V type conversion on load. why on the reader and not an offline converter: the blob is
+// self-describing per layer (type + row size in front of every K and V tensor) and every restore path (slot files,
+// disk prompt cache segments, checkpoints, the draft context's blob) already funnels through
+// llama_kv_cache::state_read_data, so converting there covers all of them, needs no second copy of a 10+ GB cache on
+// disk, and leaves the writer untouched (the server rewrites the file in its own type at the next flush, see
+// server_prompt_cache::flush_from_context). the cost is host CPU on the load (threaded, see llama_kv_cache; CPU bench
+// 2026-10-30, LFM2-80M 16k cells: f16->q8_0 1.7 GB/s, q8_0->f16 1.1 GB/s of saved K/V; ESTIMATE, not measured: ~4 s of host time for the 27B at 98k cells, ~6 GB of f16 K/V)
+void llama_context::state_read_convert_begin(llama_io_read_i & io) const {
+    io.kv_convert = cparams.kv_cache_convert;
+}
+
+void llama_context::state_read_convert_end(llama_io_read_i & io, const char * what) {
+    const auto & c = io.kv_conv;
+    if (c.n_tensors == 0) {
+        return;
+    }
+
+    // one line per load, WARN so it survives the default verbosity (lib INFO is TRACE in this fork) and
+    // llamaRunReport can count it; a server restore of N segments makes N of these plus its own summary line
+    LLAMA_LOG_WARN("%s: K/V type conversion on load: %s->%s%s, %" PRIu64 " tensors, %" PRIu64 " rows, %.1f MiB read -> %.1f MiB written\n",
+            what,
+            c.type_src >= 0 ? ggml_type_name((ggml_type) c.type_src) : "?",
+            c.type_dst >= 0 ? ggml_type_name((ggml_type) c.type_dst) : "?",
+            c.mixed ? " (mixed pairs, last shown)" : "",
+            c.n_tensors, c.n_rows,
+            c.n_bytes_src / (1024.0 * 1024.0), c.n_bytes_dst / (1024.0 * 1024.0));
+
+    kv_conv_total.n_loads     += 1;
+    kv_conv_total.n_bytes_src += c.n_bytes_src;
+    kv_conv_total.n_bytes_dst += c.n_bytes_dst;
+    kv_conv_total.type_src     = c.type_src;
+    kv_conv_total.type_dst     = c.type_dst;
+}
+
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     if (memory) {
         memory->state_read(io, seq_id, flags);
@@ -5519,6 +5583,66 @@ void llama_context::perf_reset() {
     t_p_eval_us = n_p_eval = 0;
     n_reused    = 0;
     n_reuse_skipped_pp = 0;
+}
+
+// [fork, 2026-10-30] fit step 3 B (design-fit-lazy-reserve-and-warmup-gate.md, contextFiles): lazy device memory the
+// backend allocates AFTER the scheduler reserve, priced per device for this context's shape so every fit probe sees it.
+//
+// Why: 2026-10-30 09:50, Qwen3.8-27B Q4_u, q8 KV, -np 3, 3 cards: the fit placed 22961 of 24511 MiB on Vulkan1 (compute
+// 6908, scratch 5093), 1446 MiB free after context init; the first request (98k disk restore + 76-token pp + decode)
+// moved GTT 20 -> 1046 MiB and VRAM 23114 -> 22291 with no SCRATCH GROW line in between, tg 34 -> 26 t/s. The unpriced
+// allocations (agent-reports/2026-10-30-lazy-vulkan-allocations-fit-inventory.md section 1): device and context sync
+// staging (grow to the largest single readback, permanent), D2D rings per ordered device pair, descriptor/pipeline
+// arenas. The backend owns the sizing rules (ring_target, staging, arenas); llama only describes the shape here:
+//
+//   n_ubatch, n_embd        cparams.n_ubatch, hparams.n_embd: hop = n_ubatch x n_embd x 4 bytes (f32 activations)
+//   n_links_in / _out       walk the layers THIS context's graph runs (target: [0, n_layer()), MTP: the nextn layers)
+//                           followed by the output head; every change of device between two consecutive non-CPU
+//                           entries is one ordered pair src -> dst (deduplicated: one pair per boundary). A layer on the
+//                           CPU breaks the chain (host copies are not D2D rings). The head counts only when it is not on
+//                           the last layer's device. Input embeddings come from the host, no ring.
+//   max_state_read_bytes    max over this device's layers of
+//                             KV layer:        cells x ggml_row_size(type_k, n_embd_k_gqa(il)),
+//                                              cells x ggml_row_size(type_v, n_embd_v_gqa(il))
+//                             recurrent layer: max(n_embd_r, n_embd_s) x 4 (F32, create_memory) x max(1, n_seq_max)
+//                           with cells = n_ctx_seq (= n_ctx when unified), clamped to LLAMA_LAZY_STATE_READ_CHUNK_TOKENS
+//                           when that is non-zero. The whole-sequence RAM prompt-cache save (server-context.cpp:1391)
+//                           and the non-delta disk flush (server-task.cpp:2449) read one layer's full K (then V) range in
+//                           ONE ggml_backend_tensor_get (llama_kv_cache state_write_data -> io.write_tensor), and
+//                           ggml_vk_buffer_read_2d stages that whole range on a dGPU. Upper bounds, deliberately:
+//                           SWA layers use the full n_ctx_seq too (the device max is set by the full-attention layers on
+//                           every model this rig runs); a transposed V (no flash attention) is read per element column
+//                           in the real code, smaller than the V row bound used here. Recurrent: one tensor_get per layer
+//                           and cell range; a whole-state save covers all mem_size = n_seq_max cells of group 0. The
+//                           rollback snapshot groups (n_rs_seq) are never read through tensor_get as far as the
+//                           2026-10-30 inventory found: UNKNOWN beyond that, not counted. Logits / embeddings readbacks
+//                           are not counted either: they land in buf_output, the backend's host buffer type (pinned
+//                           Vulkan_Host on a dGPU), so no staging - precondition, revisit if buf_output ever moves to a
+//                           plain CPU buffer (n_outputs_max defaults to n_batch: 8192 x 248k x 4 would be 8 GB of bound).
+//   max_state_write_bytes   0: the restore path (tensor_set from non-pinned host memory) uses the mapped path when the
+//                           device has a device-local host-visible memory type (ReBAR); no proc reports that, so 0 is a
+//                           PRECONDITION: ReBAR present on all three cards of this rig per vulkaninfo 2026-10-30. A card
+//                           without ReBAR stages the largest restore range (same size as the read bound) - unpriced.
+//   n_contexts              1 for lazy_vram/_gtt. The increment of a second context on the device (draft / MTP) is
+//                           proc(this shape, n_contexts 2) - proc(this shape without links, n_contexts 1), kept in
+//                           lazy_*_2nd; common/fit.cpp add_extra_memory charges that for the extra context on a
+//                           main-model device, so the device total = target's rings + the extra's rings + device
+//                           staging once (the target's bound, which dominates: the MTP context holds one
+//                           full-attention layer, the target holds 16 of the same width plus the RS planes) + context
+//                           staging and arenas x 2 - i.e. the proc's n_contexts = 2 reading with both contexts' links.
+// Missing proc (CPU, lavapipe builds without it, other backends, the ggml-vulkan side not landed yet) = 0/0.
+// Section C of the design chunks the save-side reads to DISK_SEGMENT_TOKENS (8192); once C ships set this to 8192 and the
+// staging bound drops from n_ctx_seq x row (648448 x 1088 B = 673 MiB per q8 K layer on the 27B) to ~8.5 MiB.
+static constexpr uint32_t LLAMA_LAZY_STATE_READ_CHUNK_TOKENS = 0; // 0 = whole-range reads (today, before C)
+
+static void llama_lazy_reserve_query(ggml_backend_dev_t dev, const ggml_backend_fork_lazy_params & p, size_t & vram, size_t & gtt) {
+    vram = gtt = 0;
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    auto fn = reg ? (ggml_backend_fork_dev_lazy_reserve_t)
+        ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_FORK_DEV_LAZY_RESERVE_PROC) : nullptr;
+    if (fn != nullptr) {
+        fn(dev, &p, &vram, &gtt);
+    }
 }
 
 llama_memory_breakdown llama_context::memory_breakdown() const {
@@ -5559,6 +5683,97 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ggml_backend_buffer_type_t buft = ggml_backend_sched_get_buffer_type(sched.get(), backend);
             ret[buft].compute += sz;
             ret[buft].scratch += sz;
+        }
+    }
+    // [fork, 2026-10-30] lazy reserve per device (see llama_lazy_reserve_query above for every formula and precondition)
+    if (!model.hparams.vocab_only && !backends.empty()) {
+        const auto & hp     = model.hparams;
+        const bool   is_mtp = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && hp.n_layer_nextn > 0;
+        const uint32_t il0  = is_mtp ? hp.n_layer() : 0;
+        const uint32_t il1  = is_mtp ? hp.n_layer_all : hp.n_layer();
+
+        auto is_gpu = [](ggml_backend_dev_t d) {
+            return d != nullptr && ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_CPU;
+        };
+
+        // layer chain + output head -> ordered device pairs
+        std::vector<ggml_backend_dev_t> chain;
+        chain.reserve(il1 - il0 + 1);
+        for (uint32_t il = il0; il < il1; il++) {
+            chain.push_back(model.dev_layer(il));
+        }
+        chain.push_back(model.dev_output());
+        std::set<std::pair<ggml_backend_dev_t, ggml_backend_dev_t>> pairs;
+        for (size_t i = 1; i < chain.size(); i++) {
+            if (chain[i] != chain[i - 1] && is_gpu(chain[i]) && is_gpu(chain[i - 1])) {
+                pairs.insert({ chain[i - 1], chain[i] });
+            }
+        }
+
+        const bool recr_all = llm_arch_is_recurrent(model.arch);
+        const bool hybrid   = llm_arch_is_hybrid(model.arch);
+        uint64_t cells = cparams.n_ctx_seq;
+        if (LLAMA_LAZY_STATE_READ_CHUNK_TOKENS > 0) {
+            cells = std::min<uint64_t>(cells, LLAMA_LAZY_STATE_READ_CHUNK_TOKENS);
+        }
+        const uint64_t rs_rows = std::max<uint32_t>(1, cparams.n_seq_max);
+
+        std::set<ggml_backend_dev_t> seen;
+        for (const auto & backend_ptr : backends) {
+            ggml_backend_t     backend = backend_ptr.get();
+            ggml_backend_dev_t dev     = ggml_backend_get_device(backend);
+            if (!is_gpu(dev) || !seen.insert(dev).second) {
+                continue;
+            }
+            ggml_backend_fork_lazy_params p = {};
+            p.n_ubatch = cparams.n_ubatch;
+            p.n_embd   = hp.n_embd;
+            for (const auto & pr : pairs) {
+                p.n_links_out += pr.first  == dev ? 1 : 0;
+                p.n_links_in  += pr.second == dev ? 1 : 0;
+            }
+            uint64_t rd = 0;
+            for (uint32_t il = il0; il < il1; il++) {
+                if (model.dev_layer(il) != dev) {
+                    continue;
+                }
+                const bool recr = recr_all || (hybrid && hp.is_recr(il));
+                if (recr) {
+                    rd = std::max<uint64_t>(rd, uint64_t(std::max(hp.n_embd_r(), hp.n_embd_s())) * sizeof(float) * rs_rows);
+                } else if (hp.has_kv(il)) {
+                    rd = std::max<uint64_t>(rd, cells * ggml_row_size(lazy_type_k, hp.n_embd_k_gqa(il)));
+                    rd = std::max<uint64_t>(rd, cells * ggml_row_size(lazy_type_v, hp.n_embd_v_gqa(il)));
+                }
+            }
+            p.max_state_read_bytes  = rd;
+            p.max_state_write_bytes = 0; // ReBAR precondition, see above
+            p.n_contexts            = 1;
+
+            size_t v1 = 0, g1 = 0, v2 = 0, g2 = 0, v0 = 0, g0 = 0;
+            llama_lazy_reserve_query(dev, p, v1, g1);
+            // 2nd-context increment = proc(this shape, n_contexts 2) - proc(same, n_contexts 1, NO links): the ggml-vulkan
+            // proc (2026-10-30) prices rings from n_links_out alone, NOT x n_contexts ("n_links_out must be the total over
+            // every context the caller prices"), and the device staging once. Subtracting a link-free single-context
+            // reading leaves exactly this context's rings + its context staging + its arena allowance.
+            {
+                ggml_backend_fork_lazy_params p0 = p;
+                p0.n_links_in = p0.n_links_out = 0;
+                llama_lazy_reserve_query(dev, p0, v0, g0);
+            }
+            p.n_contexts = 2;
+            llama_lazy_reserve_query(dev, p, v2, g2);
+            const size_t v2nd = v2 > v0 ? v2 - v0 : 0;
+            const size_t g2nd = g2 > g0 ? g2 - g0 : 0;
+
+            ggml_backend_buffer_type_t buft = ggml_backend_sched_get_buffer_type(sched.get(), backend);
+            ret[buft].lazy_vram     += v1;
+            ret[buft].lazy_gtt      += g1;
+            ret[buft].lazy_vram_2nd += v2nd;
+            ret[buft].lazy_gtt_2nd  += g2nd;
+            LLAMA_LOG_DEBUG("%s: lazy reserve %s: links in %u out %u, hop %zu B, state read %" PRIu64 " B -> %zu + %zu MiB "
+                    "(2nd context +%zu + %zu MiB)\n", __func__, ggml_backend_dev_name(dev), p.n_links_in, p.n_links_out,
+                    size_t(p.n_ubatch) * p.n_embd * sizeof(float), rd, v1 >> 20, g1 >> 20,
+                    v2nd >> 20, g2nd >> 20);
         }
     }
     return ret;
@@ -5847,6 +6062,7 @@ llama_context_params llama_context_default_params() {
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
         /*.perf_instrumentation        =*/ false,
+        /*.kv_cache_convert            =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
@@ -6616,6 +6832,10 @@ int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_
 //
 // ext
 //
+
+llama_state_convert_stats llama_state_get_convert_stats(const struct llama_context * ctx) {
+    return ctx->state_convert_stats();
+}
 
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
     return ctx->memory_breakdown();

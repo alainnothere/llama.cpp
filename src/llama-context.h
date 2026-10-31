@@ -181,6 +181,9 @@ struct llama_context {
     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags, llama_pos p0 = -1, llama_pos p1 = -1);
     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
 
+    // [fork, 2026-10-30] K/V type conversion on load, see llama_io_read_i::kv_convert
+    llama_state_convert_stats state_convert_stats() const { return kv_conv_total; }
+
     bool state_load_file(
             const char * filepath,
            llama_token * tokens_out,
@@ -304,6 +307,10 @@ private:
     size_t state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos p0 = -1, llama_pos p1 = -1);
     size_t state_seq_read_data (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags);
 
+    // arm the io for conversion (host/file readers only) and, after a successful load, log + accumulate what it did
+    void state_read_convert_begin(llama_io_read_i & io) const;
+    void state_read_convert_end  (llama_io_read_i & io, const char * what);
+
     //
     // members
     //
@@ -311,6 +318,8 @@ private:
     const llama_model & model;
 
     llama_cparams cparams;
+
+    llama_state_convert_stats kv_conv_total = { 0, 0, 0, -1, -1 };
 
     // [fork, 2026-10-22 night] llama_set_n_ubatch_cap: 0 = off, else min(cparams.n_ubatch, this) per ubatch
     uint32_t n_ubatch_cap = 0;
@@ -422,6 +431,11 @@ private:
     std::vector<ggml_backend_t>             backend_ptrs;
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
+
+    // [fork, 2026-10-30] KV cache types this context was created with (llama_context_params::type_k/type_v; cparams does
+    // not keep them). Read only by memory_breakdown() to size the lazy staging bound (fit step 3 B).
+    ggml_type lazy_type_k = GGML_TYPE_F16;
+    ggml_type lazy_type_v = GGML_TYPE_F16;
 
     // Separate arenas give batches with and without outputs distinct CUDA graph cache keys.
     std::array<llm_graph_result_ptr, 2> gf_res_prev;

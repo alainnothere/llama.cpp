@@ -162,6 +162,7 @@ struct common_log {
     // default capacity
     common_log(size_t capacity = 512) {
         file       = nullptr;
+        fit_file   = nullptr;
         colors     = false;
         prefix     = false;
         timestamps = false;
@@ -180,6 +181,9 @@ struct common_log {
         if (file) {
             fclose(file);
         }
+        if (fit_file) {
+            fclose(fit_file);
+        }
     }
 
 private:
@@ -189,6 +193,12 @@ private:
     std::condition_variable cv_full; // wait on full
 
     FILE * file;
+    // [fork, 2026-10-30] --fit-log-file: a second sink that receives only the lines of the memory-fit story (fit summary /
+    // trace, LAZY ALLOC, SCRATCH GROW, GALLOC GROW, GTT WATCH, GPU/CPU PLACEMENT, fit verify), so the owner can read the
+    // fit's view next to the kernel's without grepping the 100 MB production log (output_log.txt has 1200 lines of timing
+    // per hour of use). Substring match on the message text; the list lives in fit_log_match(). Append mode: one file
+    // across restarts is the point (the warm-up gate reloads the model, and the launch script restarts the server).
+    FILE * fit_file;
 
     bool colors;
     bool prefix;
@@ -202,12 +212,31 @@ private:
     size_t head;
     size_t tail;
 
+    static bool fit_log_match(const char * msg) {
+        static const char * keys[] = {
+            "fit ", "fit:", "fit_", "LAZY ALLOC", "SCRATCH GROW", "GALLOC GROW", "GTT WATCH", "PLACEMENT", "fit verify",
+            "n_ctx ", "memory breakdown", "sched_reserve", "compute buffer size", "model buffer size", "KV self size",
+            "llama_kv_cache", "llama_memory_recurrent",
+        };
+        for (const char * k : keys) {
+            if (strstr(msg, k)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     bool print_entry(const common_log_entry & e) const {
         if (e.is_end) return true;
 
         e.print();
         if (file) {
             e.print(file);
+        }
+        if (fit_file && (e.level == GGML_LOG_LEVEL_CONT || fit_log_match(e.msg.data()))) {
+            // CONT lines (multi-line fit traces) follow their head line; they are cheap and the file is a sidecar
+            e.print(fit_file);
+            fflush(fit_file);
         }
         return false;
     }
@@ -384,6 +413,18 @@ public:
         thrd.join();
     }
 
+    void set_fit_file(const char * path) {
+        pause();
+
+        if (fit_file) {
+            fclose(fit_file);
+        }
+
+        fit_file = path ? fopen(path, "a") : nullptr;
+
+        resume();
+    }
+
     void set_file(const char * path) {
         pause();
 
@@ -491,6 +532,10 @@ void common_log_add_json(struct common_log * log, const char * type, const commo
     }
 
     log->add_json(type, obj);
+}
+
+void common_log_set_fit_file(struct common_log * log, const char * file) {
+    log->set_fit_file(file);
 }
 
 void common_log_set_file(struct common_log * log, const char * file) {

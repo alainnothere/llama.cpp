@@ -174,7 +174,8 @@ public:
     // make ubatches of equal-length sequences sets
     // if sequential == true, the tokens in the ubatch will have increasing sequential sequence ids
     // n_keep_tail = minimum trailing tokens of a seq that must land in the same ubatch
-    llama_ubatch split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail);
+    // one_seq = true: at most one sequence set per ubatch (see llama_memory_recurrent::moves_done_seq, 2026-10-30)
+    llama_ubatch split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail, bool one_seq = false);
 
     // sequence-set-wise split - each ubatch contains a single sequence-set
     llama_ubatch split_seq(uint32_t n_ubatch);

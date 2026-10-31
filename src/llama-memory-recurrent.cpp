@@ -647,7 +647,11 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_brea
 }
 
 llama_memory_context_ptr llama_memory_recurrent::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
-    do {
+    // [fork, 2026-10-30] pass 1 splits as before; when it would move the recurrent cell of a seq that already finished in
+    // an earlier ubatch (its snapshot planes get overwritten and the post-verify rollback is refused, the -np 3 abort, see
+    // llama_memory_recurrent::moves_done_seq), pass 2 re-splits with one seq per ubatch, which never moves another seq
+    bool one_seq = false;
+    while (true) {
         balloc.split_reset();
 
         std::vector<llama_ubatch> ubatches;
@@ -663,7 +667,7 @@ llama_memory_context_ptr llama_memory_recurrent::init_batch(llama_batch_allocr &
                 // [TAG_RECURRENT_ROLLBACK_SPLITS]
                 // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
                 //   so that the rollback snapshots remain valid
-                ubatch = balloc.split_equal(n_ubatch, true, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                ubatch = balloc.split_equal(n_ubatch, true, n_rs_seq > 0 ? n_rs_seq + 1 : 0, one_seq);
             }
 
             if (ubatch.n_tokens == 0) {
@@ -678,12 +682,17 @@ llama_memory_context_ptr llama_memory_recurrent::init_batch(llama_batch_allocr &
             break;
         }
 
+        if (!one_seq && !embd_all && moves_done_seq(ubatches)) {
+            one_seq = true;
+            continue;
+        }
+
         if (!prepare(ubatches)) {
             break;
         }
 
         return std::make_unique<llama_memory_recurrent_context>(this, std::move(ubatches));
-    } while (false);
+    }
 
     return std::make_unique<llama_memory_recurrent_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
 }
@@ -706,6 +715,12 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
     auto org_used = used;
     auto org_head = head;
 
+    // [fork, 2026-10-30] find_slot() resets the rollback bounds of the seqs its gather moves out of the ubatch range.
+    // a dry run must not: when the decode then fails (attention prepare, KV full -> the server retries smaller) those
+    // seqs had lost their rollback for nothing. apply() re-runs find_slot and resets them for real when it moves them
+    auto org_rs_depth   = rs_depth;
+    auto org_rs_pre_pos = rs_pre_pos;
+
     bool success = true;
 
     for (const auto & ubatch : ubatches) {
@@ -719,8 +734,86 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
     cells = std::move(org_cells);
     used = org_used;
     head = org_head;
+    rs_depth   = std::move(org_rs_depth);
+    rs_pre_pos = std::move(org_rs_pre_pos);
 
     return success;
+}
+
+// [fork, 2026-10-30] production abort "server-context.cpp:8002: failed to remove sequence 0 from pos 1274" (Qwen3.8-27B
+// Q6, -np 3 --kv-unified --spec-rs-depth 24, three conversations at once; contextFiles/crash-logs-2026-10-30-seq_rm-np3).
+// The target decode was 535 rows in 3 ubatches (decode_stats ctx 105: slot 1 prompt chunk 147146..147658 = 512 rows +
+// 23 verify rows of slots 0 and 2). split_equal's n_keep_tail rule emitted slot 0's verify rows in an earlier ubatch than
+// a ubatch holding seqs 1 and 2. find_slot() places a ubatch on the contiguous cells [min, min + n_seqs); with
+// size == n_seq_max == 3 and seq 0's cell between theirs, the gather swapped seq 0 out: its group-0 state follows via src,
+// its snapshot groups and pre-ubatch plane stay at the old cell and the ubatch overwrites them, so find_slot reset its
+// rs_depth / rs_pre_pos (correctly). The server's post-verify seq_rm(pos_next) then had nothing to select -> false ->
+// GGML_ABORT. Needs >= 3 seqs in one decode (a 2-seq ubatch holds both seqs, a 1-seq ubatch never swaps): the same binary
+// ran 72 min with two conversations. Not preventable inside find_slot: with no spare cell every contiguous range of
+// 2 out of 3 cells covers the middle one, and a spare cell costs n_rs_seq + 2 planes (3.9 GB at 24 on the 27B).
+// Copying the left-behind planes would cost 25 x 150 MB per move inside the graph; re-splitting costs one extra ubatch
+// on the steps that would have moved a finished seq, and only then (DERIVED, not measured: ~40-50 ms of weight reads per
+// extra ubatch on the 27B from the 2026-10-23 step budget, weights 42 of a 92 ms 7-row step). CPU repro:
+// test-recurrent-state-rollback "foreign move" (failed on 10 of 10 rollback-capable dummy models before this, 2026-10-30).
+// On a 3-slot LFM2-80M n-gram server run the event fired once in ~100 multi-ubatch decodes (WARN below counts them).
+bool llama_memory_recurrent::moves_done_seq(const std::vector<llama_ubatch> & ubatches) {
+    if (n_rs_seq == 0 || ubatches.size() < 2) {
+        return false;
+    }
+
+    // the last ubatch of each seq: only the planes written there matter for the rollback after the decode
+    std::vector<int32_t> last(size, -1);
+    for (size_t k = 0; k < ubatches.size(); ++k) {
+        const auto & ub = ubatches[k];
+        for (uint32_t i = 0; i < ub.n_tokens; ++i) {
+            for (int32_t j = 0; j < ub.n_seq_id[i]; ++j) {
+                const llama_seq_id s = ub.seq_id[i][j];
+                if (s >= 0 && (uint32_t) s < size) {
+                    last[s] = (int32_t) k;
+                }
+            }
+        }
+    }
+
+    auto org_cells      = cells;
+    auto org_used       = used;
+    auto org_head       = head;
+    auto org_rs_depth   = rs_depth;
+    auto org_rs_pre_pos = rs_pre_pos;
+
+    bool moved = false;
+    std::vector<int32_t> tails(size);
+    for (size_t k = 0; k < ubatches.size() && !moved; ++k) {
+        for (uint32_t s = 0; s < size; ++s) {
+            tails[s] = cells[s].tail;
+        }
+        if (!find_slot(ubatches[k])) {
+            break; // prepare() reports it
+        }
+        for (uint32_t s = 0; s < size; ++s) {
+            if (last[s] >= 0 && last[s] < (int32_t) k && tails[s] >= 0 && cells[s].tail != tails[s]) {
+                // WARN at the 1st, 10th, 100th, ... event: how often the fallback (one extra ubatch) is paid, without
+                // a line per step when three slots decode together
+                n_moves_done_seq++;
+                if (n_moves_done_seq == n_moves_done_seq_log) {
+                    n_moves_done_seq_log *= 10;
+                    LLAMA_LOG_WARN("%s: ubatch %zu of %zu would move the recurrent cell of seq %u (its last ubatch was %d): "
+                            "splitting one seq per ubatch (event #%llu)\n",
+                            __func__, k, ubatches.size(), s, last[s], (unsigned long long) n_moves_done_seq);
+                }
+                moved = true;
+                break;
+            }
+        }
+    }
+
+    cells      = std::move(org_cells);
+    used       = org_used;
+    head       = org_head;
+    rs_depth   = std::move(org_rs_depth);
+    rs_pre_pos = std::move(org_rs_pre_pos);
+
+    return moved;
 }
 
 bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {

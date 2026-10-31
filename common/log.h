@@ -92,6 +92,7 @@ void common_log_add(struct common_log * log, enum ggml_log_level level, const ch
 //
 
 void common_log_set_file      (struct common_log * log, const char * file); // not thread-safe
+void common_log_set_fit_file  (struct common_log * log, const char * file); // not thread-safe; [fork 2026-10-30] fit-story sidecar, append mode
 void common_log_set_colors    (struct common_log * log, log_colors colors); // not thread-safe
 bool common_log_get_colors    (struct common_log * log);                    // whether colors are enabled
 void common_log_set_prefix    (struct common_log * log, bool prefix);       // whether to output prefix to each log

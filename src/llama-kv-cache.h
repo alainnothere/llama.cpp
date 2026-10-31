@@ -554,6 +554,17 @@ private:
     uint32_t n_rot_k = 0;
     uint32_t n_rot_v = 0;
 
+    // [fork, 2026-10-30] whether any graph input over this cache asked for the K / V rotation (build_input_k_rot /
+    // build_input_v_rot, called whatever n_rot is). n_rot_* is the cache's SETTING and goes into the state header, but
+    // not every attention path applies it: the plain MLA path (build_attn with llm_graph_input_attn_k, deepseek2,
+    // bailingmoe3, the hybrid attn_k child) never rotates, so its q8_0 K is stored unrotated under n_rot_k = 64.
+    // measured 2026-10-30 on the dummy models: treating the header value as truth put the f16 -> q8_0 converted
+    // logits at nmse 2.5e-3 (deepseek2) / 6.3e-2 (bailingmoe3) from native q8_0, vs 1.8e-9 / 1.3e-7 with the rotation
+    // forced off; the K/V conversion uses the rotation only where the graph does. the context's sched reserve builds
+    // the graph before any state can be loaded, so the flags are final by then
+    mutable bool k_rot_used = false;
+    mutable bool v_rot_used = false;
+
     // if all layers participating in the cache have constant head size, the value is stored here
     // otherwise the value is -1
     int32_t n_embd_head_k_all = 0;

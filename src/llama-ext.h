@@ -73,9 +73,27 @@ struct llama_memory_breakdown_data {
     // compute, so total() and every existing sum stay right; kept apart only so the fit summary can print it.
     // Measured gap it closes: prealloc_x 1368 MiB per XTX at -c 350000 (one layer's K+V copy above ~262k cells).
     size_t scratch = 0;
+    // [fork, 2026-10-30] fit step 3 B (design-fit-lazy-reserve-and-warmup-gate.md): what the backend allocates LAZILY on
+    // this device after the reserve (D2D rings, sync staging, descriptor/pipeline arenas), as reported by the backend's
+    // GGML_BACKEND_FORK_DEV_LAZY_RESERVE_PROC for this context's shape; 0/0 when the backend has no such proc.
+    // NOT inside compute (it is an estimate, nothing is allocated for it at reserve time), but inside total(), so every
+    // fit sum charges it against the device's free exactly like compute. vram = device-local, gtt = host-visible memory
+    // the device maps (charged against VRAM free too: pessimistic by design, the kernel's eviction pressure is one pool).
+    // Why: 2026-10-30 Vulkan1 placed 22961 of 24511 MiB, 1446 MiB free after init, first request moved ~1 GB to GTT with
+    // no SCRATCH GROW line in between (rings, staging and gallocr re-plans were unpriced).
+    // Counted once per device, on the buffer type of the backend that runs on it (like scratch).
+    size_t lazy_vram = 0;
+    size_t lazy_gtt  = 0;
+    // the same figure as the INCREMENT this context adds when it is the SECOND context on the device (draft / MTP):
+    // proc(params, n_contexts = 2) - proc(params, n_contexts = 1). The fit's add_extra_memory charges this instead of
+    // lazy_vram/lazy_gtt for the extra context on a main-model device, so per-device singletons (device sync staging)
+    // are counted once, by the target context; per-context parts (context staging, rings, arenas) are counted per context.
+    // NOT in total().
+    size_t lazy_vram_2nd = 0;
+    size_t lazy_gtt_2nd  = 0;
 
     size_t total() const {
-        return model + context + compute;
+        return model + context + compute + lazy_vram + lazy_gtt;
     }
 };
 

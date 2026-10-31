@@ -44,6 +44,10 @@ def test_with_and_without_draft():
 
     # create new server with draft model
     create_server()
+    # [fork 2026-10-30] the draft sampling default is now probabilistic (rejection sampling consumes the RNG differently
+    # from the no-draft run, so the sequences legitimately diverge); this test's premise is "greedy drafting reproduces
+    # the no-draft output", so it asks for greedy explicitly. test_probabilistic_draft_sampling covers the other mode.
+    server.spec_draft_sampling = "greedy"
     server.start()
     res = server.make_request("POST", "/completion", data=request)
     assert res.status_code == 200
