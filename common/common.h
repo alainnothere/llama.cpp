@@ -650,7 +650,13 @@ struct common_params {
     bool cont_batching     = true;  // insert new sequences for decoding on-the-fly
     bool no_perf           = false; // disable performance metrics
     bool perf_instrumentation = false; // --performance-instrumentation: 5s decode()/synchronize() breakdown in libllama + server update_slots() timings
-    bool cache_convert        = false; // --cache-convert: a saved K/V state in f16 loads into a q8_0 cache and back (main and draft context)
+    // --cache-convert: a saved K/V state in f16 loads into a q8_0 cache and back (main and draft context).
+    // [fork] default ON since 2026-10-30 19:40: the gate ran on the owner's server the same evening, a 305946-token f16
+    // conversation restored into a q8_0 cache in 26.2 s (20.3 GB read -> 10.8 GB, main + 1195 MiB draft ctx, Vulkan path)
+    // vs ~10 min of re-prefill; four replays of the same question kept acceptance at 0.49-0.54 (f16 arm 0.45-0.51), i.e.
+    // the converted cache is sane. One-time cost: the conversation is rewritten in the server's type at the next flushes
+    // (41 segments, 10.2 GB here, async). off = the pre-2026-10-30 behaviour (type mismatch = cache miss).
+    bool cache_convert        = true;
     bool show_timings      = true;  // show timing information on CLI
     bool ctx_shift         = false; // context shift on infinite text generation
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
