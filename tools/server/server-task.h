@@ -175,6 +175,11 @@ struct server_task {
     int64_t t_impl_us    = 0;
     int64_t t_queued_us  = 0;
 
+    // [TAG_POOL_TURNS] the task waits in the deferred queue for room in the unified KV pool: start of the wait
+    // (ggml_time_us, 0 = not waiting) and the number of deferrals so far. set on the main loop thread only
+    int64_t t_pool_wait_us = 0;
+    int32_t n_pool_waits   = 0;
+
     // only used by CLI, this allow tokenizing CLI inputs on server side
     // we need this because mtmd_context and vocab are not accessible outside of server_context
     bool                    cli = false;
@@ -768,7 +773,17 @@ struct server_prompt_cache {
     // [TAG_EVICT_ON_NEED] number of tokens load() would restore into the slot for this request, without touching any
     // context or reading a .kv file: the RAM entry load() would pick, else the disk state of conversation_id (the
     // in-RAM mirror, or the .hdr alone). -1 = load() would restore nothing and the slot keeps its own state
-    int32_t restore_n_tokens(const server_prompt & prompt, const server_tokens & tokens_new, const std::string & conversation_id, bool has_dft);
+    // src (optional): 1 = the RAM entry, 2 = the disk tier, 0 = nothing ([TAG_POOL_TURNS_READAHEAD] reads it)
+    int32_t restore_n_tokens(const server_prompt & prompt, const server_tokens & tokens_new, const std::string & conversation_id, bool has_dft, int * src = nullptr);
+
+    // [TAG_POOL_TURNS_READAHEAD] page-cache read-ahead (POSIX_FADV_WILLNEED) of the conversation's .kv/.drft/.rec on a
+    // detached thread, for a task that waits for pool room. skipped (false, reason logged) when MemAvailable does not
+    // cover the files plus a margin, the files are missing, or the platform has no posix_fadvise
+    bool disk_readahead(const std::string & conversation_id);
+
+    // [TAG_POOL_TURNS] set by the last load(): a RAM entry or the disk state was refused for lack of pool room (n_room),
+    // so the slot prefills from what it holds. the admission check in get_available_slot() makes this unreachable
+    bool last_load_refused_room = false;
 
     // [LLAMA_SERVER_UBATCH_STATS] 2026-10-22 night, set by the last load(): 0 = nothing restored (the slot's own state
     // stays), 1 = RAM entry, 2 = disk tier; bytes restored; the LCP scan over the RAM entries (us)

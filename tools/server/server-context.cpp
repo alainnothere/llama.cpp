@@ -3996,7 +3996,18 @@ private:
         return nullptr;
     }
 
-    server_slot * get_available_slot(const server_task & task) {
+    // [TAG_POOL_TURNS] why get_available_slot() returned nullptr with a free slot: the task does not fit the unified KV
+    // pool next to the processing slots, it waits for one of them to release (the caller defers it)
+    struct pool_wait_info {
+        bool        wait        = false;
+        int32_t     id_slot     = -1; // the slot it would have taken
+        int32_t     n_need      = 0;  // cells: max(prompt, restore), clamped to the slot context
+        int32_t     n_room      = 0;  // room after evicting every idle slot
+        int         restore_src = 0;  // 1 = RAM entry, 2 = disk tier (restore_n_tokens)
+        std::string holders;          // the processing slots and their cells
+    };
+
+    server_slot * get_available_slot(const server_task & task, pool_wait_info * pool_wait = nullptr) {
         server_slot * ret = nullptr;
 
         bool update_cache = false;
@@ -4085,11 +4096,78 @@ private:
             }
         }
 
+        // [TAG_POOL_TURNS] a slot requested by id is returned busy and the caller defers the task. this used to fall
+        // through: with --slot-prompt-similarity != 0 the similarity loop skips the busy slot, f_sim_best stays 0, so
+        // f_keep = 0 set update_cache and the busy slot got prompt_save() + prompt_load() (a restore into a sequence
+        // that is being decoded) before the caller saw is_processing() and deferred
+        if (ret && ret->is_processing()) {
+            return ret;
+        }
+
         if (ret) {
             update_cache = update_cache && prompt_cache;
 
             // cache prompts only for the tasks that reuse them
             update_cache = update_cache && !task.is_stateless();
+
+            // [TAG_POOL_TURNS] admission: two conversations that do not fit the unified pool together take turns. this
+            // runs before every side effect below (prompt_save, the RAM-budget spill, kv_make_room eviction,
+            // prompt_load, the in-place save), so a task that does not fit is deferred with nothing touched, and so is
+            // every retry of it (release -> callback_on_release -> pop_deferred_task re-runs this on each release).
+            //
+            // 2026-11-02 production (-np 2 --kv-unified, 343808-cell pool, f16 KV, disk tier): slot 0 was generating on
+            // a 212085-cell conversation, d6b9 (250801 tokens, 250744 on disk) took slot 1. kv_make_room found no idle
+            // victim ("no idle slot left to evict"), load_from_disk refused (needs 250744, 131723 free), load()
+            // returned true and the slot prefilled from token 0 into 131723 cells: ~5 min of prefill that could never
+            // finish, ending at the decode wall ([TAG_WALL_ONE_SLOT]). waiting for slot 0 and then evicting it costs a
+            // 15-25 s disk restore instead.
+            //
+            // - n_need: the prompt, or what load() restores before it truncates to the LCP (an edit of an earlier turn
+            //   restores more than the new prompt holds), clamped to the slot context as kv_make_room() does. the in-place
+            //   case (no update_cache) needs only the prompt: the slot's own cells are not counted as held by
+            //   kv_room_for(), so prompt <= room means "the delta fits", no wrong deferral of a continued conversation
+            // - room: pool minus the processing slots, over ctx_tgt and ctx_dft (kv_room_for, KV_ROOM_BUSY)
+            // - a prompt >= n_ctx_slot never waits: the prompt start errors it (EXCEED_CONTEXT_SIZE in update_slots)
+            // - n_need above the empty pool (a smaller draft context) never waits either: no release would make room,
+            //   it runs as before
+            // - n_cmpl > 1: only the parent is checked (children are placed by get_free_slots and get their cells by
+            //   copy_state_to, counted once per slot), as before
+            // ping-pong: two conversations bigger than the pool together now serialize, each turn waits for the other's
+            // generation and pays the restore. not a livelock (every release retries one deferred task, and a task that
+            // fits the empty pool always launches once the last busy slot releases)
+            if (params_base.kv_unified) {
+                const int32_t n_task = (int32_t) task.tokens.size();
+                if (n_task < n_ctx_slot()) {
+                    int src = 0;
+                    int32_t n_need = n_task;
+                    if (update_cache) {
+                        n_need = std::max(n_need, prompt_cache->restore_n_tokens(ret->prompt, task.tokens, task.conversation_id, ctx_dft != nullptr, &src));
+                    }
+                    n_need = std::min(n_need, n_ctx_slot());
+
+                    const int32_t n_room_busy = kv_room_for(*ret, KV_ROOM_BUSY);
+                    if (n_need > n_room_busy && n_need <= kv_room_for(*ret, KV_ROOM_EMPTY)) {
+                        if (pool_wait) {
+                            pool_wait->wait        = true;
+                            pool_wait->id_slot     = ret->id;
+                            pool_wait->n_need      = n_need;
+                            pool_wait->n_room      = n_room_busy;
+                            pool_wait->restore_src = src;
+                            pool_wait->holders.clear();
+                            llama_memory_t mem = llama_get_memory(ctx_tgt);
+                            for (const auto & s : slots) {
+                                if (s.id == ret->id || !s.is_processing()) {
+                                    continue;
+                                }
+                                const int64_t n_held = std::max<int64_t>(s.prompt.n_tokens(), (int64_t) llama_memory_seq_pos_max(mem, s.id) + 1);
+                                pool_wait->holders += string_format("%sslot %d (%" PRId64 " cells, %s)", pool_wait->holders.empty() ? "" : ", ",
+                                        s.id, n_held, s.state == SLOT_STATE_GENERATING ? "generating" : "prompt");
+                            }
+                        }
+                        return nullptr;
+                    }
+                }
+            }
 
             // [LLAMA_SERVER_UBATCH_STATS] 2026-10-22 night per-request pieces (rq_pre): save of the outgoing state,
             // restore of the incoming one and which tier served it. one bool test when off
@@ -4139,6 +4217,13 @@ private:
                     rq_pre.restore_src   = prompt_cache->last_load_src;
                     rq_pre.restore_bytes = prompt_cache->last_load_bytes;
                 }
+                // [TAG_POOL_TURNS] the admission check above defers a task whose restore does not fit after evicting the
+                // idle slots, so a refusal here means kv_make_room() reached less room than kv_room_for(BUSY) promised
+                // (or the restore size changed between the two reads). the slot prefills from what it holds, as before
+                if (prompt_cache->last_load_refused_room) {
+                    SLT_WRN(*ret, "restore of conversation %s refused for pool room (%d cells free) after the admission check passed - "
+                            "prefilling instead of waiting, please report\n", task.conversation_id.c_str(), n_room);
+                }
                 rq_pre.t_cache_lcp = prompt_cache->last_load_lcp_us;
                 rq_lap(rq_pre.t_cache_restore);
 
@@ -4182,7 +4267,13 @@ private:
     // in each context - the draft context can hold one seed row past the prompt mid-request (draft-mtp, see
     // [TAG_SPEC_AVOID_DRAFT_REEVAL]), release() drops it. cells shared by seq_cp (n_cmpl children) count once per
     // slot, so the room can be under-estimated, never over. -1 = per-slot KV streams, nothing to share
-    int32_t kv_room_for(const server_slot & self) const {
+    //
+    // [TAG_POOL_TURNS] mode: NOW = what the other slots hold now, BUSY = only the processing ones (the room
+    // kv_make_room() can reach by evicting every idle slot), EMPTY = nobody (the most the slot can ever get; the draft
+    // context can be the smaller of the two)
+    enum kv_room_mode { KV_ROOM_NOW, KV_ROOM_BUSY, KV_ROOM_EMPTY };
+
+    int32_t kv_room_for(const server_slot & self, kv_room_mode mode = KV_ROOM_NOW) const {
         if (!params_base.kv_unified) {
             return -1;
         }
@@ -4194,7 +4285,7 @@ private:
             llama_memory_t mem = llama_get_memory(ctx);
             int64_t n_held = 0;
             for (const auto & s : slots) {
-                if (s.id == self.id) {
+                if (s.id == self.id || mode == KV_ROOM_EMPTY || (mode == KV_ROOM_BUSY && !s.is_processing())) {
                     continue;
                 }
                 n_held += std::max<int64_t>(s.prompt.n_tokens(), (int64_t) llama_memory_seq_pos_max(mem, s.id) + 1);
@@ -5221,7 +5312,8 @@ private:
                     }
 
                     // get_available_slot() now dispatches on task.id_slot internally
-                    server_slot * slot = get_available_slot(task);
+                    pool_wait_info pool_wait;
+                    server_slot * slot = get_available_slot(task, &pool_wait);
                     const int64_t rq_launch_t0 = ust.on ? ggml_time_us() : 0;
                     if (ust.on) {
                         rq_pre.t_select = rq_launch_t0 - rq_sel_t0 - rq_pre.t_cache_save - rq_pre.t_cache_restore;
@@ -5232,8 +5324,27 @@ private:
                     //
 
                     if (slot == nullptr) {
-                        // if no slot is available, we defer this task for processing later
-                        SRV_DBG("no slot is available, defer task, id_task = %d\n", id_task);
+                        if (pool_wait.wait) {
+                            // [TAG_POOL_TURNS] a free slot exists but the task does not fit the pool next to the busy
+                            // slots: wait for a release. one WARN per deferral (a retry happens on every release)
+                            const bool first = task.t_pool_wait_us == 0;
+                            if (first) {
+                                task.t_pool_wait_us = ggml_time_us();
+                            }
+                            task.n_pool_waits++;
+                            SRV_WRN("conversation %s needs %d cells, the unified KV pool has %d after evicting idle slots (held by %s) - "
+                                    "task %d waits for a release (slot %d, deferral %d, %.1f s so far)\n",
+                                    task.conversation_id.empty() ? "-" : task.conversation_id.c_str(), pool_wait.n_need, pool_wait.n_room,
+                                    pool_wait.holders.c_str(), id_task, pool_wait.id_slot, task.n_pool_waits,
+                                    (ggml_time_us() - task.t_pool_wait_us) / 1e6);
+                            // [TAG_POOL_TURNS_READAHEAD] once per wait episode, only when the restore comes from disk
+                            if (first && pool_wait.restore_src == 2 && prompt_cache) {
+                                prompt_cache->disk_readahead(task.conversation_id);
+                            }
+                        } else {
+                            // if no slot is available, we defer this task for processing later
+                            SRV_DBG("no slot is available, defer task, id_task = %d\n", id_task);
+                        }
                         queue_tasks.defer(std::move(task));
                         break;
                     }
@@ -5244,6 +5355,11 @@ private:
                         queue_tasks.defer(std::move(task));
                         break;
                     }
+
+                    // [TAG_POOL_TURNS] how long the task waited for pool room, logged once it launched
+                    const int64_t     t_pool_wait  = task.t_pool_wait_us;
+                    const int32_t     n_pool_waits = task.n_pool_waits;
+                    const std::string pool_conv    = t_pool_wait > 0 ? task.conversation_id : std::string();
 
                     if (task.is_parent()) {
                         // try getting free slots for all child tasks
@@ -5261,6 +5377,11 @@ private:
                     } else if (!launch_slot_with_task(*slot, std::move(task))) {
                         SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
                         break; // drop the task
+                    }
+
+                    if (t_pool_wait > 0) {
+                        SLT_WRN(*slot, "conversation %s launched after waiting %.1f s for pool room (%d deferral(s)), task %d\n",
+                                pool_conv.empty() ? "-" : pool_conv.c_str(), (ggml_time_us() - t_pool_wait) / 1e6, n_pool_waits, id_task);
                     }
 
                     const int64_t rq_post_t0 = ust.on ? ggml_time_us() : 0;
@@ -7333,6 +7454,131 @@ private:
         SLT_DBG(slot, "verify prebuild n = %d at pos %d: %d (%.3f ms)\n", n, pos0, r, (ggml_time_us() - t0) / 1000.0);
     }
 
+    // [TAG_WALL_ONE_SLOT] the decode wall: a 1-token view at `off` found no free cell (ret == 1 at n_batch == 1) and no
+    // idle slot is left to purge. fail one slot, drop its not-yet-decoded tokens from the batch and let the caller retry
+    // the rest of the batch from `off`. returns false when no slot qualifies (the caller keeps the old clear-all path).
+    //
+    // before: every processing slot got the error, release() and prompt_clear(), then decode() threw. the throw IS
+    // caught (update_slots: catch around decode() -> abort_all_slots -> break), so the server survived, but a live
+    // generation lost its whole state for another slot's prefill. 2026-11-02 production (-np 2 --kv-unified,
+    // 343808-cell pool): slot 1 prefilled a 250801-token prompt from token 0 into the 131723 cells slot 0 (generating,
+    // 212085 cells) left free; at the wall slot 0's live state and its unflushed generation would have been cleared
+    // with it. [TAG_POOL_TURNS] keeps that prefill from starting; this is for growth nobody could see at admission
+    // (generation, n_cmpl children, a draft context fuller than the target).
+    //
+    // victim: the prefill (PROCESSING_PROMPT / DONE_PROMPT) with tokens in [off, end) holding the most cells, else the
+    // owner of the token at `off` (a generating slot whose next token has no cell). its children waiting in WAIT_OTHER
+    // go with it (they would wait forever for a parent that never finishes).
+    //
+    // why the others need no rollback: slot bookkeeping (prompt.tokens, i_batch, spec_i_batch, checkpoint plans) is
+    // advanced at batch-build time for exactly the tokens in the batch, and llama_process() applies nothing on a failed
+    // prepare (ret == 1), so a slot whose tokens stay in the batch is consistent as long as those tokens are decoded
+    // later in this same loop. the batch is compacted in place: entries at index >= off of the failed slots are
+    // removed, the survivors' i_batch / spec_i_batch at >= off are remapped (indices below off belong to views that
+    // were decoded and post_decode'd already). embedding rows are referenced through i_embd and stay valid.
+    // generating slots come first in the batch (pre_decode), so a prefill victim never shifts a generating slot's rows.
+    // if the survivors still do not fit, the next wall fails the next slot: every call removes at least one slot.
+    bool wall_fail_one_slot(int32_t off) {
+        const int32_t n = batch.size();
+        if (off < 0 || off >= n) {
+            return false;
+        }
+
+        std::vector<int32_t> n_left(slots.size(), 0);
+        for (int32_t i = off; i < n; ++i) {
+            const int32_t sid = batch.tokens[i].id_slot;
+            if (sid >= 0 && sid < (int32_t) slots.size()) {
+                n_left[sid]++;
+            }
+        }
+
+        server_slot * victim = nullptr;
+        for (auto & s : slots) {
+            if (n_left[s.id] == 0 || !s.is_processing()) {
+                continue;
+            }
+            if (s.state != SLOT_STATE_PROCESSING_PROMPT && s.state != SLOT_STATE_DONE_PROMPT) {
+                continue;
+            }
+            if (victim == nullptr || s.prompt.n_tokens() > victim->prompt.n_tokens()) {
+                victim = &s;
+            }
+        }
+        if (victim == nullptr) {
+            const int32_t sid = batch.tokens[off].id_slot;
+            if (sid >= 0 && sid < (int32_t) slots.size() && slots[sid].is_processing()) {
+                victim = &slots[sid];
+            }
+        }
+        if (victim == nullptr) {
+            return false;
+        }
+
+        std::vector<bool> failed(slots.size(), false);
+        failed[victim->id] = true;
+        const int id_task_victim = victim->task->id;
+        for (auto & s : slots) {
+            if (s.state == SLOT_STATE_WAIT_OTHER && s.task && s.task->id_parent == id_task_victim) {
+                failed[s.id] = true;
+            }
+        }
+
+        SLT_ERR(*victim, "context size has been exceeded at off = %d: failing this slot (%d tokens, %s), %d other slot(s) keep their tokens in the batch\n",
+                off, victim->prompt.n_tokens(), victim->state == SLOT_STATE_GENERATING ? "generating" : "prompt",
+                (int) std::count_if(n_left.begin(), n_left.end(), [](int32_t c) { return c > 0; }) - 1);
+
+        for (auto & s : slots) {
+            if (!failed[s.id] || !s.is_processing()) {
+                continue;
+            }
+            send_error(s, "Context size has been exceeded.");
+            s.release();
+            // tokens and memory of the failed slot are out of step mid-batch: drop both (the disk tier keeps what was
+            // flushed, prompt_clear() writes nothing)
+            s.prompt_clear();
+        }
+
+        std::vector<int32_t> remap(n, -1);
+        int32_t j = off;
+        for (int32_t i = 0; i < n; ++i) {
+            if (i < off) {
+                remap[i] = i;
+                continue;
+            }
+            const int32_t sid = batch.tokens[i].id_slot;
+            if (sid >= 0 && sid < (int32_t) slots.size() && failed[sid]) {
+                continue;
+            }
+            remap[i] = j;
+            if (j != i) {
+                batch.tokens[j] = batch.tokens[i];
+            }
+            ++j;
+        }
+        batch.tokens.resize(j);
+
+        for (auto & s : slots) {
+            if (failed[s.id]) {
+                continue;
+            }
+            if (s.i_batch >= off && s.i_batch < n) {
+                GGML_ASSERT(remap[s.i_batch] >= 0);
+                s.i_batch = remap[s.i_batch];
+            }
+            for (auto & i : s.spec_i_batch) {
+                if (i >= off && i < n) {
+                    GGML_ASSERT(remap[i] >= 0);
+                    i = remap[i];
+                }
+            }
+        }
+
+        SRV_WRN("context wall: dropped %d token(s) of the failed slot(s) from the batch, %d left to decode from off = %d\n",
+                n - j, j - off, off);
+
+        return true;
+    }
+
     // returns true = success ; false = retry with smaller batch size
     // throw std::runtime_error on fatal error
     bool decode(int32_t & n_batch, int32_t off) {
@@ -7454,8 +7700,18 @@ private:
                 std::string err;
 
                 if (n_batch == 1 && ret == 1) {
-                    // TODO: try to terminate only the largest active slot/sequence and continue with the rest
-                    //       need to remove the tokens from the current batch too
+                    // [TAG_WALL_ONE_SLOT] a slot released inside this batch (post_decode of an earlier view) left idle
+                    // cells behind that the halving below never offered: purge it first, as at n_batch > 1
+                    if (try_clear_idle_slots()) {
+                        n_batch = llama_n_batch(ctx_tgt);
+                        SRV_WRN("failed to find free space in the KV cache at n_batch = 1, purged an idle slot, retrying, off = %d\n", off);
+                        return false;
+                    }
+                    // [TAG_WALL_ONE_SLOT] fail one slot, drop its tokens from the batch, retry the rest
+                    if (wall_fail_one_slot(off)) {
+                        n_batch = llama_n_batch(ctx_tgt);
+                        return false;
+                    }
                     err = "Context size has been exceeded.";
                 }
 

@@ -18,11 +18,16 @@
 #include <random>
 #include <sstream>
 #include <system_error>
+#include <thread>
 
 #ifdef _WIN32
 #    include <io.h>
 #else
 #    include <unistd.h>
+#endif
+
+#if defined(__linux__)
+#    include <fcntl.h>
 #endif
 
 //
@@ -2029,10 +2034,15 @@ std::list<server_prompt_cache_state>::iterator server_prompt_cache::find_state(c
     return it_best;
 }
 
-int32_t server_prompt_cache::restore_n_tokens(const server_prompt & prompt, const server_tokens & tokens_new, const std::string & conversation_id, bool has_dft) {
+int32_t server_prompt_cache::restore_n_tokens(const server_prompt & prompt, const server_tokens & tokens_new, const std::string & conversation_id, bool has_dft, int * src) {
+    int src_dummy = 0;
+    int & src_out = src ? *src : src_dummy;
+    src_out = 0;
+
     // same order as load(): Phase 1 RAM entry, then Phase 3 disk
     const auto it = find_state(prompt, tokens_new);
     if (it != states.end()) {
+        src_out = 1;
         return it->prompt.n_tokens();
     }
 
@@ -2047,7 +2057,11 @@ int32_t server_prompt_cache::restore_n_tokens(const server_prompt & prompt, cons
         const auto d = disk_convs.find(conversation_id);
         if (d != disk_convs.end() && !d->second.broken && d->second.scheduled_n_tok > 0) {
             const uint32_t n_tok = d->second.scheduled_n_tok;
-            return limit_tokens > 0 && n_tok > limit_tokens ? -1 : (int32_t) n_tok;
+            if (limit_tokens > 0 && n_tok > limit_tokens) {
+                return -1;
+            }
+            src_out = 2;
+            return (int32_t) n_tok;
         }
     }
 
@@ -2061,7 +2075,90 @@ int32_t server_prompt_cache::restore_n_tokens(const server_prompt & prompt, cons
         return -1;
     }
 
+    src_out = 2;
     return (int32_t) st.n_tok;
+}
+
+// [TAG_POOL_TURNS_READAHEAD] a task deferred for pool room ([TAG_POOL_TURNS]) restores its conversation from disk as soon
+// as the busy slot releases. measured restore rate from disk 368-483 MiB/s (2026-11-02 production, 13.8-16.4 GB per
+// conversation = 15-25 s on the request path); the wait is usually minutes of the other slot's generation, so the files
+// can be in the page cache by then and the restore runs at memory speed. nothing is measured here, the kernel decides.
+// - not on the disk writer thread: load_from_disk() waits for every queued job of the conversation, a read-ahead job in
+//   that queue would delay the very restore it is for. a detached thread holds only copies of the paths, so a shutdown
+//   or the external sweep deleting the files under it is harmless (fadvise on an unlinked or truncated file is a no-op)
+// - only when MemAvailable covers the files plus a margin: WILLNEED on 16 GB that does not fit evicts the model's own
+//   mmap pages (or what the restore just read) and swaps; skipped and logged instead
+// - Linux only (/proc/meminfo, posix_fadvise); elsewhere it logs and does nothing
+bool server_prompt_cache::disk_readahead(const std::string & conversation_id) {
+    if (disk_path.empty() || conversation_id.empty()) {
+        return false;
+    }
+#if defined(__linux__)
+    const std::string base = (std::filesystem::path(disk_path) / conversation_id).string();
+
+    std::vector<std::string> paths;
+    uint64_t total = 0;
+    for (const auto ext : { SPLIT_EXT_KV, SPLIT_EXT_DRFT, SPLIT_EXT_REC }) {
+        std::string p = split_path(base, ext);
+        std::error_code ec;
+        const uint64_t sz = (uint64_t) std::filesystem::file_size(p, ec);
+        if (!ec && sz > 0) {
+            total += sz;
+            paths.push_back(std::move(p));
+        }
+    }
+    if (paths.empty()) {
+        SRV_WRN("disk read-ahead: '%s' has no .kv/.drft/.rec files - skipped\n", conversation_id.c_str());
+        return false;
+    }
+
+    uint64_t mem_avail = 0;
+    {
+        std::ifstream mi("/proc/meminfo");
+        std::string key;
+        uint64_t val = 0;
+        std::string unit;
+        while (mi >> key >> val) {
+            std::getline(mi, unit);
+            if (key == "MemAvailable:") {
+                mem_avail = val * 1024; // kB
+                break;
+            }
+        }
+    }
+
+    // margin: 4 GiB or a quarter of the files, whichever is larger - room for the restore's own segment buffers
+    // (one 512 MiB segment at a time) and whatever else the box runs
+    const uint64_t margin = std::max<uint64_t>(4ull << 30, total / 4);
+    if (mem_avail < total + margin) {
+        SRV_WRN("disk read-ahead: '%s' skipped, %.1f GiB of files + %.1f GiB margin > %.1f GiB MemAvailable\n",
+                conversation_id.c_str(), total / 1073741824.0, margin / 1073741824.0, mem_avail / 1073741824.0);
+        return false;
+    }
+
+    SRV_WRN("disk read-ahead: '%s' %.1f GiB in %zu file(s) (MemAvailable %.1f GiB)\n",
+            conversation_id.c_str(), total / 1073741824.0, paths.size(), mem_avail / 1073741824.0);
+
+    // the thread does not log: it can outlive the logger when the server exits while a 16 GB submission is still
+    // blocked in the kernel, and a log call after static destruction would crash the shutdown
+    std::thread([paths]() {
+        for (const auto & p : paths) {
+            const int fd = open(p.c_str(), O_RDONLY | O_CLOEXEC);
+            if (fd < 0) {
+                continue;
+            }
+            // WILLNEED queues the reads and returns once they are submitted (the submission itself can block on a busy
+            // device, hence the thread)
+            posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
+            close(fd);
+        }
+    }).detach();
+
+    return true;
+#else
+    SRV_INF("disk read-ahead: '%s' skipped, not supported on this platform\n", conversation_id.c_str());
+    return false;
+#endif
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, const std::string & conversation_id, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, int32_t n_room) {
@@ -2069,6 +2166,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     last_load_src   = 0;
     last_load_bytes = 0;
     last_load_lcp_us = 0;
+    last_load_refused_room = false;
     static const bool lcp_timed = getenv("LLAMA_SERVER_UBATCH_STATS") != nullptr; // no clock reads when off
     const int64_t t_lcp0 = lcp_timed ? ggml_time_us() : 0;
 
@@ -2082,6 +2180,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     if (it_best != states.end() && n_room >= 0 && it_best->prompt.n_tokens() > n_room) {
         SRV_WRN("load: RAM entry with %d tokens does not fit in %d free cells of the unified KV pool - not restored\n",
                 it_best->prompt.n_tokens(), n_room);
+        last_load_refused_room = true; // [TAG_POOL_TURNS]
         return true;
     }
 
@@ -2386,6 +2485,25 @@ bool server_prompt_cache::flush_from_context(const server_prompt & prompt, llama
 
         if (usable && lcp == st.scheduled_n_tok && n_tok == lcp) {
             SRV_INF("disk cache: '%s' already flushed (%u tokens) - nothing to write\n", conv_id.c_str(), n_tok);
+            return true;
+        }
+        // [TAG_FLUSH_PREFIX_GUARD] the live tokens are a strict prefix of what the files hold: a released partial prefill
+        // (cancel or error: release() keeps prompt.tokens, and the release flush only runs on a normal stop). the files
+        // already cover every live token with the same tokens, so there is nothing to write. before this guard the
+        // truncate branch below ran (keep = last segment end <= lcp): 2026-11-02 production, a cancelled 250801-token
+        // prefill at ~115k would have chopped the good 250744-token file of d6b9 to ~114688 and deleted its .rec on the
+        // next prompt_save of that slot (in-place reuse, LRU update_cache, kv_make_room eviction, the cache-idle-slots
+        // pass, shutdown flush). the mirror keeps the longer list, so afterwards:
+        // - the slot continues in place (its next turn shares the prefix): it prefills on top of its live cells and the
+        //   release flush appends at the old high-water mark once the live tokens pass it (lcp == scheduled_n_tok), or
+        //   truncates at the real divergence if the new turn differs below it - both against the files' own tokens
+        // - the slot is evicted or cleared: the conversation comes back as the full disk restore
+        // the K/V type does not matter here (nothing is written; a foreign-type file stays readable through
+        // --cache-convert and gets rewritten in this server's type by the first flush that really writes). a broken
+        // mirror is excluded: its scheduled list does not describe the files
+        if (!st.broken && st.scheduled_n_tok > 0 && lcp == n_tok && n_tok < st.scheduled_n_tok) {
+            SRV_WRN("disk cache: '%s' live tokens (%u) are a prefix of the %u on disk - nothing to write, the file is kept\n",
+                    conv_id.c_str(), n_tok, st.scheduled_n_tok);
             return true;
         }
         if (usable && delta_capable) {
@@ -3424,6 +3542,7 @@ bool server_prompt_cache::load_from_disk(server_prompt & prompt, const std::stri
     if (n_room >= 0 && st.n_tok > (uint32_t) n_room) {
         SRV_WRN("load_from_disk: '%s' needs %u cells, only %d free in the unified KV pool - not restored\n",
                 conversation_id.c_str(), st.n_tok, n_room);
+        last_load_refused_room = true; // [TAG_POOL_TURNS]
         return false;
     }
 
