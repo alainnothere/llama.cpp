@@ -20,6 +20,7 @@ struct ggml_tensor;
 struct llama_cparams;
 struct llama_layer;
 struct llama_prec_policy;
+struct llama_mtp_circuit;
 
 class llama_moe_cache;
 
@@ -881,6 +882,12 @@ struct llm_graph_params {
     const llama_logits_subset * logits_subset = nullptr;
     uint64_t logits_subset_gen = 0;
 
+    // [MTP_CIRCUIT] pass list of the MTP draft graph (nullptr = default M0); owned by the llama_context, swapped only
+    // on the decode thread (llama_context::mtp_circuit_apply), so the pointer is stable while a graph is built. gen
+    // changes with every applied circuit: a graph built for another pass list is never reused.
+    const llama_mtp_circuit * mtp_circuit = nullptr;
+    uint64_t mtp_circuit_gen = 0;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -945,6 +952,11 @@ struct llm_graph_params {
 
         // [VOCAB_SUBSET] the head tensors (and their n_pad) changed
         if (logits_subset_gen != other.logits_subset_gen) {
+            return false;
+        }
+
+        // [MTP_CIRCUIT] the draft graph's pass list changed (different topology, different K/V slots)
+        if (mtp_circuit_gen != other.mtp_circuit_gen) {
             return false;
         }
 
@@ -1132,6 +1144,8 @@ struct llm_graph_context {
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const llama_logits_subset * logits_subset;
+
+    const llama_mtp_circuit * mtp_circuit; // [MTP_CIRCUIT] nullptr = default circuit
 
     const llm_graph_cb & cb_func;
 
@@ -1416,6 +1430,39 @@ struct llm_graph_context {
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v] // TODO: remove
                   float   kq_scale,
                     int   il) const;
+
+    // [MTP_CIRCUIT] (2026-11-07) build_attn over the K/V layer il_kv while il stays the id for names, devices and the
+    // fused-op bookkeeping (the plain build_attn above is this with il_kv == il and no io). io (optional):
+    //   out: k_stored / v_stored = the K/V rows written into il_kv, after the K/V rotation of a quantized cache, so a
+    //        later pass that borrows this slot can write them back
+    //   in:  k_restore / v_restore != nullptr = borrow mode: k_cur / v_cur are written into il_kv only for this
+    //        attention (the current tokens attend to their own fresh K/V together with the slot's earlier rows),
+    //        then the owner's rows are written back, so the slot ends the graph holding the owner pass's K/V.
+    //        The write-back is expanded after the attention node: graph order is the execution order on the CPU
+    //        backend and the scheduler; ggml-vulkan's reorder (is_src_of: same base tensor = dependency) and its
+    //        barrier tracking (unsynced_nodes_read covers the WAR) keep it after the FA read. GPU UNVERIFIED.
+    struct attn_slot_io {
+        ggml_tensor * k_stored  = nullptr;
+        ggml_tensor * v_stored  = nullptr;
+        ggml_tensor * k_restore = nullptr;
+        ggml_tensor * v_restore = nullptr;
+    };
+
+    ggml_tensor * build_attn_slot(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * wo,
+            ggml_tensor * wo_b,
+            ggml_tensor * wo_s,
+            ggml_tensor * q_cur,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
+            ggml_tensor * kq_b,
+            ggml_tensor * sinks,
+            ggml_tensor * v_mla,
+                  float   kq_scale,
+                    int   il,
+                    int   il_kv,
+            attn_slot_io * io) const;
 
     llm_graph_input_attn_k  * build_attn_inp_k() const;
 

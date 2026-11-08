@@ -356,6 +356,13 @@ struct common_params_speculative_draft {
     // control/digit/newline tokens and every id seen in the prompts; empty = full vocab (default)
     std::string vocab_subset_path;
 
+    // [MTP_CIRCUIT] (2026-11-07) draft-mtp, qwen35 dense: pass list of the MTP draft graph (--spec-mtp-circuit,
+    // empty = env LLAMA_MTP_CIRCUIT / "M0") and the own-K/V slots the draft memory is allocated for
+    // (--spec-mtp-circuit-max-passes, 0 = env LLAMA_MTP_CIRCUIT_MAX_PASSES / as many as the initial circuit needs).
+    // Changeable at runtime within the slots: llama_mtp_set_circuit, llama-server POST /spec/circuit.
+    std::string mtp_circuit;
+    int32_t     mtp_circuit_max_passes = 0;
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;

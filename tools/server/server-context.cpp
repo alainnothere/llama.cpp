@@ -17,6 +17,7 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "../../src/llama-ext.h" // [MTP_CIRCUIT] llama_mtp_set_circuit / llama_mtp_get_circuit
 
 #include <algorithm>
 #include <array>
@@ -2112,6 +2113,17 @@ struct server_slot {
         j["tg_tps"]               = stats.n_gen_tps();
         j["graphs_reused"]        = llama_perf_context(ctx_tgt).n_reused;
         j["graphs_reuse_skipped_pp"] = llama_perf_context_n_reuse_skipped_pp(ctx_tgt);
+        // [MTP_CIRCUIT] (2026-11-07) per row, not in the config snapshot: POST /spec/circuit changes it at runtime.
+        // The circuit accepted when the request finished; a switch inside a request applies at the next draft decode,
+        // so a row can mix two circuits (only if someone POSTs mid-request). null without an MTP draft context.
+        if (ctx_dft != nullptr && llama_mtp_circuit_max_passes(ctx_dft) > 0) {
+            char buf[256];
+            const int32_t n = llama_mtp_get_circuit(ctx_dft, buf, sizeof(buf));
+            j["mtp_circuit"]            = n < (int32_t) sizeof(buf) ? json(std::string(buf)) : json(nullptr);
+            j["mtp_circuit_max_passes"] = llama_mtp_circuit_max_passes(ctx_dft);
+        } else {
+            j["mtp_circuit"] = nullptr;
+        }
 
         {
             const char * s = "none";
@@ -2582,6 +2594,12 @@ public:
 
     void reset_metrics_bucket() {
         metrics.reset_bucket();
+    }
+
+    // [MTP_CIRCUIT] for GET/POST /spec/circuit: only the thread-safe llama_mtp_* calls may use it, and only when the
+    // server is not sleeping (destroy() frees the context)
+    llama_context * get_ctx_dft() const {
+        return ctx_dft;
     }
 
 private:
@@ -9252,6 +9270,70 @@ void server_routes::init_routes() {
         // update any props here
 
         res->ok({{ "success", true }});
+        return res;
+    };
+
+    // [MTP_CIRCUIT] (2026-11-07) GET /spec/circuit, POST /spec/circuit {"circuit": "M0,M0:b0"}. Runs on the HTTP
+    // thread: llama_mtp_set_circuit only parses, checks and parks the list under the context's mutex, the decode
+    // thread swaps it in at the next draft decode (no task queue round trip, nothing here touches the decode state).
+    // ctx_dft is set by load_model before HTTP is ready and reset when the server sleeps, hence the sleeping check.
+    auto spec_circuit_state = [this]() {
+        llama_context * ctx_dft = ctx_server.get_ctx_dft();
+        json j = {
+            { "available",  false },
+            { "circuit",    nullptr },
+            { "max_passes", 0 },
+            { "last_error", "" },
+        };
+        if (ctx_dft == nullptr || llama_mtp_circuit_max_passes(ctx_dft) <= 0) {
+            return j;
+        }
+        std::string cur(512, 0), err(1024, 0);
+        cur.resize(std::min<size_t>(cur.size() - 1, (size_t) llama_mtp_get_circuit(ctx_dft, cur.data(), cur.size())));
+        err.resize(std::min<size_t>(err.size() - 1, (size_t) llama_mtp_circuit_last_error(ctx_dft, err.data(), err.size())));
+        j["available"]  = true;
+        j["circuit"]    = cur;
+        j["max_passes"] = llama_mtp_circuit_max_passes(ctx_dft);
+        j["last_error"] = err;
+        return j;
+    };
+
+    this->get_spec_circuit = [this, spec_circuit_state](const server_http_req &) {
+        auto res = create_response();
+        if (queue_tasks.is_sleeping()) {
+            res->error(format_error_response("the server is sleeping, the draft context is unloaded", ERROR_TYPE_UNAVAILABLE));
+            return res;
+        }
+        res->ok(spec_circuit_state());
+        return res;
+    };
+
+    this->post_spec_circuit = [this, spec_circuit_state](const server_http_req & req) {
+        auto res = create_response();
+        if (queue_tasks.is_sleeping()) {
+            res->error(format_error_response("the server is sleeping, the draft context is unloaded", ERROR_TYPE_UNAVAILABLE));
+            return res;
+        }
+        llama_context * ctx_dft = ctx_server.get_ctx_dft();
+        if (ctx_dft == nullptr || llama_mtp_circuit_max_passes(ctx_dft) <= 0) {
+            res->error(format_error_response("no MTP draft context (start with --spec-type draft-mtp on a model with a NextN block)", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        const json body = json::parse(req.body);
+        if (!body.is_object() || !body.contains("circuit") || !body.at("circuit").is_string()) {
+            res->error(format_error_response("body must be {\"circuit\": \"<pass list>\"}, e.g. {\"circuit\": \"M0,M0:b0\"}", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        const std::string circuit = body.at("circuit").get<std::string>();
+        if (llama_mtp_set_circuit(ctx_dft, circuit.c_str()) != 0) {
+            json st = spec_circuit_state();
+            res->error(format_error_response("circuit '" + circuit + "' rejected: " + st.value("last_error", std::string()), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        SRV_WRN("MTP circuit set to '%s' (applies at the next draft decode)\n", circuit.c_str());
+        json st = spec_circuit_state();
+        st["applies"] = "at the next draft decode";
+        res->ok(st);
         return res;
     };
 

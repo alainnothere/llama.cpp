@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <map>
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -118,7 +119,11 @@ public:
         // a model can hold more than one cache, so the tensor names have to stay unique
                  const char *   name_tag = "",
         // [KQ_MASK_INC] false: no persistent mask, for wrappers whose graphs never read get_kq_mask_dev()
-                       bool   kq_mask_inc = true);
+                       bool   kq_mask_inc = true,
+        // [MTP_CIRCUIT] extra K/V layers with ids n_layer_all .. n_layer_all + n_layer_clones - 1, each shaped and
+        // placed like layer il_clone_src (the MTP draft memory's own-K/V slots 1..; see llama-mtp-circuit.h)
+                   uint32_t   n_layer_clones = 0,
+                    int32_t   il_clone_src   = -1);
 
     ~llama_kv_cache();
 
@@ -310,7 +315,18 @@ public:
 
 private:
     const llama_model & model;
+
+    // [MTP_CIRCUIT] owns the hparams copy with the clone layers (llama_hparams::with_layer_clones) when
+    // n_layer_clones > 0; must be declared before `hparams`, which references it then
+    std::unique_ptr<llama_hparams> hparams_clones;
+
     const llama_hparams & hparams;
+
+    // [MTP_CIRCUIT] model layer id that holds the weights / device of K/V layer il: the clone source for a clone
+    // layer, il otherwise. model.dev_layer() only knows the model's layers.
+    uint32_t n_layer_model = 0; // the model's n_layer_all (clone ids start here)
+    int32_t  il_clone_src  = -1;
+    int32_t  il_model(int32_t il) const { return il >= (int32_t) n_layer_model && il_clone_src >= 0 ? il_clone_src : il; }
 
     struct kv_layer {
         // layer index in the model

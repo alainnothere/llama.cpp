@@ -2419,6 +2419,22 @@ struct llama_model_qwen35 : public llama_model_base {
 
     struct graph_mtp : public llm_graph_context {
         graph_mtp(const llama_model & model, const llm_graph_params & params);
+
+        // [MTP_CIRCUIT] one pass over the residual stream: a full-attention Qwen3.5 decoder block with the weights
+        // of model.layers[il] (the NextN block or a full-attention trunk layer) and its K/V in draft layer il_kv;
+        // ip = pass index (0 keeps the pre-circuit tensor names); part: full block or one sub-layer (.attn needs
+        // il_kv, .ffn ignores it); io: see llm_graph_context::attn_slot_io
+        ggml_tensor * build_pass(
+                const llama_model       & model,
+                ggml_tensor             * cur,
+                llm_graph_input_attn_kv * inp_attn,
+                ggml_tensor             * inp_pos,
+                int                     * sections,
+                int                       il,
+                int                       il_kv,
+                int                       ip,
+                char                      part, // 'B' full block, 'A' .attn, 'F' .ffn
+                attn_slot_io            * io);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

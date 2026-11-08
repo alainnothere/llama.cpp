@@ -66,7 +66,7 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
 
 llama_kv_cache::llama_kv_cache(
         const llama_model & model,
-        const llama_hparams & hparams,
+        const llama_hparams & hparams_in,
                 ggml_type   type_k,
                 ggml_type   type_v,
                      bool   v_trans,
@@ -82,8 +82,17 @@ llama_kv_cache::llama_kv_cache(
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
              const char *   name_tag,
-                   bool   kq_mask_inc) :
-    model(model), hparams(hparams), v_trans(v_trans),
+                   bool   kq_mask_inc,
+               uint32_t   n_layer_clones,
+                int32_t   il_clone_src) :
+    model(model),
+    // [MTP_CIRCUIT] with clones every hparams.xxx(il) of this cache (and of its contexts' get_k/get_v views) sees the
+    // clone layers as copies of il_clone_src; the body below therefore reads `hparams` (the member), never hparams_in
+    hparams_clones(n_layer_clones > 0 ? std::make_unique<llama_hparams>(hparams_in.with_layer_clones(il_clone_src, n_layer_clones)) : nullptr),
+    hparams(hparams_clones ? *hparams_clones : hparams_in),
+    n_layer_model(hparams_in.n_layer_all),
+    il_clone_src(n_layer_clones > 0 ? il_clone_src : -1),
+    v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
@@ -402,12 +411,16 @@ llama_kv_cache::llama_kv_cache(
             continue;
         }
 
-        if (filter && !filter(il)) {
+        // [MTP_CIRCUIT] clone layers (il >= n_layer_model) are always kept: the filter and the share callbacks are
+        // written against the model's layer ids
+        const bool is_clone = il >= n_layer_model;
+
+        if (filter && !is_clone && !filter(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: filtered\n", __func__, il);
             continue;
         }
 
-        if (share && other) {
+        if (share && other && !is_clone) {
             const int32_t il_share = share(il);
 
             // [CP] a CP source layer is split into ranges: a sharer would view range 0 as the whole cache
@@ -462,13 +475,13 @@ llama_kv_cache::llama_kv_cache(
         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
 
         if (offload) {
-            auto * dev = model.dev_layer(il);
+            auto * dev = model.dev_layer(il_model(il)); // [MTP_CIRCUIT] a clone sits next to its source layer
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
         }
 
-        LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
+        LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s%s\n", __func__, il, dev_name, is_clone ? " (MTP circuit clone slot)" : "");
 
         ggml_context * ctx = ctx_for_buft(buft);
         if (!ctx) {
@@ -483,7 +496,7 @@ llama_kv_cache::llama_kv_cache(
         // check reference are allocated next to it below. kv_size here stays the cell count every other path uses.
         // Range devices: [owner] + LLAMA_CP_DEVS without the owner's first occurrence, or [owner, LLAMA_CP_DEV].
         std::vector<ggml_backend_dev_t> cp_rdev;
-        bool cp_here = cp_ok && cp_want[il] && has_k && has_v;
+        bool cp_here = cp_ok && !is_clone && cp_want[il] && has_k && has_v; // [MTP_CIRCUIT] clones are never range-split
         if (cp_here) {
             ggml_backend_dev_t owner = model.dev_layer(il);
             cp_rdev.push_back(owner);
@@ -585,7 +598,7 @@ llama_kv_cache::llama_kv_cache(
     if (reuse) {
         LLAMA_LOG_DEBUG("%s: reusing layers:\n", __func__);
 
-        for (uint32_t il = 0; il < n_layer; il++) {
+        for (uint32_t il = 0; il < n_layer_model; il++) { // [MTP_CIRCUIT] the callback knows the model's layers only
             const int32_t il_reuse = reuse(il);
 
             if (il_reuse < 0) {

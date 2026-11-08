@@ -59,6 +59,10 @@ struct llama_cparams {
 
     size_t moe_cache_size;
 
+    // [MTP_CIRCUIT] own-KV passes the MTP draft memory holds (>= 1; 1 = the NextN block's own K/V layer only, as
+    // before 2026-11-07). Read by llama_model::create_memory (extra K/V layers) and llama_context (circuit checks).
+    uint32_t mtp_circuit_max_passes = 1;
+
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
     enum llama_context_type ctx_type;

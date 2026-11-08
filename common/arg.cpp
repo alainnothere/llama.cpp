@@ -4495,6 +4495,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.vocab_subset_path = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_VOCAB_SUBSET"));
+    // [MTP_CIRCUIT] (2026-11-07) see llama_mtp_set_circuit in src/llama-ext.h for the grammar
+    add_opt(common_arg(
+        {"--spec-mtp-circuit"}, "CIRCUIT",
+        "draft-mtp (qwen35 dense): pass list of the MTP draft graph, comma-separated: M0 = the NextN block, "
+        "T<il> = full-attention trunk layer il of the target, '*N' repeats, ':b<j>' borrows the K/V of pass j "
+        "instead of its own, e.g. \"M0,M0:b0\". Changeable at runtime with POST /spec/circuit (default: M0)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_circuit = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_MTP_CIRCUIT"));
+    add_opt(common_arg(
+        {"--spec-mtp-circuit-max-passes"}, "N",
+        "draft-mtp (qwen35 dense): own-K/V passes the MTP draft memory is allocated for; each extra one costs one more "
+        "NextN-sized K/V layer (n_ctx x the NextN layer's K+V row) and the fit counts it "
+        "(default: what --spec-mtp-circuit needs, 1 for M0)",
+        [](common_params & params, int value) {
+            if (value < 1 || value > 16) {
+                throw std::invalid_argument("must be in 1..16");
+            }
+            params.speculative.draft.mtp_circuit_max_passes = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_MTP_CIRCUIT_MAX_PASSES"));
     add_opt(common_arg(
         {"--spec-draft-device", "-devd", "--device-draft"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading the draft model (none = don't offload, default: follows --device)\n"

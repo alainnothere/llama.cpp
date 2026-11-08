@@ -8,6 +8,8 @@
 
 #include <cstdint>
 #include <map>
+#include <string>
+#include <vector>
 
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
@@ -172,6 +174,57 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 // The list is taken as is: keep it append-only so rows keep their place, and call it between requests, not per
 // step - a new n_pad (or the first call) re-creates the tensors and every graph after it is rebuilt.
 LLAMA_API int32_t llama_set_logits_subset(struct llama_context * ctx, const llama_token * ids, int32_t n_ids);
+
+//
+// [MTP_CIRCUIT] (fork, 2026-11-07) runtime-reconfigurable pass list of the NextN/MTP draft graph (qwen35 dense)
+//
+// The draft graph is: enorm/hnorm -> concat -> eh_proj (once), then the passes in order over the residual stream,
+// then the head norm + LM head (once). Grammar (whitespace ignored, case-insensitive letters):
+//   circuit := pass ("," pass)*            "" or "default" = "M0" (the graph before 2026-11-07, bit-identical)
+//   pass    := unit [sub] ["*" N] [":" mode]  "*N" repeats the pass N times (1..16), each copy gets the mode
+//   unit    := "M" k                       NextN block k (model.layers[n_layer() + k]); qwen35 has k = 0 only
+//            | "T" il                      trunk layer il of the TARGET used as a pass (full-attention layers only;
+//                                          a gated-delta-net layer is rejected: its recurrent state is not in ctx_dft)
+//   sub     := ".attn"                     the attention sub-layer only: x = x + attn(attn_norm(x)); takes a K/V
+//                                          slot like a full pass, same modes
+//            | ".ffn"                      the FFN sub-layer only: x = x + ffn(post_attn_norm(x)); no K/V, no mode;
+//                                          allowed on every trunk layer, gated-delta-net ones included
+//   (no sub = the full block = ".attn" then ".ffn" of the same layer, one pass, one slot)
+//   mode    := "o"                         own K/V slot (the default)
+//            | "b" j                       borrow the K/V slot of pass j (j < this pass): attend over that slot's
+//                                          stored K/V of earlier positions, with this pass's K/V for the current
+//                                          tokens, and store nothing (the slot keeps pass j's rows)
+//            | "t"                         borrow the TARGET's K/V: NOT supported (ctx_tgt and ctx_dft are separate
+//                                          contexts with their own cell numbering), rejected with a message
+// At most 16 passes in total, and at most mtp_circuit_max_passes (llama_context_params) own-K/V passes (full blocks
+// and .attn sub-blocks without ':b<j>'; .ffn passes are free).
+struct llama_mtp_pass {
+    char    kind   = 'M'; // 'M' NextN block, 'T' target trunk layer
+    int32_t idx    = 0;   // M: block offset k, T: trunk layer il
+    char    part   = 'B'; // 'B' full block, 'A' attention sub-layer (.attn), 'F' FFN sub-layer (.ffn)
+    int32_t borrow = -1;  // -1: own K/V slot, else the index of the pass whose slot is borrowed (resolved to an owner)
+    int32_t slot   = 0;   // K/V slot the pass reads: own passes are numbered 0.. in circuit order; -1 for .ffn
+};
+
+// Grammar only, no model: fills passes (expanded) and canonical ("M0,M0:b0"), returns false + err on error.
+LLAMA_API bool llama_mtp_circuit_parse(const char * circuit, std::vector<llama_mtp_pass> & passes, std::string & canonical, std::string & err);
+
+// Set the pass list of an MTP draft context (ctx_type LLAMA_CONTEXT_TYPE_MTP). Parsed and checked against the model
+// and the preallocated own-K/V slots right here, so a bad circuit returns < 0 (message: llama_mtp_circuit_last_error)
+// and the active one stays. Thread-safe w.r.t. decode: the new list takes effect at the start of the next decode on
+// ctx_dft (the decode thread swaps it in, rebuilds the graph, and clears the draft memory unless every own-K/V pass of
+// the new list is in the common prefix with the old one - see llama_context::mtp_circuit_apply). Returns 0 on success.
+LLAMA_API int32_t llama_mtp_set_circuit(struct llama_context * ctx_dft, const char * circuit);
+
+// Canonical form of the last accepted circuit (applied at the next decode if not yet), snprintf semantics: returns the
+// full length, writes at most buf_size - 1 chars + NUL.
+LLAMA_API int32_t llama_mtp_get_circuit(const struct llama_context * ctx_dft, char * buf, size_t buf_size);
+
+// The own-K/V passes the draft memory was allocated for (0 for a non-MTP context).
+LLAMA_API int32_t llama_mtp_circuit_max_passes(const struct llama_context * ctx_dft);
+
+// The message of the last rejected llama_mtp_set_circuit ("" if none), snprintf semantics.
+LLAMA_API int32_t llama_mtp_circuit_last_error(const struct llama_context * ctx_dft, char * buf, size_t buf_size);
 
 //
 // model/context data extraction

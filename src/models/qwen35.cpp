@@ -1,5 +1,6 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
+#include "llama-mtp-circuit.h"
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
@@ -564,77 +565,32 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     ggml_tensor * cur = build_lora_mm(layer.nextn.eh_proj, concat, layer.nextn.eh_proj_s);
     cb(cur, "mtp_eh_proj", il);
 
-    ggml_tensor * inpSA = cur;
-
-    cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
-    cb(cur, "mtp_attn_norm", il);
-
-    auto [Qcur_full, Kcur, Vcur] = build_qkv(layer, cur,
-            n_embd_head * 2, n_head,
-            n_embd_head,     n_head_kv,
-            n_embd_head,     n_head_kv,
-            il, false);
-    cb(Qcur_full, "mtp_Qcur_full", il);
-
-    ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full,
-            n_embd_head, n_head, n_tokens,
-            ggml_element_size(Qcur_full) * n_embd_head * 2,
-            ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
-            0);
-    Qcur = build_norm(Qcur, layer.attn_q_norm, nullptr, LLM_NORM_RMS, il);
-    cb(Qcur, "mtp_Qcur_normed", il);
-
-    ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full,
-            n_embd_head, n_head, n_tokens,
-            ggml_element_size(Qcur_full) * n_embd_head * 2,
-            ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
-            ggml_element_size(Qcur_full) * n_embd_head);
-    gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
-    cb(gate, "mtp_gate", il);
-
-    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
-    Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
-    cb(Kcur, "mtp_Kcur_normed", il);
-
-    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
-    cb(Vcur, "mtp_Vcur", il);
-
-    Qcur = ggml_rope_multi(ctx0, Qcur, inp_pos, nullptr,
-            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow);
-    Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
-            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow);
-
-    const float kq_scale = hparams.f_attention_scale == 0.0f
-            ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
-
-    cur = build_attn(inp_attn,
-            nullptr, nullptr, nullptr,
-            Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
-    cb(cur, "mtp_attn_pregate", il);
-
-    cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
-    cur = build_lora_mm(layer.wo, cur, layer.wo_s);
-    cb(cur, "mtp_attn_out", il);
-
-    cur = ggml_add(ctx0, cur, inpSA);
-    cb(cur, "mtp_attn_residual", il);
-
-    ggml_tensor * ffn_residual = cur;
-    cur = build_norm(cur, layer.attn_post_norm, nullptr, LLM_NORM_RMS, il);
-    cb(cur, "mtp_attn_post_norm", il);
-
-    cur = build_ffn(cur,
-            layer.ffn_up,   nullptr, layer.ffn_up_s,
-            layer.ffn_gate, nullptr, layer.ffn_gate_s,
-            layer.ffn_down, nullptr, layer.ffn_down_s,
-            nullptr,
-            LLM_FFN_SILU, LLM_FFN_PAR, il);
-    cb(cur, "mtp_ffn_out", il);
-
-    cur = ggml_add(ctx0, cur, ffn_residual);
-    cb(cur, "mtp_post_ffn", il);
+    // [MTP_CIRCUIT] (2026-11-07) the passes over the residual stream. Unset / "M0" = one own-K/V pass of the
+    // NextN block, the graph before the circuit node for node and name for name (CPU logits dump identical, see
+    // agent-reports/2026-11-07-mtp-circuit-engine.md). A pass list from llama_mtp_set_circuit runs each pass with the
+    // weights of its layer (M0 = the NextN block, T<il> = a full-attention trunk layer of the target) on the stream
+    // in order; the eh_proj fusion above and the head norm + LM head below run once.
+    std::vector<llama_mtp_pass> passes(1); // default: M0, own slot 0
+    if (mtp_circuit && !mtp_circuit->is_default()) {
+        passes = mtp_circuit->passes;
+    }
+    std::vector<attn_slot_io> ios(passes.size());
+    for (size_t ip = 0; ip < passes.size(); ++ip) {
+        const auto & p = passes[ip];
+        const int il_w  = p.kind == 'M' ? il + p.idx : p.idx;
+        const int il_kv = p.part == 'F' ? -1 : llama_mtp_circuit_slot_il(hparams, p.slot); // .ffn: no K/V
+        if (p.borrow >= 0) {
+            // the owner of the slot is the own pass numbered p.slot (the parser resolves a borrow of a borrow)
+            size_t owner = 0;
+            while (owner < ip && !(llama_mtp_pass_owns_kv(passes[owner]) && passes[owner].slot == p.slot)) {
+                owner++;
+            }
+            GGML_ASSERT(owner < ip && ios[owner].k_stored && "MTP circuit: borrowed slot has no owner pass before it");
+            ios[ip].k_restore = ios[owner].k_stored;
+            ios[ip].v_restore = ios[owner].v_stored;
+        }
+        cur = build_pass(model, cur, inp_attn, inp_pos, sections, il_w, il_kv, (int) ip, p.part, &ios[ip]);
+    }
 
     ggml_tensor * head_norm_w = layer.nextn.shared_head_norm
             ? layer.nextn.shared_head_norm
@@ -665,4 +621,118 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
     res->t_logits = cur;
     ggml_build_forward_expand(gf, cur);
+}
+
+// [MTP_CIRCUIT] one pass of the MTP draft graph: the NextN block's decoder ops, moved here unchanged from the
+// constructor (pass 0 of the default circuit is the old graph), with the weights of model.layers[il]. For a trunk
+// layer T<il> these are the same ops as graph::build_layer_attn + build_layer_ffn of a full-attention layer
+// (Qwen3.5 has no MoE and no per-layer difference in the full-attention block), minus build_cvec (control vectors are
+// a target-side feature). K/V: layer il_kv of the draft memory (own slot, or a borrowed one when io->k_restore is
+// set). Tensor names: pass 0 keeps "mtp_<name>-<il>", pass ip > 0 is "mtp_p<ip>_<name>-<il>".
+ggml_tensor * llama_model_qwen35::graph_mtp::build_pass(
+        const llama_model       & model,
+        ggml_tensor             * cur,
+        llm_graph_input_attn_kv * inp_attn,
+        ggml_tensor             * inp_pos,
+        int                     * sections,
+        int                       il,
+        int                       il_kv,
+        int                       ip,
+        char                      part,
+        attn_slot_io            * io) {
+    const auto & L = model.layers[il];
+    const int64_t n_embd_head = hparams.n_embd_head_v();
+
+    std::string name_buf;
+    auto nm = [&](const char * base) -> const char * {
+        name_buf = ip == 0 ? std::string("mtp_") + base : "mtp_p" + std::to_string(ip) + "_" + base;
+        return name_buf.c_str();
+    };
+
+    // [MTP_CIRCUIT] 2026-11-07 sub-block passes. Residual-stream semantics: every pass is x = x + sub(norm(x)) with
+    // the pass's own layer weights:
+    //   .attn : x = x + wo(gated_attn(attn_norm(x)))       K/V in draft layer il_kv (own or borrowed slot)
+    //   .ffn  : x = x + ffn(attn_post_norm(x))             attn_post_norm is Qwen3.5's pre-FFN norm; no K/V
+    //   full  : .attn then .ffn of the same layer, one pass (part 'B'): the pre-circuit NextN block, node for node
+    // The head norm (shared_head_norm / output_norm) + LM head stay once at the end of the graph, after the last pass.
+    // Names: a sub-block pass keeps the names of the ops it runs (mtp_[p<ip>_]attn_norm, ... / attn_post_norm, ...).
+    if (part != 'F') {
+        ggml_tensor * inpSA = cur;
+
+        cur = build_norm(cur, L.attn_norm, nullptr, LLM_NORM_RMS, il);
+        cb(cur, nm("attn_norm"), il);
+
+        auto [Qcur_full, Kcur, Vcur] = build_qkv(L, cur,
+                n_embd_head * 2, n_head,
+                n_embd_head,     n_head_kv,
+                n_embd_head,     n_head_kv,
+                il, false);
+        cb(Qcur_full, nm("Qcur_full"), il);
+
+        ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full,
+                n_embd_head, n_head, n_tokens,
+                ggml_element_size(Qcur_full) * n_embd_head * 2,
+                ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
+                0);
+        Qcur = build_norm(Qcur, L.attn_q_norm, nullptr, LLM_NORM_RMS, il);
+        cb(Qcur, nm("Qcur_normed"), il);
+
+        ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full,
+                n_embd_head, n_head, n_tokens,
+                ggml_element_size(Qcur_full) * n_embd_head * 2,
+                ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
+                ggml_element_size(Qcur_full) * n_embd_head);
+        gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
+        cb(gate, nm("gate"), il);
+
+        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+        Kcur = build_norm(Kcur, L.attn_k_norm, nullptr, LLM_NORM_RMS, il);
+        cb(Kcur, nm("Kcur_normed"), il);
+
+        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+        cb(Vcur, nm("Vcur"), il);
+
+        Qcur = ggml_rope_multi(ctx0, Qcur, inp_pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+        Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+
+        const float kq_scale = hparams.f_attention_scale == 0.0f
+                ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+
+        cur = build_attn_slot(inp_attn,
+                nullptr, nullptr, nullptr,
+                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il, il_kv, io);
+        cb(cur, nm("attn_pregate"), il);
+
+        cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
+        cur = build_lora_mm(L.wo, cur, L.wo_s);
+        cb(cur, nm("attn_out"), il);
+
+        cur = ggml_add(ctx0, cur, inpSA);
+        cb(cur, nm("attn_residual"), il);
+    } // part != 'F'
+
+    if (part == 'A') {
+        return cur;
+    }
+
+    ggml_tensor * ffn_residual = cur;
+    cur = build_norm(cur, L.attn_post_norm, nullptr, LLM_NORM_RMS, il);
+    cb(cur, nm("attn_post_norm"), il);
+
+    cur = build_ffn(cur,
+            L.ffn_up,   nullptr, L.ffn_up_s,
+            L.ffn_gate, nullptr, L.ffn_gate_s,
+            L.ffn_down, nullptr, L.ffn_down_s,
+            nullptr,
+            LLM_FFN_SILU, LLM_FFN_PAR, il);
+    cb(cur, nm("ffn_out"), il);
+
+    cur = ggml_add(ctx0, cur, ffn_residual);
+    cb(cur, nm("post_ffn"), il);
+
+    return cur;
 }

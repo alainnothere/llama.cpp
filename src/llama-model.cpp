@@ -2997,6 +2997,18 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
+                        // [MTP_CIRCUIT] (2026-11-07) the qwen35 dense MTP draft memory gets one K/V layer per own-K/V
+                        // pass of the drafter circuit: slot 0 is the NextN block's layer (n_layer(), as before), slots
+                        // 1.. are clone layers n_layer_all.. shaped and placed like it (llama_hparams::with_layer_clones).
+                        // Default max passes 1 = no clone = the cache before this change. The fit sees the extra K/V:
+                        // its probe builds this same context from the same cparams (common_fit_params -> the extra
+                        // model's cparams_dft carry mtp_circuit_max_passes) and reads llama_get_memory_breakdown, which
+                        // sums this cache's buffers per device. Size per clone = n_ctx x (n_embd_k_gqa x sizeof K +
+                        // n_embd_v_gqa x sizeof V); 27B (4 kv heads x 256): 4 KiB/token f16 = 1.2 GiB at 300k ctx.
+                        // MoE / other archs: no circuit, no clone (qwen35moe's graph does not read the circuit yet).
+                        const uint32_t n_clones = mtp_on_hybrid_qwen && arch == LLM_ARCH_QWEN35 && cparams.mtp_circuit_max_passes > 1
+                            ? cparams.mtp_circuit_max_passes - 1 : 0;
+
                         res = new llama_kv_cache(
                                 *this,
                                 hparams,
@@ -3013,7 +3025,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 nullptr,
                                 filter,
                                 nullptr,
-                                nullptr);
+                                nullptr,
+                                "",
+                                true,
+                                n_clones,
+                                (int32_t) hparams.n_layer());
                     }
                 }
             }

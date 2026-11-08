@@ -164,6 +164,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-grammar-integration.cpp)
     llama_build_and_test(test-llama-grammar.cpp)
     llama_build_and_test(test-batch-alloc.cpp)
+    # [MTP_CIRCUIT] 2026-11-07: drafter-circuit grammar, model checks, keep-or-clear rule, K/V clone layers; no model
+    llama_build_and_test(test-mtp-circuit.cpp)
     # [GRAPH_REUSE_PP] truth table always; the decode part uses the generated dummy model when it exists (no fixture
     # dependency: missing model = SKIP). Pipelined asserts only run with 2+ GPU devices
     llama_build_and_test(test-graph-reuse-pp.cpp ARGS ${CMAKE_CURRENT_BINARY_DIR}/test-models/llama-dense.gguf)

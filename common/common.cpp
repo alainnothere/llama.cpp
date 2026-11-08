@@ -1768,6 +1768,12 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.moe_cache_size = params.moe_cache_size;
 
+    // [MTP_CIRCUIT] read only by MTP draft contexts (the target ignores them). Every MTP context of the process is
+    // built from here, the fit's probe of the draft context included (common_init_result -> cparams_dft), so the
+    // extra K/V slots are in the fit's measurement. The string must outlive llama_init_from_model only (copied there).
+    cparams.mtp_circuit_max_passes = (uint32_t) std::max(0, params.speculative.draft.mtp_circuit_max_passes);
+    cparams.mtp_circuit            = params.speculative.draft.mtp_circuit.empty() ? nullptr : params.speculative.draft.mtp_circuit.c_str();
+
     return cparams;
 }
 

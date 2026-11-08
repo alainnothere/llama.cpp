@@ -638,6 +638,66 @@ llama_context::llama_context(
         }
     }
 
+    // [MTP_CIRCUIT] (2026-11-07) drafter circuit of an MTP draft context, decided before the memory: the K/V cache
+    // gets one layer per own-K/V pass (llama_model::create_memory, clone layers). Only the qwen35 dense MTP graph reads
+    // the circuit (qwen35moe: same block shape, MoE FFN, not ported); everywhere else max passes is 1 and only "M0" is
+    // accepted. max passes unset (param 0, no LLAMA_MTP_CIRCUIT_MAX_PASSES) = sized for the initial circuit.
+    // A bad initial circuit fails the context (it came from the command line / env, so the start should fail loudly).
+    mtp_circuit_arch_ok = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && model.arch == LLM_ARCH_QWEN35 && hparams.n_layer_nextn > 0;
+    cparams.mtp_circuit_max_passes = 1;
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && hparams.n_layer_nextn > 0) {
+        std::string str;
+        if (params.mtp_circuit && *params.mtp_circuit) {
+            str = params.mtp_circuit;
+        } else if (const char * e = getenv("LLAMA_MTP_CIRCUIT"); e && *e) {
+            str = e;
+        }
+        uint32_t max_passes = params.mtp_circuit_max_passes;
+        if (max_passes == 0) {
+            if (const char * e = getenv("LLAMA_MTP_CIRCUIT_MAX_PASSES"); e && *e) {
+                max_passes = (uint32_t) std::max(0, atoi(e));
+            }
+        }
+
+        std::vector<llama_mtp_pass> passes;
+        std::string canonical, err;
+        if (!llama_mtp_circuit_parse(str.c_str(), passes, canonical, err)) {
+            throw std::runtime_error("MTP circuit '" + str + "': " + err);
+        }
+        uint32_t n_own = 0;
+        for (const auto & p : passes) {
+            n_own += llama_mtp_pass_owns_kv(p) ? 1 : 0; // full blocks and own .attn sub-blocks
+        }
+        if (max_passes == 0) {
+            max_passes = std::max<uint32_t>(1, n_own);
+        }
+        if (!mtp_circuit_arch_ok) {
+            max_passes = 1; // no clone layers outside qwen35 (create_memory), the build below rejects non-default lists
+        }
+        if (max_passes > LLAMA_MTP_CIRCUIT_MAX_LEN) {
+            throw std::runtime_error("MTP circuit max passes " + std::to_string(max_passes) + " > " + std::to_string(LLAMA_MTP_CIRCUIT_MAX_LEN));
+        }
+        cparams.mtp_circuit_max_passes = max_passes;
+
+        if (!llama_mtp_circuit_build(str.c_str(), mtp_circuit_arch_ok, hparams, max_passes, mtp_circuit_active, err)) {
+            throw std::runtime_error("MTP circuit '" + str + "': " + err);
+        }
+        mtp_circuit_accepted = mtp_circuit_active.str;
+
+        // the compute buffers are reserved for max_passes own M0 passes, so a later switch within the slots does not
+        // grow them (borrowed passes add no tensor that outlives its pass; T<il> passes on another device than the
+        // NextN block allocate their activations there at first use, the fit does not see that part)
+        const std::string str_reserve = "M0*" + std::to_string(max_passes);
+        if (!llama_mtp_circuit_build(str_reserve.c_str(), mtp_circuit_arch_ok || max_passes == 1, hparams, max_passes, mtp_circuit_reserve, err)) {
+            throw std::runtime_error("MTP circuit reserve '" + str_reserve + "': " + err);
+        }
+        if (!mtp_circuit_active.is_default() || max_passes > 1) {
+            // WARN: INFO is hidden at the default verbosity of this fork (memory: lib INFO logs hidden at -lv 3)
+            LLAMA_LOG_WARN("%s: MTP circuit '%s', %u own-K/V slot(s) allocated%s\n", __func__, mtp_circuit_active.str.c_str(),
+                    max_passes, hparams.no_alloc ? " (fit probe)" : "");
+        }
+    }
+
     // init the memory module
     lazy_type_k = params.type_k; // [fork, 2026-10-30] for memory_breakdown()'s lazy staging bound
     lazy_type_v = params.type_v;
@@ -1677,6 +1737,85 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
 
 void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
+}
+
+// [MTP_CIRCUIT] (2026-11-07) llama_mtp_set_circuit: checked here on the caller's thread against immutable state
+// (model hparams, max passes fixed at construction), parked for the decode thread. Returns 0 / -1 (message kept).
+int32_t llama_context::mtp_set_circuit(const char * circuit) {
+    llama_mtp_circuit c;
+    std::string err;
+    bool ok = false;
+    if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP || model.hparams.n_layer_nextn == 0) {
+        err = "not an MTP draft context (ctx_type LLAMA_CONTEXT_TYPE_MTP on a model with a NextN block)";
+    } else {
+        ok = llama_mtp_circuit_build(circuit, mtp_circuit_arch_ok, model.hparams, cparams.mtp_circuit_max_passes, c, err);
+    }
+
+    std::lock_guard<std::mutex> lock(mtp_circuit_mutex);
+    if (!ok) {
+        mtp_circuit_err = err;
+        LLAMA_LOG_WARN("%s: MTP circuit '%s' rejected: %s\n", __func__, circuit ? circuit : "", err.c_str());
+        return -1;
+    }
+    mtp_circuit_err.clear();
+    mtp_circuit_accepted    = c.str;
+    mtp_circuit_pending     = std::move(c);
+    mtp_circuit_has_pending = true;
+    mtp_circuit_dirty.store(true, std::memory_order_release);
+    return 0;
+}
+
+std::string llama_context::mtp_get_circuit() const {
+    std::lock_guard<std::mutex> lock(mtp_circuit_mutex);
+    return mtp_circuit_accepted;
+}
+
+std::string llama_context::mtp_circuit_last_error() const {
+    std::lock_guard<std::mutex> lock(mtp_circuit_mutex);
+    return mtp_circuit_err;
+}
+
+uint32_t llama_context::mtp_circuit_max_passes() const {
+    return cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? cparams.mtp_circuit_max_passes : 0;
+}
+
+// decode thread. The draft K/V is kept when every own-K/V pass of the new list is in the common prefix with the
+// old one (llama_mtp_circuit_keeps_kv: "M0" <-> "M0,M0:b0" keeps the history), else the memory is cleared (cells
+// only, clear(false): no device write, so no race with a graph still in flight; synchronized anyway). After a clear
+// the draft attends only to positions decoded from here on: the speculative driver needs no change, its next
+// process() decodes at the target's positions and an empty draft memory accepts any start position (the
+// consecutive-position check of llama_batch_allocr only runs when the sequence has cells). History before the
+// switch is NOT rebuilt (that needs the target h of every earlier position, which nobody keeps), so acceptance
+// after a clear starts cold. Draft states cached by llama-server (prompt cache) were written by the old list.
+void llama_context::mtp_circuit_apply() {
+    llama_mtp_circuit c;
+    {
+        std::lock_guard<std::mutex> lock(mtp_circuit_mutex);
+        if (!mtp_circuit_has_pending) {
+            mtp_circuit_dirty.store(false, std::memory_order_release);
+            return;
+        }
+        c = std::move(mtp_circuit_pending);
+        mtp_circuit_pending     = {};
+        mtp_circuit_has_pending = false;
+        mtp_circuit_dirty.store(false, std::memory_order_release);
+    }
+
+    if (c.str == mtp_circuit_active.str) {
+        return;
+    }
+
+    const bool keep = llama_mtp_circuit_keeps_kv(mtp_circuit_active, c);
+    if (!keep && memory) {
+        synchronize();
+        memory->clear(false);
+    }
+
+    LLAMA_LOG_WARN("%s: MTP circuit '%s' -> '%s' (%d own-K/V pass(es) of %u slot(s), draft K/V %s)\n", __func__,
+            mtp_circuit_active.str.c_str(), c.str.c_str(), c.n_own, cparams.mtp_circuit_max_passes, keep ? "kept" : "cleared");
+
+    mtp_circuit_active = std::move(c);
+    mtp_circuit_gen++;
 }
 
 // [VOCAB_SUBSET] 2026-10-23. the gather is a device-side get_rows over an I32 view of model.output's bytes, so
@@ -3534,6 +3673,11 @@ int llama_context::decode_impl(const llama_batch_ext & batch_inp) {
         return encode(batch_inp);
     }
 
+    // [MTP_CIRCUIT] a list parked by llama_mtp_set_circuit takes effect here, before this batch touches the memory
+    if (mtp_circuit_dirty.load(std::memory_order_acquire)) {
+        mtp_circuit_apply();
+    }
+
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -4493,7 +4637,10 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
+    // [MTP_CIRCUIT] reserve for the largest pass list the draft memory allows, not the active one
+    mtp_circuit_reserving = true;
     const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    mtp_circuit_reserving = false;
 
     res->reset();
 
@@ -4549,6 +4696,12 @@ llm_graph_params llama_context::graph_params(
 
     p.logits_subset     = logits_subset.active() ? &logits_subset : nullptr;
     p.logits_subset_gen = logits_subset.gen;
+
+    // [MTP_CIRCUIT] the reserve graph gets its own gen so no decode graph is ever matched against it
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        p.mtp_circuit     = mtp_circuit_reserving ? &mtp_circuit_reserve : &mtp_circuit_active;
+        p.mtp_circuit_gen = mtp_circuit_reserving ? UINT64_MAX : mtp_circuit_gen;
+    }
 
     return p;
 }
@@ -6053,6 +6206,8 @@ llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
+        /*.mtp_circuit_max_passes      =*/ 0,
+        /*.mtp_circuit                 =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
@@ -6328,6 +6483,32 @@ void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
 
 int32_t llama_set_logits_subset(llama_context * ctx, const llama_token * ids, int32_t n_ids) {
     return ctx->set_logits_subset(ids, n_ids);
+}
+
+// [MTP_CIRCUIT] see llama-ext.h
+int32_t llama_mtp_set_circuit(llama_context * ctx_dft, const char * circuit) {
+    return ctx_dft ? ctx_dft->mtp_set_circuit(circuit) : -1;
+}
+
+static int32_t llama_mtp_copy_str(const std::string & str, char * buf, size_t buf_size) {
+    if (buf && buf_size > 0) {
+        const size_t n = std::min(str.size(), buf_size - 1);
+        memcpy(buf, str.data(), n);
+        buf[n] = 0;
+    }
+    return (int32_t) str.size();
+}
+
+int32_t llama_mtp_get_circuit(const llama_context * ctx_dft, char * buf, size_t buf_size) {
+    return llama_mtp_copy_str(ctx_dft ? ctx_dft->mtp_get_circuit() : std::string(), buf, buf_size);
+}
+
+int32_t llama_mtp_circuit_max_passes(const llama_context * ctx_dft) {
+    return ctx_dft ? (int32_t) ctx_dft->mtp_circuit_max_passes() : 0;
+}
+
+int32_t llama_mtp_circuit_last_error(const llama_context * ctx_dft, char * buf, size_t buf_size) {
+    return llama_mtp_copy_str(ctx_dft ? ctx_dft->mtp_circuit_last_error() : std::string(), buf, buf_size);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

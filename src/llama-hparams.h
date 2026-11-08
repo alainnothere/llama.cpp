@@ -470,6 +470,11 @@ struct llama_hparams {
 
     bool has_kv(uint32_t il) const;
 
+    // [MTP_CIRCUIT] (fork, 2026-11-07) a copy with n_clones extra layers appended after n_layer_all, each a copy of
+    // layer il_src in every per-layer array; n_layer_nextn grows with them so n_layer() (the trunk) is unchanged.
+    // Only for the MTP draft K/V cache (llama_kv_cache n_layer_clones): the extra own-K/V slots of a circuit.
+    llama_hparams with_layer_clones(uint32_t il_src, uint32_t n_clones) const;
+
     bool has_rope(uint32_t il) const;
 
     // number of effective layers (excludes nextn layers)

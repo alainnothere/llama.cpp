@@ -352,3 +352,40 @@ uint32_t llama_hparams::n_layer() const {
 bool llama_hparams::use_mrope() const {
     return rope_sections[0] > 0 && rope_sections[1] > 0;
 }
+
+llama_hparams llama_hparams::with_layer_clones(uint32_t il_src, uint32_t n_clones) const {
+    GGML_ASSERT(il_src < n_layer_all);
+    GGML_ASSERT(n_layer_all + n_clones <= LLAMA_MAX_LAYERS);
+
+    llama_hparams res = *this;
+
+    // every per-layer array of llama_hparams (keep in sync when one is added: a clone layer that misses one reads
+    // the 0 that load_hparams filled the tail with, e.g. n_head_kv 0 = a zero-width K/V slot)
+    for (uint32_t k = 0; k < n_clones; ++k) {
+        const uint32_t il = n_layer_all + k;
+
+        res.n_head_arr[il]            = n_head_arr[il_src];
+        res.n_head_kv_arr[il]         = n_head_kv_arr[il_src];
+        res.n_ff_arr[il]              = n_ff_arr[il_src];
+        res.n_ff_exp_arr[il]          = n_ff_exp_arr[il_src];
+        res.n_expert_used_arr[il]     = n_expert_used_arr[il_src];
+        res.rope_pattern[il]          = rope_pattern[il_src];
+        res.is_swa_impl[il]           = is_swa_impl[il_src];
+        res.is_recr_impl[il]          = is_recr_impl[il_src];
+        res.xielu_alpha_n[il]         = xielu_alpha_n[il_src];
+        res.xielu_alpha_p[il]         = xielu_alpha_p[il_src];
+        res.xielu_beta[il]            = xielu_beta[il_src];
+        res.xielu_eps[il]             = xielu_eps[il_src];
+        res.is_indexer_full_impl[il]  = is_indexer_full_impl[il_src];
+        res.dsv4_compress_ratios[il]  = dsv4_compress_ratios[il_src];
+        res.is_ple_impl[il]           = is_ple_impl[il_src];
+        res.deepstack_mapping_arr[il] = deepstack_mapping_arr[il_src];
+        res.swiglu_clamp_exp[il]      = swiglu_clamp_exp[il_src];
+        res.swiglu_clamp_shexp[il]    = swiglu_clamp_shexp[il_src];
+    }
+
+    res.n_layer_all   += n_clones;
+    res.n_layer_nextn += n_clones;
+
+    return res;
+}

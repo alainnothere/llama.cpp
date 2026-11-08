@@ -8,12 +8,16 @@
 #include "llama-impl.h"
 #include "llama-memory.h"
 #include "llama-moe-cache.h"
+#include "llama-mtp-circuit.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
 #include <array>
+#include <atomic>
 #include <map>
+#include <mutex>
+#include <string>
 #include <vector>
 
 struct llama_model;
@@ -129,6 +133,12 @@ struct llama_context {
 
     // [VOCAB_SUBSET] see llama_set_logits_subset() in llama-ext.h
     int32_t set_logits_subset(const llama_token * ids, int32_t n_ids);
+
+    // [MTP_CIRCUIT] see llama_mtp_set_circuit() in llama-ext.h; the setter and getters may run on any thread
+    int32_t     mtp_set_circuit(const char * circuit);
+    std::string mtp_get_circuit() const;
+    std::string mtp_circuit_last_error() const;
+    uint32_t    mtp_circuit_max_passes() const;
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -415,6 +425,23 @@ private:
     ggml_backend_buffer_ptr logits_subset_buf;
     std::vector<int32_t>    logits_subset_ids; // n_ids entries
     std::vector<float>      logits_subset_tmp; // host-sampler path: [n_pad x n_outputs] before the scatter
+
+    // [MTP_CIRCUIT] (2026-11-07) drafter circuit of an MTP context. The setter (HTTP thread in llama-server) parses,
+    // checks and parks the new list under the mutex; decode_impl swaps it in on the decode thread before the batch
+    // touches the memory (mtp_circuit_apply), so the graph builder reads mtp_circuit_active without a lock.
+    bool                    mtp_circuit_arch_ok  = false; // the draft graph of this arch reads the circuit (qwen35)
+    mutable std::mutex      mtp_circuit_mutex;
+    llama_mtp_circuit       mtp_circuit_pending;          // guarded
+    bool                    mtp_circuit_has_pending = false; // guarded; mirrored by mtp_circuit_dirty for the cheap check
+    std::atomic<bool>       mtp_circuit_dirty { false };
+    std::string             mtp_circuit_accepted = "M0";  // guarded: canonical form of the last accepted list
+    std::string             mtp_circuit_err;              // guarded: message of the last rejected list
+    llama_mtp_circuit       mtp_circuit_active;           // decode thread only
+    uint64_t                mtp_circuit_gen = 0;          // bumped per applied list -> llm_graph_params::allow_reuse
+    llama_mtp_circuit       mtp_circuit_reserve;          // worst case for graph_reserve: M0 x max_passes
+    bool                    mtp_circuit_reserving = false;
+
+    void mtp_circuit_apply();
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;

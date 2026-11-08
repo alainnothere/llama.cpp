@@ -398,6 +398,14 @@ extern "C" {
 
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, 0 = disabled [EXPERIMENTAL]
 
+        // [MTP_CIRCUIT] (fork, 2026-11-07) MTP draft contexts only (ctx_type == LLAMA_CONTEXT_TYPE_MTP, qwen35 dense):
+        // mtp_circuit_max_passes = own-KV passes the draft KV cache is allocated for, every extra pass is one more K/V
+        //                          layer the size of the NextN block's (0 = env LLAMA_MTP_CIRCUIT_MAX_PASSES, else 1)
+        // mtp_circuit            = initial pass list, e.g. "M0,M0:b0" (NULL or "" = env LLAMA_MTP_CIRCUIT, else "M0");
+        //                          grammar and runtime switch: llama_mtp_set_circuit() in src/llama-ext.h
+        uint32_t     mtp_circuit_max_passes;
+        const char * mtp_circuit;
+
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
         // currently works only with CPU execution
