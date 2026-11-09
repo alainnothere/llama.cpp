@@ -823,6 +823,48 @@ static void test_buft_alloc_buffer_n_views() {
     GGML_ASSERT(view->data == base->data);
 }
 
+// Check that views placed after a tensor larger than max_size are still initialized.
+// The planner used to close the chunk on a zero-size view and drop the trailing views-only chunk (KV k_stream/v_stream views, 2026-11-09).
+static void test_buft_alloc_buffer_n_trailing_views_after_oversize() {
+    {
+        dummy_backend backend      = dummy_backend_init(16);
+        auto [ctx, graph, ctx_ptr] = make_context();
+
+        ggml_tensor * a  = make_input_with_size(ctx, 24);
+        ggml_tensor * b  = make_input_with_size(ctx, 24);
+        ggml_tensor * va = ggml_view_1d(ctx, a, 2, 0);
+        ggml_tensor * vb = ggml_view_1d(ctx, b, 2, 0);
+        assign_names(ctx);
+
+        ggml_tensor * tensors[4] = { a, b, va, vb };
+        ggml_backend_buffer_ptr buffer(ggml_backend_buft_alloc_buffer_n(&backend.buffer_type, tensors, 4));
+        GGML_ASSERT(buffer != nullptr);
+        GGML_ASSERT(backend.context->buffers.size() == 2);
+        GGML_ASSERT(ggml_backend_buffer_get_size(buffer.get()) == 48);
+        for (ggml_tensor * t : tensors) {
+            GGML_ASSERT(t->buffer != nullptr);
+            GGML_ASSERT(t->data != nullptr);
+        }
+        GGML_ASSERT(va->buffer == a->buffer && va->data == a->data);
+        GGML_ASSERT(vb->buffer == b->buffer && vb->data == b->data);
+    }
+    {
+        dummy_backend backend      = dummy_backend_init(16);
+        auto [ctx, graph, ctx_ptr] = make_context();
+
+        ggml_tensor * a  = make_input_with_size(ctx, 24);
+        ggml_tensor * va = ggml_view_1d(ctx, a, 2, 0);
+        assign_names(ctx);
+
+        ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors_from_buft(ctx, &backend.buffer_type));
+        GGML_ASSERT(buffer != nullptr);
+        GGML_ASSERT(backend.context->buffers.size() == 1);
+        GGML_ASSERT(ggml_backend_buffer_get_size(buffer.get()) == 24);
+        GGML_ASSERT(va->buffer == a->buffer && va->buffer != nullptr);
+        GGML_ASSERT(va->data == a->data && va->data != nullptr);
+    }
+}
+
 // Check that the reported size matches the allocated size in various scenarios:
 // single buffer, multi buffer, and views
 static void test_alloc_ctx_tensors_from_buft_size_matches() {
@@ -1126,6 +1168,7 @@ int main() {
     run("test_buft_alloc_buffer_n_zero_size", test_buft_alloc_buffer_n_zero_size);
     run("test_buft_alloc_buffer_n_already_allocated", test_buft_alloc_buffer_n_already_allocated);
     run("test_buft_alloc_buffer_n_views", test_buft_alloc_buffer_n_views);
+    run("test_buft_alloc_buffer_n_trailing_views_after_oversize", test_buft_alloc_buffer_n_trailing_views_after_oversize);
     run("test_alloc_ctx_tensors_from_buft_size_matches", test_alloc_ctx_tensors_from_buft_size_matches);
     run("test_buft_alloc_buffer_n_custom_override", test_buft_alloc_buffer_n_custom_override);
     run("test_buft_get_alloc_size_n_single_buffer", test_buft_get_alloc_size_n_single_buffer);

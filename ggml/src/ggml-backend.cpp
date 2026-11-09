@@ -72,7 +72,10 @@ static ggml_backend_buft_alloc_buffer_n_plan_t ggml_backend_buft_alloc_buffer_n_
         }
 
         // flush the current buffer if adding this tensor would exceed max_size
-        if (cur_buf_size > 0 && (cur_buf_size + this_size) > max_size) {
+        // zero-size entries (views) never open a chunk: after a tensor larger than max_size, cur + 0 > max closed the chunk, and a trailing views-only chunk has size 0 and was never allocated
+        // seen 2026-11-09: Vulkan max = 1 GiB block, f16 K above 2^19 cells is > 1 GiB (Qwythos-9B-v2, n_ctx 839680), so the last layer's k_stream/v_stream views stayed data == NULL and the state writer asserted at the first disk-cache flush
+        // a view stays in the chunk before it: its view_src is created earlier, so it is in an earlier chunk or in this one; chunk count and byte totals do not change
+        if (this_size > 0 && cur_buf_size > 0 && (cur_buf_size + this_size) > max_size) {
             plan.push_back({ cur_buf_size, first, i });
             cur_buf_size = this_size;
             first        = i;

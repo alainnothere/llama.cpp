@@ -789,6 +789,20 @@ llama_kv_cache::llama_kv_cache(
             throw std::runtime_error("failed to allocate buffer for kv cache");
         }
 
+        // every tensor and view must have memory after a real allocation; fail at load, not at the first state save
+        // 2026-11-09: the ggml planner left the last layer's k_stream/v_stream views at data == NULL (K > 1 GiB Vulkan block),
+        // the graphs never read them, and the crash came 2 minutes into the first prompt at the disk-cache flush
+        if (!hparams.no_alloc) {
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                if (t->data == nullptr || t->buffer == nullptr) {
+                    const std::string msg = format("kv cache %s %s was not allocated in %s (data %p, buffer %p)",
+                            t->view_src ? "view" : "tensor", t->name, ggml_backend_buft_name(buft), t->data, (void *) t->buffer);
+                    ggml_backend_buffer_free(buf);
+                    throw std::runtime_error(msg);
+                }
+            }
+        }
+
         LLAMA_LOG_WARN("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
 
         // CPU PLACEMENT warning #2 of 3 (2026-10-20), KV half (the recurrent-state half,
