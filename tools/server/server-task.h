@@ -726,9 +726,12 @@ struct server_prompt_cache_state {
 };
 
 struct server_prompt_cache {
+    // disk_path_cold / demote_after_s: [TAG_COLD_TIER] second (slow, big) directory for entries idle longer than
+    // demote_after_s seconds. empty = no cold tier, the hot tier behaves exactly as before
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens,
                         std::string disk_path, int32_t queue_depth, int32_t checkpoint_spill_max,
-                        uint32_t arch_hash, uint32_t vocab_hash, uint32_t state_hash = 0);
+                        uint32_t arch_hash, uint32_t vocab_hash, uint32_t state_hash = 0,
+                        std::string disk_path_cold = "", int32_t demote_after_s = 86400);
     ~server_prompt_cache();
 
     server_prompt_cache(const server_prompt_cache &)             = delete;
@@ -744,6 +747,11 @@ struct server_prompt_cache {
 
     // disk tier config — empty disk_path disables the tier
     std::string disk_path;
+    // [TAG_COLD_TIER] cold directory (empty = off) and the idle age (seconds) after which a hot entry moves there.
+    // an entry lives in exactly one of the two directories: lookups probe hot then cold, a cold hit is promoted back
+    // to hot inside load_from_disk, the writer thread demotes idle hot entries (demote_scan)
+    std::string disk_path_cold;
+    int32_t     demote_after_s = 86400;
     int32_t     queue_depth          = 16;
     int32_t     checkpoint_spill_max = -1; // -1 = no limit
     uint32_t    arch_hash            = 0;
@@ -846,6 +854,14 @@ struct server_prompt_cache {
     // synchronous on the caller's thread; no-op if the disk tier is disabled.
     void spill_all_to_disk();
 
+    // [TAG_COLD_TIER] the conversations the slots hold right now (server-context pushes the list from update_slots).
+    // the demote scan never moves one of them. cheap when unchanged (one compare under the mutex)
+    void set_live_conversations(const std::vector<std::string> & ids);
+
+    // [TAG_COLD_TIER] where an entry lives: 0 = nowhere (no .hdr in either dir), 1 = hot, 2 = cold. base receives
+    // <dir>/<conversation_id> (no extension) of the tier that holds the .hdr
+    int resolve_tier(const std::string & conversation_id, std::string & base) const;
+
 private:
     // async writer job: either one KV segment append/rewrite or one checkpoint write
     struct disk_job {
@@ -869,8 +885,22 @@ private:
         common_state_data rec;
         uint32_t          rec_n_tok = 0;
 
+        // [TAG_DISK_ENOSPC] the conversation's mirror epoch when the flush was planned. a failed write bumps the epoch and
+        // re-seeds the mirror from the committed header, so every queued job planned against the failed timeline is
+        // dropped instead of appended with a hole in it
+        uint32_t epoch = 0;
+
+        // [TAG_DISK_ENOSPC] staged rewrite: every job of a from-scratch flush writes <id>.kv.tmp/.drft.tmp, the last one
+        // renames them over the old files after the header is ready. the old entry stays loadable until then
+        bool     staged    = false;
+        bool     last      = false; // last job of its flush
+        uint64_t est_bytes = 0;     // rewrite job only: estimated bytes of the whole staged flush (space check)
+
         // checkpoint write (when set, the segment fields are unused)
         std::shared_ptr<common_prompt_checkpoint> ckpt;
+
+        // [TAG_COLD_TIER] demote scan (all other fields unused)
+        bool demote_scan = false;
 
         size_t bytes() const {
             return kv.size() + drft.size() + rec.size() + tokens.size() * sizeof(llama_token) +
@@ -903,8 +933,25 @@ public:
         std::vector<llama_token> scheduled_tokens;
         std::vector<uint32_t>    scheduled_seg_ends; // p1 of every scheduled segment, ascending
 
-        // a write failed or the files are inconsistent: the next flush must rewrite from scratch
+        // a state capture failed or the files are inconsistent: the next flush must rewrite from scratch
         bool broken = false;
+
+        // [TAG_DISK_ENOSPC] a write failed and was rolled back to the committed header: the scheduled fields describe a
+        // timeline that never reached disk. the next flush re-reads the .hdr/.tok before planning (flush_from_context)
+        bool     needs_reseed = false;
+        uint32_t epoch        = 0;     // bumped by the writer on every rollback, see disk_job::epoch
+
+        // hybrid models: the last scheduled job carries a .rec snapshot valid at scheduled_n_tok (a header without a
+        // valid .rec loads through the checkpoint fallback, and the next flush must write one even with no new tokens)
+        bool scheduled_rec = false;
+        // read_disk_state: the .rec file matches rec_size. false = the loader restores the recurrent state from a cp_
+        bool rec_valid     = true;
+
+        // [TAG_COLD_TIER] 1 = hot, 2 = cold: the directory holding the committed files (appends go there)
+        int     tier       = 1;
+        // unix seconds of the last write or restore of this conversation (the demote scan's idle clock; 0 = unknown,
+        // then the .hdr mtime is used)
+        int64_t t_last_use = 0;
 
         // [fork, 2026-10-30] the state hash in the .hdr this mirror was seeded from (read_disk_state), or this server's
         // own once it scheduled a rewrite. a foreign one (another K/V type, read through --cache-convert) makes the
@@ -971,6 +1018,29 @@ private:
     size_t      queue_bytes = 0;        // payload bytes currently sitting in `queue`
     std::string writer_active_conv;     // conv_id the writer is persisting right now
 
+    // [TAG_DISK_ENOSPC] writer-thread only: the staging state of each in-progress staged rewrite
+    std::unordered_map<std::string, disk_conv_state> staging;
+
+    // [TAG_COLD_TIER] guarded by mtx
+    std::unordered_set<std::string> live_convs;    // set_live_conversations()
+    std::unordered_set<std::string> loading_convs; // load_from_disk() in progress (the scan skips them)
+    bool    demote_scan_requested = false;         // the hot dir ran short of space: scan before the interval
+    int64_t t_next_demote_scan_us = 0;             // writer thread: ggml_time_us() of the next scheduled scan
+
+    // [TAG_DISK_ENOSPC] writer thread: roll the mirror back to the committed header after a failed write
+    void rollback_mirror(const std::string & conv_id, const char * why);
+    // [TAG_DISK_ENOSPC] writer thread: false (and one log line) when dir has less than need + DISK_FREE_MARGIN_BYTES
+    bool disk_space_ok(const std::string & dir, uint64_t need, const std::string & conv_id, const char * what);
+    void process_staged_job(const disk_job & job, disk_conv_state & st);
+    void abort_staging(const std::string & conv_id);
+
+    // [TAG_COLD_TIER] writer thread
+    void demote_scan();
+    // 1 = moved, 0 = skipped, -1 = yielded to queued work (partial copy removed)
+    int  demote_one(const std::string & conv_id);
+    // load_from_disk(): move the conversation's cp_ files from cold to hot and repoint cp_index
+    void move_cp_files(const std::string & conv_id, const std::string & from_dir, const std::string & to_dir);
+
     // launched lazily once disk_path is non-empty
     void start_writer_if_needed();
     void writer_loop();
@@ -991,6 +1061,11 @@ public:
                         llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, int32_t n_room = -1);
 
 private:
+    // [TAG_DISK_ENOSPC] load_from_disk(): recurrent state of a hybrid entry from its newest matching cp_ file when the
+    // .rec is missing or stale. returns the checkpoint's n_tokens (the attention cells past it are removed), 0 = none
+    int64_t restore_rec_from_checkpoint(const std::string & conversation_id, const disk_conv_state & st,
+                                        llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+
     // Phase 1 of load(): the RAM entry that beats the slot's own prefix, or states.end()
     std::list<server_prompt_cache_state>::iterator find_state(const server_prompt & prompt, const server_tokens & tokens_new);
 };

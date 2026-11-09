@@ -10,7 +10,9 @@
 #include "speculative.h"
 #include "server-common.h"
 
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -60,6 +62,23 @@ constexpr uint32_t DISK_SEGMENT_TOKENS = 8192;
 // 1-2 segment append must never wait here.
 constexpr size_t DISK_QUEUE_MAX_BYTES = 2ull << 30; // 2 GiB
 
+// [TAG_DISK_ENOSPC] free space every disk-cache write leaves behind on its filesystem. a write that would go below it is
+// skipped with one log line (no retry loop, the next flush tries again). 2026-11-01: the hot dir's filesystem
+// (/home/xlayn/theOtherDocs, shared with everything else on the box) hit 0 bytes, appends failed, and the old policy
+// turned every failure into a rewrite that wrote 17 x 512 MiB and died again (~350 GiB of writes for one conversation).
+// 2 GiB = the next 512 MiB segment (~200 ms on the NVMe) plus a dozen 150 MiB cp_ files of the other slot still in
+// the queue, with room left for the .tok/.hdr rewrites and for whatever else writes to that disk
+constexpr uint64_t DISK_FREE_MARGIN_BYTES = 2ull << 30;
+
+// [TAG_COLD_TIER] the demote scan runs at startup, then at most once per this many seconds (or earlier when the hot dir
+// runs short of space). a shorter --cache-disk-demote-after shortens it too (the tests use 1 s)
+constexpr int64_t DISK_DEMOTE_SCAN_INTERVAL_S = 600;
+
+// [TAG_COLD_TIER] copy granularity of a demotion. between chunks the writer checks for queued work and a load of the
+// same conversation and abandons the copy if there is any: the cold disk is a spinner at ~200 MB/s, a 15 GB entry is
+// ~75 s, and a flush that waited behind it would block the request thread at DISK_QUEUE_MAX_BYTES
+constexpr size_t DISK_DEMOTE_CHUNK_BYTES = 32ull << 20;
+
 // checkpoint files - written by spill_checkpoint() the moment create_checkpoint() captures a
 // checkpoint. format: magic, version, arch_hash, vocab_hash, state_hash,
 // pos_min (i32), pos_max (i32), n_tokens (i64), token_prefix_hash (u64),
@@ -107,13 +126,11 @@ static bool disk_fsync(FILE * f) {
 #endif
 }
 
-// overwrite atomically: write tmp, fsync, rename over the target. the optional second part is
-// appended to the first (the .rec file is [u32 n_tok][shared blob], see disk_job::rec)
-static bool disk_write_file_atomic(const std::string & path, const void * data, size_t n,
-                                   const void * data2 = nullptr, size_t n2 = 0) {
-    const std::string tmppath = path + ".tmp";
-
-    FILE * f = fopen(tmppath.c_str(), "wb");
+// write (truncate) + fsync, no rename. the optional second part is appended to the first
+// (the .rec file is [u32 n_tok][shared blob], see disk_job::rec). a failed write removes the file
+static bool disk_write_file(const std::string & path, const void * data, size_t n,
+                            const void * data2 = nullptr, size_t n2 = 0) {
+    FILE * f = fopen(path.c_str(), "wb");
     if (!f) {
         return false;
     }
@@ -122,12 +139,21 @@ static bool disk_write_file_atomic(const std::string & path, const void * data, 
     ok = ok && fflush(f) == 0;
     ok = ok && disk_fsync(f);
     ok = fclose(f) == 0 && ok;
-
-    std::error_code ec;
     if (!ok) {
-        std::filesystem::remove(tmppath, ec);
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+    }
+    return ok;
+}
+
+// overwrite atomically: write tmp, fsync, rename over the target
+static bool disk_write_file_atomic(const std::string & path, const void * data, size_t n,
+                                   const void * data2 = nullptr, size_t n2 = 0) {
+    const std::string tmppath = path + ".tmp";
+    if (!disk_write_file(tmppath, data, n, data2, n2)) {
         return false;
     }
+    std::error_code ec;
     std::filesystem::rename(tmppath, path, ec);
     if (ec) {
         std::filesystem::remove(tmppath, ec);
@@ -136,17 +162,112 @@ static bool disk_write_file_atomic(const std::string & path, const void * data, 
     return true;
 }
 
+// [TAG_DISK_ENOSPC] test hook: LLAMA_DISK_CACHE_FAIL_AFTER_BYTES=N makes the .kv/.drft appends of this process fail once
+// N bytes were appended in total (staged rewrites and promotions included). the failing append still writes the bytes
+// up to N, like a disk that fills mid-write, so the rollback has an orphan tail to cut. unset or negative = off.
+// returns true when this append must fail; n_ok = the bytes it may write first
+static bool disk_fault_inject(size_t n, size_t & n_ok) {
+    static const int64_t budget = []() {
+        const char * e = getenv("LLAMA_DISK_CACHE_FAIL_AFTER_BYTES");
+        return e ? (int64_t) std::strtoll(e, nullptr, 10) : (int64_t) -1;
+    }();
+    static std::atomic<int64_t> used{0};
+
+    n_ok = n;
+    if (budget < 0) {
+        return false;
+    }
+    const int64_t before = used.fetch_add((int64_t) n);
+    if (before + (int64_t) n <= budget) {
+        return false;
+    }
+    n_ok = before >= budget ? 0 : (size_t) (budget - before);
+    return true;
+}
+
 // append and fsync - the caller is responsible for truncating orphan tails first
 static bool disk_append_file(const std::string & path, const void * data, size_t n) {
+    size_t n_ok = n;
+    const bool inject = disk_fault_inject(n, n_ok);
+
     FILE * f = fopen(path.c_str(), "ab");
     if (!f) {
         return false;
     }
-    bool ok = n == 0 || fwrite(data, 1, n, f) == n;
+    bool ok = n_ok == 0 || fwrite(data, 1, n_ok, f) == n_ok;
     ok = ok && fflush(f) == 0;
     ok = ok && disk_fsync(f);
     ok = fclose(f) == 0 && ok;
-    return ok;
+    return ok && !inject;
+}
+
+// cut a data file back to its committed size (an append that failed half way leaves a tail no header describes)
+static void disk_truncate_to(const std::string & path, uint64_t size) {
+    std::error_code ec;
+    const uint64_t actual = (uint64_t) std::filesystem::file_size(path, ec);
+    if (!ec && actual > size) {
+        std::filesystem::resize_file(path, size, ec);
+    }
+}
+
+// [TAG_COLD_TIER] copy src to dst (truncating dst) in DISK_DEMOTE_CHUNK_BYTES chunks, fsync. abort() is asked before
+// every chunk. 1 = copied, 0 = I/O error, -1 = aborted. dst is removed unless the copy completed
+template <typename F>
+static int disk_copy_file(const std::string & src, const std::string & dst, F && abort) {
+    FILE * in = fopen(src.c_str(), "rb");
+    if (!in) {
+        return 0;
+    }
+    FILE * out = fopen(dst.c_str(), "wb");
+    if (!out) {
+        fclose(in);
+        return 0;
+    }
+    std::vector<char> buf(DISK_DEMOTE_CHUNK_BYTES);
+    int res = 1;
+    while (true) {
+        if (abort()) {
+            res = -1;
+            break;
+        }
+        const size_t n = fread(buf.data(), 1, buf.size(), in);
+        if (n > 0 && fwrite(buf.data(), 1, n, out) != n) {
+            res = 0;
+            break;
+        }
+        if (n < buf.size()) {
+            if (ferror(in)) {
+                res = 0;
+            }
+            break;
+        }
+    }
+    fclose(in);
+    if (res == 1 && (fflush(out) != 0 || !disk_fsync(out))) {
+        res = 0;
+    }
+    if (fclose(out) != 0 && res == 1) {
+        res = 0;
+    }
+    if (res != 1) {
+        std::error_code ec;
+        std::filesystem::remove(dst, ec);
+    }
+    return res;
+}
+
+// [TAG_COLD_TIER] seconds since the file was last written (-1 = no such file)
+static int64_t disk_file_age_s(const std::string & path) {
+    std::error_code ec;
+    const auto t = std::filesystem::last_write_time(path, ec);
+    if (ec) {
+        return -1;
+    }
+    return (int64_t) std::chrono::duration_cast<std::chrono::seconds>(std::filesystem::file_time_type::clock::now() - t).count();
+}
+
+static int64_t disk_now_s() {
+    return (int64_t) std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
 // cp_{conv}_{pos_min}.bin -> pos_min. pos_min is the last field, terminated by the '.' of ".bin" and not by
@@ -183,6 +304,37 @@ static uint64_t disk_hdr_checksum(const uint8_t * data, size_t n) {
         sum ^= word;
     }
     return sum;
+}
+
+// the .hdr bytes for a committed state (layout: see read_disk_state). state_hash is the identity the data files carry
+static std::vector<uint8_t> disk_make_hdr(uint32_t arch_hash, uint32_t vocab_hash, uint32_t state_hash, uint32_t limit_tokens,
+                                          const server_prompt_cache::disk_conv_state & st, uint64_t rec_size) {
+    std::vector<uint8_t> hdr;
+    auto put = [&hdr](const auto & v) {
+        const uint8_t * p = reinterpret_cast<const uint8_t *>(&v);
+        hdr.insert(hdr.end(), p, p + sizeof(v));
+    };
+    put(DISK_CACHE_MAGIC);
+    put(DISK_CACHE_VERSION);
+    put(arch_hash);
+    put(vocab_hash);
+    put(state_hash);
+    put(limit_tokens);
+    put(st.n_tok);
+    put((uint32_t) st.segments.size());
+    put(st.kv_size);
+    put(st.drft_size);
+    put(rec_size);
+    for (const auto & s : st.segments) {
+        put(s.kv_off);
+        put(s.kv_size);
+        put(s.drft_off);
+        put(s.drft_size);
+        put(s.p0);
+        put(s.p1);
+    }
+    put(disk_hdr_checksum(hdr.data(), hdr.size()));
+    return hdr;
 }
 } // anonymous namespace
 
@@ -2055,7 +2207,7 @@ int32_t server_prompt_cache::restore_n_tokens(const server_prompt & prompt, cons
     {
         std::lock_guard<std::mutex> lock(mtx);
         const auto d = disk_convs.find(conversation_id);
-        if (d != disk_convs.end() && !d->second.broken && d->second.scheduled_n_tok > 0) {
+        if (d != disk_convs.end() && !d->second.broken && !d->second.needs_reseed && d->second.scheduled_n_tok > 0) {
             const uint32_t n_tok = d->second.scheduled_n_tok;
             if (limit_tokens > 0 && n_tok > limit_tokens) {
                 return -1;
@@ -2094,7 +2246,11 @@ bool server_prompt_cache::disk_readahead(const std::string & conversation_id) {
         return false;
     }
 #if defined(__linux__)
-    const std::string base = (std::filesystem::path(disk_path) / conversation_id).string();
+    // [TAG_COLD_TIER] the files of a cold entry: the read-ahead warms exactly what load_from_disk will stream (and copy)
+    std::string base;
+    if (resolve_tier(conversation_id, base) == 0) {
+        base = (std::filesystem::path(disk_path) / conversation_id).string();
+    }
 
     std::vector<std::string> paths;
     uint64_t total = 0;
@@ -2329,7 +2485,8 @@ void server_prompt_cache::spill_all_to_disk() {
 server_prompt_cache::server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens_in,
                                           std::string disk_path_in, int32_t queue_depth_in,
                                           int32_t checkpoint_spill_max_in,
-                                          uint32_t arch_hash_in, uint32_t vocab_hash_in, uint32_t state_hash_in) {
+                                          uint32_t arch_hash_in, uint32_t vocab_hash_in, uint32_t state_hash_in,
+                                          std::string disk_path_cold_in, int32_t demote_after_s_in) {
     this->limit_size            = 1024ull * 1024ull * (limit_size_mib < 0 ? 0 : limit_size_mib);
     this->limit_tokens          = limit_tokens_in;
     this->disk_path             = std::move(disk_path_in);
@@ -2338,6 +2495,30 @@ server_prompt_cache::server_prompt_cache(int32_t limit_size_mib, size_t limit_to
     this->arch_hash             = arch_hash_in;
     this->vocab_hash            = vocab_hash_in;
     this->state_hash            = state_hash_in;
+    this->disk_path_cold        = std::move(disk_path_cold_in);
+    this->demote_after_s        = demote_after_s_in > 0 ? demote_after_s_in : 1;
+
+    // [TAG_COLD_TIER] the cold tier only exists behind a hot one, and never as the same directory
+    if (!this->disk_path_cold.empty()) {
+        std::error_code ec;
+        if (this->disk_path.empty()) {
+            SRV_WRN("disk cache: --cache-disk-path-cold '%s' ignored without --cache-disk-path\n", this->disk_path_cold.c_str());
+            this->disk_path_cold.clear();
+        } else {
+            std::filesystem::create_directories(this->disk_path_cold, ec);
+            if (ec) {
+                SRV_WRN("disk cache: cannot create cold directory '%s': %s - cold tier disabled\n",
+                        this->disk_path_cold.c_str(), ec.message().c_str());
+                this->disk_path_cold.clear();
+            } else {
+                std::filesystem::create_directories(this->disk_path, ec);
+                if (std::filesystem::equivalent(this->disk_path, this->disk_path_cold, ec)) {
+                    SRV_WRN("disk cache: cold directory '%s' is the hot directory - cold tier disabled\n", this->disk_path_cold.c_str());
+                    this->disk_path_cold.clear();
+                }
+            }
+        }
+    }
 
     if (!this->disk_path.empty()) {
         std::error_code ec;
@@ -2350,6 +2531,11 @@ server_prompt_cache::server_prompt_cache(int32_t limit_size_mib, size_t limit_to
             SRV_WRN("disk cache: enabled at '%s' (queue depth %d, checkpoint spill max %d, arch=0x%08x, vocab=0x%08x, state=0x%08x)\n",
                     this->disk_path.c_str(), this->queue_depth, this->checkpoint_spill_max,
                     this->arch_hash, this->vocab_hash, this->state_hash);
+            if (!this->disk_path_cold.empty()) {
+                SRV_WRN("disk cache: cold tier at '%s', entries idle for %d s are demoted to it (scan at startup, then every %lld s)\n",
+                        this->disk_path_cold.c_str(), this->demote_after_s,
+                        (long long) std::min<int64_t>(DISK_DEMOTE_SCAN_INTERVAL_S, this->demote_after_s));
+            }
             start_writer_if_needed();
         }
     }
@@ -2370,23 +2556,43 @@ void server_prompt_cache::start_writer_if_needed() {
 }
 
 void server_prompt_cache::writer_loop() {
+    // [TAG_COLD_TIER] the demote scan is a writer job too (serialized with the appends), run only while the queue is
+    // empty: at startup, then every min(DISK_DEMOTE_SCAN_INTERVAL_S, demote_after_s) seconds, or early on request
+    const int64_t scan_interval_us = std::min<int64_t>(DISK_DEMOTE_SCAN_INTERVAL_S, demote_after_s) * 1000000;
+
     while (true) {
         disk_job job;
         {
             std::unique_lock<std::mutex> lock(mtx);
-            cv.wait(lock, [this]() { return stop_flag.load() || !queue.empty(); });
+            if (disk_path_cold.empty()) {
+                cv.wait(lock, [this]() { return stop_flag.load() || !queue.empty(); });
+            } else {
+                while (!stop_flag.load() && queue.empty()) {
+                    const int64_t now = ggml_time_us();
+                    if (demote_scan_requested || now >= t_next_demote_scan_us) {
+                        job.demote_scan = true;
+                        break;
+                    }
+                    cv.wait_for(lock, std::chrono::microseconds(t_next_demote_scan_us - now));
+                }
+            }
             if (stop_flag.load() && queue.empty()) {
                 return;
             }
-            job = std::move(queue.front());
-            queue.pop_front();
-            writer_active_conv = job.conv_id;
+            if (job.demote_scan) {
+                demote_scan_requested = false;
+                t_next_demote_scan_us = ggml_time_us() + scan_interval_us;
+            } else {
+                job = std::move(queue.front());
+                queue.pop_front();
+                writer_active_conv = job.conv_id;
+            }
         }
 
         // I/O outside the lock - writes can take seconds.
-        // write failures mark the conversation broken (next flush rewrites from scratch)
-        // rather than retrying: real failures here are persistent (ENOSPC, EIO, unmounted)
-        // and a retry loop would peg the disk without making progress.
+        // [TAG_DISK_ENOSPC] a failed write is rolled back to the committed header (files truncated, mirror re-seeded)
+        // instead of retried: real failures here are persistent (ENOSPC, EIO, unmounted) and a retry loop would peg
+        // the disk without making progress. nothing is ever deleted to make room
         process_disk_job(job);
 
         {
@@ -2439,19 +2645,33 @@ bool server_prompt_cache::flush_from_context(const server_prompt & prompt, llama
     // hybrid Qwen3.5/3.6 uses a plain attention KV, which the segments cover fully.
     const bool rec_needed = delta_capable && llama_model_is_hybrid(model_tgt);
 
-    // first touch of this conversation: seed the in-RAM mirror from an existing .hdr
+    // first touch of this conversation: seed the in-RAM mirror from an existing .hdr.
+    // [TAG_DISK_ENOSPC] same after a failed write (needs_reseed): the writer rolled the files back to the committed header
+    // and bumped the epoch, so the queued jobs of the failed timeline are dropped; plan against what is on disk
     {
         bool have_state = false;
+        bool reseed     = false;
         {
             std::lock_guard<std::mutex> lock(mtx);
-            have_state = disk_convs.count(conv_id) > 0;
+            const auto d = disk_convs.find(conv_id);
+            have_state = d != disk_convs.end();
+            reseed     = have_state && d->second.needs_reseed;
         }
-        if (!have_state) {
+        if (!have_state || reseed) {
             disk_conv_state seed;
             read_disk_state(conv_id, seed); // missing/invalid files leave the default (rewrite)
 
             std::lock_guard<std::mutex> lock(mtx);
-            disk_convs.emplace(conv_id, std::move(seed));
+            auto d = disk_convs.find(conv_id);
+            if (d == disk_convs.end()) {
+                disk_convs.emplace(conv_id, std::move(seed));
+            } else if (d->second.needs_reseed) {
+                SRV_WRN("disk cache: '%s' re-planned from the committed header (%u tokens) after a failed write\n",
+                        conv_id.c_str(), seed.n_tok);
+                seed.epoch      = d->second.epoch;
+                seed.t_last_use = d->second.t_last_use;
+                d->second       = std::move(seed);
+            }
         }
     }
 
@@ -2465,9 +2685,12 @@ bool server_prompt_cache::flush_from_context(const server_prompt & prompt, llama
     bool     rewrite     = true;
     int32_t  truncate_to = -1;
     uint32_t old_n_tok   = 0;
+    uint32_t epoch0      = 0;
     {
         std::lock_guard<std::mutex> lock(mtx);
         auto & st = disk_convs[conv_id];
+        epoch0 = st.epoch;
+        st.t_last_use = disk_now_s();
 
         // longest common prefix of the scheduled tokens and the live tokens
         const size_t n_cmp = std::min<size_t>(std::min<size_t>(st.scheduled_n_tok, st.scheduled_tokens.size()), n_tok);
@@ -2481,9 +2704,15 @@ bool server_prompt_cache::flush_from_context(const server_prompt & prompt, llama
             SRV_WRN("disk cache: '%s' was saved with another K/V type (state=0x%08x, this server 0x%08x) - rewriting it in this server's type\n",
                     conv_id.c_str(), st.file_state_hash, state_hash);
         }
-        const bool usable = !st.broken && st.scheduled_n_tok > 0 && same_type;
+        const bool usable = !st.broken && !st.needs_reseed && st.scheduled_n_tok > 0 && same_type;
 
-        if (usable && lcp == st.scheduled_n_tok && n_tok == lcp) {
+        // [TAG_DISK_ENOSPC] a hybrid file whose .rec is missing or stale (an append that failed after an intermediate
+        // header commit, or a restore through the checkpoint fallback) is not "already flushed" even with no new token:
+        // the last segment is rewritten with a fresh .rec (truncate branch below), else every restore of it reprocesses
+        // the tail after the newest cp_ file again
+        const bool rec_ok = !rec_needed || st.scheduled_rec;
+
+        if (usable && lcp == st.scheduled_n_tok && n_tok == lcp && rec_ok) {
             SRV_INF("disk cache: '%s' already flushed (%u tokens) - nothing to write\n", conv_id.c_str(), n_tok);
             return true;
         }
@@ -2507,7 +2736,7 @@ bool server_prompt_cache::flush_from_context(const server_prompt & prompt, llama
             return true;
         }
         if (usable && delta_capable) {
-            if (lcp == st.scheduled_n_tok) {
+            if (lcp == st.scheduled_n_tok && n_tok > lcp) {
                 base    = st.scheduled_n_tok;
                 rewrite = false;
             } else if (!st.scheduled_seg_ends.empty() && st.scheduled_seg_ends.back() == st.scheduled_n_tok) {
@@ -2550,6 +2779,9 @@ bool server_prompt_cache::flush_from_context(const server_prompt & prompt, llama
         job.conv_id     = conv_id;
         job.rewrite     = first && rewrite;
         job.truncate_to = first ? truncate_to : -1;
+        job.epoch       = epoch0;
+        job.staged      = rewrite; // [TAG_DISK_ENOSPC] every job of a rewrite goes to the .tmp files
+        job.last        = p1 == n_tok;
         first = false;
         job.p0 = (llama_pos) p0;
         job.p1 = (llama_pos) p1;
@@ -2559,6 +2791,8 @@ bool server_prompt_cache::flush_from_context(const server_prompt & prompt, llama
                     which, conv_id.c_str(), p0, p1);
             std::lock_guard<std::mutex> lock(mtx);
             disk_convs[conv_id].broken = true;
+            // [TAG_DISK_ENOSPC] the jobs of this flush already queued are dropped (a staged rewrite's .tmp files with them)
+            disk_convs[conv_id].epoch++;
         };
 
         {
@@ -2599,6 +2833,13 @@ bool server_prompt_cache::flush_from_context(const server_prompt & prompt, llama
 
         job.tokens.assign(toks.begin(), toks.begin() + p1);
 
+        // [TAG_DISK_ENOSPC] the rewrite's space check covers the whole staged flush (the old entry stays on disk until
+        // the swap, so both copies coexist): segments are equal-sized except the tail, the .rec (~157 MB on the 27B)
+        // fits in DISK_FREE_MARGIN_BYTES
+        if (job.rewrite) {
+            job.est_bytes = (uint64_t) (job.kv.size() + job.drft.size()) * n_seg + (uint64_t) n_tok * sizeof(llama_token);
+        }
+
         // the last chunk of a hybrid flush carries the recurrent-state snapshot - it is
         // captured from the live context and only valid at the current position (n_tok)
         if (rec_needed && p1 == n_tok) {
@@ -2634,6 +2875,14 @@ bool server_prompt_cache::flush_from_context(const server_prompt & prompt, llama
             cv.wait(lock, [this]() { return queue_bytes < DISK_QUEUE_MAX_BYTES; });
 
             auto & st = disk_convs[conv_id];
+            // [TAG_DISK_ENOSPC] a write of this conversation failed while this flush was enqueueing: the jobs already
+            // queued carry the old epoch and are dropped, the rest is not worth capturing. the next flush re-plans
+            if (st.epoch != epoch0) {
+                SRV_WRN("disk cache: '%s' flush stopped at pos %u - an earlier write failed, the next flush re-plans from the committed header\n",
+                        conv_id.c_str(), p0);
+                return false;
+            }
+            st.scheduled_rec    = !job.rec.empty();
             st.scheduled_n_tok  = p1;
             st.scheduled_tokens = job.tokens;
             if (job.rewrite) {
@@ -2655,17 +2904,14 @@ bool server_prompt_cache::flush_from_context(const server_prompt & prompt, llama
 }
 
 void server_prompt_cache::process_disk_job(const disk_job & job) {
+    if (job.demote_scan) {
+        demote_scan();
+        return;
+    }
     if (job.ckpt) {
         write_checkpoint_file(*job.ckpt, job.conv_id);
         return;
     }
-
-    const std::string base      = (std::filesystem::path(disk_path) / job.conv_id).string();
-    const std::string kv_path   = split_path(base, SPLIT_EXT_KV);
-    const std::string drft_path = split_path(base, SPLIT_EXT_DRFT);
-    const std::string rec_path  = split_path(base, SPLIT_EXT_REC);
-
-    const int64_t t_start = ggml_time_us();
 
     // snapshot the committed state
     disk_conv_state st;
@@ -2673,12 +2919,38 @@ void server_prompt_cache::process_disk_job(const disk_job & job) {
         std::lock_guard<std::mutex> lock(mtx);
         st = disk_convs[job.conv_id];
     }
+
+    // [TAG_DISK_ENOSPC] planned against a timeline that a failed write rolled back: its segment would leave a hole
+    if (job.epoch != st.epoch) {
+        SRV_INF("disk cache: dropping write of '%s' pos [%d, %d) - planned before a failed write\n", job.conv_id.c_str(), job.p0, job.p1);
+        if (job.staged) {
+            abort_staging(job.conv_id);
+        }
+        return;
+    }
     if (st.broken && !job.rewrite) {
         SRV_WRN("disk cache: dropping append for broken conversation '%s' (a rewrite will follow)\n", job.conv_id.c_str());
         return;
     }
+    if (job.staged) {
+        process_staged_job(job, st);
+        return;
+    }
 
-    auto fail = [&](const char * what) {
+    // appends go to the tier that holds the committed files ([TAG_COLD_TIER]: cold only when a promotion was skipped)
+    const std::string & dir     = st.tier == 2 && !disk_path_cold.empty() ? disk_path_cold : disk_path;
+    const std::string base      = (std::filesystem::path(dir) / job.conv_id).string();
+    const std::string kv_path   = split_path(base, SPLIT_EXT_KV);
+    const std::string drft_path = split_path(base, SPLIT_EXT_DRFT);
+    const std::string rec_path  = split_path(base, SPLIT_EXT_REC);
+    const std::string tok_path  = split_path(base, SPLIT_EXT_TOK);
+    const std::string hdr_path  = split_path(base, SPLIT_EXT_HDR);
+
+    const int64_t t_start = ggml_time_us();
+
+    // the files are inconsistent with the header (smaller than it says): nothing to roll back to, rewrite. the staged
+    // rewrite leaves this entry in place until the new one is complete
+    auto mark_broken = [&](const char * what) {
         SRV_WRN("disk cache: %s failed for '%s' - marking conversation for rewrite\n", what, job.conv_id.c_str());
         std::lock_guard<std::mutex> lock(mtx);
         disk_convs[job.conv_id].broken = true;
@@ -2686,72 +2958,94 @@ void server_prompt_cache::process_disk_job(const disk_job & job) {
 
     std::error_code ec;
 
-    if (job.rewrite) {
-        st.segments.clear();
-        st.kv_size   = 0;
-        st.drft_size = 0;
-        st.rec_size  = 0;
-        st.n_tok     = 0;
-
-        std::filesystem::remove(kv_path, ec);
-        std::filesystem::remove(drft_path, ec);
-        std::filesystem::remove(rec_path, ec);
-    } else {
-        if (job.truncate_to >= 0) {
-            // divergence below the high-water mark: drop the segments above truncate_to. the
-            // resize below cuts their bytes off .kv/.drft; lower segments are not touched.
-            // a crash before the header commit leaves the old header bigger than the files,
-            // so read_disk_state rejects it (cache miss, not corruption).
-            while (!st.segments.empty() && st.segments.back().p1 > job.truncate_to) {
-                st.segments.pop_back();
-            }
-            if (st.segments.empty() || st.segments.back().p1 != job.truncate_to) {
-                fail("truncate boundary");
-                return;
-            }
-            const auto & last = st.segments.back();
-            st.kv_size   = last.kv_off + last.kv_size;
-            st.drft_size = last.drft_off + last.drft_size;
-            st.n_tok     = (uint32_t) job.truncate_to;
-
-            // .rec is overwrite-only and valid at the old n_tok only. remove it as a rewrite
-            // does: the last job of this flush writes the new one. a stale .rec could match the
-            // n_tok of an intermediate header (old n_tok == base + k * DISK_SEGMENT_TOKENS).
-            if (st.rec_size > 0) {
-                std::filesystem::remove(rec_path, ec);
-                st.rec_size = 0;
-            }
+    if (job.truncate_to >= 0) {
+        // divergence below the high-water mark: drop the segments above truncate_to. lower segments are not touched.
+        // [TAG_DISK_ENOSPC] the shorter header is committed BEFORE the tails are cut: until then the old header describes
+        // the old files, after it the new header describes their prefix, so a failure anywhere in this job (or in the
+        // append that follows) leaves an entry that loads. not a staged copy: the kept prefix is up to 15 GB (286k
+        // tokens on the 27B), copying it to make a tail edit atomic would cost more than the ~9 s rewrite this path
+        // exists to avoid
+        while (!st.segments.empty() && st.segments.back().p1 > job.truncate_to) {
+            st.segments.pop_back();
         }
-
-        // crash-orphan cleanup: the data files must be at least as large as the committed
-        // sizes; extra tail bytes come from an append whose header never committed
-        const uint64_t kv_actual = (uint64_t) std::filesystem::file_size(kv_path, ec);
-        if (ec || kv_actual < st.kv_size) {
-            fail("kv size check");
+        if (st.segments.empty() || st.segments.back().p1 != job.truncate_to) {
+            SRV_WRN("disk cache: truncate boundary %d of '%s' is not a committed segment end - flush dropped\n", job.truncate_to, job.conv_id.c_str());
+            rollback_mirror(job.conv_id, "truncate boundary");
             return;
         }
-        if (kv_actual > st.kv_size) {
-            std::filesystem::resize_file(kv_path, st.kv_size, ec);
-            if (ec) {
-                fail("kv truncate");
-                return;
-            }
+        const auto & last = st.segments.back();
+        st.kv_size   = last.kv_off + last.kv_size;
+        st.drft_size = last.drft_off + last.drft_size;
+        st.n_tok     = (uint32_t) job.truncate_to;
+        // .rec is valid at the old n_tok only: the new header has none (the loader falls back to a cp_ file if the
+        // append below fails), the last job of this flush writes the new one
+        st.rec_size  = 0;
+
+        const std::vector<uint8_t> hdr = disk_make_hdr(arch_hash, vocab_hash, state_hash, (uint32_t) limit_tokens, st, 0);
+        if (!disk_write_file_atomic(hdr_path, hdr.data(), hdr.size())) {
+            SRV_WRN("disk cache: truncate header write failed for '%s' - flush dropped, the entry is unchanged\n", job.conv_id.c_str());
+            rollback_mirror(job.conv_id, "truncate hdr");
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            auto & live = disk_convs[job.conv_id];
+            live.n_tok     = st.n_tok;
+            live.kv_size   = st.kv_size;
+            live.drft_size = st.drft_size;
+            live.rec_size  = 0;
+            live.segments  = st.segments;
+        }
+        std::filesystem::remove(rec_path, ec);
+    } else if (job.p0 != (llama_pos) st.n_tok) {
+        // [TAG_DISK_ENOSPC] an append must start at the committed high-water mark. it cannot after a dropped segment of
+        // the same flush (that one already rolled back and bumped the epoch, so this is a defensive check)
+        SRV_WRN("disk cache: append of '%s' pos [%d, %d) does not start at the committed %u tokens - flush dropped\n",
+                job.conv_id.c_str(), job.p0, job.p1, st.n_tok);
+        rollback_mirror(job.conv_id, "gap");
+        return;
+    }
+
+    // crash-orphan cleanup: the data files must be at least as large as the committed
+    // sizes; extra tail bytes come from an append whose header never committed
+    {
+        const uint64_t kv_actual = (uint64_t) std::filesystem::file_size(kv_path, ec);
+        if (ec || kv_actual < st.kv_size) {
+            mark_broken("kv size check");
+            return;
         }
         if (st.drft_size > 0) {
             const uint64_t drft_actual = (uint64_t) std::filesystem::file_size(drft_path, ec);
             if (ec || drft_actual < st.drft_size) {
-                fail("drft size check");
+                mark_broken("drft size check");
                 return;
             }
-            if (drft_actual > st.drft_size) {
-                std::filesystem::resize_file(drft_path, st.drft_size, ec);
-                if (ec) {
-                    fail("drft truncate");
-                    return;
-                }
-            }
+        }
+        disk_truncate_to(kv_path, st.kv_size);
+        if (st.drft_size > 0 || !job.drft.empty()) {
+            disk_truncate_to(drft_path, st.drft_size);
         }
     }
+
+    // [TAG_DISK_ENOSPC] skip (one line, no retry) instead of filling the disk
+    if (!disk_space_ok(dir, job.kv.size() + job.drft.size() + job.rec.size() + job.tokens.size() * sizeof(llama_token),
+                       job.conv_id, "append")) {
+        rollback_mirror(job.conv_id, "space");
+        return;
+    }
+
+    // [TAG_DISK_ENOSPC] a failed write is rolled back to the committed header: the data files are cut back to the sizes
+    // it names, the conversation is NOT marked broken (the old policy deleted the good entry and rewrote it from scratch,
+    // and under ENOSPC that rewrite failed on the same segment again, every turn), and the mirror re-plans from disk
+    const std::string rec_new = rec_path + ".new";
+    auto fail = [&](const char * what) {
+        disk_truncate_to(kv_path, st.kv_size);
+        disk_truncate_to(drft_path, st.drft_size);
+        std::filesystem::remove(rec_new, ec);
+        SRV_WRN("disk cache: %s failed for '%s' pos [%d, %d) - rolled back to the committed %u tokens, the entry stays loadable\n",
+                what, job.conv_id.c_str(), job.p0, job.p1, st.n_tok);
+        rollback_mirror(job.conv_id, what);
+    };
 
     disk_conv_state::seg_entry seg;
     seg.kv_off    = st.kv_size;
@@ -2770,70 +3064,57 @@ void server_prompt_cache::process_disk_job(const disk_job & job) {
         return;
     }
 
-    st.segments.push_back(seg);
-    st.kv_size   += job.kv.size();
-    st.drft_size += job.drft.size();
-    st.n_tok      = (uint32_t) job.tokens.size();
-
-    // recurrent-state snapshot (hybrid models, last chunk of a flush) - overwrite mode
+    // recurrent-state snapshot (hybrid models, last chunk of a flush) - overwrite mode. written next to the old one and
+    // renamed over it only after the header commit: until then the old .rec stays valid for the old header
+    uint64_t rec_size_new = st.rec_size;
     if (!job.rec.empty()) {
-        if (!disk_write_file_atomic(rec_path, &job.rec_n_tok, sizeof(uint32_t), job.rec.data(), job.rec.size())) {
+        if (!disk_write_file(rec_new, &job.rec_n_tok, sizeof(uint32_t), job.rec.data(), job.rec.size())) {
             fail("rec write");
             return;
         }
-        st.rec_size = sizeof(uint32_t) + job.rec.size();
+        rec_size_new = sizeof(uint32_t) + job.rec.size();
     }
 
-    if (!disk_write_file_atomic(split_path(base, SPLIT_EXT_TOK), job.tokens.data(), job.tokens.size() * sizeof(llama_token))) {
+    if (!disk_write_file_atomic(tok_path, job.tokens.data(), job.tokens.size() * sizeof(llama_token))) {
         fail("tok write");
         return;
     }
 
+    disk_conv_state nst = st;
+    nst.segments.push_back(seg);
+    nst.kv_size   += job.kv.size();
+    nst.drft_size += job.drft.size();
+    nst.n_tok      = (uint32_t) job.tokens.size();
+
     // header last - a crash before this point leaves only an orphan tail in the data
     // files, which the next append (or load) truncates away using the old header
-    std::vector<uint8_t> hdr;
-    auto put = [&hdr](const auto & v) {
-        const uint8_t * p = reinterpret_cast<const uint8_t *>(&v);
-        hdr.insert(hdr.end(), p, p + sizeof(v));
-    };
-    put(DISK_CACHE_MAGIC);
-    put(DISK_CACHE_VERSION);
-    put(arch_hash);
-    put(vocab_hash);
-    put(state_hash);
-    put((uint32_t) limit_tokens);
-    put(st.n_tok);
-    put((uint32_t) st.segments.size());
-    put(st.kv_size);
-    put(st.drft_size);
-    put(st.rec_size);
-    for (const auto & s : st.segments) {
-        put(s.kv_off);
-        put(s.kv_size);
-        put(s.drft_off);
-        put(s.drft_size);
-        put(s.p0);
-        put(s.p1);
-    }
-    put(disk_hdr_checksum(hdr.data(), hdr.size()));
-
-    if (!disk_write_file_atomic(split_path(base, SPLIT_EXT_HDR), hdr.data(), hdr.size())) {
+    const std::vector<uint8_t> hdr = disk_make_hdr(arch_hash, vocab_hash, state_hash, (uint32_t) limit_tokens, nst, rec_size_new);
+    if (!disk_write_file_atomic(hdr_path, hdr.data(), hdr.size())) {
         fail("hdr write");
         return;
     }
 
-    const size_t n_segs = st.segments.size();
+    if (!job.rec.empty()) {
+        std::filesystem::rename(rec_new, rec_path, ec);
+        if (ec) {
+            // the header names a .rec this file is not: read_disk_state flags it, the loader takes a cp_ file instead
+            SRV_WRN("disk cache: '%s' .rec rename failed (%s) - the next restore uses a checkpoint\n", job.conv_id.c_str(), ec.message().c_str());
+        }
+    }
+
+    const size_t n_segs = nst.segments.size();
 
     // commit
     {
         std::lock_guard<std::mutex> lock(mtx);
         auto & live = disk_convs[job.conv_id];
-        live.n_tok     = st.n_tok;
-        live.kv_size   = st.kv_size;
-        live.drft_size = st.drft_size;
-        live.rec_size  = st.rec_size;
-        live.segments  = std::move(st.segments);
-        live.broken    = false;
+        live.n_tok          = nst.n_tok;
+        live.kv_size        = nst.kv_size;
+        live.drft_size      = nst.drft_size;
+        live.rec_size       = rec_size_new;
+        live.segments       = std::move(nst.segments);
+        live.broken         = false;
+        live.t_last_use     = disk_now_s();
     }
 
     const double t_ms = (ggml_time_us() - t_start) / 1e3;
@@ -2841,11 +3122,213 @@ void server_prompt_cache::process_disk_job(const disk_job & job) {
             job.conv_id.c_str(), job.p0, job.p1,
             job.kv.size() / (1024.0 * 1024.0), job.drft.size() / (1024.0 * 1024.0),
             job.rec.size() / (1024.0 * 1024.0),
-            t_ms, st.n_tok, n_segs);
+            t_ms, nst.n_tok, n_segs);
+}
+
+// [TAG_DISK_ENOSPC] one job of a from-scratch flush. the segments go to <id>.kv.tmp/.drft.tmp in the hot dir and the
+// last job renames everything over the old entry once its own header is on disk. 2026-11-01: the old rewrite removed
+// the valid .kv/.drft/.rec first, committed a header per segment, and died on segment 18 of a 141k conversation under
+// ENOSPC, leaving a hybrid header with rec_size 0 that the loader then read as a full-state file (151k-token reprocess,
+// 152 s, again 2026-11-04). now a failure at any point leaves the previous entry exactly as it was
+void server_prompt_cache::process_staged_job(const disk_job & job, disk_conv_state & st) {
+    const std::string base     = (std::filesystem::path(disk_path) / job.conv_id).string();
+    const std::string kv_tmp   = split_path(base, SPLIT_EXT_KV)   + ".tmp";
+    const std::string drft_tmp = split_path(base, SPLIT_EXT_DRFT) + ".tmp";
+    const std::string rec_tmp  = split_path(base, SPLIT_EXT_REC)  + ".tmp";
+    const std::string tok_tmp  = split_path(base, SPLIT_EXT_TOK)  + ".tmp";
+    const std::string hdr_tmp  = split_path(base, SPLIT_EXT_HDR)  + ".tmp";
+
+    const int64_t t_start = ggml_time_us();
+
+    auto fail = [&](const char * what) {
+        SRV_WRN("disk cache: %s failed for '%s' (staged rewrite, pos [%d, %d)) - abandoned, the previous entry (%u tokens) is untouched\n",
+                what, job.conv_id.c_str(), job.p0, job.p1, st.n_tok);
+        abort_staging(job.conv_id);
+        rollback_mirror(job.conv_id, what);
+    };
+
+    if (job.rewrite) {
+        abort_staging(job.conv_id); // leftovers of an earlier flush that never reached its last job
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            disk_convs[job.conv_id].broken = false; // the jobs after this one belong to this rewrite
+        }
+        if (!disk_space_ok(disk_path, job.est_bytes, job.conv_id, "rewrite")) {
+            rollback_mirror(job.conv_id, "space");
+            return;
+        }
+        disk_conv_state sg;
+        sg.tier = 1;
+        staging[job.conv_id] = std::move(sg);
+    }
+
+    auto it = staging.find(job.conv_id);
+    if (it == staging.end()) {
+        SRV_INF("disk cache: dropping staged write of '%s' pos [%d, %d) - no rewrite in progress\n", job.conv_id.c_str(), job.p0, job.p1);
+        return;
+    }
+    disk_conv_state & sg = it->second;
+
+    if (job.p0 != (llama_pos) sg.n_tok) {
+        fail("staged segment order");
+        return;
+    }
+    if (!job.rewrite && !disk_space_ok(disk_path, job.kv.size() + job.drft.size() + job.rec.size(), job.conv_id, "staged segment")) {
+        abort_staging(job.conv_id);
+        rollback_mirror(job.conv_id, "space");
+        return;
+    }
+
+    disk_conv_state::seg_entry seg;
+    seg.kv_off    = sg.kv_size;
+    seg.kv_size   = job.kv.size();
+    seg.drft_off  = sg.drft_size;
+    seg.drft_size = job.drft.size();
+    seg.p0        = job.p0;
+    seg.p1        = job.p1;
+
+    if (!disk_append_file(kv_tmp, job.kv.data(), job.kv.size())) {
+        fail("kv append");
+        return;
+    }
+    if (!job.drft.empty() && !disk_append_file(drft_tmp, job.drft.data(), job.drft.size())) {
+        fail("drft append");
+        return;
+    }
+    sg.segments.push_back(seg);
+    sg.kv_size   += job.kv.size();
+    sg.drft_size += job.drft.size();
+    sg.n_tok      = (uint32_t) job.tokens.size();
+
+    if (!job.last) {
+        SRV_WRN("disk cache: wrote '%s' segment pos [%d, %d) %.1f MiB (drft %.1f MiB) in %.0f ms - staged, %u tokens so far\n",
+                job.conv_id.c_str(), job.p0, job.p1, job.kv.size() / (1024.0 * 1024.0), job.drft.size() / (1024.0 * 1024.0),
+                (ggml_time_us() - t_start) / 1e3, sg.n_tok);
+        return;
+    }
+
+    if (!job.rec.empty()) {
+        if (!disk_write_file(rec_tmp, &job.rec_n_tok, sizeof(uint32_t), job.rec.data(), job.rec.size())) {
+            fail("rec write");
+            return;
+        }
+        sg.rec_size = sizeof(uint32_t) + job.rec.size();
+    }
+    if (!disk_write_file(tok_tmp, job.tokens.data(), job.tokens.size() * sizeof(llama_token))) {
+        fail("tok write");
+        return;
+    }
+    const std::vector<uint8_t> hdr = disk_make_hdr(arch_hash, vocab_hash, state_hash, (uint32_t) limit_tokens, sg, sg.rec_size);
+    if (!disk_write_file(hdr_tmp, hdr.data(), hdr.size())) {
+        fail("hdr write");
+        return;
+    }
+
+    // swap. the old header goes first: from here until the new header lands the entry is invisible (a cache miss after a
+    // crash), never a new data file under an old header. renames within one directory do not need space
+    std::string old_base;
+    const int old_tier = resolve_tier(job.conv_id, old_base);
+    std::error_code ec;
+    if (old_tier != 0) {
+        std::filesystem::remove(split_path(old_base, SPLIT_EXT_HDR), ec);
+    }
+    bool ok = true;
+    auto put = [&](const std::string & tmp, std::string_view ext, bool present) {
+        const std::string dst = split_path(base, ext);
+        if (present) {
+            std::filesystem::rename(tmp, dst, ec);
+            ok = ok && !ec;
+        } else {
+            std::filesystem::remove(dst, ec);
+        }
+    };
+    put(kv_tmp,   SPLIT_EXT_KV,   true);
+    put(drft_tmp, SPLIT_EXT_DRFT, sg.drft_size > 0);
+    put(rec_tmp,  SPLIT_EXT_REC,  sg.rec_size > 0);
+    put(tok_tmp,  SPLIT_EXT_TOK,  true);
+    put(hdr_tmp,  SPLIT_EXT_HDR,  true);
+    if (!ok) {
+        SRV_ERR("disk cache: '%s' staged rewrite: rename failed (%s) - the entry is gone, the next flush rewrites it\n",
+                job.conv_id.c_str(), ec.message().c_str());
+        abort_staging(job.conv_id);
+        rollback_mirror(job.conv_id, "rename");
+        return;
+    }
+    // [TAG_COLD_TIER] the entry now lives in hot: the old cold copy goes (its header is already gone)
+    if (old_tier == 2) {
+        for (const auto ext : { SPLIT_EXT_KV, SPLIT_EXT_DRFT, SPLIT_EXT_REC, SPLIT_EXT_TOK }) {
+            std::filesystem::remove(split_path(old_base, ext), ec);
+        }
+    }
+
+    const size_t   n_segs = sg.segments.size();
+    const uint32_t n_tok  = sg.n_tok;
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        auto & live = disk_convs[job.conv_id];
+        live.n_tok           = sg.n_tok;
+        live.kv_size         = sg.kv_size;
+        live.drft_size       = sg.drft_size;
+        live.rec_size        = sg.rec_size;
+        live.segments        = std::move(sg.segments);
+        live.broken          = false;
+        live.tier            = 1;
+        live.t_last_use      = disk_now_s();
+    }
+    staging.erase(it);
+
+    SRV_WRN("disk cache: wrote '%s' segment pos [%d, %d) %.1f MiB (drft %.1f MiB, rec %.1f MiB) in %.0f ms - now %u tokens in %zu segment(s) (staged rewrite committed)\n",
+            job.conv_id.c_str(), job.p0, job.p1,
+            job.kv.size() / (1024.0 * 1024.0), job.drft.size() / (1024.0 * 1024.0), job.rec.size() / (1024.0 * 1024.0),
+            (ggml_time_us() - t_start) / 1e3, n_tok, n_segs);
+}
+
+void server_prompt_cache::abort_staging(const std::string & conv_id) {
+    const std::string base = (std::filesystem::path(disk_path) / conv_id).string();
+    std::error_code ec;
+    for (const auto ext : { SPLIT_EXT_KV, SPLIT_EXT_DRFT, SPLIT_EXT_REC, SPLIT_EXT_TOK, SPLIT_EXT_HDR }) {
+        std::filesystem::remove(split_path(base, ext) + ".tmp", ec);
+    }
+    staging.erase(conv_id);
+}
+
+void server_prompt_cache::rollback_mirror(const std::string & conv_id, const char * why) {
+    GGML_UNUSED(why);
+    abort_staging(conv_id);
+    std::lock_guard<std::mutex> lock(mtx);
+    auto & live = disk_convs[conv_id];
+    live.epoch++;
+    live.needs_reseed = true;
+}
+
+bool server_prompt_cache::disk_space_ok(const std::string & dir, uint64_t need, const std::string & conv_id, const char * what) {
+    std::error_code ec;
+    const auto sp = std::filesystem::space(dir, ec);
+    if (ec || sp.available >= need + DISK_FREE_MARGIN_BYTES) {
+        return true; // unknown free space: the write itself reports a failure
+    }
+    SRV_WRN("disk cache: skipping %s of '%s' - %.1f MiB free in '%s', need %.1f MiB + %.0f MiB margin\n",
+            what, conv_id.c_str(), sp.available / (1024.0 * 1024.0), dir.c_str(), need / (1024.0 * 1024.0),
+            DISK_FREE_MARGIN_BYTES / (1024.0 * 1024.0));
+    // [TAG_COLD_TIER] a short hot dir brings the demote scan forward. it still only moves entries idle for demote_after_s:
+    // nothing is evicted to make room
+    if (dir == disk_path && !disk_path_cold.empty()) {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (!demote_scan_requested) {
+            demote_scan_requested = true;
+            SRV_WRN("%s", "disk cache: hot dir short of space - the demote scan runs early\n");
+        }
+    }
+    return false;
 }
 
 bool server_prompt_cache::read_disk_state(const std::string & conversation_id, disk_conv_state & st, bool with_tokens) {
-    const std::string base = (std::filesystem::path(disk_path) / conversation_id).string();
+    // [TAG_COLD_TIER] hot first, then cold
+    std::string base;
+    const int tier = resolve_tier(conversation_id, base);
+    if (tier == 0) {
+        return false;
+    }
 
     std::vector<uint8_t> hdr;
     {
@@ -2937,11 +3420,23 @@ bool server_prompt_cache::read_disk_state(const std::string & conversation_id, d
             return false;
         }
     }
+    // [TAG_DISK_ENOSPC] a missing, short or stale .rec no longer hides the entry: the attention segments are intact and
+    // load_from_disk restores the recurrent state from the newest matching cp_ file instead (the tail after it is
+    // reprocessed). before, the entry was ignored here, or worse, a rec_size 0 header was read as a full-state file
+    bool rec_valid = true;
     if (rec_size > 0) {
-        const uint64_t rec_actual = (uint64_t) std::filesystem::file_size(split_path(base, SPLIT_EXT_REC), ec);
-        if (ec || rec_actual != rec_size) {
-            SRV_WRN("disk cache: '%s.rec' size mismatch - ignoring\n", conversation_id.c_str());
-            return false;
+        const std::string rec_path = split_path(base, SPLIT_EXT_REC);
+        const uint64_t rec_actual = (uint64_t) std::filesystem::file_size(rec_path, ec);
+        uint32_t rec_n_tok = 0;
+        if (!ec && rec_actual == rec_size) {
+            std::ifstream rf(rec_path, std::ios::binary);
+            rec_valid = read_disk_u32(rf, rec_n_tok) && rec_n_tok == n_tok;
+        } else {
+            rec_valid = false;
+        }
+        if (!rec_valid) {
+            SRV_WRN("disk cache: '%s.rec' does not match the header (size %llu vs %llu, n_tok %u vs %u) - recurrent state comes from a checkpoint\n",
+                    conversation_id.c_str(), ec ? 0ull : (unsigned long long) rec_actual, (unsigned long long) rec_size, rec_n_tok, n_tok);
         }
     }
 
@@ -2965,6 +3460,10 @@ bool server_prompt_cache::read_disk_state(const std::string & conversation_id, d
     st.scheduled_n_tok  = n_tok;
     st.scheduled_tokens = std::move(toks);
     st.broken           = false;
+    st.needs_reseed     = false;
+    st.rec_valid        = rec_valid;
+    st.scheduled_rec    = rec_size > 0 && rec_valid;
+    st.tier             = tier;
 
     st.scheduled_seg_ends.clear();
     for (const auto & s : st.segments) {
@@ -3065,6 +3564,12 @@ bool server_prompt_cache::write_checkpoint_file(const common_prompt_checkpoint &
     const std::string filename = "cp_" + conversation_id + "_" + std::to_string(cp.pos_min) + ".bin";
     const std::filesystem::path filepath = std::filesystem::path(disk_path) / filename;
     const std::filesystem::path tmppath  = std::filesystem::path(disk_path) / (filename + ".tmp");
+
+    // [TAG_DISK_ENOSPC] a checkpoint that does not fit is skipped like a segment (no retry)
+    if (!disk_space_ok(disk_path, CHECKPOINT_FILE_HEADER_BYTES + cp.data_tgt.size() + cp.data_dft.size() + sizeof(uint64_t),
+                       conversation_id, "checkpoint")) {
+        return false;
+    }
 
     {
         std::ofstream f(tmppath, std::ios::binary | std::ios::trunc);
@@ -3464,28 +3969,34 @@ void server_prompt_cache::cp_index_seed(const std::string & conversation_id) {
     const std::string conv_prefix = "cp_" + conversation_id + "_";
     std::vector<cp_file_entry> found;
 
-    std::error_code ec;
-    for (const auto & de : std::filesystem::directory_iterator(disk_path, ec)) {
-        if (ec) {
-            break;
-        }
-        int32_t pmin = 0;
-        if (!parse_cp_file_name(de.path().filename().string(), conv_prefix, pmin)) {
+    // [TAG_COLD_TIER] hot first: a pos_min present in both (a promotion or demotion cut short) resolves to the hot file
+    for (const std::string * dir : { &disk_path, &disk_path_cold }) {
+        if (dir->empty()) {
             continue;
         }
-        cp_file_entry e;
-        if (!read_checkpoint_file_entry(de.path().string(), e)) {
-            continue;
+        std::error_code ec;
+        for (const auto & de : std::filesystem::directory_iterator(*dir, ec)) {
+            if (ec) {
+                break;
+            }
+            int32_t pmin = 0;
+            if (!parse_cp_file_name(de.path().filename().string(), conv_prefix, pmin)) {
+                continue;
+            }
+            cp_file_entry e;
+            if (!read_checkpoint_file_entry(de.path().string(), e)) {
+                continue;
+            }
+            e.pos_min = pmin; // the name is the key (the header can be unreadable)
+            found.push_back(std::move(e));
         }
-        e.pos_min = pmin; // the name is the key (the header can be unreadable)
-        found.push_back(std::move(e));
     }
 
     std::lock_guard<std::mutex> lock(mtx);
     auto & ci = cp_index[conversation_id];
     for (auto & e : found) {
         const int32_t key = e.pos_min;
-        ci.files.emplace(key, std::move(e)); // entries the writer added meanwhile win
+        ci.files.emplace(key, std::move(e)); // entries the writer added meanwhile win (and hot wins over cold)
     }
     ci.seeded = true;
 
@@ -3499,9 +4010,12 @@ bool server_prompt_cache::load_from_disk(server_prompt & prompt, const std::stri
         return false;
     }
 
-    // wait until no write for this conversation is queued or in flight
+    // wait until no write for this conversation is queued or in flight.
+    // [TAG_COLD_TIER] registered as loading before the wait: a demotion of this conversation that is copying right now
+    // sees it between two chunks and gives up (its partial cold copy is removed), and the scan skips it from here on
     {
         std::unique_lock<std::mutex> lock(mtx);
+        loading_convs.insert(conversation_id);
         cv.wait(lock, [&]() {
             if (writer_active_conv == conversation_id) {
                 return false;
@@ -3514,6 +4028,14 @@ bool server_prompt_cache::load_from_disk(server_prompt & prompt, const std::stri
             return true;
         });
     }
+    struct loading_guard {
+        server_prompt_cache * c;
+        const std::string   & id;
+        ~loading_guard() {
+            std::lock_guard<std::mutex> lock(c->mtx);
+            c->loading_convs.erase(id);
+        }
+    } loading { this, conversation_id };
 
     disk_conv_state st;
     if (!read_disk_state(conversation_id, st)) {
@@ -3546,17 +4068,96 @@ bool server_prompt_cache::load_from_disk(server_prompt & prompt, const std::stri
         return false;
     }
 
-    const std::string base = (std::filesystem::path(disk_path) / conversation_id).string();
+    const bool        from_cold = st.tier == 2;
+    const std::string base      = (std::filesystem::path(from_cold ? disk_path_cold : disk_path) / conversation_id).string();
+
+    // [TAG_DISK_ENOSPC] the file layout comes from the model, never from rec_size: a delta-capable hybrid model writes
+    // attention-only range blobs (APPEND) plus a .rec, everything else writes full-state blobs. 2026-11-01 and again
+    // 2026-11-04 (production log 20261104_082417 ~L18285): a rewrite that died under ENOSPC left a hybrid header with
+    // rec_size 0, segment 0 was applied with flags NONE, state_read wanted a recurrent section the range blob does not
+    // have ("unexpectedly reached end of buffer", set_data returned 0 of 537067936), and 151k tokens were reprocessed
+    // from zero (152 s). same test as flush_from_context's delta_capable / rec_needed
+    const llama_model * model_tgt = llama_get_model(ctx_tgt);
+    bool delta_capable = llama_model_n_swa(model_tgt) == 0 && !llama_model_is_recurrent(model_tgt);
+    if (ctx_dft) {
+        const llama_model * model_dft = llama_get_model(ctx_dft);
+        delta_capable = delta_capable && llama_model_n_swa(model_dft) == 0 && !llama_model_is_recurrent(model_dft);
+    }
+    const bool hybrid = delta_capable && llama_model_is_hybrid(model_tgt);
 
     std::ifstream kf(split_path(base, SPLIT_EXT_KV), std::ios::binary);
     if (!kf) {
         return false;
     }
+
+    // [TAG_COLD_TIER] promotion: a cold entry is copied to hot in the same pass that restores it - every segment read
+    // from the spinner (~200 MB/s) is written to <hot>/<id>.kv.tmp (NVMe, ~512 MiB in ~200 ms) before it is applied, so
+    // the copy hides behind the read. the cold files go only after the hot ones are complete and renamed
+    bool promote = from_cold;
+    const std::string hot_base = (std::filesystem::path(disk_path) / conversation_id).string();
+    const std::string hot_kv_tmp   = split_path(hot_base, SPLIT_EXT_KV)   + ".tmp";
+    const std::string hot_drft_tmp = split_path(hot_base, SPLIT_EXT_DRFT) + ".tmp";
+    const std::string hot_rec_tmp  = split_path(hot_base, SPLIT_EXT_REC)  + ".tmp";
+    const std::string hot_tok_tmp  = split_path(hot_base, SPLIT_EXT_TOK)  + ".tmp";
+    const std::string hot_hdr_tmp  = split_path(hot_base, SPLIT_EXT_HDR)  + ".tmp";
+    FILE * pk = nullptr;
+    FILE * pd = nullptr;
+    auto promo_close = [&]() {
+        if (pk) { fclose(pk); pk = nullptr; }
+        if (pd) { fclose(pd); pd = nullptr; }
+    };
+    auto promo_remove = [&]() {
+        std::error_code ec;
+        for (const auto & p : { hot_kv_tmp, hot_drft_tmp, hot_rec_tmp, hot_tok_tmp, hot_hdr_tmp }) {
+            std::filesystem::remove(p, ec);
+        }
+    };
+    auto promo_abort = [&](const char * why) {
+        if (!promote) {
+            return;
+        }
+        promote = false;
+        promo_close();
+        promo_remove();
+        SRV_WRN("disk cache: promotion of '%s' abandoned (%s) - the cold entry is kept\n", conversation_id.c_str(), why);
+    };
+    if (promote) {
+        // the segments must tile the files from offset 0 so the copy reproduces the committed bytes exactly
+        bool tiles = true;
+        uint64_t kv_off = 0, drft_off = 0;
+        for (const auto & seg : st.segments) {
+            tiles = tiles && seg.kv_off == kv_off && seg.drft_off == drft_off;
+            kv_off   += seg.kv_size;
+            drft_off += seg.drft_size;
+        }
+        if (!tiles || kv_off != st.kv_size || drft_off != st.drft_size) {
+            promo_abort("segments do not tile the files");
+        } else {
+            std::error_code ec;
+            const auto sp = std::filesystem::space(disk_path, ec);
+            const uint64_t need = st.kv_size + st.drft_size + st.rec_size + (uint64_t) st.n_tok * sizeof(llama_token);
+            if (!ec && sp.available < need + DISK_FREE_MARGIN_BYTES) {
+                promote = false;
+                SRV_WRN("disk cache: '%s' restored from cold without promotion - %.1f MiB free in the hot dir, need %.1f MiB + margin\n",
+                        conversation_id.c_str(), sp.available / (1024.0 * 1024.0), need / (1024.0 * 1024.0));
+            } else {
+                pk = fopen(hot_kv_tmp.c_str(), "wb");
+                pd = st.drft_size > 0 ? fopen(hot_drft_tmp.c_str(), "wb") : nullptr;
+                if (!pk || (st.drft_size > 0 && !pd)) {
+                    promo_abort("cannot create the hot files");
+                }
+            }
+        }
+    }
+
     std::ifstream df;
-    if (runtime_has_dft) {
+    if (runtime_has_dft || (promote && st.drft_size > 0)) {
         df.open(split_path(base, SPLIT_EXT_DRFT), std::ios::binary);
         if (!df) {
-            return false;
+            promo_abort("no .drft");
+            if (runtime_has_dft) {
+                return false;
+            }
         }
     }
 
@@ -3566,18 +4167,17 @@ bool server_prompt_cache::load_from_disk(server_prompt & prompt, const std::stri
     const llama_state_convert_stats conv0_tgt = llama_state_get_convert_stats(ctx_tgt);
     const llama_state_convert_stats conv0_dft = ctx_dft ? llama_state_get_convert_stats(ctx_dft) : llama_state_convert_stats { 0, 0, 0, -1, -1 };
 
-    SRV_INF("load_from_disk: '%s' n_tok=%u kv=%.1f MiB drft=%.1f MiB segments=%zu\n",
+    SRV_INF("load_from_disk: '%s' n_tok=%u kv=%.1f MiB drft=%.1f MiB segments=%zu%s\n",
             conversation_id.c_str(), st.n_tok,
-            st.kv_size / (1024.0 * 1024.0), st.drft_size / (1024.0 * 1024.0), st.segments.size());
+            st.kv_size / (1024.0 * 1024.0), st.drft_size / (1024.0 * 1024.0), st.segments.size(), from_cold ? " (cold)" : "");
 
     // stream the segments into the context one buffer at a time; peak host RAM = the
     // largest single segment.
     //
-    // rec_size == 0: full-state blobs - the first segment replaces the sequence (flags=0
+    // non-hybrid: full-state blobs - the first segment replaces the sequence (flags=0
     // parses the complete state layout), later segments merge in with APPEND.
-    // rec_size > 0 (hybrid): every segment is attention-only, which only the APPEND path
-    // parses - so wipe the sequence explicitly and apply all segments with APPEND, then
-    // restore the recurrent state from .rec with PARTIAL_ONLY.
+    // hybrid: every segment is attention-only, which only the APPEND path parses - so wipe the sequence explicitly and
+    // apply all segments with APPEND, then restore the recurrent state from .rec (or a cp_ file) with PARTIAL_ONLY.
     // the prompt is cleared with the memory: load() returns true after a failed disk load and the caller keeps the
     // slot, so stale tokens left here would claim cells that are gone (the next turn would reuse a prefix of them)
     auto wipe_slot = [&]() {
@@ -3587,85 +4187,109 @@ bool server_prompt_cache::load_from_disk(server_prompt & prompt, const std::stri
         }
         prompt.clear();
     };
+    auto fail = [&]() {
+        promo_abort("restore failed");
+        wipe_slot();
+        return false;
+    };
 
-    const bool hybrid_file = st.rec_size > 0;
-    if (hybrid_file) {
+    if (hybrid) {
         wipe_slot();
     }
 
     std::vector<uint8_t> buf;
     for (size_t i = 0; i < st.segments.size(); ++i) {
         const auto & seg = st.segments[i];
-        const llama_state_seq_flags flags = (hybrid_file || i > 0) ? LLAMA_STATE_SEQ_FLAGS_APPEND : LLAMA_STATE_SEQ_FLAGS_NONE;
+        const llama_state_seq_flags flags = (hybrid || i > 0) ? LLAMA_STATE_SEQ_FLAGS_APPEND : LLAMA_STATE_SEQ_FLAGS_NONE;
 
         buf.resize(seg.kv_size);
         kf.seekg((std::streamoff) seg.kv_off);
         kf.read(reinterpret_cast<char *>(buf.data()), (std::streamsize) seg.kv_size);
         if (!kf) {
             SRV_WRN("load_from_disk: '%s.kv' read failed at segment %zu\n", conversation_id.c_str(), i);
-            wipe_slot();
-            return false;
+            return fail();
+        }
+        if (promote) {
+            size_t n_ok = buf.size();
+            const bool inject = disk_fault_inject(buf.size(), n_ok); // [TAG_DISK_ENOSPC] the same test hook as appends
+            if (fwrite(buf.data(), 1, n_ok, pk) != n_ok || inject) {
+                promo_abort("hot .kv write failed");
+            }
         }
 
         size_t n = llama_state_seq_set_data_ext(ctx_tgt, buf.data(), buf.size(), id_slot, flags);
         if (n != buf.size()) {
             SRV_WRN("load_from_disk: set_data (main, segment %zu) returned %zu of %zu\n", i, n, buf.size());
-            wipe_slot();
-            return false;
+            return fail();
         }
 
-        if (runtime_has_dft && seg.drft_size > 0) {
+        if (seg.drft_size > 0 && (runtime_has_dft || promote)) {
             buf.resize(seg.drft_size);
             df.seekg((std::streamoff) seg.drft_off);
             df.read(reinterpret_cast<char *>(buf.data()), (std::streamsize) seg.drft_size);
             if (!df) {
                 SRV_WRN("load_from_disk: '%s.drft' read failed at segment %zu\n", conversation_id.c_str(), i);
-                wipe_slot();
-                return false;
+                if (runtime_has_dft) {
+                    return fail();
+                }
+                promo_abort("cold .drft read failed");
+                continue;
+            }
+            if (promote && fwrite(buf.data(), 1, buf.size(), pd) != buf.size()) {
+                promo_abort("hot .drft write failed");
             }
 
-            n = llama_state_seq_set_data_ext(ctx_dft, buf.data(), buf.size(), id_slot, flags);
-            if (n != buf.size()) {
-                SRV_WRN("load_from_disk: set_data (drft, segment %zu) returned %zu of %zu\n", i, n, buf.size());
-                wipe_slot();
-                return false;
+            if (runtime_has_dft) {
+                n = llama_state_seq_set_data_ext(ctx_dft, buf.data(), buf.size(), id_slot, flags);
+                if (n != buf.size()) {
+                    SRV_WRN("load_from_disk: set_data (drft, segment %zu) returned %zu of %zu\n", i, n, buf.size());
+                    return fail();
+                }
             }
         }
     }
 
     // hybrid models: restore the recurrent state (valid at n_tok) on top of the attention cells
-    if (hybrid_file) {
-        common_state_data rec; // [TAG_STATE_BLOB] no zero fill of 157 MB before the read
-        uint8_t * rec_dst = rec.reserve_for_write(st.rec_size);
-        std::ifstream rf(split_path(base, SPLIT_EXT_REC), std::ios::binary);
-        if (!rf) {
-            wipe_slot();
-            return false;
-        }
-        rf.read(reinterpret_cast<char *>(rec_dst), (std::streamsize) rec.size());
-        if (!rf || rec.size() <= sizeof(uint32_t)) {
-            wipe_slot();
-            return false;
+    uint32_t n_tok_restored = st.n_tok;
+    common_state_data rec; // [TAG_STATE_BLOB] no zero fill of 157 MB before the read
+    bool rec_ok = false;
+    if (hybrid) {
+        if (st.rec_size > sizeof(uint32_t) && st.rec_valid) {
+            uint8_t * rec_dst = rec.reserve_for_write(st.rec_size);
+            std::ifstream rf(split_path(base, SPLIT_EXT_REC), std::ios::binary);
+            rf.read(reinterpret_cast<char *>(rec_dst), (std::streamsize) rec.size());
+            uint32_t rec_n_tok = 0;
+            if (rf) {
+                memcpy(&rec_n_tok, rec.data(), sizeof(uint32_t));
+            }
+            // the snapshot must match the header's token count - a crash between the segment
+            // append and the .rec overwrite leaves them inconsistent
+            if (!rf || rec_n_tok != st.n_tok) {
+                SRV_WRN("load_from_disk: '%s.rec' unreadable or for %u tokens (header %u) - trying a checkpoint\n",
+                        conversation_id.c_str(), rec_n_tok, st.n_tok);
+            } else {
+                const size_t n = llama_state_seq_set_data_ext(ctx_tgt, rec.data() + sizeof(uint32_t),
+                                                              rec.size() - sizeof(uint32_t), id_slot,
+                                                              LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                rec_ok = n == rec.size() - sizeof(uint32_t);
+                if (!rec_ok) {
+                    SRV_WRN("load_from_disk: set_data (rec) returned %zu of %zu - trying a checkpoint\n", n, rec.size() - sizeof(uint32_t));
+                }
+            }
         }
 
-        // the snapshot must match the header's token count - a crash between the segment
-        // append and the .rec overwrite leaves them inconsistent, which cannot be restored
-        uint32_t rec_n_tok = 0;
-        memcpy(&rec_n_tok, rec.data(), sizeof(uint32_t));
-        if (rec_n_tok != st.n_tok) {
-            SRV_WRN("load_from_disk: '%s.rec' is for %u tokens but header says %u - reprocessing\n",
-                    conversation_id.c_str(), rec_n_tok, st.n_tok);
-            wipe_slot();
-            return false;
-        }
-
-        const size_t n = llama_state_seq_set_data_ext(ctx_tgt, rec.data() + sizeof(uint32_t),
-                                                      rec.size() - sizeof(uint32_t), id_slot,
-                                                      LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        if (n != rec.size() - sizeof(uint32_t)) {
-            SRV_WRN("load_from_disk: set_data (rec) returned %zu of %zu\n", n, rec.size() - sizeof(uint32_t));
-            wipe_slot();
-            return false;
+        if (!rec_ok) {
+            // [TAG_DISK_ENOSPC] no usable .rec: the attention cells are all in, the recurrent state comes from the newest
+            // cp_ file of this exact token timeline at or below n_tok. the attention cells past it are dropped (the
+            // recurrent state only knows the tokens up to it) and the server reprocesses the tail from there.
+            // 2026-11-01: cp_9b88741580953422_139224.bin would have saved 139k of the 186k tokens reprocessed from zero
+            const int64_t n_cp = restore_rec_from_checkpoint(conversation_id, st, ctx_tgt, ctx_dft, id_slot);
+            if (n_cp <= 0) {
+                SRV_WRN("load_from_disk: '%s' has no valid .rec (rec_size %llu) and no matching checkpoint - the %u tokens are reprocessed from zero\n",
+                        conversation_id.c_str(), (unsigned long long) st.rec_size, st.n_tok);
+                return fail();
+            }
+            n_tok_restored = (uint32_t) n_cp;
         }
     }
 
@@ -3673,7 +4297,7 @@ bool server_prompt_cache::load_from_disk(server_prompt & prompt, const std::stri
     // merge_checkpoint_spills() which registers this conversation's cp_ files lazily.
     prompt.tokens.clear();
     {
-        llama_tokens toks = st.scheduled_tokens;
+        llama_tokens toks(st.scheduled_tokens.begin(), st.scheduled_tokens.begin() + n_tok_restored);
         prompt.tokens.insert(toks);
     }
     prompt.checkpoints.clear();
@@ -3682,18 +4306,94 @@ bool server_prompt_cache::load_from_disk(server_prompt & prompt, const std::stri
     // [LLAMA_SERVER_UBATCH_STATS] 2026-10-22 night: per-request restore size (load() sets last_load_src)
     last_load_bytes = (int64_t) (st.kv_size + st.drft_size + st.rec_size);
 
-    // seed the in-RAM mirror so the next flush appends instead of re-reading the header
-    {
-        std::lock_guard<std::mutex> lock(mtx);
-        if (disk_convs.count(conversation_id) == 0) {
-            disk_convs.emplace(conversation_id, std::move(st));
+    const double t_ms = (ggml_time_us() - t_start) / 1e3;
+
+    // [TAG_COLD_TIER] finish the promotion: .rec/.tok/.hdr next to the copied segments, renames (header last), then the
+    // cold files go. any failure removes the hot files and keeps the cold entry, the restore itself already succeeded
+    if (promote) {
+        bool ok = true;
+        ok = ok && fflush(pk) == 0 && disk_fsync(pk);
+        ok = ok && (!pd || (fflush(pd) == 0 && disk_fsync(pd)));
+        ok = (fclose(pk) == 0) && ok;
+        pk = nullptr;
+        if (pd) {
+            ok = (fclose(pd) == 0) && ok;
+            pd = nullptr;
+        }
+        // the .rec only travels when it was valid; otherwise the hot header says rec_size 0 (checkpoint fallback)
+        const uint64_t rec_size_hot = rec_ok ? rec.size() : 0;
+        ok = ok && (!rec_ok || disk_write_file(hot_rec_tmp, rec.data(), rec.size()));
+        ok = ok && disk_write_file(hot_tok_tmp, st.scheduled_tokens.data(), st.scheduled_tokens.size() * sizeof(llama_token));
+        if (ok) {
+            const std::vector<uint8_t> hdr = disk_make_hdr(arch_hash, vocab_hash, st.file_state_hash, (uint32_t) limit_tokens, st, rec_size_hot);
+            ok = disk_write_file(hot_hdr_tmp, hdr.data(), hdr.size());
+        }
+        std::error_code ec;
+        auto put = [&](const std::string & tmp, std::string_view ext, bool present) {
+            const std::string dst = split_path(hot_base, ext);
+            if (present) {
+                std::filesystem::rename(tmp, dst, ec);
+                ok = ok && !ec;
+            } else {
+                std::filesystem::remove(dst, ec);
+            }
+        };
+        if (ok) {
+            put(hot_kv_tmp,   SPLIT_EXT_KV,   true);
+            put(hot_drft_tmp, SPLIT_EXT_DRFT, st.drft_size > 0);
+            put(hot_rec_tmp,  SPLIT_EXT_REC,  rec_ok);
+            put(hot_tok_tmp,  SPLIT_EXT_TOK,  true);
+        }
+        if (ok) {
+            put(hot_hdr_tmp,  SPLIT_EXT_HDR,  true);
+        }
+        if (!ok) {
+            promo_remove();
+            for (const auto ext : { SPLIT_EXT_KV, SPLIT_EXT_DRFT, SPLIT_EXT_REC, SPLIT_EXT_TOK }) {
+                std::filesystem::remove(split_path(hot_base, ext), ec); // renamed already, no hot header names them
+            }
+            SRV_WRN("disk cache: promotion of '%s' failed at the commit - the cold entry is kept\n", conversation_id.c_str());
+        } else {
+            // the hot header exists: the entry resolves to hot from here. the cold header goes first so the entry is never
+            // listed in both tiers longer than these unlinks take
+            for (const auto ext : { SPLIT_EXT_HDR, SPLIT_EXT_KV, SPLIT_EXT_DRFT, SPLIT_EXT_REC, SPLIT_EXT_TOK }) {
+                std::filesystem::remove(split_path(base, ext), ec);
+            }
+            move_cp_files(conversation_id, disk_path_cold, disk_path);
+            st.tier          = 1;
+            st.rec_size      = rec_size_hot;
+            st.rec_valid     = rec_ok;
+            st.scheduled_rec = rec_ok;
+
+            const double t_promo_ms = (ggml_time_us() - t_start) / 1e3;
+            SRV_WRN("disk cache: promoted '%s' %u tokens %.1f MiB from cold in %.0f ms\n",
+                    conversation_id.c_str(), st.n_tok,
+                    (st.kv_size + st.drft_size + rec_size_hot) / (1024.0 * 1024.0), t_promo_ms);
         }
     }
 
-    const double t_ms = (ggml_time_us() - t_start) / 1e3;
+    // seed the in-RAM mirror so the next flush appends instead of re-reading the header
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        st.t_last_use = disk_now_s();
+        auto d = disk_convs.find(conversation_id);
+        if (d == disk_convs.end()) {
+            disk_convs.emplace(conversation_id, std::move(st));
+        } else {
+            // [TAG_COLD_TIER] an existing mirror keeps its scheduled view; only where the files live and the idle clock change
+            d->second.tier       = st.tier;
+            d->second.t_last_use = st.t_last_use;
+            if (from_cold && st.tier == 1) {
+                d->second.rec_size      = st.rec_size;
+                d->second.rec_valid     = st.rec_valid;
+                d->second.scheduled_rec = d->second.scheduled_rec && st.rec_valid;
+            }
+        }
+    }
+
     SRV_WRN("load_from_disk: restored '%s' tokens=%zu in %.0f ms (%.1f MiB/s)\n",
             conversation_id.c_str(), prompt.tokens.size(), t_ms,
-            t_ms > 0.0 ? ((st.kv_size + st.drft_size) / (1024.0 * 1024.0)) / (t_ms / 1e3) : 0.0);
+            t_ms > 0.0 ? ((last_load_bytes) / (1024.0 * 1024.0)) / (t_ms / 1e3) : 0.0);
 
     // [fork, 2026-10-30] one line per converted restore (the library adds one per segment it converted); the next
     // flush of this conversation rewrites it in this server's type, see flush_from_context
@@ -3717,6 +4417,69 @@ bool server_prompt_cache::load_from_disk(server_prompt & prompt, const std::stri
     }
 
     return true;
+}
+
+// [TAG_DISK_ENOSPC] the recurrent half of a hybrid restore from a cp_ file, for a .hdr whose .rec is missing or stale. the
+// attention segments of [0, st.n_tok) are already applied. newest first: the first cp_ file of this token timeline
+// (token_prefix_hash over st's tokens) with n_tokens <= st.n_tok that loads wins. returns its n_tokens, 0 = none
+int64_t server_prompt_cache::restore_rec_from_checkpoint(const std::string & conversation_id, const disk_conv_state & st,
+                                                         llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+    cp_index_seed(conversation_id);
+
+    std::vector<cp_file_entry> entries;
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        for (const auto & kv : cp_index[conversation_id].files) {
+            entries.push_back(kv.second);
+        }
+    }
+    std::sort(entries.begin(), entries.end(), [](const cp_file_entry & a, const cp_file_entry & b) { return a.n_tokens > b.n_tokens; });
+
+    const server_tokens toks(llama_tokens(st.scheduled_tokens.begin(), st.scheduled_tokens.end()), false);
+
+    for (const auto & e : entries) {
+        // pos_max + 1 == n_tokens: text-only timelines (the disk tier never holds mtmd), the cut below is by position
+        if (e.status != cp_file_entry::CP_OK || e.n_tokens <= 0 || e.n_tokens > (int64_t) st.n_tok || e.pos_max + 1 != e.n_tokens) {
+            continue;
+        }
+        if (hash_token_prefix(toks, (size_t) e.n_tokens) != e.token_prefix_hash) {
+            continue;
+        }
+
+        // the recurrent state of this checkpoint has seen exactly the first n_tokens tokens: drop the attention cells
+        // past it (the recurrent child holds nothing for this sequence yet, so only the attention child is cut)
+        const llama_pos p0 = (llama_pos) e.n_tokens;
+        if (!llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, p0, -1) ||
+            (ctx_dft && !llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, p0, -1))) {
+            SRV_WRN("load_from_disk: '%s' cannot cut the attention cells at %d - no checkpoint restore\n", conversation_id.c_str(), p0);
+            return 0;
+        }
+
+        common_prompt_checkpoint cp;
+        cp.pos_min           = e.pos_min;
+        cp.pos_max           = e.pos_max;
+        cp.n_tokens          = e.n_tokens;
+        cp.token_prefix_hash = e.token_prefix_hash;
+        cp.src_path          = e.path;
+        cp.off_tgt           = e.off_tgt;
+        cp.sz_tgt            = e.sz_tgt;
+        cp.off_dft           = e.off_dft;
+        cp.sz_dft            = e.sz_dft;
+
+        if (!cp.load_tgt(ctx_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ||
+            !cp.load_dft(ctx_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+            SRV_WRN("load_from_disk: checkpoint '%s' failed to load - trying an older one\n", std::filesystem::path(e.path).filename().string().c_str());
+            forget_checkpoint_spill(conversation_id, e.pos_min);
+            continue;
+        }
+
+        SRV_WRN("load_from_disk: '%s' recurrent state from checkpoint '%s' (%" PRId64 " of %u tokens, the last %" PRId64 " are reprocessed)\n",
+                conversation_id.c_str(), std::filesystem::path(e.path).filename().string().c_str(), e.n_tokens, st.n_tok,
+                (int64_t) st.n_tok - e.n_tokens);
+        return e.n_tokens;
+    }
+
+    return 0;
 }
 
 void server_prompt_cache::wait_idle() {
@@ -3749,4 +4512,287 @@ void server_prompt_cache::shutdown_and_spill() {
 
     // mtmd states cannot be persisted
     states.clear();
+}
+
+//
+// server_prompt_cache - cold tier ([TAG_COLD_TIER])
+//
+
+void server_prompt_cache::set_live_conversations(const std::vector<std::string> & ids) {
+    if (disk_path_cold.empty()) {
+        return;
+    }
+    std::unordered_set<std::string> next(ids.begin(), ids.end());
+    std::lock_guard<std::mutex> lock(mtx);
+    if (next != live_convs) {
+        live_convs = std::move(next);
+    }
+}
+
+int server_prompt_cache::resolve_tier(const std::string & conversation_id, std::string & base) const {
+    std::error_code ec;
+    if (!disk_path.empty()) {
+        const std::string b = (std::filesystem::path(disk_path) / conversation_id).string();
+        if (std::filesystem::exists(split_path(b, SPLIT_EXT_HDR), ec)) {
+            base = b;
+            return 1;
+        }
+    }
+    if (!disk_path_cold.empty()) {
+        const std::string b = (std::filesystem::path(disk_path_cold) / conversation_id).string();
+        if (std::filesystem::exists(split_path(b, SPLIT_EXT_HDR), ec)) {
+            base = b;
+            return 2;
+        }
+    }
+    return 0;
+}
+
+void server_prompt_cache::move_cp_files(const std::string & conv_id, const std::string & from_dir, const std::string & to_dir) {
+    const std::string conv_prefix = "cp_" + conv_id + "_";
+    std::vector<std::pair<int32_t, std::string>> files;
+    {
+        std::error_code ec;
+        for (const auto & de : std::filesystem::directory_iterator(from_dir, ec)) {
+            if (ec) {
+                break;
+            }
+            int32_t pmin = 0;
+            const std::string fn = de.path().filename().string();
+            if (parse_cp_file_name(fn, conv_prefix, pmin)) {
+                files.emplace_back(pmin, fn);
+            }
+        }
+    }
+
+    size_t n_moved = 0;
+    for (const auto & [pmin, fn] : files) {
+        const std::string src = (std::filesystem::path(from_dir) / fn).string();
+        const std::string dst = (std::filesystem::path(to_dir)   / fn).string();
+        std::error_code ec;
+        // rename first (same filesystem); hot and cold are normally different disks, then copy + unlink
+        std::filesystem::rename(src, dst, ec);
+        if (ec) {
+            const std::string tmp = dst + ".tmp";
+            if (disk_copy_file(src, tmp, []() { return false; }) != 1) {
+                SRV_WRN("disk cache: cannot copy '%s' to '%s' - left in place\n", src.c_str(), to_dir.c_str());
+                continue;
+            }
+            const auto t = std::filesystem::last_write_time(src, ec);
+            if (!ec) {
+                std::filesystem::last_write_time(tmp, t, ec);
+            }
+            std::filesystem::rename(tmp, dst, ec);
+            if (ec) {
+                std::filesystem::remove(tmp, ec);
+                continue;
+            }
+            std::filesystem::remove(src, ec);
+        }
+        ++n_moved;
+        std::lock_guard<std::mutex> lock(mtx);
+        auto it = cp_index.find(conv_id);
+        if (it != cp_index.end()) {
+            auto f = it->second.files.find(pmin);
+            if (f != it->second.files.end()) {
+                f->second.path = dst;
+            }
+        }
+    }
+    if (n_moved > 0) {
+        SRV_INF("disk cache: moved %zu checkpoint file(s) of '%s' to '%s'\n", n_moved, conv_id.c_str(), to_dir.c_str());
+    }
+}
+
+// writer thread. lists the hot .hdr files and demotes every entry that is idle (last write or restore older than
+// demote_after_s), held by no slot, not being loaded and has nothing queued. yields to queued work between entries and
+// inside an entry's copy
+void server_prompt_cache::demote_scan() {
+    if (disk_path_cold.empty()) {
+        return;
+    }
+
+    std::vector<std::string> ids;
+    {
+        std::error_code ec;
+        for (const auto & de : std::filesystem::directory_iterator(disk_path, ec)) {
+            if (ec) {
+                break;
+            }
+            const std::string fn = de.path().filename().string();
+            if (fn.size() > SPLIT_EXT_HDR.size() && fn.compare(fn.size() - SPLIT_EXT_HDR.size(), SPLIT_EXT_HDR.size(), SPLIT_EXT_HDR) == 0) {
+                ids.push_back(fn.substr(0, fn.size() - SPLIT_EXT_HDR.size()));
+            }
+        }
+    }
+
+    const int64_t now = disk_now_s();
+    size_t n_demoted = 0;
+    for (const auto & id : ids) {
+        if (stop_flag.load()) {
+            break;
+        }
+        const int64_t age_file = disk_file_age_s(split_path((std::filesystem::path(disk_path) / id).string(), SPLIT_EXT_HDR));
+        if (age_file < 0) {
+            continue; // gone since the listing
+        }
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            if (!queue.empty()) {
+                break; // appends first, the next idle period resumes
+            }
+            if (live_convs.count(id) || loading_convs.count(id) || staging.count(id)) {
+                continue;
+            }
+            int64_t age = age_file;
+            const auto d = disk_convs.find(id);
+            if (d != disk_convs.end() && d->second.t_last_use > 0) {
+                age = std::min(age, now - d->second.t_last_use);
+            }
+            if (age < demote_after_s) {
+                continue;
+            }
+            // load_from_disk() of this conversation now waits until the move is done (or abandoned)
+            writer_active_conv = id;
+        }
+
+        const int r = demote_one(id);
+
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            writer_active_conv.clear();
+            cv.notify_all();
+        }
+        if (r < 0) {
+            break;
+        }
+        n_demoted += r;
+    }
+    if (n_demoted > 0) {
+        SRV_INF("disk cache: demote scan moved %zu of %zu hot entr%s to cold\n", n_demoted, ids.size(), ids.size() == 1 ? "y" : "ies");
+    }
+}
+
+int server_prompt_cache::demote_one(const std::string & conv_id) {
+    const std::string hot_base  = (std::filesystem::path(disk_path)      / conv_id).string();
+    const std::string cold_base = (std::filesystem::path(disk_path_cold) / conv_id).string();
+
+    // the files of the entry: data first, then the cp_ files, the header last (it makes the cold copy visible)
+    std::vector<std::pair<std::string, std::string>> moves; // hot path, cold path
+    uint64_t total = 0;
+    std::error_code ec;
+    auto add = [&](const std::string & hot, const std::string & cold) {
+        const uint64_t sz = (uint64_t) std::filesystem::file_size(hot, ec);
+        if (!ec) {
+            moves.emplace_back(hot, cold);
+            total += sz;
+        }
+    };
+    for (const auto ext : { SPLIT_EXT_KV, SPLIT_EXT_DRFT, SPLIT_EXT_REC, SPLIT_EXT_TOK }) {
+        add(split_path(hot_base, ext), split_path(cold_base, ext));
+    }
+    {
+        const std::string conv_prefix = "cp_" + conv_id + "_";
+        for (const auto & de : std::filesystem::directory_iterator(disk_path, ec)) {
+            if (ec) {
+                break;
+            }
+            int32_t pmin = 0;
+            const std::string fn = de.path().filename().string();
+            if (parse_cp_file_name(fn, conv_prefix, pmin)) {
+                add(de.path().string(), (std::filesystem::path(disk_path_cold) / fn).string());
+            }
+        }
+    }
+    add(split_path(hot_base, SPLIT_EXT_HDR), split_path(cold_base, SPLIT_EXT_HDR));
+    if (moves.empty() || moves.back().first != split_path(hot_base, SPLIT_EXT_HDR)) {
+        return 0; // the header vanished (the external sweep)
+    }
+
+    const auto sp = std::filesystem::space(disk_path_cold, ec);
+    if (!ec && sp.available < total + DISK_FREE_MARGIN_BYTES) {
+        SRV_WRN("disk cache: not demoting '%s' (%.1f MiB) - %.1f MiB free in the cold dir\n",
+                conv_id.c_str(), total / (1024.0 * 1024.0), sp.available / (1024.0 * 1024.0));
+        return 0;
+    }
+
+    const int64_t t_start = ggml_time_us();
+
+    // a load of this conversation or any queued write wins over the move: the partial cold copy is dropped
+    auto yield = [this, &conv_id]() {
+        if (stop_flag.load()) {
+            return true;
+        }
+        std::lock_guard<std::mutex> lock(mtx);
+        return !queue.empty() || loading_convs.count(conv_id) > 0;
+    };
+
+    std::vector<std::string> copied; // cold .tmp paths
+    auto drop_copies = [&]() {
+        for (const auto & t : copied) {
+            std::filesystem::remove(t, ec);
+        }
+    };
+    for (const auto & [hot, cold] : moves) {
+        const std::string tmp = cold + ".tmp";
+        const int r = disk_copy_file(hot, tmp, yield);
+        if (r != 1) {
+            drop_copies();
+            if (r < 0) {
+                SRV_INF("disk cache: demotion of '%s' yielded to queued work - retried on the next idle scan\n", conv_id.c_str());
+                return -1;
+            }
+            SRV_WRN("disk cache: demotion of '%s' failed copying '%s' - the hot entry is kept\n", conv_id.c_str(), hot.c_str());
+            return 0;
+        }
+        // keep the last-write time: the external sweep (3 days on the .kv mtime, both dirs) measures idle time from the
+        // last real use, not from the day the entry moved
+        const auto t = std::filesystem::last_write_time(hot, ec);
+        if (!ec) {
+            std::filesystem::last_write_time(tmp, t, ec);
+        }
+        copied.push_back(tmp);
+    }
+
+    // commit the cold copy (header last), then remove the hot files (header first: from here the entry resolves to cold)
+    for (size_t i = 0; i < moves.size(); ++i) {
+        std::filesystem::rename(copied[i], moves[i].second, ec);
+        if (ec) {
+            SRV_WRN("disk cache: demotion of '%s' failed renaming '%s' (%s) - the hot entry is kept\n",
+                    conv_id.c_str(), copied[i].c_str(), ec.message().c_str());
+            for (size_t j = 0; j < i; ++j) {
+                std::filesystem::remove(moves[j].second, ec); // no cold header was renamed yet (it is the last move)
+            }
+            drop_copies();
+            return 0;
+        }
+    }
+    std::filesystem::remove(moves.back().first, ec);
+    for (size_t i = 0; i + 1 < moves.size(); ++i) {
+        std::filesystem::remove(moves[i].first, ec);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        auto d = disk_convs.find(conv_id);
+        if (d != disk_convs.end()) {
+            d->second.tier = 2;
+        }
+        auto c = cp_index.find(conv_id);
+        if (c != cp_index.end()) {
+            for (auto & kv : c->second.files) {
+                const std::string cold = (std::filesystem::path(disk_path_cold) / std::filesystem::path(kv.second.path).filename()).string();
+                for (const auto & m : moves) {
+                    if (m.second == cold) {
+                        kv.second.path = cold;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    SRV_WRN("disk cache: demoted '%s' %.1f MiB (%zu files) to cold in %.0f ms\n",
+            conv_id.c_str(), total / (1024.0 * 1024.0), moves.size(), (ggml_time_us() - t_start) / 1e3);
+    return 1;
 }

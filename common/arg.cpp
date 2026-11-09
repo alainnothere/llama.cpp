@@ -1737,6 +1737,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_PATH").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-disk-path-cold"}, "PATH",
+        "second (slow, large) directory for the disk cache (default: empty = disabled, requires --cache-disk-path). "
+        "entries idle for --cache-disk-demote-after seconds move there and come back to --cache-disk-path on their next restore; "
+        "an entry lives in exactly one of the two directories",
+        [](common_params & params, const std::string & value) {
+            params.cache_disk_path_cold = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_PATH_COLD").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-demote-after"}, "N",
+        string_format("seconds without a write or restore after which a disk cache entry moves to --cache-disk-path-cold (default: %d)", params.cache_disk_demote_after),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("--cache-disk-demote-after must be >= 1");
+            }
+            params.cache_disk_demote_after = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_DEMOTE_AFTER").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--cache-disk-queue-depth"}, "N",
         string_format("async writer queue depth for the disk cache (default: %d). queue overflow falls through to synchronous write on the task thread", params.cache_disk_queue_depth),
         [](common_params & params, int value) {

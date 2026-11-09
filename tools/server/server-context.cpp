@@ -3408,7 +3408,8 @@ private:
                 params_base.cache_ram_mib, n_ctx,
                 params_base.cache_disk_path, params_base.cache_disk_queue_depth,
                 params_base.checkpoint_spill_max,
-                arch_hash, vocab_hash, state_hash);
+                arch_hash, vocab_hash, state_hash,
+                params_base.cache_disk_path_cold, params_base.cache_disk_demote_after);
             prompt_cache->state_hash_accept = std::move(state_hash_accept);
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
@@ -5798,6 +5799,21 @@ private:
                 }
             }
         } ust_exit_guard { ust };
+
+        // [TAG_COLD_TIER] the demote scan (writer thread) never moves a conversation a slot holds. pushed every iteration:
+        // n_slots strings and one set compare under the cache mutex, nothing when the cold tier is off
+        if (prompt_cache && !prompt_cache->disk_path_cold.empty()) {
+            std::vector<std::string> live;
+            for (const auto & slot : slots) {
+                if (!slot.prompt.conversation_id.empty()) {
+                    live.push_back(slot.prompt.conversation_id);
+                }
+                if (slot.task && !slot.task->conversation_id.empty()) {
+                    live.push_back(slot.task->conversation_id);
+                }
+            }
+            prompt_cache->set_live_conversations(live);
+        }
 
         const bool perf_instr = params_base.perf_instrumentation;
         static int64_t t_prev = 0;

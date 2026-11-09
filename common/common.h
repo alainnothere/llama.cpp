@@ -726,6 +726,8 @@ struct common_params {
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
     std::string cache_disk_path;          // empty = disabled. directory for disk-backed KV cache spill
     int32_t cache_disk_queue_depth  = 16; // bounded async writer queue; overflow falls through synchronously
+    std::string cache_disk_path_cold;          // [TAG_COLD_TIER] empty = off. idle entries of cache_disk_path move here
+    int32_t cache_disk_demote_after = 86400;   // [TAG_COLD_TIER] seconds without a write or restore before a hot entry is demoted
     int32_t checkpoint_spill_max    = 16; // max checkpoint spill files kept on disk per slot by pos_min, -1 = no limit
     bool    cache_multiverse        = false; // keep the checkpoint spill files of abandoned conversation branches
     std::string http_request_dump_path; // empty = disabled. dump every POST body + meta sidecar here for diagnostic diffs

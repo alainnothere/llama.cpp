@@ -22,6 +22,8 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include <thread>
+#include <chrono>
 
 namespace fs = std::filesystem;
 
@@ -810,6 +812,145 @@ static void test_state_blob_pool() {
     fs::remove_all(dir);
 }
 
+// hand-craft a v6 entry (.hdr/.tok/.kv, one segment of kv_bytes, rec_size as given) the way process_disk_job writes it
+static void write_entry(const std::string & dir, const std::string & conv, uint32_t arch, uint32_t vocab, uint32_t state,
+                        uint32_t n_tok, uint64_t kv_bytes, uint64_t rec_size) {
+    std::vector<uint8_t> hdr;
+    auto put32 = [&hdr](uint32_t v) { const uint8_t * p = reinterpret_cast<const uint8_t *>(&v); hdr.insert(hdr.end(), p, p + 4); };
+    auto put64 = [&hdr](uint64_t v) { const uint8_t * p = reinterpret_cast<const uint8_t *>(&v); hdr.insert(hdr.end(), p, p + 8); };
+    put32(0x53504344u); put32(6); put32(arch); put32(vocab); put32(state); put32(0); put32(n_tok); put32(1);
+    put64(kv_bytes); put64(0); put64(rec_size);
+    put64(0); put64(kv_bytes); put64(0); put64(0); put32(0); put32(n_tok);
+    uint64_t sum = 0;
+    for (size_t i = 0; i < hdr.size(); i += 8) {
+        uint64_t word = 0;
+        memcpy(&word, hdr.data() + i, std::min<size_t>(8, hdr.size() - i));
+        sum ^= word;
+    }
+    put64(sum);
+
+    std::ofstream(dir + "/" + conv + ".hdr", std::ios::binary).write(reinterpret_cast<const char *>(hdr.data()), (std::streamsize) hdr.size());
+    std::vector<char> kv(kv_bytes, 'k');
+    std::ofstream(dir + "/" + conv + ".kv", std::ios::binary).write(kv.data(), (std::streamsize) kv.size());
+    std::vector<int32_t> toks(n_tok);
+    for (uint32_t i = 0; i < n_tok; ++i) {
+        toks[i] = (int32_t) (i * 7 + 1);
+    }
+    std::ofstream(dir + "/" + conv + ".tok", std::ios::binary).write(reinterpret_cast<const char *>(toks.data()), (std::streamsize) (toks.size() * 4));
+}
+
+// [TAG_DISK_ENOSPC] a .rec that is missing (header rec_size > 0) or written for another n_tok does not hide the entry any
+// more: the header still describes good attention segments, the loader takes the recurrent state from a cp_ file
+static void test_hdr_rec_mismatch_is_not_fatal() {
+    std::printf("test_hdr_rec_mismatch_is_not_fatal\n");
+    const std::string dir = make_temp_dir("rec_mm");
+    const uint32_t arch = 0x51u, vocab = 0x52u, state = 0x53u;
+    server_prompt_cache cache(64, 0, dir, 16, -1, arch, vocab, state);
+
+    write_entry(dir, "conv_norec", arch, vocab, state, 8, 64, 12);
+    server_prompt_cache::disk_conv_state st;
+    CHECK(cache.read_disk_state("conv_norec", st));
+    CHECK(st.n_tok == 8);
+    CHECK(st.rec_size == 12);
+    CHECK(!st.rec_valid);
+    CHECK(!st.scheduled_rec);
+
+    // a .rec of the right size but for another token count (an append whose header committed, rec not yet)
+    {
+        const uint32_t other = 5;
+        std::ofstream f(dir + "/conv_norec.rec", std::ios::binary);
+        f.write(reinterpret_cast<const char *>(&other), 4);
+        const char pad[8] = {};
+        f.write(pad, 8);
+    }
+    server_prompt_cache::disk_conv_state st2;
+    CHECK(cache.read_disk_state("conv_norec", st2));
+    CHECK(!st2.rec_valid);
+
+    // and the matching one is valid
+    {
+        const uint32_t n = 8;
+        std::ofstream f(dir + "/conv_norec.rec", std::ios::binary);
+        f.write(reinterpret_cast<const char *>(&n), 4);
+        const char pad[8] = {};
+        f.write(pad, 8);
+    }
+    server_prompt_cache::disk_conv_state st3;
+    CHECK(cache.read_disk_state("conv_norec", st3));
+    CHECK(st3.rec_valid);
+    CHECK(st3.scheduled_rec);
+    CHECK(st3.tier == 1);
+    fs::remove_all(dir);
+}
+
+// [TAG_COLD_TIER] the startup demote scan moves an idle hot entry (mtime older than demote-after) with its cp_ files to
+// cold; the entry then resolves to cold, reads back from there, and its checkpoints merge from the cold dir. an entry
+// with a fresh mtime stays hot
+static void test_cold_tier_demote_and_resolve() {
+    std::printf("test_cold_tier_demote_and_resolve\n");
+    const std::string hot  = make_temp_dir("tier_hot");
+    const std::string cold = make_temp_dir("tier_cold");
+    const uint32_t arch = 0x61u, vocab = 0x62u, state = 0x63u;
+
+    {
+        // cp_ files written by a cache without the cold tier
+        server_prompt_cache writer(64, 0, hot, 16, -1, arch, vocab, state);
+        writer.spill_checkpoint(make_ckpt(3, 3, 4, 256, 0, 5), "conv_old");
+        writer.wait_idle();
+    }
+    write_entry(hot, "conv_old", arch, vocab, state, 16, 4096, 0);
+    write_entry(hot, "conv_new", arch, vocab, state, 16, 4096, 0);
+    const auto old_time = fs::file_time_type::clock::now() - std::chrono::hours(48);
+    for (const auto & e : fs::directory_iterator(hot)) {
+        if (e.path().filename().string().find("conv_old") != std::string::npos) {
+            fs::last_write_time(e.path(), old_time);
+        }
+    }
+
+    server_prompt_cache cache(64, 0, hot, 16, -1, arch, vocab, state, cold, /*demote_after_s*/ 3600);
+    // the scan runs on the writer thread at startup
+    for (int i = 0; i < 100 && fs::exists(hot + "/conv_old.hdr"); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    cache.wait_idle();
+
+    CHECK(!fs::exists(hot + "/conv_old.hdr"));
+    CHECK(!fs::exists(hot + "/conv_old.kv"));
+    CHECK(!fs::exists(hot + "/cp_conv_old_3.bin"));
+    CHECK(fs::exists(cold + "/conv_old.hdr"));
+    CHECK(fs::exists(cold + "/conv_old.kv"));
+    CHECK(fs::exists(cold + "/conv_old.tok"));
+    CHECK(fs::exists(cold + "/cp_conv_old_3.bin"));
+    CHECK(fs::file_size(cold + "/conv_old.kv") == 4096);
+    CHECK(fs::exists(hot + "/conv_new.hdr"));
+    CHECK(!fs::exists(cold + "/conv_new.hdr"));
+    for (const auto & e : fs::directory_iterator(cold)) {
+        CHECK(e.path().extension() != ".tmp");
+    }
+
+    std::string base;
+    CHECK(cache.resolve_tier("conv_old", base) == 2);
+    CHECK(cache.resolve_tier("conv_new", base) == 1);
+    CHECK(cache.resolve_tier("conv_none", base) == 0);
+
+    server_prompt_cache::disk_conv_state st;
+    CHECK(cache.read_disk_state("conv_old", st));
+    CHECK(st.tier == 2);
+    CHECK(st.n_tok == 16);
+
+    server_prompt prompt;
+    prompt.conversation_id = "conv_old";
+    bind_prompt(prompt, 512);
+    cache.merge_checkpoint_spills(prompt);
+    CHECK(prompt.checkpoints.size() == 1);
+    if (!prompt.checkpoints.empty()) {
+        CHECK(fs::path(prompt.checkpoints.front().src_path).parent_path() == fs::path(cold));
+    }
+
+    fs::remove_all(hot);
+    fs::remove_all(cold);
+}
+
 int main() {
     test_lazy_registration_roundtrip();
     test_hash_mismatch_rejected();
@@ -829,6 +970,8 @@ int main() {
     test_spill_all_frees_ram();
     test_spill_all_noop_without_disk();
     test_state_blob_pool();
+    test_hdr_rec_mismatch_is_not_fatal();
+    test_cold_tier_demote_and_resolve();
 
     if (g_failures == 0) {
         std::printf("All prompt-cache disk tests passed\n");
