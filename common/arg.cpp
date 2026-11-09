@@ -283,6 +283,23 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
     }
 }
 
+// [fork, 2026-11-09] --override-tensor-source <regex>=<file.gguf>[,...]: same shape as the -ot parser above (split
+// on ',' then on the first '='), the right side is a GGUF path instead of a buffer type name
+static void parse_tensor_source_overrides(const std::string & value, std::vector<llama_model_tensor_source_override> & overrides) {
+    for (const auto & override : string_split<std::string>(value, ',')) {
+        const std::string::size_type pos = override.find('=');
+        if (pos == std::string::npos || pos == 0 || pos + 1 == override.size()) {
+            throw std::invalid_argument("invalid value, expected <tensor name pattern>=<file.gguf>");
+        }
+        // keep strings alive and avoid leaking memory by storing them in a static list
+        static std::list<std::string> tso_strings;
+        tso_strings.push_back(override.substr(0, pos));
+        const char * pattern = tso_strings.back().c_str();
+        tso_strings.push_back(override.substr(pos + 1));
+        overrides.push_back({pattern, tso_strings.back().c_str()});
+    }
+}
+
 static std::string clean_file_name(const std::string & fname) {
     std::string clean_fname = fname;
     string_replace_all(clean_fname, "\\", "_");
@@ -935,6 +952,11 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     if (!params.kv_overrides.empty()) {
         params.kv_overrides.emplace_back();
         params.kv_overrides.back().key[0] = 0;
+    }
+
+    // [fork, 2026-11-09] NOT in the tensor_buft_overrides array below, which is padded here and rewritten by the fit
+    if (!params.tensor_source_overrides.empty()) {
+        params.tensor_source_overrides.push_back({nullptr, nullptr});
     }
 
     const bool mcp_enabled = !params.mcp_servers_config.empty() || !params.mcp_servers_json.empty();
@@ -2850,6 +2872,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             parse_tensor_buffer_overrides(value, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_OVERRIDE_TENSOR"));
+    add_opt(common_arg(
+        {"--override-tensor-source"}, "<tensor name pattern>=<file.gguf>,...",
+        "load the tensors whose name matches the pattern from another GGUF instead of the model file (repeatable);\n"
+        "replace-only: every match must exist in both files with the same shape, the type may differ, the fit sees\n"
+        "the new sizes; intended for an MTP head, e.g. '^blk\\.64\\.=head.gguf' (the file is mapped, not prefetched)\n"
+        "note: output.weight / token_embd.weight are shared with the target, overriding them changes the target too",
+        [](common_params & params, const std::string & value) {
+            parse_tensor_source_overrides(value, params.tensor_source_overrides);
+        }
+    ).set_env("LLAMA_ARG_OVERRIDE_TENSOR_SOURCE"));
     add_opt(common_arg(
         {"-cmoe", "--cpu-moe"},
         "keep all Mixture of Experts (MoE) weights in the CPU",

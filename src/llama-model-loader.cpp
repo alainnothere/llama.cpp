@@ -541,7 +541,8 @@ llama_model_loader::llama_model_loader(
         bool no_alloc,
         bool load_mtp,
         const llama_model_kv_override * param_overrides_p,
-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
+        const llama_model_tensor_source_override * param_tensor_source_overrides_p)
         : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
@@ -713,6 +714,10 @@ llama_model_loader::llama_model_loader(
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
     }
+
+    // [fork, 2026-11-09] must run before n_tensors is taken: the overlay replaces entries and never adds names, so
+    // done_getting_tensors' n_created == n_tensors check holds unchanged
+    apply_tensor_source_overrides(param_tensor_source_overrides_p);
 
     n_kv      = gguf_get_n_kv(metadata);
     n_tensors = weights_map.size();
@@ -1407,6 +1412,164 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
     }
 }
 
+// [fork, 2026-11-09] --override-tensor-source <regex>=<file.gguf>
+//
+// Why: the MTP head experiments ran on spliced copies of the trunk (splice_head.py -> Qwen3.8-27B-UD-Q6_u-headIQ4XS,
+// -Q4_u-headQ6, -Q8_u-headIQ4XS in ~/theOtherDocs/ai/modelsOnOllamaToGguf, 15-30 GB each, differing from the trunk
+// only in the 15 blk.64.* tensors). This overlay takes those tensors from the second file at load time instead.
+//
+// Why here and not like --mtp-head: the tensor TYPE is decided by the weights_map entry (create_tensor copies its
+// meta), and the backend buffers are sized from it. --mtp-head writes after allocation, so it can only requantize
+// into the trunk's type and the fit never sees a size change. Here the entry itself points at the second file, so
+// the type and byte size come from it, and every fit probe (no_alloc loads of the same llama_model_params) measures
+// the overlaid sizes. IQ4 on Q6 = -122 MB, F16 on Q6 = about +500 MB: unseen, that is a GTT spill on a filled card.
+//
+// Why not as an extra split: a non-split trunk ignores the split list, and the split path demands split.no,
+// split.count and unique names (research 2026-11-09 sec. 3). Everything below weights_map is keyed by weight.idx
+// (mappings, host-ptr buffers, load_all_data, unmap), so an entry pointing at an extra files[] index just works.
+//
+// Rules: replace-only (a name must exist in both files: no adding, or done_getting_tensors' count breaks), same
+// shape (ne), type free. A pattern matching nothing, a name the source lacks, a source tensor the model lacks, a
+// shape mismatch and a tensor claimed by two overrides all throw: a silent partial overlay would be a wrong head.
+// The source's KV metadata is ignored (general.file_type stays the trunk's, as with the splice).
+//
+// RISK: output.weight and token_embd.weight are shared by the trunk and the MTP drafter (the head files carry no
+// nextn.shared_head_head / nextn.embed_tokens). Overriding them changes the TARGET's logits/embeddings too, and makes
+// common_fit_vocab_subset_bytes (reads the model file's output.weight type) stale. Intended use is ^blk\.64\. only;
+// a WARN line is printed when a shared tensor is replaced.
+void llama_model_loader::apply_tensor_source_overrides(const llama_model_tensor_source_override * overrides) {
+    if (overrides == nullptr || overrides->pattern == nullptr) {
+        return;
+    }
+    if (files.empty()) {
+        throw std::runtime_error(format("%s: --override-tensor-source needs a model loaded from a file", __func__));
+    }
+
+    // one files[] entry per distinct source path, patterns in the order given
+    std::vector<std::string> paths;
+    std::map<std::string, std::vector<std::string>> patterns_by_path;
+    for (const llama_model_tensor_source_override * p = overrides; p->pattern != nullptr; p++) {
+        if (p->path == nullptr || p->path[0] == '\0') {
+            throw std::runtime_error(format("%s: tensor source override '%s' has no file", __func__, p->pattern));
+        }
+        if (patterns_by_path.find(p->path) == patterns_by_path.end()) {
+            paths.emplace_back(p->path);
+        }
+        patterns_by_path[p->path].emplace_back(p->pattern);
+    }
+
+    std::set<std::string> replaced; // a tensor claimed by two overrides is an error, not last-wins
+
+    for (const std::string & path : paths) {
+        struct ggml_context * ctx = nullptr;
+        struct gguf_init_params params = {
+            /*.no_alloc = */ true,
+            /*.ctx      = */ &ctx,
+        };
+        gguf_context_ptr ctx_gguf { gguf_init_from_file(path.c_str(), params) };
+        if (!ctx_gguf) {
+            throw std::runtime_error(format("%s: failed to load tensor source GGUF %s", __func__, path.c_str()));
+        }
+        contexts.emplace_back(ctx); // keeps the tensor metas the weights point at alive
+
+        {
+            const int kid = gguf_find_key(ctx_gguf.get(), llm_kv(LLM_KV_GENERAL_ARCHITECTURE).c_str());
+            const std::string arch_src = kid >= 0 ? gguf_get_val_str(ctx_gguf.get(), kid) : "";
+            if (!arch_src.empty() && arch_src != arch_name) {
+                LLAMA_LOG_WARN("%s: tensor source %s has architecture '%s', the model '%s' (only shapes are checked)\n",
+                        __func__, path.c_str(), arch_src.c_str(), arch_name.c_str());
+            }
+        }
+
+        if (files.size() >= UINT16_MAX) {
+            throw std::runtime_error(format("%s: too many model files (%zu) for a uint16 file index", __func__, files.size()));
+        }
+        const uint16_t idx = (uint16_t) files.size();
+        files.emplace_back(new llama_file(path.c_str(), "rb", use_direct_io));
+        source_override_files.insert(idx);
+
+        for (const std::string & pattern : patterns_by_path.at(path)) {
+            std::regex re;
+            try {
+                re = std::regex(pattern);
+            } catch (const std::regex_error & e) {
+                throw std::runtime_error(format("%s: invalid tensor source pattern '%s': %s", __func__, pattern.c_str(), e.what()));
+            }
+
+            // the source must not carry a matching tensor the model lacks: that would be an add, not a replace
+            for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+                if (std::regex_search(cur->name, re) && weights_map.find(cur->name) == weights_map.end()) {
+                    throw std::runtime_error(format("%s: tensor '%s' of %s matches '%s' but is not in the model "
+                            "(a tensor source override replaces tensors, it never adds them)",
+                            __func__, cur->name, path.c_str(), pattern.c_str()));
+                }
+            }
+
+            std::vector<std::string> names;
+            for (const auto & it : weights_map) {
+                if (std::regex_search(it.first, re)) {
+                    names.push_back(it.first);
+                }
+            }
+            if (names.empty()) {
+                throw std::runtime_error(format("%s: tensor source pattern '%s' (%s) matches no tensor of the model",
+                        __func__, pattern.c_str(), path.c_str()));
+            }
+
+            std::map<std::pair<ggml_type, ggml_type>, int> type_changes;
+            size_t bytes_old = 0;
+            size_t bytes_new = 0;
+            std::vector<std::string> shared;
+            for (const std::string & name : names) {
+                ggml_tensor * cur = ggml_get_tensor(ctx, name.c_str());
+                if (cur == nullptr) {
+                    throw std::runtime_error(format("%s: pattern '%s' matches model tensor '%s', which %s does not have",
+                            __func__, pattern.c_str(), name.c_str(), path.c_str()));
+                }
+                if (!replaced.insert(name).second) {
+                    throw std::runtime_error(format("%s: tensor '%s' is matched by more than one tensor source override",
+                            __func__, name.c_str()));
+                }
+                llama_tensor_weight & w = weights_map.at(name);
+                if (!ggml_are_same_shape(w.tensor, cur)) {
+                    throw std::runtime_error(format("%s: tensor '%s' has shape %s in the model but %s in %s",
+                            __func__, name.c_str(), llama_format_tensor_shape(w.tensor).c_str(),
+                            llama_format_tensor_shape(cur).c_str(), path.c_str()));
+                }
+                if (name == "output.weight" || name == "token_embd.weight") {
+                    shared.push_back(name);
+                }
+
+                type_changes[{w.tensor->type, cur->type}]++;
+                bytes_old += ggml_nbytes(w.tensor);
+                bytes_new += ggml_nbytes(cur);
+                n_bytes    = n_bytes    - ggml_nbytes(w.tensor)     + ggml_nbytes(cur);
+                n_elements = n_elements - ggml_nelements(w.tensor) + ggml_nelements(cur);
+
+                LLAMA_LOG_DEBUG("%s: %-40s %-8s -> %-8s from %s\n", __func__, name.c_str(),
+                        ggml_type_name(w.tensor->type), ggml_type_name(cur->type), path.c_str());
+
+                w = llama_tensor_weight(files.back().get(), idx, ctx_gguf.get(), cur); // bounds-checks against file B
+            }
+
+            // WARN, not INFO: libllama INFO is hidden at the default -lv 3 in this fork ("logs : reduce v2")
+            std::string types;
+            for (const auto & tc : type_changes) {
+                types += format("%s%s->%s x%d", types.empty() ? "" : ", ",
+                        ggml_type_name(tc.first.first), ggml_type_name(tc.first.second), tc.second);
+            }
+            LLAMA_LOG_WARN("%s: tensor source '%s' <- %s: %zu tensors (%s), %.2f -> %.2f MiB (%+.2f MiB)\n",
+                    __func__, pattern.c_str(), path.c_str(), names.size(), types.c_str(),
+                    bytes_old / 1024.0 / 1024.0, bytes_new / 1024.0 / 1024.0,
+                    ((double) bytes_new - (double) bytes_old) / 1024.0 / 1024.0);
+            for (const std::string & name : shared) {
+                LLAMA_LOG_WARN("%s: '%s' is shared by the model and the MTP drafter: this override changes the "
+                        "target's %s too\n", __func__, name.c_str(), name == "output.weight" ? "logits" : "embeddings");
+            }
+        }
+    }
+}
+
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
     // note: read_lazy also requires mmap; this condition make sure it's usable even when --load-mode is not set to mmap
     if (use_mmap || lazy.any()) {
@@ -1426,7 +1589,12 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                 }
             }
 
-            const size_t prefetch_size = prefetch && use_mmap ? -1 : 0;
+            // [fork, 2026-11-09] a --override-tensor-source file is mapped like any split (its tensors load from the
+            // mapping) but never prefetched: prefetch -1 is MAP_POPULATE + WILLNEED over the WHOLE file, and the
+            // intended source is a full 22-29 GB model of which the 15 blk.64.* head tensors (226-451 MB) are used.
+            // Without this a Q8_u head source pulls 29 GB through the page cache on every start.
+            const bool is_source_override = source_override_files.count(idx) > 0;
+            const size_t prefetch_size = prefetch && use_mmap && !is_source_override ? -1 : 0;
 
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
                     lazy.for_file(idx));

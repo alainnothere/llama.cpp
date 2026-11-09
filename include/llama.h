@@ -317,6 +317,14 @@ extern "C" {
         ggml_backend_buffer_type_t buft;
     };
 
+    // [fork, 2026-11-09] --override-tensor-source: tensors whose name matches `pattern` (std::regex_search, like -ot)
+    // are read from the GGUF at `path` instead of the model file. Replace-only: every matched name must exist in
+    // both files with the same shape, the type may differ (that is the point: a Q6_u trunk with an IQ4_XS MTP head).
+    struct llama_model_tensor_source_override {
+        const char * pattern;
+        const char * path;
+    };
+
     struct llama_model_params {
         // NULL-terminated list of devices to use for offloading (if NULL, all available devices are used)
         ggml_backend_dev_t * devices;
@@ -354,6 +362,11 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+
+        // [fork, 2026-11-09] NULL-terminated list (pattern == NULL ends it) of tensor sources, or NULL. Kept apart
+        // from tensor_buft_overrides on purpose: common pads that array and the fit rewrites it per probe. Kept last
+        // so upstream picks touching the fields above stay clean.
+        const struct llama_model_tensor_source_override * tensor_source_overrides;
     };
 
     struct llama_sampler_seq_config {

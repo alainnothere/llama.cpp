@@ -1720,6 +1720,15 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
         mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
     }
 
+    // [fork, 2026-11-09] rides in llama_model_params so every fit probe (a copy of these mparams, no_alloc) loads the
+    // overlaid tensor types and measures their real sizes; a post-load writer (--mtp-head) would leave the fit blind
+    if (params.tensor_source_overrides.empty()) {
+        mparams.tensor_source_overrides = NULL;
+    } else {
+        GGML_ASSERT(params.tensor_source_overrides.back().pattern == nullptr && "Tensor source overrides not terminated with empty pattern");
+        mparams.tensor_source_overrides = params.tensor_source_overrides.data();
+    }
+
     mparams.progress_callback           = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;

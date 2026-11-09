@@ -118,6 +118,8 @@ struct llama_model_loader {
     } lazy;
 
     llama_files files;
+    // [fork, 2026-11-09] indices into files[] opened by --override-tensor-source: mapped, never prefetched
+    std::set<uint32_t> source_override_files;
     llama_ftype ftype;
     llama_fver  fver;
 
@@ -183,7 +185,11 @@ struct llama_model_loader {
         bool no_alloc,
         bool load_mtp,
         const llama_model_kv_override * param_overrides_p,
-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
+        const llama_model_tensor_source_override * param_tensor_source_overrides_p);
+
+    // [fork, 2026-11-09] --override-tensor-source overlay, run by the ctor once weights_map holds the model file(s)
+    void apply_tensor_source_overrides(const llama_model_tensor_source_override * overrides);
 
     template<typename T>
     typename std::enable_if<std::is_integral<T>::value, bool>::type

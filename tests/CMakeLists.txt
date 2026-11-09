@@ -169,6 +169,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-graph-reuse-pp.cpp ARGS ${CMAKE_CURRENT_BINARY_DIR}/test-models/llama-dense.gguf)
     # [MTP_CHUNK] 2026-10-27: common_batch_decode_chunked over n_batch + 7 entries, two seqs, CPU; missing model = SKIP
     llama_build_and_test(test-speculative-batch-chunks.cpp ARGS ${CMAKE_CURRENT_BINARY_DIR}/test-models/llama-dense.gguf)
+    # [fork, 2026-11-09] --override-tensor-source: overlay from a gguf-written source on the dummy llama model, CPU only;
+    # scratch sources go to the build dir (not /tmp = tmpfs) and are removed; missing model = SKIP
+    llama_build_and_test(test-tensor-source-override.cpp ARGS ${CMAKE_CURRENT_BINARY_DIR}/test-models/llama-dense.gguf ${CMAKE_CURRENT_BINARY_DIR})
+    set_tests_properties(test-tensor-source-override PROPERTIES FIXTURES_REQUIRED generate-models)
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-chat PRIVATE server-context)
